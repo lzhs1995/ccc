@@ -1,0 +1,1100 @@
+#!/usr/bin/env python3
+"""cmux-stack — one control plane over three independently-executing components.
+
+The three components are the CCC continuation watcher, the cmux janitor/guard
+pair, and the ccp-new profile manager.  They were built separately, they fail
+separately, and they must keep doing so.  What was missing was a single place to
+ask "what is the state of all of this" without having to remember three CLIs.
+
+Design contract, and the reason each half of it exists:
+
+  Control plane unified, execution plane isolated.  This controller only
+  *orchestrates published read-only interfaces*.  It does not re-derive any
+  component's verdict.  The janitor already learned this lesson the hard way:
+  ``status.sh`` used to parse ``config.env`` itself and printed a 48-hour
+  retention promise while the janitor script read a different key and deleted
+  after 24.  A status surface that computes its own answer can disagree with the
+  executor about what will happen, which is worse than having no status surface.
+  So every field below is projected from another program's output.
+
+  ccp-new stays an interactive CLI.  It is deliberately NOT given a LaunchAgent,
+  a daemon loop, or shared mutable state.  It edits live API credentials under a
+  human's eyes; making it a background service would mean unattended credential
+  writes.  ``cmux-stack profile`` therefore ``exec``s it with the terminal
+  intact rather than capturing it.
+
+  Projection is an allowlist, never a filter.  The watcher's ``status`` embeds
+  its whole runtime state (~300 KB, session-derived).  Nothing here copies a
+  component's payload wholesale: each field is named explicitly, so a new field
+  appearing upstream cannot leak through this surface by default.
+
+Exit codes:
+  0 all probed components healthy
+  1 degraded -- at least one component reachable but unhealthy
+  2 usage error
+  3 fail closed -- state could not be determined, nothing is assumed
+  4 a required component is absent / not installed
+
+Environment overrides (exist so the test suite can run against fakes; every one
+of them is also a legitimate operator escape hatch):
+  CMUX_STACK_LAUNCHCTL   launchctl binary            (default /bin/launchctl)
+  CMUX_STACK_JANITORCTL  cmux-janitorctl path        (default ~/.config/cmux-janitor/cmux-janitorctl)
+  CMUX_STACK_CCP         _ccp_new.py path            (default ~/.claude-profiles/_ccp_new.py)
+  CMUX_STACK_WATCHER     cmux_codex_watch.py path    (default alongside this file)
+  CMUX_STACK_PYTHON      interpreter for subprocesses (default sys.executable)
+  CMUX_STACK_TIMEOUT     per-probe timeout seconds   (default 30)
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+SCHEMA_VERSION = 1
+
+EXIT_OK = 0
+EXIT_DEGRADED = 1
+EXIT_USAGE = 2
+EXIT_FAIL_CLOSED = 3
+EXIT_ABSENT = 4
+
+HOME = Path(os.environ.get("HOME") or Path.home())
+HERE = Path(__file__).resolve().parent
+
+LAUNCHCTL = os.environ.get("CMUX_STACK_LAUNCHCTL") or "/bin/launchctl"
+JANITORCTL = Path(os.environ.get("CMUX_STACK_JANITORCTL")
+                  or (HOME / ".config" / "cmux-janitor" / "cmux-janitorctl"))
+CCP = Path(os.environ.get("CMUX_STACK_CCP")
+           or (HOME / ".claude-profiles" / "_ccp_new.py"))
+WATCHER = Path(os.environ.get("CMUX_STACK_WATCHER") or (HERE.parent / "cmux_codex_watch.py"))
+PYTHON = os.environ.get("CMUX_STACK_PYTHON") or sys.executable
+TIMEOUT = float(os.environ.get("CMUX_STACK_TIMEOUT") or 30)
+
+# Public defaults are deliberately neutral. Installations that keep a different
+# label can override them without editing the controller.
+WATCHER_LABEL = os.environ.get("CMUX_STACK_WATCHER_LABEL") or "com.example.ccc-continue"
+JANITOR_LABEL = os.environ.get("CMUX_STACK_JANITOR_LABEL") or "com.example.ccc-janitor"
+GUARD_LABEL = os.environ.get("CMUX_STACK_GUARD_LABEL") or "com.example.ccc-janitor-guard"
+
+COMPONENTS = ("watcher", "janitor", "profiles")
+
+# ---------------------------------------------------------------- PATH install
+#
+# One symlink, no short alias.  The watcher installs both `cmux-codex-continue`
+# and `ccc` because it is a high-frequency interactive entry point; this is a
+# low-frequency health-check entry point, and every extra alias is one more name
+# that can collide with something else on PATH.
+#
+# The watcher's install_cli_link() (cmux_codex_watch.py:6897) cannot be reused:
+# it hardcodes its own APP_NAME as the link target *and* `ccc` as a second link,
+# so calling it from here would point cmux-stack at the watcher's entry point and
+# create/remove `ccc` as a side effect.  Hence an own function that copies only
+# its three correct decisions: idempotent when already ours, refuse when it is
+# someone else's, create when absent.
+#
+# CMUX_STACK_BINDIR exists so the test suite can prove install/uninstall against
+# a temporary directory.  Without it every install test would have to write to
+# the real /opt/homebrew/bin, which is exactly the blast radius the tests are
+# supposed to bound.
+INSTALL_BINDIR = Path(os.environ.get("CMUX_STACK_BINDIR") or "/opt/homebrew/bin")
+INSTALL_NAME = "cmux-stack"
+
+
+class FailClosed(Exception):
+    """State could not be determined.  Never downgraded to a cheerful default."""
+
+
+# --------------------------------------------------------------------- probes
+
+def _run(argv: list[str], *, timeout: float | None = None) -> tuple[int | None, str, str]:
+    """Bounded subprocess.  Returns (rc, stdout, stderr); rc None = could not run.
+
+    ``rc is None`` and ``rc != 0`` are kept distinct on purpose: "the probe
+    could not be executed" and "the probe ran and said no" have different
+    remedies, and collapsing them is how an absent component starts reporting as
+    a healthy one.
+    """
+    try:
+        done = subprocess.run(argv, capture_output=True, text=True,
+                              timeout=timeout if timeout is not None else TIMEOUT)
+    except (OSError, subprocess.SubprocessError):
+        return None, "", ""
+    return done.returncode, done.stdout, done.stderr
+
+
+def _launchd_loaded(label: str) -> bool | None:
+    """None when launchctl cannot answer, so absent is never faked as false.
+
+    Same shape as janitorctl._launchd_loaded.  Deliberately duplicated rather
+    than imported: importing the janitor controller would couple this process to
+    the janitor's module-level state, and a tri-state boolean is not business
+    logic.
+    """
+    rc, _out, _err = _run([LAUNCHCTL, "print", f"gui/{os.getuid()}/{label}"], timeout=10)
+    if rc is None:
+        return None
+    return rc == 0
+
+
+def _json_or_none(text: str) -> Any:
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def probe_watcher() -> dict:
+    """Project the watcher's own ``status`` output.  Bounded, allowlisted.
+
+    The watcher publishes its entire runtime state under ``runtime``; that blob
+    is session-derived and is never copied here.  Only counts and scalars cross
+    this boundary.
+    """
+    row: dict[str, Any] = {
+        "component": "watcher",
+        "installed": WATCHER.is_file(),
+        "launchd_loaded": _launchd_loaded(WATCHER_LABEL),
+        "probe_ok": False,
+        "healthy": None,
+        "mode": None,
+        "global_paused": None,
+        "pid": None,
+        "pid_alive": None,
+        "source_matches_disk": None,
+        "runtime_metadata_present": None,
+        "explicit_target_count": None,
+        "workspace_rule_count": None,
+        "reason": None,
+    }
+    if not row["installed"]:
+        row["reason"] = "watcher source not found"
+        return row
+
+    rc, out, _err = _run([PYTHON, str(WATCHER), "status"])
+    if rc is None:
+        row["reason"] = "could not execute watcher"
+        return row
+    payload = _json_or_none(out)
+    if not isinstance(payload, dict):
+        row["reason"] = "watcher status was not JSON"
+        return row
+
+    row["probe_ok"] = True
+    row["mode"] = payload.get("mode") if isinstance(payload.get("mode"), str) else None
+    row["global_paused"] = payload.get("global_paused") is True
+
+    daemon = payload.get("daemon")
+    daemon = daemon if isinstance(daemon, dict) else {}
+    pid = daemon.get("pid")
+    row["pid"] = int(pid) if isinstance(pid, int) and pid > 0 else None
+    row["pid_alive"] = daemon.get("pid_alive") is True
+    row["source_matches_disk"] = daemon.get("source_matches_disk") is True
+    row["runtime_metadata_present"] = daemon.get("runtime_metadata_present") is True
+
+    targets = payload.get("explicit_targets")
+    rules = payload.get("workspace_rules")
+    row["explicit_target_count"] = len(targets) if isinstance(targets, list) else None
+    row["workspace_rule_count"] = len(rules) if isinstance(rules, list) else None
+
+    row["healthy"], row["reason"] = _watcher_verdict(row)
+    return row
+
+
+def _watcher_verdict(row: dict) -> tuple[bool | None, str | None]:
+    """Rank the watcher's facts.  ``launchd_loaded is False`` outranks everything.
+
+    Guide 106.14.4 is the governing precedent, and it was written after a real
+    28-minute outage: the janitor's label was booted out of launchd while every
+    *file-derived* field stayed frozen at its last healthy value, so the panel
+    painted "running" throughout.  A live PID is exactly such a stale fact -- a
+    daemon whose label is gone keeps running until it dies, and then nothing
+    restarts it.  Reporting that as healthy would also make ``up`` skip the one
+    component that needs bootstrapping, which is P1-1.
+
+    Tri-state is preserved deliberately: ``None`` means launchctl could not
+    answer, which is unknown, not "not loaded".  Collapsing it to False would
+    invent an outage; collapsing it to True would hide one.
+    """
+    loaded = row.get("launchd_loaded")
+    if loaded is False:
+        return False, (f"not loaded into launchd ({WATCHER_LABEL}); a live pid here is a "
+                       "leftover process that nothing will restart -- run: cmux-stack up")
+    if row.get("pid_alive") is not True:
+        return False, "daemon pid not alive"
+    if loaded is None:
+        # Fail closed: scheduling is the thing that keeps this alive, and we
+        # could not read it.  Unknown must not render as ok.
+        return None, "launchctl could not answer; scheduling state unknown"
+    if row.get("global_paused") is True:
+        # Unlike the janitor's DISABLED sentinel (which janitorctl documents as a
+        # deliberate paused-and-still-publishing state), the watcher has no such
+        # contract: global_paused means no session will be continued, so it is a
+        # fault the operator should see, not a benign mode.
+        return False, "globally paused; no session will be continued"
+    # A watcher whose on-disk source differs from the running one is NOT judged
+    # unhealthy: it only means a restart would change behaviour, and deciding to
+    # restart is a human call.  Surfaced in the row, never folded into healthy.
+    return True, None
+
+
+def probe_janitor() -> dict:
+    """Project ``cmux-janitorctl status --json``.  The janitor owns its verdict."""
+    row: dict[str, Any] = {
+        "component": "janitor",
+        "installed": JANITORCTL.is_file(),
+        "launchd_loaded": _launchd_loaded(JANITOR_LABEL),
+        "guard_launchd_loaded": _launchd_loaded(GUARD_LABEL),
+        "probe_ok": False,
+        "healthy": None,
+        "paused": None,
+        "guard_tripped": None,
+        "guard_health": None,
+        "janitor_stale": None,
+        "guard_stale": None,
+        "janitor_present": None,
+        "janitor_invalid": None,
+        "guard_present": None,
+        "guard_invalid": None,
+        "quarantine_batch_count": None,
+        "violation_count": None,
+        "reason": None,
+    }
+    if not row["installed"]:
+        row["reason"] = "janitorctl not installed"
+        return row
+
+    rc, out, _err = _run([PYTHON, str(JANITORCTL), "status", "--json"])
+    if rc is None:
+        row["reason"] = "could not execute janitorctl"
+        return row
+    payload = _json_or_none(out)
+    if not isinstance(payload, dict):
+        # rc 3 with no JSON is the janitor's own fail-closed path.
+        row["reason"] = f"janitorctl status unusable (rc={rc})"
+        return row
+
+    row["probe_ok"] = True
+    control = payload.get("control") if isinstance(payload.get("control"), dict) else {}
+    janitor = payload.get("janitor") if isinstance(payload.get("janitor"), dict) else {}
+    guard = payload.get("guard") if isinstance(payload.get("guard"), dict) else {}
+    quarantine = payload.get("quarantine") if isinstance(payload.get("quarantine"), dict) else {}
+
+    row["paused"] = control.get("paused") is True
+    row["guard_tripped"] = control.get("guard_tripped") is True
+    row["guard_health"] = guard.get("health") if isinstance(guard.get("health"), str) else None
+    row["janitor_stale"] = janitor.get("stale") is True
+    row["guard_stale"] = guard.get("stale") is True
+    # present/invalid were published by janitorctl from the start and consumed by
+    # nobody -- the same producer-writes/consumer-ignores drift that 106.14.4 was
+    # written about.  An invalid state file must not read as a healthy one.
+    row["janitor_present"] = janitor.get("present") is True
+    row["janitor_invalid"] = janitor.get("invalid") is True
+    row["guard_present"] = guard.get("present") is True
+    row["guard_invalid"] = guard.get("invalid") is True
+    batches = quarantine.get("batch_count")
+    row["quarantine_batch_count"] = batches if isinstance(batches, (int, float)) else None
+    violations = guard.get("violations")
+    row["violation_count"] = len(violations) if isinstance(violations, list) else None
+
+    row["healthy"], row["reason"] = _janitor_verdict(row)
+    return row
+
+
+def _janitor_verdict(row: dict) -> tuple[bool | None, str | None]:
+    """Rank the janitor's facts.  Scheduling outranks every file-derived field.
+
+    Ordering rationale, highest first:
+
+    1. ``launchd_loaded is False`` -- 106.14.4 verbatim: when the label was booted
+       out, ``phase``/``health``/``stale`` all froze at their last healthy values
+       because no process was left to overwrite them.  Every field below this one
+       is read from a file some scheduled process must write, so if nothing is
+       scheduled they are history, not status.
+    2. Guard not scheduled -- the guide calls a ``healthy`` reading from an
+       unscheduled guard "the most dangerous thing on this page", because a guard
+       that never runs can never trip.
+    3. Tripped / violations -- real faults.  Never auto-rearmed here.
+    4. Invalid state files -- unparseable is not healthy.
+    5. Guard staleness -- ALWAYS a fault.  guard.sh runs on a 60s StartInterval
+       and writes ``guard-state.json`` unconditionally; pausing the janitor does
+       not pause the guard.  So a stale guard means the guard itself stopped.
+    6. Janitor staleness -- a fault *only when not paused*.  janitorctl documents
+       that the janitor publishes only from inside a real run and GATE 0 exits
+       early while paused, so "paused, last measured N minutes ago" is the
+       designed state, not a defect.  Calling that unhealthy would push an
+       operator toward re-arming a deliberately paused janitor.
+    7. ``launchd_loaded is None`` -- launchctl could not answer; unknown.
+
+    Paused-and-otherwise-fine stays healthy: it is an operator decision, and
+    reporting it as a fault invites exactly the un-pausing this must not cause.
+    """
+    if row.get("launchd_loaded") is False:
+        return False, (f"not loaded into launchd ({JANITOR_LABEL}); nothing will sweep and "
+                       "every field below is a frozen last reading -- run: cmux-stack up")
+    if row.get("guard_launchd_loaded") is False:
+        return False, (f"guard not loaded into launchd ({GUARD_LABEL}); an unscheduled guard "
+                       "can never trip, so its health reading proves nothing")
+    if row.get("guard_tripped") is True:
+        return False, "guard tripped (manual review required; no auto-rearm)"
+    if (row.get("violation_count") or 0) > 0:
+        return False, f"{row['violation_count']} guard violation(s)"
+    if row.get("guard_invalid") is True:
+        return False, "guard state file is not valid JSON"
+    if row.get("janitor_invalid") is True:
+        return False, "janitor state file is not valid JSON"
+    # `present` is False when the component has never published state at all.
+    # janitorctl's own resume path refuses on exactly this ("guard has never
+    # published state"), so the controller must not rank it above that.  It also
+    # covers the whole-block-missing case: if `guard` or `janitor` is absent from
+    # the payload, every scalar below reads as its falsy default and the ladder
+    # would otherwise fall through to healthy=True with reason=None -- a green
+    # verdict derived from no measurement whatsoever.
+    if row.get("guard_present") is not True:
+        return False, "guard has never published state; nothing to judge"
+    if row.get("janitor_present") is not True:
+        return False, "janitor has never published state; nothing to judge"
+    if row.get("guard_stale") is True:
+        return False, ("guard state is stale; guard.sh runs every 60s regardless of pause, "
+                       "so staleness means the guard stopped publishing")
+    if row.get("janitor_stale") is True and row.get("paused") is not True:
+        return False, "janitor state is stale while not paused; sweeps are not completing"
+    if row.get("launchd_loaded") is None or row.get("guard_launchd_loaded") is None:
+        return None, "launchctl could not answer; scheduling state unknown"
+    if row.get("paused") is True:
+        # Healthy on purpose.  See docstring item 6.
+        return True, "paused by operator (deliberate; stale janitor state is expected here)"
+    return True, None
+
+
+def probe_profiles() -> dict:
+    """Project ``_ccp_new.py --status --json``.  Offline, read-only, no network."""
+    row: dict[str, Any] = {
+        "component": "profiles",
+        "installed": CCP.is_file(),
+        # ccp-new must never acquire a LaunchAgent; there is no label to probe.
+        "launchd_loaded": None,
+        "probe_ok": False,
+        "healthy": None,
+        "profile_count": None,
+        "unhealthy_count": None,
+        "template_healthy": None,
+        "manifest_healthy": None,
+        "source_sha256": None,
+        "reason": None,
+    }
+    if not row["installed"]:
+        row["reason"] = "ccp-new not installed"
+        return row
+
+    rc, out, _err = _run([PYTHON, str(CCP), "--status", "--json"])
+    if rc is None:
+        row["reason"] = "could not execute ccp-new"
+        return row
+    payload = _json_or_none(out)
+    if not isinstance(payload, dict):
+        row["reason"] = "ccp-new status was not JSON"
+        return row
+
+    row["probe_ok"] = True
+    row["profile_count"] = payload.get("profile_count")
+    # S3 (2026-09-01): unhealthy_count is a gate input, so it is strongly
+    # typed.  Anything but a non-negative integer -- missing, string, bool,
+    # negative -- projects as None (unknown).  The old truthiness test made
+    # None and "" read as "zero unhealthy", i.e. a broken status fed the
+    # healthy verdict (fail open).
+    raw_unhealthy = payload.get("unhealthy_count")
+    row["unhealthy_count"] = (
+        raw_unhealthy
+        if isinstance(raw_unhealthy, int) and not isinstance(raw_unhealthy, bool)
+        and raw_unhealthy >= 0 else None)
+    tpl = payload.get("template") if isinstance(payload.get("template"), dict) else {}
+    man = payload.get("manifest") if isinstance(payload.get("manifest"), dict) else {}
+    row["template_healthy"] = tpl.get("healthy") is True
+    row["manifest_healthy"] = man.get("healthy") is True
+    sha = payload.get("source_sha256")
+    row["source_sha256"] = sha if isinstance(sha, str) else None
+    row["healthy"] = bool(rc == 0 and row["template_healthy"] and row["manifest_healthy"]
+                          and row["unhealthy_count"] == 0)
+    if not row["healthy"]:
+        if row["unhealthy_count"] is None:
+            row["reason"] = (f"unhealthy_count unreadable ({raw_unhealthy!r}); "
+                             "unknown is not healthy")
+        else:
+            row["reason"] = (f"{row['unhealthy_count']} unhealthy profile(s) "
+                             "or bad template/manifest")
+    return row
+
+
+PROBES = {"watcher": probe_watcher, "janitor": probe_janitor, "profiles": probe_profiles}
+
+
+def build_status(only: tuple[str, ...] = COMPONENTS) -> dict:
+    """Probe each component in isolation.  One crash must not hide the others."""
+    components: dict[str, Any] = {}
+    for name in only:
+        try:
+            components[name] = PROBES[name]()
+        except Exception as exc:  # noqa: BLE001 - isolation is the point
+            # Component-level failure isolation: a broken probe degrades exactly
+            # one entry.  The exception type is published, never its message,
+            # which can carry paths or payload fragments.
+            components[name] = {
+                "component": name, "probe_ok": False, "healthy": None,
+                "reason": f"probe raised {type(exc).__name__}",
+            }
+
+    probed = [c for c in components.values() if c.get("probe_ok")]
+    unhealthy = [c for c in probed if c.get("healthy") is False]
+    # A probed component whose verdict is None answered, but its answer was
+    # "I cannot tell" -- launchctl silent, scheduling state unreadable.  Before
+    # this branch existed such a row fell through to the `else` and the whole
+    # stack printed overall=ok / exit 0, which is the same class of defect as
+    # 106.14.4: an unknown rendered as a confident green.  Unknown is not ok.
+    unknown = [c for c in probed if c.get("healthy") is None]
+    if not probed:
+        overall = "unknown"
+    elif unhealthy:
+        # A definite fault outranks an unknown: it is the more actionable of the
+        # two, and it is already named in `unhealthy`.
+        overall = "degraded"
+    elif unknown:
+        overall = "unknown"
+    elif len(probed) < len(only):
+        overall = "partial"
+    else:
+        overall = "ok"
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "controller": "cmux-stack",
+        "observed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "read_only": True,
+        "overall": overall,
+        "probed_count": len(probed),
+        "requested_count": len(only),
+        "unhealthy": sorted(c["component"] for c in unhealthy),
+        "unknown": sorted(c["component"] for c in unknown),
+        "components": components,
+    }
+
+
+def status_exit_code(status: dict) -> int:
+    overall = status.get("overall")
+    if overall == "ok":
+        return EXIT_OK
+    if overall == "degraded":
+        return EXIT_DEGRADED
+    if overall == "partial":
+        return EXIT_ABSENT
+    return EXIT_FAIL_CLOSED
+
+
+# ------------------------------------------------------------------ rendering
+
+def _mark(value: Any) -> str:
+    if value is True:
+        return "OK"
+    if value is False:
+        return "FAIL"
+    return "?"
+
+
+def render_status(status: dict) -> None:
+    print(f"\n=== cmux-stack === {status['observed_at']}  overall={status['overall']}")
+    for name in COMPONENTS:
+        row = status["components"].get(name)
+        if row is None:
+            continue
+        if not row.get("probe_ok"):
+            print(f"  {name:<9} 未探测   {row.get('reason') or 'unavailable'}")
+            continue
+        health = _mark(row.get("healthy"))
+        extra = ""
+        if name == "watcher":
+            extra = (f"pid={row.get('pid') or '-'} alive={_mark(row.get('pid_alive'))} "
+                     f"mode={row.get('mode')} targets={row.get('explicit_target_count')}")
+            if row.get("source_matches_disk") is False:
+                extra += "  [磁盘源与运行源不同：重启会改变行为]"
+        elif name == "janitor":
+            extra = (f"paused={row.get('paused')} guard={row.get('guard_health')} "
+                     f"quarantine={row.get('quarantine_batch_count')}")
+        elif name == "profiles":
+            extra = (f"profiles={row.get('profile_count')} "
+                     f"unhealthy={row.get('unhealthy_count')}")
+        print(f"  {name:<9} {health:<5}  {extra}")
+        if row.get("reason"):
+            print(f"  {'':<9}        note: {row['reason']}")
+    print()
+    print("  子命令: status --json | doctor | up | profile | update --plan | down --component")
+    print()
+
+
+# ------------------------------------------------------------------ subcommands
+
+def cmd_status(args: argparse.Namespace) -> int:
+    only = _selected_components(args)
+    status = build_status(only)
+    if args.json:
+        json.dump(status, sys.stdout, ensure_ascii=False, indent=2 if args.pretty else None)
+        sys.stdout.write("\n")
+    else:
+        render_status(status)
+    return status_exit_code(status)
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Status plus the install-level facts that explain a bad status."""
+    status = build_status(_selected_components(args))
+    findings: list[dict[str, Any]] = []
+
+    for path, label in ((WATCHER, "watcher source"), (JANITORCTL, "janitorctl"), (CCP, "ccp-new")):
+        findings.append({"check": f"{label} present", "ok": path.is_file(), "path": str(path)})
+
+    findings.append({"check": "launchctl usable",
+                     "ok": _launchd_loaded(WATCHER_LABEL) is not None,
+                     "path": LAUNCHCTL})
+
+    # ccp-new must stay a foreground CLI.  A LaunchAgent for it would be a
+    # design violation, so its *absence* is the passing condition.
+    ccp_plist = HOME / "Library" / "LaunchAgents" / "com.example.ccp-new.plist"
+    findings.append({"check": "ccp-new has no LaunchAgent (required)",
+                     "ok": not ccp_plist.exists(), "path": str(ccp_plist)})
+
+    watcher = status["components"].get("watcher", {})
+    if watcher.get("probe_ok") and watcher.get("source_matches_disk") is False:
+        findings.append({"check": "watcher running source == disk source",
+                         "ok": False, "path": str(WATCHER)})
+
+    payload = {"schema_version": SCHEMA_VERSION, "controller": "cmux-stack",
+               "mode": "doctor", "status": status, "findings": findings}
+    if args.json:
+        json.dump(payload, sys.stdout, ensure_ascii=False, indent=2 if args.pretty else None)
+        sys.stdout.write("\n")
+    else:
+        render_status(status)
+        print("  诊断:")
+        for f in findings:
+            print(f"    [{'OK' if f['ok'] else '  '}] {f['check']}")
+            if not f["ok"]:
+                print(f"           {f['path']}")
+        print()
+    if any(not f["ok"] for f in findings):
+        return EXIT_DEGRADED
+    return status_exit_code(status)
+
+
+def cmd_up(args: argparse.Namespace) -> int:
+    """Bring absent components up.  Idempotent: a healthy watcher is left alone.
+
+    Restarting a healthy watcher is not a no-op -- it drops in-flight episode
+    state and re-reads config.  So "already healthy" must mean "do nothing",
+    not "restart to be sure".
+    """
+    only = _selected_components(args)
+    status = build_status(only)
+    plan: list[dict[str, Any]] = []
+
+    for name in only:
+        row = status["components"].get(name, {})
+        if name == "profiles":
+            plan.append({"component": name, "action": "none",
+                         "why": "ccp-new is an interactive CLI; it has no service to start"})
+            continue
+        if not row.get("installed"):
+            plan.append({"component": name, "action": "blocked",
+                         "why": "not installed; install is a separate authorized step"})
+            continue
+
+        # S1 (2026-09-01): the janitor component is TWO LaunchAgents -- the
+        # sweeper and its guard.  Recovering only the sweeper's label left a
+        # booted-out guard unscheduled forever, and an unguarded janitor is
+        # exactly the configuration the guard exists to prevent.  Each label
+        # is judged on its own live load state.
+        if name == "janitor":
+            label_states = [(JANITOR_LABEL, row.get("launchd_loaded")),
+                            (GUARD_LABEL, row.get("guard_launchd_loaded"))]
+        else:
+            label_states = [(WATCHER_LABEL, row.get("launchd_loaded"))]
+
+        # Scheduling is decided FIRST, before any health reading, and for the
+        # same reason as in the probes: every other field is a file read, and an
+        # unscheduled service leaves those files frozen at their last healthy
+        # values.  The pre-fix ladder asked ``healthy is True`` first, so a stale
+        # PID that still answered "alive" produced action=none for a service that
+        # launchd was no longer scheduling -- i.e. `up` declined to perform the
+        # one recovery it exists to perform.  Load state is the only field here
+        # that is measured live.
+        scheduled = True
+        for label, loaded in label_states:
+            if loaded is False:
+                scheduled = False
+                plan.append({"component": name, "action": "bootstrap", "label": label,
+                             "why": f"{label} not loaded in launchd; nothing is scheduling it",
+                             "command": f"{LAUNCHCTL} bootstrap gui/{os.getuid()} "
+                                        f"~/Library/LaunchAgents/{label}.plist"})
+                continue
+
+            # launchctl could not answer.  Refuse to write on an unknown:
+            # bootstrapping something that is in fact already loaded is not free,
+            # and "unknown" is not "absent" (janitorctl:318 publishes None
+            # precisely so absent is never faked as false).  Fail closed and let
+            # a human look.
+            if loaded is None:
+                scheduled = False
+                plan.append({"component": name, "action": "blocked", "label": label,
+                             "why": f"launchctl could not report load state for {label}; "
+                                    "refusing to bootstrap on an unknown (fail closed)"})
+        if not scheduled:
+            continue
+
+        if row.get("healthy") is True:
+            plan.append({"component": name, "action": "none", "why": "already healthy"})
+            continue
+
+        # Loaded but unhealthy: launchd is scheduling it, so bootstrap is not the
+        # remedy and restarting would drop in-flight episode state.  Name the
+        # reason and stop -- deciding to restart is a human call.
+        labels = "+".join(label for label, _ in label_states)
+        plan.append({"component": name, "action": "none",
+                     "why": f"LaunchAgent {labels} is loaded but component reports "
+                            f"unhealthy ({row.get('reason') or 'no reason given'}); "
+                            "bootstrap is not the remedy, not restarting"})
+
+    actionable = [p for p in plan if p["action"] == "bootstrap"]
+    payload = {"schema_version": SCHEMA_VERSION, "controller": "cmux-stack", "mode": "up",
+               "applied": False, "plan": plan}
+
+    if not args.apply:
+        payload["note"] = "dry run; pass --apply to execute (requires authorization)"
+        _emit(payload, args)
+        return EXIT_OK if not actionable else EXIT_DEGRADED
+
+    # --apply performs real launchd changes.  Guard-tripped state is never
+    # cleared here: rearm is a human decision by design.
+    results = []
+    for item in actionable:
+        rc, _out, err = _run([LAUNCHCTL, "bootstrap", f"gui/{os.getuid()}",
+                              str(HOME / "Library" / "LaunchAgents" / f"{item['label']}.plist")])
+        results.append({"component": item["component"], "rc": rc,
+                        "ok": rc == 0, "stderr_head": (err or "")[:200]})
+    payload["applied"] = True
+    payload["results"] = results
+    _emit(payload, args)
+    return EXIT_OK if all(r["ok"] for r in results) else EXIT_DEGRADED
+
+
+def cmd_down(args: argparse.Namespace) -> int:
+    """Take one named component down.  Never all of them at once by accident."""
+    if not args.component:
+        print("down 必须显式指定 --component（不提供全量停机）", file=sys.stderr)
+        return EXIT_USAGE
+    name = args.component
+    if name not in COMPONENTS:
+        print(f"未知组件: {name}（可选 {', '.join(COMPONENTS)}）", file=sys.stderr)
+        return EXIT_USAGE
+    if name == "profiles":
+        print("ccp-new 没有常驻服务，无可停止对象（这是设计要求，不是缺陷）。",
+              file=sys.stderr)
+        return EXIT_USAGE
+
+    label = WATCHER_LABEL if name == "watcher" else JANITOR_LABEL
+    payload = {"schema_version": SCHEMA_VERSION, "controller": "cmux-stack", "mode": "down",
+               "component": name, "label": label, "applied": False,
+               "command": f"{LAUNCHCTL} bootout gui/{os.getuid()}/{label}"}
+    if not args.apply:
+        payload["note"] = "dry run; pass --apply to execute (requires authorization)"
+        _emit(payload, args)
+        return EXIT_OK
+    rc, _out, err = _run([LAUNCHCTL, "bootout", f"gui/{os.getuid()}/{label}"])
+    payload["applied"] = True
+    payload["rc"] = rc
+    payload["ok"] = rc == 0
+    payload["stderr_head"] = (err or "")[:200]
+    _emit(payload, args)
+    return EXIT_OK if rc == 0 else EXIT_DEGRADED
+
+
+def _install_paths() -> tuple[Path, Path]:
+    """(target, link).  Target is this very file, resolved through symlinks."""
+    return Path(__file__).resolve(), INSTALL_BINDIR / INSTALL_NAME
+
+
+def install_plan() -> dict:
+    """Decide what installing would do, without doing any of it.
+
+    Three outcomes, and the middle one is the whole point of having this
+    function: a link that exists but points somewhere else is *refused*, never
+    replaced.  Overwriting it would silently hijack a name the user pointed at
+    something else on purpose.
+    """
+    target, link = _install_paths()
+    row: dict[str, Any] = {
+        "target": str(target),
+        "link": str(link),
+        "bindir_exists": link.parent.is_dir(),
+        "bindir_writable": os.access(link.parent, os.W_OK) if link.parent.is_dir() else False,
+        "link_exists": link.exists() or link.is_symlink(),
+        "link_is_symlink": link.is_symlink(),
+        "points_to": None,
+        "action": None,
+        "why": None,
+    }
+    if link.is_symlink():
+        try:
+            row["points_to"] = str(link.resolve())
+        except OSError:
+            # A dangling symlink cannot be resolved.  It is still not ours, so
+            # it still must not be replaced silently.
+            row["points_to"] = None
+    if row["link_is_symlink"] and row["points_to"] == str(target):
+        row["action"] = "none"
+        row["why"] = "already installed and pointing here (idempotent)"
+        return row
+    if row["link_exists"]:
+        row["action"] = "refused"
+        row["why"] = (f"{link} already exists and does not point here "
+                      f"(points to {row['points_to'] or 'an unresolvable target'}); "
+                      "refusing to replace it")
+        return row
+    if not row["bindir_exists"]:
+        row["action"] = "blocked"
+        row["why"] = f"{link.parent} does not exist"
+        return row
+    if not row["bindir_writable"]:
+        row["action"] = "blocked"
+        row["why"] = f"{link.parent} is not writable; installing would need elevated rights"
+        return row
+    row["action"] = "symlink"
+    row["why"] = f"create {link} -> {target}"
+    return row
+
+
+def uninstall_plan() -> dict:
+    """Decide what uninstalling would do.  Only ever removes our own link."""
+    target, link = _install_paths()
+    row: dict[str, Any] = {
+        "target": str(target),
+        "link": str(link),
+        "link_exists": link.exists() or link.is_symlink(),
+        "link_is_symlink": link.is_symlink(),
+        "points_to": None,
+        "action": None,
+        "why": None,
+    }
+    if link.is_symlink():
+        try:
+            row["points_to"] = str(link.resolve())
+        except OSError:
+            row["points_to"] = None
+    if not row["link_exists"]:
+        row["action"] = "none"
+        row["why"] = "not installed; nothing to remove"
+        return row
+    if not (row["link_is_symlink"] and row["points_to"] == str(target)):
+        row["action"] = "refused"
+        row["why"] = (f"{link} is not our symlink "
+                      f"(points to {row['points_to'] or 'an unresolvable target'}); "
+                      "refusing to remove someone else's file")
+        return row
+    row["action"] = "unlink"
+    row["why"] = f"remove {link}"
+    return row
+
+
+def cmd_install(args: argparse.Namespace) -> int:
+    """Dry run by default; --apply performs the one filesystem write.
+
+    Same shape as up/down: the plan is always printed, and the write happens
+    only behind --apply.  Upgrades need no reinstall -- the link points at the
+    file, so editing bin/cmux-stack takes effect immediately and rolling back is
+    a git operation, not a PATH operation.
+    """
+    plan = install_plan()
+    payload = {"schema_version": SCHEMA_VERSION, "controller": "cmux-stack",
+               "mode": "install", "applied": False, "plan": [dict(plan, component="stack")]}
+
+    if plan["action"] == "refused":
+        payload["note"] = plan["why"]
+        _emit(payload, args)
+        return EXIT_DEGRADED
+    if plan["action"] == "blocked":
+        payload["note"] = plan["why"]
+        _emit(payload, args)
+        return EXIT_ABSENT
+    if plan["action"] == "none":
+        payload["note"] = plan["why"]
+        _emit(payload, args)
+        return EXIT_OK
+    if not args.apply:
+        payload["note"] = "dry run; pass --apply to create the symlink (requires authorization)"
+        _emit(payload, args)
+        return EXIT_OK
+
+    target, link = _install_paths()
+    try:
+        link.symlink_to(target)
+    except OSError as exc:
+        payload["applied"] = True
+        payload["ok"] = False
+        payload["note"] = f"symlink failed: {type(exc).__name__}"
+        _emit(payload, args)
+        return EXIT_FAIL_CLOSED
+    payload["applied"] = True
+    payload["ok"] = True
+    payload["note"] = f"installed {link}"
+    _emit(payload, args)
+    return EXIT_OK
+
+
+def cmd_uninstall(args: argparse.Namespace) -> int:
+    """Dry run by default; --apply removes only a symlink that is ours."""
+    plan = uninstall_plan()
+    payload = {"schema_version": SCHEMA_VERSION, "controller": "cmux-stack",
+               "mode": "uninstall", "applied": False, "plan": [dict(plan, component="stack")]}
+
+    if plan["action"] == "refused":
+        payload["note"] = plan["why"]
+        _emit(payload, args)
+        return EXIT_DEGRADED
+    if plan["action"] == "none":
+        payload["note"] = plan["why"]
+        _emit(payload, args)
+        return EXIT_OK
+    if not args.apply:
+        payload["note"] = "dry run; pass --apply to remove the symlink (requires authorization)"
+        _emit(payload, args)
+        return EXIT_OK
+
+    _target, link = _install_paths()
+    try:
+        link.unlink()
+    except OSError as exc:
+        payload["applied"] = True
+        payload["ok"] = False
+        payload["note"] = f"unlink failed: {type(exc).__name__}"
+        _emit(payload, args)
+        return EXIT_FAIL_CLOSED
+    payload["applied"] = True
+    payload["ok"] = True
+    payload["note"] = f"removed {link}"
+    _emit(payload, args)
+    return EXIT_OK
+
+
+def cmd_update(args: argparse.Namespace) -> int:
+    """Per-component update plan.  Explicitly NOT an atomic transaction.
+
+    The three components live in different trust domains: a launchd service, a
+    shell-script cleaner with its own guard, and an interactive credential
+    editor.  Presenting a single "update everything" button would imply
+    all-or-nothing semantics that cannot be delivered across those domains --
+    there is no shared rollback.  So the plan is sequential, per-component, and
+    says so.
+    """
+    only = _selected_components(args)
+    status = build_status(only)
+    steps = []
+    for name in only:
+        row = status["components"].get(name, {})
+        if name == "watcher":
+            steps.append({"component": name, "order": len(steps) + 1,
+                          "verify": "cmux-stack status --json → watcher.pid_alive",
+                          "rollback": "restore prior source, bootout+bootstrap the label",
+                          "independent": True,
+                          "blocked_by": None if row.get("installed") else "not installed"})
+        elif name == "janitor":
+            steps.append({"component": name, "order": len(steps) + 1,
+                          "verify": "cmux-janitorctl status --json → guard.health",
+                          "rollback": "restore janitor/src, re-run deploy script",
+                          "independent": True,
+                          "blocked_by": None if row.get("installed") else "not installed"})
+        else:
+            steps.append({"component": name, "order": len(steps) + 1,
+                          "verify": "ccp-new --status → exit 0",
+                          "rollback": "profile .bak / _trash restore (per profile)",
+                          "independent": True,
+                          "blocked_by": None if row.get("installed") else "not installed"})
+
+    payload = {
+        "schema_version": SCHEMA_VERSION, "controller": "cmux-stack", "mode": "update-plan",
+        "atomic": False,
+        "atomicity_note": ("components span three trust domains with no shared rollback; "
+                           "steps are sequential and independently revertible, and a later "
+                           "failure does not undo an earlier success"),
+        "applied": False,
+        "steps": steps,
+    }
+    if args.component:
+        if args.component not in COMPONENTS:
+            print(f"未知组件: {args.component}", file=sys.stderr)
+            return EXIT_USAGE
+        payload["steps"] = [s for s in steps if s["component"] == args.component]
+        payload["note"] = ("single-component update is the supported granularity; "
+                           "execution still requires separate authorization")
+    _emit(payload, args)
+    return EXIT_OK
+
+
+def cmd_profile(args: argparse.Namespace) -> int:
+    """Hand the terminal to ccp-new.  Full TTY, no capture, no nesting.
+
+    ``os.execv`` replaces this process, so ccp-new inherits stdin/stdout/stderr
+    exactly as the user's terminal provides them -- getpass keeps working and
+    the interactive menu behaves identically to invoking it directly.  Capturing
+    it into a pipe, or driving it from inside a curses draw thread, would break
+    the credential prompt and is forbidden by design.
+    """
+    if not CCP.is_file():
+        print(f"ccp-new 不存在: {CCP}", file=sys.stderr)
+        return EXIT_ABSENT
+    passthrough = list(args.passthrough or [])
+    # ``--`` is argparse's own end-of-options marker.  When the caller writes
+    # ``profile -- --status`` it must not survive into ccp-new's argv, or
+    # ccp-new sees ``--`` as a profile name and rejects it.  Only the first one
+    # is consumed: a second ``--`` is genuine payload.
+    if passthrough and passthrough[0] == "--":
+        passthrough = passthrough[1:]
+    argv = [PYTHON, str(CCP), *passthrough]
+    try:
+        os.execv(argv[0], argv)
+    except OSError as exc:
+        print(f"无法执行 ccp-new: {type(exc).__name__}", file=sys.stderr)
+        return EXIT_FAIL_CLOSED
+    return EXIT_FAIL_CLOSED  # unreachable when execv succeeds
+
+
+def _emit(payload: dict, args: argparse.Namespace) -> None:
+    if getattr(args, "json", False):
+        json.dump(payload, sys.stdout, ensure_ascii=False,
+                  indent=2 if getattr(args, "pretty", False) else None)
+        sys.stdout.write("\n")
+        return
+    mode = payload.get("mode", "?")
+    print(f"\n=== cmux-stack {mode} ===")
+    if payload.get("note"):
+        print(f"  {payload['note']}")
+    if payload.get("atomicity_note"):
+        print(f"  非原子: {payload['atomicity_note']}")
+    for item in payload.get("plan", payload.get("steps", [])):
+        bits = " ".join(f"{k}={v}" for k, v in item.items() if k != "component")
+        print(f"  {item.get('component','?'):<9} {bits}")
+    for r in payload.get("results", []):
+        print(f"  {r['component']:<9} rc={r['rc']} ok={r['ok']}")
+    if "ok" in payload and "component" in payload:
+        print(f"  {payload['component']:<9} ok={payload['ok']} rc={payload.get('rc')}")
+    print()
+
+
+class UsageError(Exception):
+    """A bad argument value.  Raised rather than silently widening the scope."""
+
+
+def _selected_components(args: argparse.Namespace) -> tuple[str, ...]:
+    """Resolve --component to a probe set.
+
+    An unknown name is a usage error, never a fallback to "all".  Falling back
+    would make ``status --component watchr`` print a full green stack and exit 0,
+    i.e. a typo in the narrowing flag would silently answer a question the
+    operator did not ask.
+    """
+    chosen = getattr(args, "component", None)
+    if not chosen:
+        return COMPONENTS
+    if chosen not in COMPONENTS:
+        raise UsageError(f"未知组件: {chosen}（可选 {', '.join(COMPONENTS)}）")
+    return (chosen,)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="cmux-stack", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="command")
+
+    st = sub.add_parser("status", help="aggregate read-only status")
+    st.add_argument("--json", action="store_true")
+    st.add_argument("--pretty", action="store_true")
+    st.add_argument("--component", default=None)
+
+    dr = sub.add_parser("doctor", help="status plus install-level checks")
+    dr.add_argument("--json", action="store_true")
+    dr.add_argument("--pretty", action="store_true")
+    dr.add_argument("--component", default=None)
+
+    up = sub.add_parser("up", help="start absent components (idempotent)")
+    up.add_argument("--json", action="store_true")
+    up.add_argument("--pretty", action="store_true")
+    up.add_argument("--component", default=None)
+    up.add_argument("--apply", action="store_true", help="execute; otherwise dry run")
+
+    dn = sub.add_parser("down", help="stop ONE named component")
+    dn.add_argument("--json", action="store_true")
+    dn.add_argument("--pretty", action="store_true")
+    dn.add_argument("--component", default=None)
+    dn.add_argument("--apply", action="store_true")
+
+    ud = sub.add_parser("update", help="per-component update plan")
+    ud.add_argument("--plan", action="store_true", help="accepted and implied; plan is the only mode")
+    ud.add_argument("--json", action="store_true")
+    ud.add_argument("--pretty", action="store_true")
+    ud.add_argument("--component", default=None)
+
+    pr = sub.add_parser("profile", help="hand the TTY to ccp-new")
+    pr.add_argument("passthrough", nargs=argparse.REMAINDER)
+
+    ins = sub.add_parser("install", help="symlink this file onto PATH (dry run by default)")
+    ins.add_argument("--json", action="store_true")
+    ins.add_argument("--pretty", action="store_true")
+    ins.add_argument("--apply", action="store_true", help="execute; otherwise dry run")
+
+    uns = sub.add_parser("uninstall", help="remove our PATH symlink (dry run by default)")
+    uns.add_argument("--json", action="store_true")
+    uns.add_argument("--pretty", action="store_true")
+    uns.add_argument("--apply", action="store_true", help="execute; otherwise dry run")
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    raw = list(sys.argv[1:] if argv is None else argv)
+    parser = build_parser()
+    if not raw:
+        parser.print_help()
+        return EXIT_USAGE
+    # ``profile`` is a pure passthrough: everything after it belongs to ccp-new,
+    # including flags this controller happens to share a name with.  Letting
+    # argparse see them makes ``profile --status`` an unrecognized-argument
+    # error, which would force operators to learn a ``--`` quoting rule for the
+    # one subcommand whose whole purpose is transparency.
+    if raw[0] == "profile":
+        args = argparse.Namespace(command="profile", passthrough=raw[1:])
+    else:
+        args = parser.parse_args(raw)
+    if args.command is None:
+        parser.print_help()
+        return EXIT_USAGE
+
+    handlers = {"status": cmd_status, "doctor": cmd_doctor, "up": cmd_up,
+                "down": cmd_down, "update": cmd_update, "profile": cmd_profile,
+                "install": cmd_install, "uninstall": cmd_uninstall}
+    try:
+        return handlers[args.command](args)
+    except UsageError as exc:
+        # A typo in a narrowing flag must exit 2, not traceback and not widen the
+        # scope back to every component.
+        print(f"{exc}", file=sys.stderr)
+        return EXIT_USAGE
+    except FailClosed as exc:
+        print(f"fail closed: {exc}", file=sys.stderr)
+        return EXIT_FAIL_CLOSED
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        raise SystemExit(130) from None

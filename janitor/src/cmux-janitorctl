@@ -1,0 +1,890 @@
+#!/usr/bin/env python3
+"""cmux-janitorctl — the only public way to read or steer the janitor.
+
+The janitor and its guard stay in Bash: they own file judgement and the circuit
+breaker.  This tool owns the parts Bash is bad at — atomic JSON, type
+validation, and a stable contract for a curses TUI that must never block.
+
+Everything here is either read-only or a single sentinel write.  It never moves,
+deletes, or inspects a cmux artifact; only ``cmux-janitor.sh`` does that, behind
+its own gates.  ``run --manual`` asks the janitor to run now and returns
+immediately, so a caller in a draw loop cannot stall behind lsof.
+
+Exit codes
+    0  ok
+    1  refused (a gate said no; the reason is in the JSON/stderr)
+    2  usage error
+    3  fail closed (state unreadable, interpreter/dir missing, schema unknown)
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+SCHEMA_VERSION = 1
+
+HOME = Path(os.environ.get("CMUX_JANITOR_HOME", Path.home()))
+JANITOR_DIR = HOME / ".config" / "cmux-janitor"
+JANITOR_SH = JANITOR_DIR / "cmux-janitor.sh"
+GUARD_SH = JANITOR_DIR / "guard.sh"
+CONFIG_ENV = JANITOR_DIR / "config.env"
+BASELINE = JANITOR_DIR / "guard.baseline"
+DISABLED = JANITOR_DIR / "DISABLED"
+GUARD_TRIPPED = JANITOR_DIR / "GUARD_TRIPPED"
+JANITOR_STATE = JANITOR_DIR / "janitor-state.json"
+GUARD_STATE = JANITOR_DIR / "guard-state.json"
+METRICS = JANITOR_DIR / "metrics.jsonl"
+
+JANITOR_LABEL = os.environ.get("CMUX_JANITOR_LABEL") or "com.example.ccc-janitor"
+GUARD_LABEL = os.environ.get("CMUX_GUARD_LABEL") or "com.example.ccc-janitor-guard"
+
+# Quarantine layout, and it must match cmux-janitor.sh exactly: the script owns
+# these names (cmux-janitor.sh:62-63,72) and this tool only ever adds the
+# metadata file to a batch that has none.  A mismatch here would mean migrating
+# a directory the janitor does not read.
+QUARANTINE_DIR = HOME / ".cmuxterm-janitor-quarantine"
+MUTEX = JANITOR_DIR / ".janitor.mutex"
+BATCH_META = ".janitor-batch.json"
+BATCH_SCHEMA = 1
+
+# A batch directory is named at seal time with `date '+%Y%m%d-%H%M%S'`
+# (cmux-janitor.sh:678), so the name *is* the seal timestamp recorded by the
+# janitor itself.  Migration treats it as evidence, not as truth: it is
+# cross-checked against the directory mtime, and the later of the two wins.
+BATCH_NAME_FORMAT = "%Y%m%d-%H%M%S"
+
+# How far the name and the mtime may disagree before a batch is left alone for a
+# human.  Sealing touches the directory, so the two should be seconds apart;
+# a day of slack absorbs timezone/DST reading errors without accepting a batch
+# whose two independent timestamps tell different stories.
+BATCH_TIMESTAMP_TOLERANCE_SEC = 24 * 3600
+
+# A guard cycle is 60s and a janitor cycle 30min.  Past these the reading is
+# history, not status, and the caller has to say so rather than imply currency.
+GUARD_STALE_SEC = 180.0
+JANITOR_STALE_SEC = 2700.0
+
+# Retention defaults, used only when config.env does not say otherwise.  The
+# canonical names are METRICS_KEEP_LINES / METRICS_KEEP_DAYS and they live in
+# config.env; both the shell and this tool read them from there, so changing the
+# file changes pruning in both.  Hard-coding them here was how the controller
+# came to enforce a limit the operator had not chosen.
+METRICS_KEEP_LINES_DEFAULT = 2048
+METRICS_KEEP_DAYS_DEFAULT = 14
+
+# Retired names that must never be honoured silently.  Each one caused a real
+# silent misconfiguration: the value was declared in config.env under one name
+# and read from code under another, so the configured number did nothing.
+RETIRED_CONFIG_KEYS = {
+    "QUARANTINE_RETAIN_HOURS": "QUARANTINE_KEEP_HOURS",
+    "METRICS_MAX_LINES": "METRICS_KEEP_LINES",
+}
+
+# Keys the janitor refuses to see defined twice (cmux-janitor.sh:117).  Sourcing
+# the file would take the last assignment, which is not necessarily the one the
+# operator believes is in effect, so the shell aborts instead of choosing.  This
+# list must stay identical to the shell's: a key the shell refuses but this tool
+# accepts means one config file produces two different safety decisions, and for
+# metrics that difference is "abort" versus "delete records".
+UNIQUE_CONFIG_KEYS = (
+    "QUARANTINE_KEEP_HOURS",
+    "METRICS_KEEP_LINES",
+    "METRICS_KEEP_DAYS",
+)
+
+
+class FailClosed(Exception):
+    """State cannot be trusted, so no answer is better than a wrong one."""
+
+
+def _finite_number(value: Any) -> float | int | None:
+    """A usable number, or None when the value cannot be one.
+
+    ``bool`` is rejected before ``int`` because ``True`` would otherwise read as
+    1 and a JSON ``true`` in a byte count would silently become a size.  NaN and
+    the infinities are rejected for the same reason a size of "inf" is not a
+    size: they compare in ways no caller expects.
+    """
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if value < 0:
+        return None
+    return value
+
+
+def _measure(raw: Any) -> dict[str, Any]:
+    """Normalise a ``{value, precision}`` pair from published state.
+
+    An unusable value degrades to ``precision="unknown"`` with ``value=None`` —
+    never to 0, which would render as "nothing there" instead of "not measured".
+    """
+
+    if not isinstance(raw, dict):
+        return {"value": None, "precision": "unknown"}
+    value = _finite_number(raw.get("value"))
+    precision = raw.get("precision")
+    if precision not in {"exact", "estimated", "unknown"}:
+        precision = "unknown"
+    if value is None:
+        return {"value": None, "precision": "unknown"}
+    return {"value": value, "precision": precision}
+
+
+# Public count name -> the key the janitor actually writes inside its nested
+# ``counts`` object.  Two things went wrong here and both are why this table
+# exists instead of a bare name list:
+#
+#   * the counts live under ``counts``, and reading them from the top level
+#     returned None for every one of them — a valid run published a full funnel
+#     and the public contract reported "not measured" for all of it;
+#   * ``protected`` is published as ``protected_ids``, so even a correctly
+#     nested read would have missed that one.
+#
+# Anything absent stays None.  A count that was not published must not read as
+# 0, because 0 candidates and "the janitor did not say" are different facts.
+COUNT_KEYS: dict[str, str] = {
+    "raw_sb": "raw_sb",
+    "raw_staging": "raw_staging",
+    "protected": "protected_ids",
+    "eligible": "eligible",
+    "selected": "selected",
+    "would_dispose": "would_dispose",
+    "disposed": "disposed",
+    "would_expire_batches": "would_expire_batches",
+    "would_expire_items": "would_expire_items",
+    "expired_batches": "expired_batches",
+    "expired_items": "expired_items",
+    "skipped_moving": "skipped_moving",
+    "skipped_fresh": "skipped_fresh",
+    "skipped_held": "skipped_held",
+    "skipped_outside": "skipped_outside",
+}
+
+
+def _project_counts(raw: Any) -> dict[str, Any]:
+    """Project the janitor's nested ``counts`` object onto the public names.
+
+    A non-mapping (missing, a list, a string, a number) yields every count as
+    None rather than raising or inventing zeros: the document is then telling us
+    it has no funnel to report, which the panel renders as ``?``.
+    """
+
+    source = raw if isinstance(raw, dict) else {}
+    return {public: _finite_number(source.get(published))
+            for public, published in COUNT_KEYS.items()}
+
+
+def _read_json(path: Path) -> dict[str, Any] | None:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise FailClosed(f"cannot read {path.name}: {exc}") from exc
+    try:
+        # parse_constant catches bare NaN/Infinity, which json accepts by
+        # default and which would defeat the finite check downstream.
+        data = json.loads(text, parse_constant=lambda c: (_ for _ in ()).throw(ValueError(c)))
+    except (ValueError, RecursionError):
+        return {"__invalid__": True}
+    if not isinstance(data, dict):
+        return {"__invalid__": True}
+    return data
+
+
+def _config_value(name: str) -> str | None:
+    """One config.env assignment, read the way the janitor's ``.`` would read it.
+
+    Last assignment wins, because that is what sourcing the file does.  The
+    shell refuses a duplicated key outright; this reader agrees with the shell
+    rather than picking a different one.
+
+    ``None`` means the key is absent.  An empty assignment (``KEY=``) returns
+    ``""``, which is *not* the same thing: the shell's ``is_uint ""`` fails and
+    the janitor aborts, so a reader that folded the two together would disagree
+    with the component that actually enforces the config.
+    """
+
+    try:
+        lines = CONFIG_ENV.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    value = None
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith(f"{name}="):
+            value = stripped.partition("=")[2].strip()
+    return value
+
+
+def _config_assignment_count(name: str) -> int:
+    """How many times config.env assigns ``name``.
+
+    Deliberately the same match the shell makes with
+    ``grep -cE '^[[:space:]]*NAME='``: leading whitespace is ignored and a
+    commented line does not count, because ``#`` is not whitespace.  Counting
+    differently here would reintroduce the divergence this guards against.
+    """
+
+    try:
+        lines = CONFIG_ENV.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return 0
+    return sum(1 for line in lines if line.strip().startswith(f"{name}="))
+
+
+def _refuse_duplicate_config_keys() -> None:
+    """Fail closed on a key the janitor itself would refuse.
+
+    Called before any read that influences a destructive decision.  The shell
+    checks this before sourcing config.env and aborts the whole run; a tool that
+    proceeded on the same file would let ``compact-metrics`` delete records using
+    a limit the scheduled janitor had already rejected as ambiguous.
+    """
+
+    for name in UNIQUE_CONFIG_KEYS:
+        count = _config_assignment_count(name)
+        if count > 1:
+            raise FailClosed(f"{name} defined {count} times in config.env")
+
+
+def _config_mode() -> str | None:
+    # An empty MODE= is no more usable than an absent one: both leave
+    # mode_matches_baseline False, which is what refuses a resume.
+    return _config_value("MODE") or None
+
+
+def _config_positive_int(name: str, default: int) -> int:
+    """A positive integer from config.env, or ``default`` when unset.
+
+    Fails closed on anything else.  This governs how many lines survive pruning,
+    and pruning deletes, so a limit nobody chose must never be applied: refusing
+    keeps the data, guessing removes it.  The default applies only when the key
+    is genuinely absent, which is the one case where no operator intent exists to
+    contradict.
+
+    Retired aliases raise rather than being ignored.  A file that says
+    ``METRICS_MAX_LINES=100`` states an intent this tool will not honour, and
+    silently pruning at 2048 instead is how the original defect looked.
+    """
+
+    # Duplicates first: an ambiguous file must be refused before any single
+    # value is trusted, which is the order the shell uses too (it checks
+    # duplicates before sourcing, so no value is ever read from a file it has
+    # already judged ambiguous).
+    _refuse_duplicate_config_keys()
+    for old, new in RETIRED_CONFIG_KEYS.items():
+        if new == name and _config_value(old) is not None:
+            raise FailClosed(
+                f"retired key {old} present in config.env; use {new} only"
+            )
+    raw = _config_value(name)
+    if raw is None:
+        return default
+    try:
+        parsed = int(raw)
+    except (TypeError, ValueError):
+        raise FailClosed(f"{name} is not an integer: {raw!r}") from None
+    if parsed <= 0:
+        raise FailClosed(f"{name} must be > 0, got {parsed}")
+    return parsed
+
+
+def _baseline_field(name: str) -> str | None:
+    try:
+        lines = BASELINE.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    value = None
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith(f"{name}="):
+            value = stripped.partition("=")[2].strip()
+    return value or None
+
+
+def _launchd_loaded(label: str) -> bool | None:
+    """None when launchctl cannot answer, so absent is never faked as false."""
+
+    try:
+        done = subprocess.run(
+            ["/bin/launchctl", "print", f"gui/{os.getuid()}/{label}"],
+            capture_output=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return done.returncode == 0
+
+
+def _age(observed_at: Any, now: float) -> float | None:
+    if not isinstance(observed_at, str):
+        return None
+    stamp = observed_at.strip().replace("Z", "+00:00")
+    try:
+        import datetime
+
+        parsed = datetime.datetime.fromisoformat(stamp)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return max(0.0, now - parsed.timestamp())
+
+
+def build_status(now: float | None = None) -> dict[str, Any]:
+    """Merge published state with live sentinels.
+
+    The janitor only publishes from inside a real run, and GATE 0 exits before
+    that, so while paused its state is deliberately stale.  The sentinels below
+    are read live on every call, which is what makes "paused, last measured N
+    minutes ago" honest rather than a stale value dressed as current.
+    """
+
+    moment = time.time() if now is None else now
+    if not JANITOR_DIR.is_dir():
+        raise FailClosed(f"janitor directory missing: {JANITOR_DIR}")
+
+    janitor_raw = _read_json(JANITOR_STATE)
+    guard_raw = _read_json(GUARD_STATE)
+
+    janitor_invalid = bool(janitor_raw and janitor_raw.get("__invalid__"))
+    guard_invalid = bool(guard_raw and guard_raw.get("__invalid__"))
+    janitor_raw = {} if (janitor_raw is None or janitor_invalid) else janitor_raw
+    guard_raw = {} if (guard_raw is None or guard_invalid) else guard_raw
+
+    j_age = _age(janitor_raw.get("observed_at"), moment)
+    g_age = _age(guard_raw.get("observed_at"), moment)
+
+    config_mode = _config_mode()
+    base_mode = _baseline_field("BASE_MODE")
+    base_schema = _baseline_field("BASE_SCHEMA")
+
+    disabled = DISABLED.exists()
+    tripped = GUARD_TRIPPED.exists()
+
+    quarantine_raw = janitor_raw.get("quarantine")
+    quarantine_raw = quarantine_raw if isinstance(quarantine_raw, dict) else {}
+
+    status: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "observed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(moment)),
+        # Live, not from state: this is why a paused janitor still reports truthfully.
+        "control": {
+            "paused": disabled,
+            "guard_tripped": tripped,
+            "config_mode": config_mode,
+            "baseline_mode": base_mode,
+            "baseline_schema": base_schema,
+            "mode_matches_baseline": (
+                config_mode is not None and base_mode is not None and config_mode == base_mode
+            ),
+        },
+        "launchd": {
+            "janitor_loaded": _launchd_loaded(JANITOR_LABEL),
+            "guard_loaded": _launchd_loaded(GUARD_LABEL),
+        },
+        "janitor": {
+            "present": bool(janitor_raw),
+            "invalid": janitor_invalid,
+            "run_id": janitor_raw.get("run_id") if isinstance(janitor_raw.get("run_id"), str) else None,
+            "trigger": janitor_raw.get("trigger") if janitor_raw.get("trigger") in {"scheduled", "manual"} else None,
+            "phase": janitor_raw.get("phase") if isinstance(janitor_raw.get("phase"), str) else None,
+            "mode": janitor_raw.get("mode") if janitor_raw.get("mode") in {"dry", "apply"} else None,
+            # safety_complete is the only disposal gate; a missing value is False.
+            "safety_complete": janitor_raw.get("safety_complete") is True,
+            "observed_at": janitor_raw.get("observed_at") if isinstance(janitor_raw.get("observed_at"), str) else None,
+            "age_sec": j_age,
+            "stale": (j_age is None or j_age > JANITOR_STALE_SEC),
+            "counts": _project_counts(janitor_raw.get("counts")),
+            "selected_bytes": _measure(janitor_raw.get("selected_bytes")),
+            "expired_bytes": _measure(janitor_raw.get("expired_bytes")),
+            "limit": _finite_number(janitor_raw.get("limit")),
+            "error": janitor_raw.get("error") if isinstance(janitor_raw.get("error"), str) else None,
+        },
+        # Bounded on purpose: counts and boundary timestamps only, never batch
+        # names or paths.
+        "quarantine": {
+            "batch_count": _finite_number(quarantine_raw.get("batch_count")),
+            "bytes": _measure(quarantine_raw.get("bytes")),
+            "oldest_sealed_at": (
+                quarantine_raw.get("oldest_sealed_at")
+                if isinstance(quarantine_raw.get("oldest_sealed_at"), str)
+                else None
+            ),
+            "next_expiry_at": (
+                quarantine_raw.get("next_expiry_at")
+                if isinstance(quarantine_raw.get("next_expiry_at"), str)
+                else None
+            ),
+            "keep_hours": _finite_number(quarantine_raw.get("keep_hours")),
+        },
+        "guard": {
+            "present": bool(guard_raw),
+            "invalid": guard_invalid,
+            "health": guard_raw.get("health") if isinstance(guard_raw.get("health"), str) else None,
+            "observed_at": guard_raw.get("observed_at") if isinstance(guard_raw.get("observed_at"), str) else None,
+            "age_sec": g_age,
+            "stale": (g_age is None or g_age > GUARD_STALE_SEC),
+            "baseline_schema": _finite_number(guard_raw.get("baseline_schema")),
+            "violations": [v for v in (guard_raw.get("violations") or []) if isinstance(v, str)][:16],
+        },
+    }
+    return status
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    status = build_status()
+    if args.json:
+        json.dump(status, sys.stdout, ensure_ascii=False, indent=2 if args.pretty else None)
+        sys.stdout.write("\n")
+    else:
+        control = status["control"]
+        janitor = status["janitor"]
+        state = "已暂停" if control["paused"] else "运行中"
+        if control["guard_tripped"]:
+            state = "守卫跳闸"
+        age = janitor["age_sec"]
+        age_text = "无测量" if age is None else f"{int(age // 60)} 分钟前"
+        print(f"清扫器 {state} | 模式 {control['config_mode']} | 最后运行 {age_text}")
+    return 0
+
+
+def cmd_pause(args: argparse.Namespace) -> int:
+    if not JANITOR_DIR.is_dir():
+        raise FailClosed(f"janitor directory missing: {JANITOR_DIR}")
+    DISABLED.write_text(
+        f"paused by cmux-janitorctl at {time.strftime('%F %T')}\n", encoding="utf-8"
+    )
+    print(json.dumps({"ok": True, "paused": True}, ensure_ascii=False))
+    return 0
+
+
+def cmd_resume(args: argparse.Namespace) -> int:
+    """Clear DISABLED only when every precondition holds.
+
+    The old ENABLE.command deleted the sentinel unconditionally, so a tripped
+    guard could be walked past by double-clicking it.  Rearming is explicitly
+    not done here: that is an operator decision made in a terminal.
+    """
+
+    status = build_status()
+    control = status["control"]
+    guard = status["guard"]
+    refusals: list[str] = []
+
+    if control["guard_tripped"]:
+        refusals.append(
+            "guard is tripped; investigate, then run: guard.sh --status "
+            "and guard.sh --rearm"
+        )
+    if guard["invalid"]:
+        refusals.append("guard state is not valid JSON")
+    elif not guard["present"]:
+        refusals.append("guard has never published state")
+    elif guard["stale"]:
+        age = guard["age_sec"]
+        refusals.append(
+            f"guard state is stale ({'unknown' if age is None else int(age)}s old); "
+            "guard may not be running"
+        )
+    if not control["mode_matches_baseline"]:
+        refusals.append(
+            f"config MODE={control['config_mode']} does not match baseline "
+            f"BASE_MODE={control['baseline_mode']}; use "
+            "guard.sh --rearm --accept-mode <mode> first"
+        )
+
+    if refusals:
+        print(json.dumps({"ok": False, "refused": refusals}, ensure_ascii=False, indent=2))
+        return 1
+
+    try:
+        DISABLED.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise FailClosed(f"cannot remove DISABLED: {exc}") from exc
+    print(json.dumps({"ok": True, "paused": False}, ensure_ascii=False))
+    return 0
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    """Ask the janitor to run now.  Only the wait is skipped, never a gate."""
+
+    if not args.manual:
+        print("run requires --manual", file=sys.stderr)
+        return 2
+    if not JANITOR_SH.is_file():
+        raise FailClosed(f"janitor script missing: {JANITOR_SH}")
+
+    status = build_status()
+    control = status["control"]
+    refusals: list[str] = []
+    # Refuse in the controller for a usable message; GATE 0 refuses again in the
+    # script, which is what actually makes it safe.
+    if control["paused"]:
+        refusals.append("janitor is paused (DISABLED); resume first")
+    if control["guard_tripped"]:
+        refusals.append("guard is tripped; investigate before sweeping")
+    if refusals:
+        print(json.dumps({"ok": False, "refused": refusals}, ensure_ascii=False, indent=2))
+        return 1
+
+    # Detached: a manual sweep runs lsof per candidate and can take minutes.
+    log = JANITOR_DIR / "manual-run.log"
+    try:
+        handle = log.open("ab")
+    except OSError as exc:
+        raise FailClosed(f"cannot open {log.name}: {exc}") from exc
+    with handle:
+        proc = subprocess.Popen(
+            ["/bin/bash", str(JANITOR_SH), "--manual"],
+            stdout=handle,
+            stderr=handle,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    print(json.dumps({"ok": True, "started": True, "pid": proc.pid}, ensure_ascii=False))
+    return 0
+
+
+def metrics_retention() -> dict[str, int]:
+    """The two retention bounds, read from config.env like the shell reads them.
+
+    Both numbers come from the same file the janitor sources, so an operator who
+    edits ``METRICS_KEEP_LINES`` changes pruning in the shell *and* here.  The
+    previous version hard-coded them, which meant the controller quietly
+    enforced a limit nobody had chosen.
+
+    An unusable or retired value raises :class:`FailClosed` (exit 3) instead of
+    falling back, because the fallback is what prunes the file at a limit the
+    operator did not choose.  Growth is not the competing risk it looks like:
+    ``cmux-janitor.sh`` validates the same keys and aborts before it appends, so
+    a config bad enough to stop pruning has already stopped writing.
+    """
+
+    return {
+        "keep_lines": _config_positive_int("METRICS_KEEP_LINES", METRICS_KEEP_LINES_DEFAULT),
+        "keep_days": _config_positive_int("METRICS_KEEP_DAYS", METRICS_KEEP_DAYS_DEFAULT),
+    }
+
+
+def compact_metrics(now: float | None = None) -> dict[str, int]:
+    """Keep metrics.jsonl bounded by both age and line count.
+
+    Two bounds, not one: a quiet fortnight would otherwise keep nothing useful,
+    and a burst inside one day would otherwise grow without limit.  Both come
+    from config.env; the applied values are returned so a caller can prove which
+    limits actually ran.
+    """
+
+    moment = time.time() if now is None else now
+    limits = metrics_retention()
+    keep_lines = limits["keep_lines"]
+    max_age_sec = limits["keep_days"] * 24 * 3600
+    if not METRICS.exists():
+        return {"kept": 0, "dropped": 0, **limits}
+    cutoff = moment - max_age_sec
+    kept: list[str] = []
+    dropped = 0
+    for line in METRICS.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            dropped += 1
+            continue
+        # ``_age`` returns seconds-since; subtracting it back off recovers the
+        # record's own timestamp, which is what the cutoff compares against.
+        age = _age(record.get("observed_at"), moment) if isinstance(record, dict) else None
+        if age is not None and (moment - age) < cutoff:
+            dropped += 1
+            continue
+        kept.append(line)
+    if len(kept) > keep_lines:
+        dropped += len(kept) - keep_lines
+        kept = kept[-keep_lines:]
+    tmp = METRICS.with_suffix(".jsonl.tmp")
+    tmp.write_text("".join(f"{line}\n" for line in kept), encoding="utf-8")
+    os.replace(tmp, METRICS)
+    return {"kept": len(kept), "dropped": dropped, **limits}
+
+
+def cmd_compact(args: argparse.Namespace) -> int:
+    print(json.dumps(compact_metrics(), ensure_ascii=False))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# migrate-batches — give pre-sealing batches the metadata the expirer requires
+# ---------------------------------------------------------------------------
+#
+# Why this exists at all: `expire_quarantine` (cmux-janitor.sh:479-482) fails
+# closed on a batch with no `.janitor-batch.json` and logs SKIP-NO-BATCH-META.
+# That is the correct default — an unknown seal time must never be guessed — but
+# every batch created before two-phase sealing shipped has no metadata, so it can
+# never expire.  Production is in exactly that state: 19 batches, ~30 GB, and
+# `oldest_sealed_at: null`.  Without this step, deploying the new janitor would
+# leave that storage pinned forever while the TUI reports 0 expirable batches.
+#
+# The reconstruction is evidence-based, not a guess.  Two independent timestamps
+# exist for every batch, both written by the old janitor:
+#   * the directory name, which is `date '+%Y%m%d-%H%M%S'` at seal time;
+#   * the directory mtime, bumped by the final `mv` that sealed it.
+# They must agree within BATCH_TIMESTAMP_TOLERANCE_SEC, and the *later* of the
+# two becomes sealed_at.  Later is the conservative choice: it can only delay
+# expiry, never bring it forward, so a reconstruction error keeps data longer
+# rather than deleting it early.  A batch whose two timestamps disagree, or whose
+# name is unparseable, is left untouched for a human — the same fail-closed
+# stance the expirer takes.
+
+
+def _batch_meta_is_readable(meta: Path) -> bool:
+    """True only if the shell's own parser would accept this metadata.
+
+    ``batch_sealed_epoch`` (cmux-janitor.sh:438-447) does not parse JSON: it
+    greps for ``"sealed_at_epoch": <digits>`` and then applies ``is_uint``.  This
+    mirrors that exactly rather than using ``json.loads``, because a file that
+    Python parses but the grep does not — or the reverse — is precisely the kind
+    of disagreement that leaves a batch unexpirable while a tool reports it
+    migrated.
+    """
+
+    try:
+        text = meta.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    found = re.search(r'"sealed_at_epoch"\s*:\s*([0-9]+)', text)
+    return bool(found and found.group(1).isdigit())
+
+
+def _batch_name_epoch(name: str) -> int | None:
+    """Seal epoch implied by the batch directory name, or None if not a batch name."""
+
+    try:
+        parsed = time.strptime(name, BATCH_NAME_FORMAT)
+    except ValueError:
+        return None
+    # The janitor writes the name with local `date`, so it must be read back as
+    # local time.  Reading it as UTC would shift every reconstructed timestamp by
+    # the timezone offset and silently change when batches expire.
+    return int(time.mktime(parsed))
+
+
+def _reconstruct_sealed_epoch(batch: Path) -> tuple[int | None, str]:
+    """The defensible seal epoch for a legacy batch, plus why it was chosen."""
+
+    name_epoch = _batch_name_epoch(batch.name)
+    if name_epoch is None:
+        return None, f"name {batch.name!r} is not {BATCH_NAME_FORMAT}"
+    try:
+        mtime_epoch = int(batch.stat().st_mtime)
+    except OSError as exc:
+        return None, f"cannot stat batch: {exc}"
+    drift = abs(mtime_epoch - name_epoch)
+    if drift > BATCH_TIMESTAMP_TOLERANCE_SEC:
+        return None, (
+            f"name and mtime disagree by {drift}s "
+            f"(name={name_epoch} mtime={mtime_epoch}); left for a human"
+        )
+    # Later of the two: a wrong guess must delay expiry, never advance it.
+    return max(name_epoch, mtime_epoch), (
+        "name" if name_epoch >= mtime_epoch else "mtime"
+    )
+
+
+def migrate_batches(*, apply: bool, now: float | None = None) -> dict[str, Any]:
+    """Add metadata to legacy quarantine batches so they can expire.
+
+    Refuses to run unless the janitor is paused and no sweep holds the mutex:
+    writing into a batch that a live run is filling would race the two-phase
+    seal.  ``apply=False`` reports exactly what would change and writes nothing.
+    """
+
+    moment = time.time() if now is None else now
+    if not QUARANTINE_DIR.is_dir():
+        return {"ok": True, "quarantine": "absent", "batches": [],
+                "migrated": 0, "skipped": 0, "already_sealed": 0, "applied": apply}
+
+    # Gate order matches the janitor's: pause (GATE 0) before mutex (GATE 1).
+    if apply:
+        if not DISABLED.exists():
+            raise FailClosed(
+                "migrate-batches --apply requires the janitor paused first "
+                "(run `cmux-janitorctl pause`)"
+            )
+        if MUTEX.exists():
+            raise FailClosed(
+                "a sweep holds the mutex; migration must not race a run in progress"
+            )
+
+    migrated: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    already: list[str] = []
+    for batch in sorted(QUARANTINE_DIR.iterdir()):
+        if not batch.is_dir():
+            continue
+        # `.incomplete-*` is a batch that was still being filled; the expirer and
+        # uninstall both skip it, and so must this (cmux-janitor.sh:478).
+        if batch.name.startswith(".incomplete-"):
+            skipped.append({"batch": batch.name, "reason": "incomplete batch"})
+            continue
+        meta = batch / BATCH_META
+        if meta.exists():
+            if _batch_meta_is_readable(meta):
+                already.append(batch.name)
+            else:
+                # Corrupt metadata is not ours to overwrite: the expirer already
+                # fails closed on it, and replacing it would destroy the only
+                # record of what the janitor originally wrote.
+                skipped.append({"batch": batch.name,
+                                "reason": "metadata present but unreadable; "
+                                          "left for a human"})
+            continue
+        sealed, why = _reconstruct_sealed_epoch(batch)
+        if sealed is None:
+            skipped.append({"batch": batch.name, "reason": why})
+            continue
+        items = sum(1 for child in batch.iterdir() if child.name != BATCH_META)
+        record = {
+            "batch": batch.name,
+            "sealed_at_epoch": sealed,
+            "sealed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(sealed)),
+            "item_count": items,
+            "evidence": why,
+            "age_hours": round((moment - sealed) / 3600.0, 2),
+        }
+        # The guard's fingerprint is basename|inode|mtime per batch
+        # (guard.sh:106-123).  Creating ``.janitor-batch.json`` inside a batch DOES
+        # move that batch directory's mtime on this APFS volume -- measured, not
+        # assumed; only appending to an already-existing file leaves it alone.
+        # What keeps the fingerprint stable is the ``os.utime(batch, (sealed,
+        # sealed))`` call below, which puts the mtime back after the write.  Do not
+        # remove that call: without it every migrated batch's fingerprint moves and
+        # the guard reads that as an R7 violation under MODE=dry.
+        #
+        # So the fingerprint moves only when ``sealed`` differs from the mtime
+        # already on disk -- i.e. when the name was the later timestamp and
+        # therefore won.  Measured per batch rather than assumed: an unconditional
+        # "re-arm required" note would be false in every case where the mtime wins,
+        # which is the common one.
+        mtime_moves = int(batch.stat().st_mtime) != sealed
+        record["mtime_moves"] = mtime_moves
+        if apply:
+            payload = {
+                "schema_version": BATCH_SCHEMA,
+                "run_id": f"migrated-{int(moment)}",
+                "created_at_epoch": sealed,
+                "sealed_at_epoch": sealed,
+                "sealed_at": record["sealed_at"],
+                "item_count": items,
+                # Provenance: this batch's seal time was reconstructed, not
+                # observed.  Kept so a later reader can tell the difference.
+                "migrated_from": "legacy-unsealed",
+                "migration_evidence": why,
+            }
+            tmp = batch / f".meta.tmp.{os.getpid()}"
+            tmp.write_text(json.dumps(payload, ensure_ascii=False) + "\n",
+                           encoding="utf-8")
+            os.replace(tmp, meta)
+            # The shell touches the directory after sealing; matching that keeps
+            # the mtime consistent with a natively sealed batch.
+            os.utime(batch, (sealed, sealed))
+            if not _batch_meta_is_readable(meta):
+                raise FailClosed(
+                    f"wrote metadata for {batch.name} but the shell's parser "
+                    "would not accept it"
+                )
+        migrated.append(record)
+
+    fingerprint_moves = [item["batch"] for item in migrated if item["mtime_moves"]]
+    return {
+        "ok": True,
+        "applied": apply,
+        "quarantine": str(QUARANTINE_DIR),
+        "batches": migrated,
+        "migrated": len(migrated),
+        "skipped": len(skipped),
+        "skipped_detail": skipped,
+        "already_sealed": len(already),
+        "fingerprint_changed": bool(fingerprint_moves),
+        "fingerprint_changed_batches": fingerprint_moves,
+        "guard_note": (
+            "quarantine fingerprint moves for "
+            f"{len(fingerprint_moves)} batch(es); under MODE=dry the guard "
+            "reads that as an R7 violation, so re-arm (guard.sh --rearm) "
+            "before resuming"
+            if fingerprint_moves else
+            "quarantine fingerprint unchanged (every batch kept its mtime); "
+            "no re-arm needed for this migration"
+        ),
+    }
+
+
+def cmd_migrate(args: argparse.Namespace) -> int:
+    result = migrate_batches(apply=args.apply)
+    print(json.dumps(result, ensure_ascii=False, indent=2 if args.pretty else None))
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="cmux-janitorctl", description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    status = sub.add_parser("status", help="read merged state (never walks cmux dirs)")
+    status.add_argument("--json", action="store_true", help="machine-readable output")
+    status.add_argument("--pretty", action="store_true", help="indent the JSON")
+    status.set_defaults(func=cmd_status)
+
+    run = sub.add_parser("run", help="request an immediate sweep")
+    run.add_argument("--manual", action="store_true", required=True)
+    run.set_defaults(func=cmd_run)
+
+    pause = sub.add_parser("pause", help="write the DISABLED sentinel")
+    pause.set_defaults(func=cmd_pause)
+
+    resume = sub.add_parser("resume", help="clear DISABLED when it is safe to")
+    resume.set_defaults(func=cmd_resume)
+
+    compact = sub.add_parser("compact-metrics", help="bound metrics.jsonl")
+    compact.set_defaults(func=cmd_compact)
+
+    migrate = sub.add_parser(
+        "migrate-batches",
+        help="give pre-sealing quarantine batches the metadata the expirer needs")
+    # Dry by default, like the janitor itself: the destructive direction always
+    # needs a word typed on purpose.  Without metadata a batch simply never
+    # expires, so doing nothing is safe and there is no hurry to write.
+    migrate.add_argument("--apply", action="store_true",
+                         help="write metadata (default: report only)")
+    migrate.add_argument("--pretty", action="store_true", help="indent the JSON")
+    migrate.set_defaults(func=cmd_migrate)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        return args.func(args)
+    except FailClosed as exc:
+        print(json.dumps({"ok": False, "fail_closed": str(exc)}, ensure_ascii=False), file=sys.stderr)
+        return 3
+
+
+if __name__ == "__main__":
+    sys.exit(main())

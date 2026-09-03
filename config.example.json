@@ -1,0 +1,23 @@
+{
+  "schema_version": 2,
+  "mode": "dry-run",
+  "global_paused": false,
+  "message": "任务请继续",
+  "claude_message": "任务中断了么？如果是就请继续，如果任务完成了务必在最后一句向我报告 ‘ 完成，建议检查 usage: /context’ 。如果任务没有中断就请继续，不要影响你的进度",
+  "poll_interval_sec": 1,
+  "send_interval_sec": 1,
+  "repeat_send_delay_sec": 1,
+  "first_send_immediate": true,
+  "claude_enabled": false,
+  "claude_working_clear_polls": 3,
+  "claude_event_workers": 4,
+  "claude_repeat_warning_after": 5,
+  "claude_hook_unverified_grace_sec": 30,
+  "circuit_pause_after": 0,
+  "same_frame_guard_polls": 1,
+  "cmux_unavailable_poll_sec": 2,
+  "workspace_discovery_interval_sec": 5,
+  "cmux_path": "/opt/homebrew/bin/cmux",
+  "targets": [],
+  "workspace_rules": []
+}
