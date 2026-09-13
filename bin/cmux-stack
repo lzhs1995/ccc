@@ -305,7 +305,10 @@ def _observed_at(value: Any) -> str | None:
     if not isinstance(value, str) or len(value) > 40:
         return None
     try:
-        return value if datetime.fromisoformat(value).tzinfo is not None else None
+        # Python 3.10 does not yet accept the ISO UTC `Z` suffix. Validate its
+        # equivalent offset without changing the timestamp published upstream.
+        parsed = value[:-1] + "+00:00" if value.endswith("Z") else value
+        return value if datetime.fromisoformat(parsed).tzinfo is not None else None
     except ValueError:
         return None
 
