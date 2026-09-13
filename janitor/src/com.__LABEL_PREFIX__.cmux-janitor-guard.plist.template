@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>__LABEL__</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__HOME__/.config/cmux-janitor/guard.sh</string>
+    </array>
+
+    <!-- every 60 seconds; a single pass costs ~54ms and writes nothing when healthy -->
+    <key>StartInterval</key>
+    <integer>60</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/.config/cmux-janitor/guard.launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.config/cmux-janitor/guard.launchd.err.log</string>
+
+    <key>WorkingDirectory</key>
+    <string>__HOME__/.config/cmux-janitor</string>
+
+    <!-- Interactive, not Background: Background gets deprioritised and can be
+         deferred by ~80s, which would make a 60s interval meaningless. -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>LowPriorityIO</key>
+    <true/>
+    <key>Nice</key>
+    <integer>5</integer>
+
+    <key>KeepAlive</key>
+    <false/>
+</dict>
+</plist>

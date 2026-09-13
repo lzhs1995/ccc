@@ -16,3 +16,4 @@ profiles/
 handoff/
 observations/
 backups/
+dist/

@@ -22,6 +22,7 @@ manually or by an external scheduler; no session cron is required.
 
 from __future__ import annotations
 
+import argparse
 import json
 import hashlib
 import os
@@ -39,7 +40,12 @@ AUDIT_STATE = AUDIT_DIR / "audit-state.json"
 AUDIT_JOURNAL = AUDIT_DIR / "audit.jsonl"
 AUDIT_ACKNOWLEDGEMENTS = AUDIT_DIR / "acknowledgements.json"
 SOURCE_PATH = Path(__file__).resolve().parent / "cmux_codex_watch.py"
-LABEL = os.environ.get("CCC_WATCHER_LABEL") or "com.example.ccc-continue"
+# Derived, not hardcoded: a literal account name here makes the auditor
+# unusable on any other machine and leaks that name when the source is
+# published.  The value must still match the label launchd actually loaded, so
+# it is computed the same way in every component (see bin/cmux-stack
+# LABEL_PREFIX).  On the box this was written on the result is unchanged.
+LABEL = f"com.{os.environ.get('USER') or Path.home().name or 'user'}.cmux-codex-continue"
 
 # Baselines the daemon is expected to hold.  A change is a NOTE, not an ALERT:
 # the user may legitimately add a surface.  Silence would be the real failure.
@@ -695,11 +701,22 @@ def _acknowledged(value: Any, now: float) -> tuple[bool, str]:
     return True, str(value.get("reason") or "acknowledged")
 
 
-def audit(*, now: float | None = None, live_pids: list[int] | None = None) -> dict[str, Any]:
+def audit(*, now: float | None = None, live_pids: list[int] | None = None,
+          read_only: bool = False) -> dict[str, Any]:
     now = time.time() if now is None else float(now)
     alerts: list[str] = []
     notes: list[str] = []
     candidates: dict[str, dict[str, Any]] = {}
+    input_errors: list[str] = []
+
+    def read_object(path: Path, *, required: bool = False) -> Mapping[str, Any]:
+        value = load_json(path, None)
+        if isinstance(value, Mapping):
+            return value
+        if required or path.exists():
+            input_errors.append(path.name)
+            alerts.append(f"INPUT UNVERIFIABLE: {path.name} is missing, unreadable or not a JSON object")
+        return {}
 
     def condition(key: str, detail: str, *, evidence_since: Any = 0.0) -> None:
         try:
@@ -710,20 +727,20 @@ def audit(*, now: float | None = None, live_pids: list[int] | None = None) -> di
             since = now
         candidates[key] = {"detail": detail, "evidence_since": since}
 
-    prev = load_json(AUDIT_STATE, {}) or {}
+    prev = read_object(AUDIT_STATE)
     # Read before any condition is raised: the gap_rate lifecycle below needs to
     # know which buckets already alerted while their hour was open.
     previous_conditions = prev.get("conditions") or {}
     if not isinstance(previous_conditions, Mapping):
         previous_conditions = {}
-    acknowledgements = load_json(AUDIT_ACKNOWLEDGEMENTS, {}) or {}
+    acknowledgements = read_object(AUDIT_ACKNOWLEDGEMENTS)
     if not isinstance(acknowledgements, Mapping):
         acknowledgements = {}
     config_path = APP_DIR / "config.json"
-    config = load_json(config_path, {}) or {}
-    state = load_json(APP_DIR / "state.json", {}) or {}
-    runtime_meta = load_json(APP_DIR / "daemon-runtime.json", {}) or {}
-    ledger = (load_json(APP_DIR / "claude-event-ledger.json", {}) or {}).get("events", {})
+    config = read_object(config_path, required=True)
+    state = read_object(APP_DIR / "state.json", required=True)
+    runtime_meta = read_object(APP_DIR / "daemon-runtime.json", required=True)
+    ledger = read_object(APP_DIR / "claude-event-ledger.json", required=True).get("events", {})
     if not isinstance(ledger, Mapping):
         ledger = {}
 
@@ -1231,6 +1248,8 @@ def audit(*, now: float | None = None, live_pids: list[int] | None = None) -> di
             alerts.append(rendered)
 
     summary = {
+        "read_only": read_only,
+        "input_errors": input_errors,
         "at": now,
         "at_text": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)),
         "pid": live[0] if live else 0,
@@ -1268,6 +1287,9 @@ def audit(*, now: float | None = None, live_pids: list[int] | None = None) -> di
         "log_transition": log_transition,
         "started_at": started_at,
     }
+
+    if read_only:
+        return summary
 
     AUDIT_DIR.mkdir(parents=True, exist_ok=True)
     tmp = AUDIT_STATE.with_suffix(".tmp")
@@ -1314,8 +1336,21 @@ def _format_distribution(summary: Mapping[str, Any]) -> str:
     return " ".join(parts)
 
 
-def main() -> int:
-    s = audit()
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--json", action="store_true", help="machine-readable audit result")
+    parser.add_argument("--read-only", action="store_true", help="do not publish state or advance the journal cursor")
+    args = parser.parse_args(argv)
+    try:
+        s = audit(read_only=args.read_only)
+    except (OSError, ValueError, TypeError, AttributeError) as exc:
+        error = {"read_only": args.read_only, "error": type(exc).__name__,
+                 "alerts": ["Audit inputs or output storage could not be verified"]}
+        print(json.dumps(error) if args.json else f"AUDIT ERROR: {error['error']}")
+        return 2
+    if args.json:
+        print(json.dumps(s, ensure_ascii=False, sort_keys=True))
+        return 2 if s["alerts"] else 0
     head = (
         f"pid={s['pid']} sha={s['run_sha']} {s['mode']} "
         f"{s['targets']}/{s['paused']} sessions={s['sessions']}"

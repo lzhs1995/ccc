@@ -1,0 +1,54 @@
+name: CCC CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    runs-on: macos-14
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.14']
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Full regression suite
+        run: python -B -m unittest discover -s tests -p 'test_*.py'
+      - name: Standalone stack contract tests
+        run: python -B tests/test_cmux_stack.py
+      - name: Isolated profile editor PTY tests
+        run: python -B tools/ccp_pty_stress.py --script ./ccp_new.py --rounds 3
+      - name: Shell syntax
+        run: |
+          while IFS= read -r script; do
+            bash -n "$script"
+          done < <(git ls-files '*.sh' '*.command' 'bin/cmux-codex-continue' 'bin/cmux-codex-release')
+      - name: Package the committed tree
+        run: python -B scripts/package_release.py --output dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ccc-python-${{ matrix.python }}
+          path: dist/
+
+  ccc-ci:
+    if: always()
+    needs: [regression]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every regression job
+        env:
+          REGRESSION_RESULT: ${{ needs.regression.result }}
+        run: test "$REGRESSION_RESULT" = success

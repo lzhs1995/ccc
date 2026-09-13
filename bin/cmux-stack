@@ -51,8 +51,10 @@ import argparse
 import json
 import os
 import subprocess
+import hashlib
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -70,17 +72,32 @@ HERE = Path(__file__).resolve().parent
 LAUNCHCTL = os.environ.get("CMUX_STACK_LAUNCHCTL") or "/bin/launchctl"
 JANITORCTL = Path(os.environ.get("CMUX_STACK_JANITORCTL")
                   or (HOME / ".config" / "cmux-janitor" / "cmux-janitorctl"))
+JANITOR_SOURCE = Path(os.environ.get("CMUX_STACK_JANITOR_SOURCE") or (HERE.parent / "janitor" / "src"))
 CCP = Path(os.environ.get("CMUX_STACK_CCP")
            or (HOME / ".claude-profiles" / "_ccp_new.py"))
 WATCHER = Path(os.environ.get("CMUX_STACK_WATCHER") or (HERE.parent / "cmux_codex_watch.py"))
 PYTHON = os.environ.get("CMUX_STACK_PYTHON") or sys.executable
 TIMEOUT = float(os.environ.get("CMUX_STACK_TIMEOUT") or 30)
 
-# Public defaults are deliberately neutral. Installations that keep a different
-# label can override them without editing the controller.
-WATCHER_LABEL = os.environ.get("CMUX_STACK_WATCHER_LABEL") or "com.example.ccc-continue"
-JANITOR_LABEL = os.environ.get("CMUX_STACK_JANITOR_LABEL") or "com.example.ccc-janitor"
-GUARD_LABEL = os.environ.get("CMUX_STACK_GUARD_LABEL") or "com.example.ccc-janitor-guard"
+# LaunchAgent label prefix, derived from the invoking account rather than
+# hardcoded.  Two reasons, and the second is the one that matters:
+#
+#   1. A hardcoded `com.<someone>.` prefix makes this file unusable on any other
+#      machine, and publishing it leaks an account name.
+#   2. The derived value must be *byte-identical* to whatever launchd already
+#      loaded, or `status` starts reporting a healthy daemon as absent.  On the
+#      box this was written on $USER is the same account that owns the plists,
+#      so the labels below come out exactly as they were written before.
+#
+# CMUX_STACK_LABEL_PREFIX is the escape hatch for the case those two differ --
+# an operator whose login name is not the account that owns the LaunchAgents --
+# and is also how the test suite pins a sandbox prefix.
+LABEL_PREFIX = (os.environ.get("CMUX_STACK_LABEL_PREFIX")
+                or f"com.{os.environ.get('USER') or HOME.name or 'user'}")
+
+WATCHER_LABEL = os.environ.get("CMUX_STACK_WATCHER_LABEL") or f"{LABEL_PREFIX}.cmux-codex-continue"
+JANITOR_LABEL = os.environ.get("CMUX_STACK_JANITOR_LABEL") or f"{LABEL_PREFIX}.cmux-janitor"
+GUARD_LABEL = os.environ.get("CMUX_STACK_GUARD_LABEL") or f"{LABEL_PREFIX}.cmux-janitor-guard"
 
 COMPONENTS = ("watcher", "janitor", "profiles")
 
@@ -194,8 +211,22 @@ def probe_watcher() -> dict:
     pid = daemon.get("pid")
     row["pid"] = int(pid) if isinstance(pid, int) and pid > 0 else None
     row["pid_alive"] = daemon.get("pid_alive") is True
-    row["source_matches_disk"] = daemon.get("source_matches_disk") is True
+    match = daemon.get("source_matches_disk")
+    row["source_matches_disk"] = match if isinstance(match, bool) else None
     row["runtime_metadata_present"] = daemon.get("runtime_metadata_present") is True
+    coverage = payload.get("claude_hook_coverage")
+    if isinstance(coverage, dict):
+        row["claude_hook_coverage"] = {key: coverage.get(key) for key in (
+            "status", "scope", "monitored_live", "verified", "needs_verification",
+            "completed_unverified", "paused_unverified")}
+    observation = payload.get("observation_coverage")
+    if isinstance(observation, dict):
+        row["observation_coverage"] = {key: observation.get(key) for key in (
+            "status", "scope", "observed_at", "stale_after_sec")}
+        counts = observation.get("counts", {})
+        row["observation_coverage"]["counts"] = {
+            key: counts.get(key) for key in ("readable", "live_unreadable", "dormant", "paused", "missing", "unknown")
+        } if isinstance(counts, dict) else {}
 
     targets = payload.get("explicit_targets")
     rules = payload.get("workspace_rules")
@@ -237,10 +268,46 @@ def _watcher_verdict(row: dict) -> tuple[bool | None, str | None]:
         # contract: global_paused means no session will be continued, so it is a
         # fault the operator should see, not a benign mode.
         return False, "globally paused; no session will be continued"
+    coverage = row.get("observation_coverage", {})
+    hooks = row.get("claude_hook_coverage", {})
+    if coverage.get("status") == "degraded" or hooks.get("status") == "degraded":
+        return False, "authorized targets have an observation or Hook coverage gap"
+    if coverage.get("status") != "ok" or hooks.get("status") != "ok":
+        return None, "authorized target observation or Hook coverage unknown"
     # A watcher whose on-disk source differs from the running one is NOT judged
     # unhealthy: it only means a restart would change behaviour, and deciding to
     # restart is a human call.  Surfaced in the row, never folded into healthy.
     return True, None
+
+
+def _file_sha(path: Path) -> str | None:
+    try:
+        with path.open("rb") as handle:
+            digest = hashlib.sha256()
+            for block in iter(lambda: handle.read(128 * 1024), b""):
+                digest.update(block)
+            return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def _janitor_sources() -> dict:
+    result = {}
+    for name in ("cmux-janitor.sh", "guard.sh", "cmux-janitorctl", "config.env"):
+        source = _file_sha(JANITOR_SOURCE / name)
+        installed = _file_sha(JANITORCTL.parent / name)
+        result[name] = {"source_sha256": source, "installed_sha256": installed,
+                        "matches": source == installed if source and installed else None}
+    return result
+
+
+def _observed_at(value: Any) -> str | None:
+    if not isinstance(value, str) or len(value) > 40:
+        return None
+    try:
+        return value if datetime.fromisoformat(value).tzinfo is not None else None
+    except ValueError:
+        return None
 
 
 def probe_janitor() -> dict:
@@ -263,6 +330,9 @@ def probe_janitor() -> dict:
         "guard_invalid": None,
         "quarantine_batch_count": None,
         "violation_count": None,
+        "artifact_sources": _janitor_sources(),
+        "janitor_observed_at": None,
+        "guard_observed_at": None,
         "reason": None,
     }
     if not row["installed"]:
@@ -290,6 +360,8 @@ def probe_janitor() -> dict:
     row["guard_health"] = guard.get("health") if isinstance(guard.get("health"), str) else None
     row["janitor_stale"] = janitor.get("stale") is True
     row["guard_stale"] = guard.get("stale") is True
+    row["janitor_observed_at"] = _observed_at(janitor.get("observed_at"))
+    row["guard_observed_at"] = _observed_at(guard.get("observed_at"))
     # present/invalid were published by janitorctl from the start and consumed by
     # nobody -- the same producer-writes/consumer-ignores drift that 106.14.4 was
     # written about.  An invalid state file must not read as a healthy one.
@@ -434,6 +506,43 @@ def probe_profiles() -> dict:
 PROBES = {"watcher": probe_watcher, "janitor": probe_janitor, "profiles": probe_profiles}
 
 
+def _component_warnings(name: str, row: dict) -> list[str]:
+    """Release freshness and observation age do not redefine operational health."""
+    if not row.get("probe_ok"):
+        return ["probe_unavailable"]
+    warnings = []
+    if name == "watcher":
+        if row.get("source_matches_disk") is False:
+            warnings.append("source_drift")
+        elif row.get("source_matches_disk") is None:
+            warnings.append("source_provenance_unknown")
+        if row.get("runtime_metadata_present") is not True:
+            warnings.append("runtime_metadata_missing")
+        coverage = row.get("claude_hook_coverage", {})
+        if coverage.get("status") == "degraded":
+            warnings.append("claude_hook_coverage_gap")
+        elif coverage.get("status") == "unknown":
+            warnings.append("claude_hook_coverage_unknown")
+        observation = row.get("observation_coverage", {})
+        if observation.get("status") == "degraded":
+            warnings.append("terminal_observation_gap")
+        elif observation.get("status") != "ok":
+            warnings.append("terminal_observation_unknown")
+    elif name == "janitor":
+        sources = list(row.get("artifact_sources", {}).values())
+        if any(item["matches"] is False for item in sources):
+            warnings.append("installed_source_drift")
+        if any(item["source_sha256"] is None for item in sources):
+            warnings.append("source_reference_unavailable")
+        if any(item["installed_sha256"] is None for item in sources):
+            warnings.append("installed_artifact_unverifiable")
+        if row.get("janitor_stale") is True:
+            warnings.append("janitor_observation_stale")
+        if row.get("guard_stale") is True:
+            warnings.append("guard_observation_stale")
+    return warnings
+
+
 def build_status(only: tuple[str, ...] = COMPONENTS) -> dict:
     """Probe each component in isolation.  One crash must not hide the others."""
     components: dict[str, Any] = {}
@@ -448,6 +557,10 @@ def build_status(only: tuple[str, ...] = COMPONENTS) -> dict:
                 "component": name, "probe_ok": False, "healthy": None,
                 "reason": f"probe raised {type(exc).__name__}",
             }
+        components[name]["warnings"] = _component_warnings(name, components[name])
+
+    warnings = [{"component": name, "code": code}
+                for name, row in components.items() for code in row["warnings"]]
 
     probed = [c for c in components.values() if c.get("probe_ok")]
     unhealthy = [c for c in probed if c.get("healthy") is False]
@@ -475,6 +588,8 @@ def build_status(only: tuple[str, ...] = COMPONENTS) -> dict:
         "controller": "cmux-stack",
         "observed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "read_only": True,
+        "warnings": warnings,
+        "warning_count": len(warnings),
         "overall": overall,
         "probed_count": len(probed),
         "requested_count": len(only),
@@ -530,6 +645,8 @@ def render_status(status: dict) -> None:
         print(f"  {name:<9} {health:<5}  {extra}")
         if row.get("reason"):
             print(f"  {'':<9}        note: {row['reason']}")
+        if row.get("warnings"):
+            print(f"  {'':<9}        warnings: {', '.join(row['warnings'])}")
     print()
     print("  子命令: status --json | doctor | up | profile | update --plan | down --component")
     print()
@@ -562,7 +679,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     # ccp-new must stay a foreground CLI.  A LaunchAgent for it would be a
     # design violation, so its *absence* is the passing condition.
-    ccp_plist = HOME / "Library" / "LaunchAgents" / "com.example.ccp-new.plist"
+    ccp_plist = HOME / "Library" / "LaunchAgents" / f"{LABEL_PREFIX}.ccp-new.plist"
     findings.append({"check": "ccp-new has no LaunchAgent (required)",
                      "ok": not ccp_plist.exists(), "path": str(ccp_plist)})
 

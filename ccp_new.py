@@ -31,6 +31,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import fcntl
 import getpass
 import json
@@ -43,6 +44,7 @@ import ssl
 import subprocess
 import sys
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 from copy import deepcopy
@@ -389,6 +391,54 @@ def verify_upstream(url: str, key: str, model: str) -> VerifyResult:
             return VerifyResult(True, "OK", f"HTTP {status} /v1/models 返回 {len(listing)} 个模型")
         return VerifyResult(True, "OK", f"HTTP {status} /v1/models 返回合法 JSON")
     return VerifyResult(False, "HTTP_ERROR", f"HTTP {status}")
+
+
+def _verify_profile(name: str) -> dict[str, object]:
+    """Verify one profile and return a deliberately non-sensitive result."""
+    started = time.monotonic()
+    try:
+        env = read_profile(name)["env"]
+        url = str(env.get("ANTHROPIC_BASE_URL") or "").strip()
+        key = str(env.get("ANTHROPIC_AUTH_TOKEN") or env.get("ANTHROPIC_API_KEY") or "").strip()
+        if not url or not key:
+            return {"name": name, "ok": False, "status": "INVALID_PROFILE",
+                    "latency_ms": round((time.monotonic() - started) * 1000)}
+        result = verify_upstream(url, key, probe_model())
+        return {"name": name, "ok": result.ok, "status": result.kind,
+                "latency_ms": round((time.monotonic() - started) * 1000)}
+    except (InputError, KeyError, TypeError, ValueError):
+        return {"name": name, "ok": False, "status": "INVALID_PROFILE",
+                "latency_ms": round((time.monotonic() - started) * 1000)}
+
+
+def verify_all_profiles(max_workers: int = 5) -> list[dict[str, object]]:
+    """Run the existing GET-only probe concurrently without writing profiles."""
+    names = list_profiles()
+    workers = max(1, min(int(max_workers), 16))
+    if not names:
+        return []
+    with ThreadPoolExecutor(max_workers=min(workers, len(names))) as pool:
+        rows = [future.result() for future in as_completed(
+            {pool.submit(_verify_profile, name): name for name in names})]
+    return sorted(rows, key=lambda row: str(row["name"]))
+
+
+def cmd_verify_all(*, as_json: bool = False, max_workers: int = 5) -> int:
+    """Verify every profile; never mutates the profile directory."""
+    workers = max(1, min(int(max_workers), 16))
+    rows = verify_all_profiles(workers)
+    if as_json:
+        print(json.dumps({"component": "ccp-new", "read_only": True,
+                          "concurrency": workers, "profiles": rows},
+                         ensure_ascii=False, indent=2))
+    else:
+        print(f"\nccp-new 批量验证（只读，GET /v1/models，并发 {workers}）")
+        print(f"{'名称':<20} {'状态':<18} {'耗时(ms)':>10}")
+        print("-" * 52)
+        for row in rows:
+            print(f"{str(row['name']):<20} {str(row['status']):<18} {int(row['latency_ms']):>10}")
+        print(f"\n合计 {len(rows)} 个，健康 {sum(bool(row['ok']) for row in rows)} 个")
+    return EXIT_OK if all(bool(row["ok"]) for row in rows) else EXIT_VERIFY_FAILED
 
 
 def probe_model() -> str:
@@ -1037,47 +1087,147 @@ def editor_exit_hint(argv: list[str]) -> str:
     return "请使用当前编辑器的保存/退出命令；不保存可用 Ctrl-C 退出并放弃改动。"
 
 
+def display_width(text: str) -> int:
+    """字符串占的终端【列数】。
+
+    Wide/Fullwidth（CJK）算两列，其余算一列 —— 与 cmux_supervisor_tui 里同名
+    函数同一套判定，两处渲染才不会对同一串给出不同宽度。East Asian
+    "Ambiguous" 一律算一列，与本机终端的实际渲染一致。
+    """
+    return sum(2 if unicodedata.east_asian_width(char) in "WF" else 1 for char in text)
+
+
+def clip_to_cells(text: str, cells: int) -> str:
+    """按【显示单元格】裁剪，不切开一个宽字形。
+
+    curses 的 addnstr 是按【字符个数】截断的：一行 40 个汉字在 n=79 下不会被
+    截断，却要占 80 列 —— 于是写出窗口。所以裁剪必须先在这里按列数做完。
+    """
+    if cells <= 0:
+        return ""
+    if display_width(text) <= cells:
+        return text
+    kept: list[str] = []
+    used = 0
+    for char in text:
+        char_cells = display_width(char)
+        if used + char_cells > cells:
+            break
+        kept.append(char)
+        used += char_cells
+    return "".join(kept)
+
+
 def _builtin_draw(stdscr: object, row: int, text: str, width: int,
                   attr: int = 0) -> None:
-    """在有限宽度终端内安全绘制一行（供内置编辑器使用）。"""
-    if width <= 1:
+    """在有限宽度终端内安全绘制一行（供内置编辑器使用）。
+
+    row 为负表示「这一行在当前窗口里放不下」，直接不画。
+    """
+    if row < 0 or width <= 1:
+        return
+    fitted = clip_to_cells(text, width - 1)
+    if not fitted:
         return
     try:
-        stdscr.addnstr(row, 0, text, max(1, width - 1), attr)
+        stdscr.addnstr(row, 0, fitted, len(fitted), attr)
     except Exception:
         # curses 在窗口刚缩小时可能对最后一个单元格抛 error；下一帧会重画。
         return
+
+
+def _builtin_field_rows(height: int) -> dict[str, int]:
+    """按【实测高度】排布字段编辑行；窗口变矮时压缩，而不是画到窗外。
+
+    行号写死（标题 0、当前值 4、新值 6）在高度不足时会让「新值」整行连同光标
+    落在窗口外：curses 抛 error 被吞掉，用户就在看不见输入的情况下改凭据。
+    """
+    if height >= 7:
+        return {"title": 0, "hint1": 1, "hint2": 2, "current": 4, "value": 6}
+    last = max(0, height - 1)
+    rows = {"value": last}
+    for index, name in enumerate(("title", "hint1", "hint2", "current")):
+        rows[name] = index if index < last else -1
+    return rows
+
+
+# 整块编辑器的固定开销：上面 4 行（标题、两行提示、一行空白），下面 2 行（页脚
+# 与留给光标的最后一行）。阈值由这两个数【算出来】，不另写一个常数：写死的阈值
+# 和实际排版是两份真相，改了一处另一处不会跟着动。
+_EDITOR_TOP_ROWS = 4
+_EDITOR_BOTTOM_ROWS = 2
+
+
+def _builtin_editor_rows(height: int) -> dict[str, int]:
+    """按【实测高度】排布整块编辑器；放不下的行返回 -1（不画），而不是画到窗外。
+
+    行号写死（列表从 4 起、页脚 height - 2）在高度不足时让两块重叠：height == 6
+    时第 4 行既是唯一一行列表又是页脚，页脚后画覆盖掉列表 —— 用户看不见选中的是
+    哪一个键，却仍能按 e 直接编辑那个键的凭据；height <= 4 时整块列表落在窗口外，
+    curses 抛 error 被 _builtin_draw 吞掉，屏幕上一行列表都没有。两种情形下
+    「看不见」和「画对了」在屏幕上不可区分，而用户的下一次按键是要改凭据的。
+    """
+    if height >= _EDITOR_TOP_ROWS + 1 + _EDITOR_BOTTOM_ROWS:
+        return {"title": 0, "hint1": 1, "hint2": 2,
+                "first": _EDITOR_TOP_ROWS,
+                "visible": height - _EDITOR_TOP_ROWS - _EDITOR_BOTTOM_ROWS,
+                "footer": height - 2}
+    # 高度不足：列表是用户据以决定「按不按 e」的唯一信息，优先保住一行列表；
+    # 先丢页脚 —— 它那句话在 hint1 里已经完整出现过一次，丢的是重复不是信息。
+    rows = {"title": 0 if height > 1 else -1, "hint1": -1, "hint2": -1,
+            "footer": -1, "visible": 1,
+            "first": min(_EDITOR_TOP_ROWS, max(0, height - 1))}
+    if height >= 3:
+        rows["hint1"] = 1
+    if height >= 5:
+        rows["hint2"] = 2
+    return rows
 
 
 def _builtin_get_text(stdscr: object, key: str, current: str) -> tuple[bool, str]:
     """编辑一个字符串值。Enter 接受，Esc/Ctrl-C 取消本次字段编辑。"""
     import curses
 
-    try:
-        height, width = stdscr.getmaxyx()
-    except Exception:
-        height, width = 24, 100
     sensitive = is_sensitive_key(key)
     chars: list[str] = []
+    value_label = "新值："
     try:
         curses.curs_set(1)
         curses.noecho()
     except curses.error:
         pass
     while True:
-        stdscr.erase()
-        _builtin_draw(stdscr, 0, f"编辑配置值：{key}", width)
-        _builtin_draw(stdscr, 1, "Enter 接受本次值；Esc 取消本次字段编辑；Ctrl-C 取消", width)
-        _builtin_draw(stdscr, 2, "空 Enter = 保持原值；输入 - = 置空串（中和）", width)
-        _builtin_draw(stdscr, 4, f"当前值：{show_value(key, current)}", width)
-        shown = "*" * len(chars) if sensitive else "".join(chars)
-        _builtin_draw(stdscr, 6, f"新值：{shown}", width)
+        # 每一帧都重新量宽高：只在进入时量一次的话，编辑途中拖动终端会让后面
+        # 所有行按旧尺寸裁剪，并把光标放到窗口之外（KEY_RESIZE 也修不回来）。
         try:
-            stdscr.move(6, min(width - 2, 6 + len(shown)))
+            height, width = stdscr.getmaxyx()
+        except Exception:
+            height, width = 24, 100
+        rows = _builtin_field_rows(height)
+        stdscr.erase()
+        _builtin_draw(stdscr, rows["title"], f"编辑配置值：{key}", width)
+        _builtin_draw(stdscr, rows["hint1"],
+                      "Enter 接受本次值；Esc 取消本次字段编辑；Ctrl-C 取消", width)
+        _builtin_draw(stdscr, rows["hint2"], "空 Enter = 保持原值；输入 - = 置空串（中和）", width)
+        _builtin_draw(stdscr, rows["current"], f"当前值：{show_value(key, current)}", width)
+        shown = "*" * len(chars) if sensitive else "".join(chars)
+        _builtin_draw(stdscr, rows["value"], f"{value_label}{shown}", width)
+        # 光标跟随【真正渲染出来的那串】：掩码是一字符一个 ASCII 星号，所以敏感
+        # 值的光标只反映输入了几个字符，不会泄露原值的宽字符分布。前缀宽度按
+        # 文案量，不写死列号 —— 写死的 6 只是"新值："当前恰好占 6 列，改文案就错位。
+        cursor_col = display_width(value_label) + display_width(shown)
+        cursor_col = max(0, min(width - 2, cursor_col))
+        try:
+            stdscr.move(rows["value"], cursor_col)
+        except curses.error:
+            pass
+        try:
             stdscr.refresh()
             raw = stdscr.get_wch()
         except (AttributeError, curses.error):
             raw = stdscr.getch()
+        if raw == curses.KEY_RESIZE:
+            continue                      # 下一圈按新尺寸重量、重画、重放光标
         # get_wch() returns one-character strings for ordinary keys (including
         # Enter/Esc); the getch() fallback returns integer key codes.
         if raw in (10, 13, "\n", "\r"):
@@ -1102,18 +1252,21 @@ def _builtin_confirm(stdscr: object, prompt: str) -> bool:
     """只接受 y/n 的确认框；其它输入保持在确认框，不误触提交。"""
     import curses
 
-    try:
-        _height, width = stdscr.getmaxyx()
-    except Exception:
-        width = 100
     while True:
-        _builtin_draw(stdscr, max(0, (getattr(stdscr, "getmaxyx", lambda: (24, width))()[0] - 2)),
-                      f"{prompt} [y/n]", width)
+        # 与字段编辑器同一条规则：确认框的宽高也每帧重量。缓存宽度会让缩窄后的
+        # 提示按旧宽度裁剪，缓存高度会把提示画到窗口外 —— 那就是"看不见的确认框"。
+        try:
+            height, width = stdscr.getmaxyx()
+        except Exception:
+            height, width = 24, 100
+        _builtin_draw(stdscr, max(0, height - 2), f"{prompt} [y/n]", width)
         try:
             stdscr.refresh()
             raw = stdscr.get_wch()
         except (AttributeError, curses.error):
             raw = stdscr.getch()
+        if raw == curses.KEY_RESIZE:
+            continue
         if isinstance(raw, int):
             if 0 <= raw < 256:
                 raw = chr(raw)
@@ -1143,22 +1296,24 @@ def _builtin_editor_loop(stdscr: object, payload: dict, hint: str) -> dict | Non
             height, width = stdscr.getmaxyx()
         except Exception:
             height, width = 24, 100
-        visible = max(1, height - 6)
+        plan = _builtin_editor_rows(height)
+        visible = plan["visible"]
         if selected < offset:
             offset = selected
         if selected >= offset + visible:
             offset = selected - visible + 1
         stdscr.erase()
-        _builtin_draw(stdscr, 0, "ccp-new 整块配置编辑（内置模式）", width)
-        _builtin_draw(stdscr, 1, "↑↓/jk 选择值；e 编辑选中项；Enter 保存；Esc 放弃；q 放弃", width)
-        _builtin_draw(stdscr, 2, hint, width)
-        for screen_row, index in enumerate(range(offset, min(len(keys), offset + visible)), 4):
+        _builtin_draw(stdscr, plan["title"], "ccp-new 整块配置编辑（内置模式）", width)
+        _builtin_draw(stdscr, plan["hint1"], "↑↓/jk 选择值；e 编辑选中项；Enter 保存；Esc 放弃；q 放弃", width)
+        _builtin_draw(stdscr, plan["hint2"], hint, width)
+        for screen_row, index in enumerate(range(offset, min(len(keys), offset + visible)),
+                                           plan["first"]):
             name = keys[index]
             marker = "> " if index == selected else "  "
             _builtin_draw(stdscr, screen_row,
                           f"{marker}{name:<38} {show_value(name, env[name])}", width,
                           curses.A_REVERSE if index == selected else 0)
-        _builtin_draw(stdscr, height - 2, "Enter 保存当前 JSON 修改？随后选择 y/n；Esc 放弃？随后选择 y/n", width)
+        _builtin_draw(stdscr, plan["footer"], "Enter 保存当前 JSON 修改？随后选择 y/n；Esc 放弃？随后选择 y/n", width)
         stdscr.refresh()
         raw = stdscr.getch()
         if raw in (curses.KEY_UP, ord("k")):
@@ -1577,6 +1732,8 @@ USAGE = """用法:
   ccp-new <名称> <URL> <API-key>   直接新建或覆盖
   ccp-new -y <名称> <URL> <KEY>    覆盖同名不再询问
   ccp-new --status [--json]        只读状态快照（离线、不写盘、不打上游）
+  ccp-new verify-all [--json] [--concurrency N]
+                                    批量验证所有 profile（只读，GET /v1/models）
 
 菜单动作:
   [n] 新建   [e] 改三项（名称/URL/key）  [d] 删除   [l] 列表
@@ -1623,6 +1780,30 @@ def main() -> int:
             print("用法: ccp-new --status [--json]", file=sys.stderr)
             return EXIT_USAGE
         return cmd_status(rest == ["--json"])
+
+    if args and args[0] in ("verify-all", "--verify-all"):
+        rest = args[1:]
+        as_json = False
+        workers = 5
+        i = 0
+        while i < len(rest):
+            if rest[i] == "--json" and not as_json:
+                as_json = True
+            elif rest[i] in ("--concurrency", "-j") and i + 1 < len(rest):
+                try:
+                    workers = int(rest[i + 1])
+                except ValueError:
+                    print("--concurrency 必须是整数", file=sys.stderr)
+                    return EXIT_USAGE
+                i += 1
+            else:
+                print("用法: ccp-new verify-all [--json] [--concurrency N]", file=sys.stderr)
+                return EXIT_USAGE
+            i += 1
+        if workers < 1 or workers > 16:
+            print("--concurrency 范围为 1..16", file=sys.stderr)
+            return EXIT_USAGE
+        return cmd_verify_all(as_json=as_json, max_workers=workers)
 
     assume_yes = False
     if args and args[0] in ("-y", "--yes"):

@@ -71,6 +71,7 @@ ERROR_LABELS = {
     "stream": "断流",
     "prompt_cache": "缓存400",
     "claude_503": "503",
+    "claude_model_unavailable": "模型错误",
     "claude_429": "429",
     "claude_overloaded": "过载",
     "claude_quota": "额度",
@@ -93,6 +94,7 @@ STATE_LABELS = {
     "incompatible": "看不清",
     "missing": "已消失",
     "missing_or_error": "无画面",
+    "terminal_dormant": "未初始化",
     "unknown": "未知",
     "composer_busy": "正在输入",
     # Codex accepted our message but has not consumed it yet; sending more would
@@ -110,6 +112,7 @@ STATE_LABELS = {
     # Claude stop events are single-shot: stopped sends once, completed waits
     # for the user, pending never queues a duplicate prompt.
     "claude_stopped": "待续跑",
+    "claude_model_unavailable": "模型错误",
     "claude_input_guard": "输入保护",
     "claude_completed": "已完成",
     "claude_pending_input": "已续跑",
@@ -117,9 +120,9 @@ STATE_LABELS = {
     "claude_event_pending": "待续跑",
     "claude_event_reserved": "发送中",
     "claude_event_sent": "已续跑",
-    "claude_hook_missing": "Hook缺失",
+    "claude_hook_missing": "Hook未验",
     "claude_hook_unverified": "Hook待验",
-    "claude_hook_legacy": "旧Hook",
+    "claude_hook_legacy": "配置待核",
     "claude_hook_config_degraded": "Hook配置错",
     "claude_hook_gap_candidate": "双帧确认",
     "claude_hook_gap_exhausted": "续跑限次",
@@ -152,6 +155,7 @@ DETAIL_FALLBACKS = {
     "send_guard_unavailable": "无法验证 Dock 状态",
     "claude_observed": "Claude 功能关闭",
     "claude_stopped": "Claude 已停止，本次事件可续跑一次",
+    "claude_model_unavailable": "Claude 报告模型不存在或无访问权限；重复续跑不能修复，需核对 /model",
     "claude_input_guard": "等待输入保护期结束；用户输入优先",
     "claude_completed": "Claude 已完成；仍持续监控，下个任务自动恢复",
     "claude_pending_input": "本次停止已续跑，不会重复排队",
@@ -159,9 +163,9 @@ DETAIL_FALLBACKS = {
     "claude_event_pending": "已收到 Claude 停止事件，正在进行输入保护校验",
     "claude_event_reserved": "事件已预留，正在调用 cmux send",
     "claude_event_sent": "本次 Claude 停止事件已续跑",
-    "claude_hook_missing": "未收到 Claude 生命周期 Hook，保持监控但不猜测发送",
+    "claude_hook_missing": "尚无已接纳的新 Hook，不能据此断言未安装；保持监控",
     "claude_hook_unverified": "等待 SessionStart 或下一条 Claude 生命周期 Hook 验证",
-    "claude_hook_legacy": "旧 Claude 会话未加载 CCC Hook；重启/恢复一次即可，登记不变",
+    "claude_hook_legacy": "启动参数含旧 Hook 配置且尚无已接纳事件；先用 /hooks 核对实际加载项，不据此强制重启",
     "claude_hook_config_degraded": "全局 Claude Hook 配置缺失或损坏；守护器会尝试无损修复",
     "claude_hook_gap_candidate": "Hook 未到，正在验证第二帧停止画面",
     "claude_identity_conflict": "Hook 会话与 surface 身份无法唯一对应",
@@ -189,6 +193,7 @@ DETAIL_SHORT = {
     "send_guard_unavailable": "验不了",
     "claude_observed": "Claude关",
     "claude_stopped": "已停止",
+    "claude_model_unavailable": "模型错误",
     "claude_input_guard": "保护中",
     "claude_completed": "已完成",
     "claude_pending_input": "已续跑",
@@ -196,9 +201,9 @@ DETAIL_SHORT = {
     "claude_event_pending": "待续跑",
     "claude_event_reserved": "发送中",
     "claude_event_sent": "已续跑",
-    "claude_hook_missing": "缺Hook",
+    "claude_hook_missing": "未验Hook",
     "claude_hook_unverified": "待验",
-    "claude_hook_legacy": "需重启",
+    "claude_hook_legacy": "配置待核",
     "claude_hook_config_degraded": "配置错",
     "claude_hook_gap_candidate": "验二帧",
     "claude_identity_conflict": "身份错",
@@ -429,8 +434,9 @@ def compact_duration(seconds: float) -> str:
 HOOK_LABELS = {
     "healthy": "正常",
     "unverified": "待验证",
-    "legacy_override": "旧会话",
-    "missing": "缺失",
+    "legacy_override": "配置待核",
+    "missing": "未验",
+    "historical": "待新事件",
     "offline": "离线",
 }
 
@@ -479,6 +485,16 @@ def diagnostic_detail(candidate: Candidate) -> str:
         while detail.lower().startswith(prefix.lower()):
             detail = detail[len(prefix):]
     return detail
+
+
+def runtime_observation(runtime: Mapping[str, Any]) -> tuple[str, str]:
+    """Use a matching observation without relabeling an old send episode."""
+    error = str(runtime.get("error_type") or "-")
+    reason = ""
+    if runtime.get("observed_state") == runtime.get("state") and runtime.get("observed_at"):
+        error = str(runtime.get("observed_error_type") or error)
+        reason = str(runtime.get("observed_reason") or "")
+    return error, reason
 
 
 def error_label(candidate: Candidate) -> str:
@@ -637,8 +653,9 @@ def rule(char: str, width: int) -> str:
 
 TITLE_COL_WIDTH = 12
 SESSION_COL_WIDTH = 36
-# Shown instead of the UUID when the terminal cannot fit the whole cell.  It
-# must never be confusable with an id, so it carries no hex at all.
+# 【已退役，保留只为当"禁止出现的字符串"用】。以前 session 列放不下时画它；现在
+# 放不下就整列省略。留着这个名字，是为了让测试可以按名断言它在任何宽度下都不出
+# 现 —— 删掉名字，那条负向断言就只能写成字面量，改文案时会静默失效。
 SESSION_NARROW_MARKER = "窗口过窄"
 SESSION_UNMEASURED = "未测量"
 SESSION_GROUP_CELL = "—"
@@ -1505,12 +1522,13 @@ def collab_group_counts(roles: Mapping[str, CollabRole]) -> dict[str, int]:
 
 
 def collab_column_fits(width: int | None) -> bool:
-    """Frame-level decision, computed from the same spec that draws the row."""
-    if width is None:
-        return False
-    body = sum(col_width for _, col_width, _ in ROW_COLUMNS) + (len(ROW_COLUMNS) - 1)
-    minimum = 5 + body + 1 + COLLAB_COL_WIDTH + 2 + TITLE_COL_WIDTH
-    return width >= minimum
+    """协作列在这个宽度下放不放得下 —— 与画行用的是同一次测量。
+
+    历史实现在这里按完整 ROW_COLUMNS 自己算一遍 ``width >= 106``。那个 106 在窄
+    屏走响应式列集、或者行尾还要接一个「窗口过窄」标记时都不成立，于是"准许"和
+    "真的放得下"是两个数。现在两者都问 row_layout()。
+    """
+    return row_layout(width, collab_available=True).collab
 
 
 def collab_focus_note(candidate: Candidate | None, roles: Mapping[str, CollabRole]) -> str:
@@ -1574,6 +1592,81 @@ ROW_COLUMNS: tuple[tuple[str, int, str], ...] = (
     ("续跑", 5, ">"),
 )
 
+# 前缀 5 列：光标、建议标记，再加把 surface 嵌在 workspace 之下的三格缩进。
+# 表头与数据行必须用同一个数，否则两者的列位对不上。
+ROW_PREFIX_CELLS = 5
+# 核心三列回答「这一行是谁」，任何宽度下都不去掉。程序列保持 7：最长的取值是
+# "Copilot"，6 会把它截成 "Copilo"（历史窄屏分支就是这么截的）。
+CORE_COLUMN_NAMES = ("监控", "位置", "程序")
+# 牺牲顺序：越靠前越先被去掉。顺序本身是产品选择，写在这里只有一份。
+OPTIONAL_DROP_ORDER = ("上下文", "Hook", "续跑", "画面", "错误")
+
+
+@dataclass(frozen=True)
+class RowLayout:
+    """一帧里表格行的全部布局决定，一次量出来。
+
+    协作列与 session 列不再各自算一次宽度：历史实现里 collab_column_fits() 按
+    完整 ROW_COLUMNS 算，而真正画出来的行可能是被裁过的列集，再加上一个「窗口过
+    窄」标记，于是同一个宽度上「准许显示协作」和「协作真的放得下」不是一回事。
+    """
+
+    columns: tuple[tuple[str, int, str], ...]
+    collab: bool
+    session: bool
+    head_cells: int      # session 列之前那一段占的显示单元格数
+
+
+def _head_cells(columns: tuple[tuple[str, int, str], ...], *, collab: bool) -> int:
+    """与 _row_text 的拼法逐项对应：前缀 + 各列(单空格分隔) + [空格+协作] + 两空格 + 标题。"""
+    body = sum(col_width for _, col_width, _ in columns) + max(0, len(columns) - 1)
+    if collab:
+        body += 1 + COLLAB_COL_WIDTH
+    return ROW_PREFIX_CELLS + body + 2 + TITLE_COL_WIDTH
+
+
+# 能画出核心行的最小可用宽度，【推导出来的】：核心三列 + 分隔 + 前缀 + 标题。
+# 不是记住的 55/56 —— 那个数字来自某一版的列宽，列宽一改它就是错的。
+MIN_CORE_WIDTH = _head_cells(
+    tuple(col for col in ROW_COLUMNS if col[0] in CORE_COLUMN_NAMES), collab=False)
+
+
+def row_layout(width: int | None, *, collab_available: bool = False) -> RowLayout:
+    """按【实测可用宽度】决定列集、协作列、session 列。
+
+    规则（只有这一处）：
+      1. 从信息最全的配置开始往下退，第一个放得下的就是答案 —— 于是更宽的终端
+         永远不会显示得更少（单调）。
+      2. 数据列优先于协作列：协作列是补充说明，数据列回答这一行是谁。
+      3. session 列全有或全无，判据是 36 个显示单元格全部放得下。放不下就整列
+         省略：既不画标记也不画片段，因为 ``9f7aa928-0525`` 看起来就是个合法 id、
+         能干净地复制、却 resume 不了任何东西。完整 id 在焦点行里给。
+    """
+    if width is None:
+        # 历史形态：没有终端可量的调用方（和老测试）拿到固定九列，不做任何裁剪。
+        return RowLayout(ROW_COLUMNS, False, False, _head_cells(ROW_COLUMNS, collab=False))
+    for dropped in range(len(OPTIONAL_DROP_ORDER) + 1):
+        removed = set(OPTIONAL_DROP_ORDER[:dropped])
+        columns = tuple(col for col in ROW_COLUMNS if col[0] not in removed)
+        for collab in ((True, False) if collab_available else (False,)):
+            head = _head_cells(columns, collab=collab)
+            if head <= width:
+                return RowLayout(columns, collab,
+                                 head + 1 + SESSION_COL_WIDTH <= width, head)
+    # 比核心行还窄：仍然只给核心三列，剩下的交给按列裁剪，不再有更小的列集可退。
+    columns = tuple(col for col in ROW_COLUMNS if col[0] in CORE_COLUMN_NAMES)
+    return RowLayout(columns, False, False, _head_cells(columns, collab=False))
+
+
+def get_visible_columns(width: int) -> tuple[tuple[str, int, str], ...]:
+    """兼容入口：等价于 ``row_layout(width).columns``。
+
+    自己不再判宽度。历史实现按 80/100/106 三个写死的阈值挑列，而真正决定放不放得
+    下的是「前缀 + 各列 + 分隔 + 标题 + 可选协作列」这一串的实际列宽；两处各算一
+    次，就一定会在某个宽度上不一致 —— 106 正是那个不一致点。
+    """
+    return row_layout(width).columns
+
 
 def session_cell(text: str, available: int) -> str | None:
     """The session cell for a row, or ``None`` when it does not fit.
@@ -1597,8 +1690,9 @@ def _row_text(
     width: int | None = None,
     session: str = "",
     collab: str | None = None,
+    visible_columns: tuple[tuple[str, int, str], ...] | None = None,
 ) -> str:
-    """One table row.
+    """One table row with responsive column layout.
 
     ``width`` is the usable column count.  Passing ``None`` keeps the historical
     nine-column row, which is what callers that have no terminal to measure
@@ -1610,27 +1704,38 @@ def _row_text(
     the header and every row always agree, and the session cell's own
     fits-or-marker arithmetic keeps working because it measures the head it is
     actually appended to.
-    """
 
-    body = " ".join(pad(value, width_, align) for value, (_, width_, align) in zip(cells, ROW_COLUMNS))
+    ``visible_columns`` allows responsive layout: when provided, only those
+    columns are rendered. The cells tuple must match the original ROW_COLUMNS
+    order; this function extracts the visible subset.
+    """
+    columns = visible_columns if visible_columns is not None else ROW_COLUMNS
+
+    body = " ".join(pad(value, width_, align) for value, (_, width_, align) in zip(cells, columns))
     if collab is not None:
         body = f"{body} {pad(collab, COLLAB_COL_WIDTH)}"
     head = f"{prefix}{body}  {pad(title, TITLE_COL_WIDTH)}"
     if width is None:
         return f"{prefix}{body}  {title}"
     cell = session_cell(session, width - display_width(head) - 1)
-    return f"{head} {SESSION_NARROW_MARKER if cell is None else cell}".rstrip()
+    # 全有或全无，且「无」就是【整列省略】：不画标记、不画片段。标记本身也要占
+    # 位（"窗口过窄" 是 8 个显示单元格 + 一个空格），在临界宽度上反而把行顶出窗
+    # 口，于是"放不下 id"变成"连行都画坏"。完整 id 由焦点行给出。
+    if cell is None:
+        return head.rstrip()
+    return f"{head} {cell}".rstrip()
 
 
-def header_text(width: int | None = None, collab: str | None = None) -> str:
+def header_text(width: int | None = None, collab: str | None = None, visible_columns: tuple[tuple[str, int, str], ...] | None = None) -> str:
     # Five leading spaces: cursor, suggested-marker, then the member indent that
     # nests surfaces under their workspace header.
     #
     # The header goes through the same code path as the data rows, so the
     # session label cannot appear on one and not the other.
+    columns = visible_columns if visible_columns is not None else ROW_COLUMNS
     return _row_text(
-        "     ", tuple(name for name, _, _ in ROW_COLUMNS), "标题",
-        width, "session", collab,
+        "     ", tuple(name for name, _, _ in columns), "标题",
+        width, "session", collab, visible_columns,
     )
 
 
@@ -1731,7 +1836,10 @@ def focus_summary(candidate: Candidate | None, workspace_ref: str = "") -> str:
             # it were being actively watched.
             program = candidate.process_summary or agent_label(candidate.agent_kind)
             facts.append(f"这一格当前没有 Codex 在跑（{program}），守护器不会发送")
-        if candidate.state in DETAIL_FALLBACKS:
+        if candidate.state == "error_superseded":
+            facts.append(f"错误 {error_label(candidate)}")
+            facts.append(diagnostic_detail(candidate) or "错误后存在其他输出，未发送续跑")
+        elif candidate.state in DETAIL_FALLBACKS:
             # Spell the diagnostic out here; the column only had room for "读不到".
             facts.append(diagnostic_detail(candidate) or DETAIL_FALLBACKS[candidate.state])
         elif error_label(candidate) != "—":
@@ -2028,9 +2136,9 @@ def selected_action_hint(candidate: Candidate | None) -> str:
                 # genuinely needs a human, unlike an unpaused blind pane.
                 return (
                     f"画面读不出且已暂停（已 {span}）：暂停中不再轮询，"
-                    "需人工 r 恢复发送   x 删除这一路登记"
+                    "需人工 r 恢复监控，下一轮重新判定   x 删除这一路登记"
                 )
-            return "r 恢复发送   x 删除这一路登记"
+            return "r 恢复监控，下一轮重新判定   x 删除这一路登记"
         # The 错误 column is 8 columns wide, so a blind pane can only say
         # "看不清" there.  This line is free-form, so it carries the duration --
         # the number is the whole point: surface:72 sat unreadable for 5.65h
@@ -2060,11 +2168,13 @@ def selected_action_hint(candidate: Candidate | None) -> str:
         if candidate.hook_health == "legacy_override":
             span = compact_duration(candidate.unprotected_sec)
             suffix = f"（已 {span}）" if span else ""
-            return f"旧会话未加载 CCC Hook{suffix}：在该格重启/恢复 Claude 一次；登记和监控不会丢"
+            return f"内联配置待核{suffix}：尚无已接纳 Hook，不等于已证明覆盖；检查该会话 /hooks"
         if candidate.hook_health == "missing":
             span = compact_duration(candidate.unprotected_sec)
             suffix = f"（已 {span}）" if span else ""
-            return f"Hook 缺失{suffix}：保持监控但不会猜测发送；查看 ccc hook-audit 后重启/恢复该会话"
+            return f"Hook 未接入{suffix}：尚无本代可信事件，不等于未安装；查看 ccc hook-audit"
+        if candidate.hook_health == "historical":
+            return "已找回同进程 Hook 身份，等待新事件验证；历史报错不会直接触发续跑"
         if candidate.state == "claude_hook_gap_exhausted":
             return (
                 "同一停止画面续跑已达上限：保持监控但不再重复发送；确认 Claude 状态后，"
@@ -2251,17 +2361,18 @@ class SupervisorModel:
                 else:
                     source = "untracked"
                 runtime = self.runtime.get(surface_id, {}) if isinstance(self.runtime, Mapping) else {}
+                observed_error, observed_reason = runtime_observation(runtime)
                 exclusion = (rule or {}).get("excluded_surface_reasons", {}).get(surface_id, {})
                 exclusion_reason = str(exclusion.get("reason") or "") if isinstance(exclusion, Mapping) else ""
                 rows.append(Candidate(
                     record=record,
                     source=source,
                     state=("untracked" if source in {"untracked", "workspace_non_codex"} else str(runtime.get("state") or "unknown")),
-                    error_type=str(runtime.get("error_type") or "-"),
+                    error_type=observed_error,
                     send_count=int(runtime.get("send_count") or 0),
                     paused=bool(target and target.get("paused")),
                     selected_hint=surface_id in {self.suggested_surface, str(self.suggested_surface)},
-                    status_detail=str(runtime.get("paused_reason") or (target or {}).get("paused_reason") or exclusion_reason),
+                    status_detail=str(runtime.get("paused_reason") or (target or {}).get("paused_reason") or exclusion_reason or observed_reason),
                     agent_kind=agent_kind,
                     process_summary=process_summary,
                     hook_health=str(runtime.get("claude_hook_health") or ""),
@@ -2307,6 +2418,7 @@ class SupervisorModel:
                 if not surface_id or surface_id in live_ids:
                     continue
                 runtime = self.runtime.get(surface_id, {}) if isinstance(self.runtime, Mapping) else {}
+                observed_error, observed_reason = runtime_observation(runtime)
                 rows.append(Candidate(
                     record={
                         "surface_id": surface_id,
@@ -2321,11 +2433,11 @@ class SupervisorModel:
                     },
                     source="explicit",
                     state=str(runtime.get("state") or "missing"),
-                    error_type=str(runtime.get("error_type") or "-"),
+                    error_type=observed_error,
                     send_count=int(runtime.get("send_count") or 0),
                     paused=bool(target.get("paused")),
                     selected_hint=surface_id == self.suggested_surface,
-                    status_detail=str(runtime.get("paused_reason") or target.get("paused_reason") or ""),
+                    status_detail=str(runtime.get("paused_reason") or target.get("paused_reason") or observed_reason),
                     # The surface is gone, so nothing is running in it.  Claiming
                     # "Codex" here was a lie the 程序 column then printed.
                     agent_kind="unknown",
@@ -2990,6 +3102,10 @@ def _stack_absent(reason: str) -> dict[str, Any]:
         "requested_count": None,
         "unhealthy": [],
         "unknown": [],
+        # 读不到状态时警告数是 None（没量到），不是 0（量到了、没有）。
+        # 把"没测"渲染成 0 是我反复犯过的错，这里显式区分。
+        "warning_count": None,
+        "warnings": [],
         "components": {},
     }
 
@@ -3030,6 +3146,11 @@ def _stack_component(raw: Any, name: str) -> dict[str, Any]:
         "healthy": row.get("healthy") if isinstance(row.get("healthy"), bool) else None,
         "launchd_loaded": _flat_flag(row, "launchd_loaded"),
         "reason": row.get("reason") if isinstance(row.get("reason"), str) else None,
+        # 警告是【与 healthy 平行】的一列，不是 healthy 的来源。控制器
+        # (bin/cmux-stack:488) 明确写了"发布新鲜度和观测年龄不重新定义运行健康"，
+        # 所以这里只搬运，不折叠进任何判活字段；不投影它才是真正的信息丢失：
+        # 白名单会默默吞掉整列漂移警告，面板永远显示"正常"。
+        "warnings": [c for c in (row.get("warnings") or []) if isinstance(c, str)][:8],
     }
     if name == "watcher":
         projected["pid"] = _finite_int(row.get("pid"))
@@ -3038,6 +3159,15 @@ def _stack_component(raw: Any, name: str) -> dict[str, Any]:
         projected["source_matches_disk"] = (
             row.get("source_matches_disk") if isinstance(row.get("source_matches_disk"), bool) else None
         )
+        coverage = row.get("observation_coverage", {})
+        if isinstance(coverage, Mapping):
+            counts = coverage.get("counts", {})
+            projected["observation_coverage"] = {
+                "status": coverage.get("status") if isinstance(coverage.get("status"), str) else "unknown",
+                "counts": {key: _finite_int(counts.get(key)) for key in (
+                    "readable", "live_unreadable", "dormant", "paused", "missing", "unknown")}
+                if isinstance(counts, Mapping) else {},
+            }
     elif name == "janitor":
         # Summary only.  Janitor DETAIL has exactly one source in this panel --
         # the junk row and the G page, which read cmux-janitorctl directly.  If
@@ -3066,12 +3196,24 @@ def _stack_snapshot_from_status(document: Mapping[str, Any]) -> dict[str, Any]:
         if name in components_raw
     }
     overall = document.get("overall")
+    warnings = [
+        {"component": item.get("component"), "code": item.get("code")}
+        for item in (document.get("warnings") or [])
+        if isinstance(item, Mapping)
+        and isinstance(item.get("component"), str) and isinstance(item.get("code"), str)
+    ][:16]
     return {
         "available": True,
         "reason": None,
         "overall": overall if isinstance(overall, str) else None,
         "probed_count": _finite_int(document.get("probed_count")),
         "requested_count": _finite_int(document.get("requested_count")),
+        # 计数用控制器自己的 warning_count，而不是 len(warnings)：上面截了 16 条，
+        # 用截断后的长度当总数会把"27 条警告"说成"16 条"。读不到就退回本地长度。
+        "warning_count": (_finite_int(document.get("warning_count"))
+                          if _finite_int(document.get("warning_count")) is not None
+                          else len(warnings)),
+        "warnings": warnings,
         "unhealthy": [n for n in (document.get("unhealthy") or []) if isinstance(n, str)][:8],
         "unknown": [n for n in (document.get("unknown") or []) if isinstance(n, str)][:8],
         "components": components,
@@ -3210,6 +3352,31 @@ def _stack_overall_text(overall: Any) -> str:
             "partial": "组件缺失", "unknown": "状态未知"}.get(overall, overall)
 
 
+# 控制器给的警告码是英文 snake_case（bin/cmux-stack:487 起）。这里只做显示翻译，
+# 认不出的码原样透出：新码应该看起来陌生，不该被套进某个熟悉的说法里。
+STACK_WARNING_TEXT = {
+    "probe_unavailable": "探测不可用",
+    "source_drift": "运行源与磁盘源不同",
+    "source_provenance_unknown": "源出处未知",
+    "runtime_metadata_missing": "缺运行时元数据",
+    "installed_source_drift": "已装件与源不同",
+    "source_reference_unavailable": "源参照读不到",
+    "installed_artifact_unverifiable": "已装件无法校验",
+    "janitor_observation_stale": "清扫观测已过期",
+    "guard_observation_stale": "守卫观测已过期",
+    "terminal_observation_gap": "存活会话画面不可读",
+    "terminal_observation_unknown": "画面观测待核验",
+    "claude_hook_coverage_gap": "Claude Hook 覆盖缺口",
+    "claude_hook_coverage_unknown": "Claude Hook 覆盖待核验",
+}
+
+
+def _stack_warning_text(code: Any) -> str:
+    if not isinstance(code, str) or not code:
+        return "未知警告"
+    return STACK_WARNING_TEXT.get(code, code)
+
+
 def stack_line(snapshot: Mapping[str, Any]) -> str:
     """One summary row for the main screen.  No janitor detail lives here."""
 
@@ -3226,16 +3393,32 @@ def stack_line(snapshot: Mapping[str, Any]) -> str:
     for key in ("watcher", "janitor", "profiles"):
         if key in components:
             parts.append(f"{names[key]} {_stack_verdict_text(components[key])}")
+    coverage = components.get("watcher", {}).get("observation_coverage", {})
+    counts = coverage.get("counts", {})
+    if counts.get("readable") is not None:
+        parts.append(f"可读 {counts.get('readable', 0)} / 未初始化 {counts.get('dormant', 0)} / "
+                     f"缺口 {counts.get('live_unreadable', 0)} / 未知 {counts.get('unknown', 0)}")
     probed = snapshot.get("probed_count")
     requested = snapshot.get("requested_count")
     if isinstance(probed, int) and isinstance(requested, int) and probed < requested:
         parts.append(f"已探测 {probed}/{requested}")
+    # 警告【单独成段】，不改 icon 也不改 label：三个组件都在跑、只是发布不新鲜，
+    # 那它就是"全部正常 + 注意 2 条"。把警告并进 icon 会让运维把陈旧观测读成掉线，
+    # 反过来不显示警告则等于把漂移藏起来。两个字段各说各的事。
+    count = snapshot.get("warning_count")
+    if isinstance(count, int) and count > 0:
+        parts.append(f"注意 {count} 条")
     parts.append("v 详情")
     return " | ".join(parts)
 
 
 def stack_is_alarming(snapshot: Mapping[str, Any]) -> bool:
-    """Highlight only what the operator has to act on."""
+    """Highlight only what the operator has to act on.
+
+    警告【故意】不进这里：它衡量的是覆盖新鲜度，不是运行状态。若把警告算进来，
+    一条"源出处未知"就会让运行正常的守卫器变红，红色也就不再意味着要动手。
+    警告的可见性由 stack_has_warnings() 单独承担。
+    """
 
     if not snapshot.get("available"):
         return True
@@ -3249,6 +3432,17 @@ def stack_is_alarming(snapshot: Mapping[str, Any]) -> bool:
         if row.get("launchd_loaded") is False or row.get("healthy") is not True:
             return True
     return False
+
+
+def stack_has_warnings(snapshot: Mapping[str, Any]) -> bool:
+    """运行正常但覆盖不干净。与 stack_is_alarming() 互不覆盖。"""
+
+    if not snapshot.get("available"):
+        return False          # 读不到不是"有警告"，是没量到；那已经由 alarming 报了
+    count = snapshot.get("warning_count")
+    if isinstance(count, int):
+        return count > 0
+    return bool(snapshot.get("warnings"))
 
 
 def junk_line(snapshot: Mapping[str, Any]) -> str:
@@ -3362,10 +3556,12 @@ def junk_is_alarming(snapshot: Mapping[str, Any]) -> bool:
 # drawn on top of the key legend.
 TOP_ROWS = 8      # title, counts, Hook, context, junk, stack, rule, column header
 BOTTOM_ROWS = 7   # rule, focus summary, focus keys, message, rule, keys x2
+# 表格帧的最小高度【由上下两块推导】，不写死 16：TOP_ROWS 与 BOTTOM_ROWS 任何一
+# 边加减一行，这个下限自己跟着走。写死的常量会在下一次加行时静默失效。
+MIN_HEIGHT = TOP_ROWS + 1 + BOTTOM_ROWS
 
 
 def layout(height: int) -> dict[str, int]:
-    floor = TOP_ROWS
     first_row = TOP_ROWS
     visible = max(1, height - TOP_ROWS - BOTTOM_ROWS)
     # Keep the first data row above the focus separator on short terminals.
@@ -3466,18 +3662,52 @@ def _safe_addnstr(stdscr: Any, y: int, x: int, text: str, width: int, attr: int 
         stdscr.addnstr(y, x, text, len(text) + 1, attr)
 
 
-def _confirm(stdscr: Any, prompt: str) -> bool:
-    height, width = stdscr.getmaxyx()
+def _prompt_row(height: int) -> int | None:
+    """提示行行号；窗口矮到没有独立提示行时返回 None。
+
+    不写死数字：沿用 layout() 的 message 行，所以它跟着 TOP_ROWS/BOTTOM_ROWS 走。
+    低于 MIN_HEIGHT 时表格帧本身已经退成 _draw_compact，message 行不再成立。
+    """
+    if height < MIN_HEIGHT:
+        return None
     row = layout(height)["message"]
-    _safe_addnstr(stdscr, row, 0, " " * max(1, width - 1), max(1, width - 1))
-    _safe_addnstr(stdscr, row, 0, f"{prompt} [y/N] ", max(1, width - 1), curses.A_REVERSE)
-    stdscr.refresh()
+    return row if 0 <= row < height else None
+
+
+def _refuse_prompt(stdscr: Any, height: int, clip: int) -> None:
+    """拒绝提问时尽量留一行说明；连这一行都放不下就什么都不画。"""
+    row = height - 1
+    if row < 0:
+        return
+    _safe_addnstr(stdscr, row, 0, "窗口太小，已取消该操作", clip, curses.A_REVERSE)
+    with contextlib.suppress(curses.error):
+        stdscr.refresh()
+
+
+def _confirm(stdscr: Any, prompt: str) -> bool:
+    """y/N 确认。问题画不全就【拒绝】并返回 False，不做盲问。
+
+    每一帧都重新取尺寸：改窗后 message 行号和可用宽度都会变，只在循环外量一次
+    会把提问画到旧行号上，用户看到的是别的内容却在替一次破坏性动作按键。
+    """
+    text = f"{prompt} [y/N]"
     stdscr.timeout(-1)
     try:
         while True:
+            height, width = stdscr.getmaxyx()
+            clip = max(1, width - 1)
+            row = _prompt_row(height)
+            if row is None or display_width(text) > clip:
+                # 看不见问的是什么，任何一次按键都是盲答，而返回值会去执行破坏性动作。
+                _refuse_prompt(stdscr, height, clip)
+                return False
+            _safe_addnstr(stdscr, row, 0, " " * clip, clip)
+            _safe_addnstr(stdscr, row, 0, f"{text} ", clip, curses.A_REVERSE)
+            with contextlib.suppress(curses.error):
+                stdscr.refresh()
             key = stdscr.getch()
             if key in (curses.ERR, curses.KEY_RESIZE):
-                continue
+                continue  # 重画：尺寸变了要按新尺寸重新问一遍
             return key in (ord("y"), ord("Y"))
     finally:
         stdscr.timeout(500)
@@ -3489,20 +3719,28 @@ def _text_prompt(stdscr: Any, prompt: str, initial: str = "") -> str | None:
     ``getch`` yields one byte at a time, so a UTF-8 character arrives as
     several bytes and ``chr(key)`` turns it into mojibake.  Workspace titles
     here are mostly Chinese, so searching by name needs ``get_wch``.
+
+    提示放不下时【拒绝】并返回 None（等同取消），不留一个看不见提示的输入框。
+    尺寸每帧重量，move() 的目标列按当前宽度收紧，避免改窗后写到窗外。
     """
-    height, width = stdscr.getmaxyx()
-    # Reuse the transient-message row so the prompt never covers the key legend.
-    y = layout(height)["message"]
     value = initial
     curses.curs_set(1)
     stdscr.timeout(-1)
     try:
         while True:
-            _safe_addnstr(stdscr, y, 0, " " * max(1, width - 1), max(1, width - 1))
-            _safe_addnstr(stdscr, y, 0, f"{prompt}{value}", max(1, width - 1), curses.A_BOLD)
+            height, width = stdscr.getmaxyx()
+            clip = max(1, width - 1)
+            # Reuse the transient-message row so the prompt never covers the key legend.
+            y = _prompt_row(height)
+            if y is None or display_width(prompt) + 1 > clip:
+                _refuse_prompt(stdscr, height, clip)
+                return None
+            _safe_addnstr(stdscr, y, 0, " " * clip, clip)
+            _safe_addnstr(stdscr, y, 0, f"{prompt}{value}", clip, curses.A_BOLD)
             cursor_column = display_width(prompt) + display_width(value)
-            stdscr.move(y, min(width - 2, cursor_column))
-            stdscr.refresh()
+            with contextlib.suppress(curses.error):
+                stdscr.move(y, max(0, min(clip - 1, cursor_column)))
+                stdscr.refresh()
             try:
                 key = stdscr.get_wch()
             except curses.error:
@@ -3525,6 +3763,8 @@ def _text_prompt(stdscr: Any, prompt: str, initial: str = "") -> str | None:
                 return None
             if key in (curses.KEY_BACKSPACE, 127, 8):
                 value = value[:-1]
+            elif key in (curses.ERR, curses.KEY_RESIZE):
+                continue  # 重画：新尺寸下可能已经放不下，下一轮重新判定
     finally:
         curses.curs_set(0)
         stdscr.timeout(500)
@@ -3593,6 +3833,26 @@ GLOBAL_KEYS_1 = "↑↓ jk 移动   Tab 折/展   z 全折起   Z 全展开   [ 
 GLOBAL_KEYS_2 = "f 筛选   R 刷新   G 存储   v 三件套   e 配置   A 开启发   S 全局停发   d 全局停发(只观察)   q 退出"
 
 
+def _draw_compact(stdscr: Any, model: SupervisorModel, rows: list[ViewRow],
+                  height: int, clip: int) -> None:
+    """窗口比 MIN_HEIGHT 还矮时的降级帧。
+
+    只画放得下的前几行，一行都放不下就一个字也不画。这里【不】调用 layout()：那张
+    表在矮窗口上会把好几行挤到同一行，谁覆盖谁取决于绘制顺序，而不是取决于哪条信
+    息更重要。降级帧自己排序：先说清"为什么看起来是坏的"，再说怎么退出。
+    """
+    lines = [
+        (f"→ 续跑管理   {mode_label(model.config)}", attr("title")),
+        (f"窗口高 {height} 行 < 需要 {MIN_HEIGHT} 行；{len(rows)} 行数据暂不显示",
+         attr("paused") | curses.A_BOLD),
+        ("拉高终端窗口即恢复表格；q 退出", attr("dim")),
+    ]
+    for row_index, (text, style) in enumerate(lines):
+        if row_index >= height:
+            return
+        _safe_addnstr(stdscr, row_index, 0, text, clip, style)
+
+
 def _draw(
     stdscr: Any,
     model: SupervisorModel,
@@ -3606,6 +3866,13 @@ def _draw(
     height, width = stdscr.getmaxyx()
     at = layout(height)
     clip = max(1, width - 1)
+    if height < MIN_HEIGHT:
+        # 太矮就画降级帧并直接返回：表格帧的行号是按 TOP_ROWS/BOTTOM_ROWS 排的，
+        # 在 height < MIN_HEIGHT 时它们会互相压行（layout() 的 max() 让多行落到
+        # 同一行），画出来的是互相覆盖的碎片。降级帧最多画 height 行、每行按列裁，
+        # 所以【按构造】不会写到窗口外；主循环不受影响，q 和改窗口照常。
+        _draw_compact(stdscr, model, rows, height, clip)
+        return
     counts = model.counts()
     armed = model.config.get("mode") == "armed" and not model.config.get("global_paused")
 
@@ -3691,13 +3958,21 @@ def _draw(
     # for that, because two independent derivations of the same fact are how a
     # panel starts contradicting the executor it reports on (106.4.3).
     stack = model.stack.snapshot()
+    # 三档，不是两档：红=要动手（判活失败），黄=在跑但覆盖不干净（警告），灰=干净。
+    # 中间那档是 plan 第 3 条要求的"把运行存活和无警告覆盖分开"在颜色上的落点。
+    if stack_is_alarming(stack):
+        stack_attr = attr("error") | curses.A_BOLD
+    elif stack_has_warnings(stack):
+        stack_attr = attr("paused")
+    else:
+        stack_attr = attr("dim")
     _safe_addnstr(
         stdscr,
         at["stack"],
         0,
         stack_line(stack),
         clip,
-        attr("error") | curses.A_BOLD if stack_is_alarming(stack) else attr("dim"),
+        stack_attr,
     )
     _safe_addnstr(stdscr, at["top_rule"], 0, rule("=", clip), clip, attr("rule"))
     # One frame, one decision: the same show_collab drives the header and every
@@ -3706,11 +3981,15 @@ def _draw(
     # the last task disarms, the layout returns to the historical one and the
     # session column regains its usual width budget.
     collab_by_uuid = model.collab.snapshot()
-    show_collab = bool(collab_by_uuid) and collab_column_fits(clip)
+    # 一帧只量一次：列集、协作列、session 列都出自这一个结果，表头与数据行不可能
+    # 各自算出不同的答案。
+    row_plan = row_layout(clip, collab_available=bool(collab_by_uuid))
+    show_collab = row_plan.collab
     collab_cells = collab_cells_for_rows(rows, collab_by_uuid) if show_collab else {}
     collab_counts = collab_group_counts(collab_by_uuid) if show_collab else {}
+    visible_columns = row_plan.columns
     _safe_addnstr(stdscr, at["header"], 0,
-                  header_text(clip, "协作" if show_collab else None), clip, attr("dim"))
+                  header_text(clip, "协作" if show_collab else None, visible_columns), clip, attr("dim"))
 
     visible = at["visible"]
     page = window_start(index, len(rows), visible)
@@ -3728,22 +4007,32 @@ def _draw(
         else:
             candidate = row.candidate
             assert candidate is not None
+            # Build all cells in ROW_COLUMNS order, then extract visible subset.
+            all_cells = (
+                watch_label(candidate),
+                location_text(candidate.record, row.workspace_ref),
+                program_label(candidate),
+                hook_label(candidate),
+                context_label(candidate),
+                screen_label(candidate),
+                error_label(candidate),
+                send_label(candidate),
+            )
+            # Map visible columns by name to extract the correct subset.
+            column_names = [name for name, _, _ in ROW_COLUMNS]
+            visible_names = [name for name, _, _ in visible_columns]
+            visible_cells = tuple(
+                all_cells[column_names.index(name)]
+                for name in visible_names
+            )
             label = _row_text(
                 f"{cursor}{'*' if candidate.selected_hint else ' '}   ",
-                (
-                    watch_label(candidate),
-                    location_text(candidate.record, row.workspace_ref),
-                    program_label(candidate),
-                    hook_label(candidate),
-                    context_label(candidate),
-                    screen_label(candidate),
-                    error_label(candidate),
-                    send_label(candidate),
-                ),
+                visible_cells,
                 str(candidate.record.get("title", "")),
                 clip,
                 candidate.session_text,
                 collab_cells.get(row.key, "") if show_collab else None,
+                visible_columns,
             )
         style = curses.A_REVERSE if selected else view_row_attr(row)
         _safe_addnstr(stdscr, at["first_row"] + row_index, 0, label, clip, style)
@@ -4050,6 +4339,11 @@ def stack_page_lines(snapshot: Mapping[str, Any]) -> list[str]:
         lines.append(f"不健康: {'、'.join(unhealthy)}")
     if unknown:
         lines.append(f"未知（判不出，按 fail closed 处理）: {'、'.join(unknown)}")
+    count = snapshot.get("warning_count")
+    if isinstance(count, int) and count > 0:
+        # 明写"不改变总体判定"，因为这一页是运维唯一会仔细读的地方，而这里最容易
+        # 把"有警告"读成"有故障"。
+        lines.append(f"警告 {count} 条（只说覆盖新鲜度，不改变上面的总体判定）")
     lines.append("")
 
     for name, label in (("watcher", "续跑守卫器"), ("janitor", "清扫器"),
@@ -4084,6 +4378,8 @@ def stack_page_lines(snapshot: Mapping[str, Any]) -> list[str]:
         reason = row.get("reason")
         if reason:
             lines.append(f"    原因: {reason}")
+        for code in (row.get("warnings") or []):
+            lines.append(f"    警告: {_stack_warning_text(code)}（{code}）")
         lines.append("")
 
     lines.append("写操作不在本页执行。请复制到终端运行：")
@@ -4405,7 +4701,7 @@ def _run(stdscr: Any, model: SupervisorModel) -> None:
                 "add": f"已登记 {where}",
                 "workspace": f"已授权整个 {candidate.workspace_ref}",
                 "pause": f"已暂停 {where}" if candidate.source == "explicit" else f"已排除 {where}",
-                "resume": f"已恢复 {where}",
+                "resume": f"已恢复监控 {where}，下一轮重新判定",
                 "remove": f"已删除 {where} 的单路登记",
                 "untrack_workspace": f"已取消整个 {candidate.workspace_ref} 授权",
             }.get(action, f"已处理 {where}")
