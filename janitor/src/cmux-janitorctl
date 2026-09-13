@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/opt/homebrew/bin/python3.14
 """cmux-janitorctl — the only public way to read or steer the janitor.
 
 The janitor and its guard stay in Bash: they own file judgement and the circuit
@@ -44,8 +44,9 @@ JANITOR_STATE = JANITOR_DIR / "janitor-state.json"
 GUARD_STATE = JANITOR_DIR / "guard-state.json"
 METRICS = JANITOR_DIR / "metrics.jsonl"
 
-JANITOR_LABEL = os.environ.get("CMUX_JANITOR_LABEL") or "com.example.ccc-janitor"
-GUARD_LABEL = os.environ.get("CMUX_GUARD_LABEL") or "com.example.ccc-janitor-guard"
+LABEL_PREFIX = os.environ.get("CMUX_JANITOR_LABEL_PREFIX") or f"com.{os.environ.get('USER', 'user')}"
+JANITOR_LABEL = f"{LABEL_PREFIX}.cmux-janitor"
+GUARD_LABEL = f"{LABEL_PREFIX}.cmux-janitor-guard"
 
 # Quarantine layout, and it must match cmux-janitor.sh exactly: the script owns
 # these names (cmux-janitor.sh:62-63,72) and this tool only ever adds the
@@ -850,6 +851,11 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--pretty", action="store_true", help="indent the JSON")
     status.set_defaults(func=cmd_status)
 
+    preview = sub.add_parser("preview", help="read-only candidate snapshot (waits for safety checks)")
+    preview.add_argument("--json", action="store_true")
+    preview.add_argument("--verbose", action="store_true")
+    preview.set_defaults(func=cmd_preview)
+
     run = sub.add_parser("run", help="request an immediate sweep")
     run.add_argument("--manual", action="store_true", required=True)
     run.set_defaults(func=cmd_run)
@@ -875,6 +881,18 @@ def build_parser() -> argparse.ArgumentParser:
     migrate.set_defaults(func=cmd_migrate)
 
     return parser
+
+
+def cmd_preview(args: argparse.Namespace) -> int:
+    command = ["/bin/bash", str(JANITOR_SH), "--preview"]
+    if args.json:
+        command.append("--json")
+    if args.verbose:
+        command.append("--verbose")
+    try:
+        return subprocess.run(command, env={**os.environ, "HOME": str(HOME)}).returncode
+    except OSError as exc:
+        raise FailClosed(f"preview unavailable: {type(exc).__name__}") from exc
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -84,14 +84,31 @@ VERBOSE=0
 # `inspect`: DISABLED must stay an absolute kill switch, so nothing may run
 # behind GATE 0 just to refresh a display.
 TRIGGER=scheduled
-case "${1:-}" in
-  --manual)    TRIGGER=manual ;;
-  --scheduled) TRIGGER=scheduled ;;
-  "")          TRIGGER=scheduled ;;
-  *)
-    printf 'usage: %s [--scheduled|--manual]\n' "$0" >&2
-    exit 2 ;;
-esac
+PREVIEW_MODE=0
+PREVIEW_VERBOSE=0
+PREVIEW_JSON=0
+PREVIEW_REASON=ready
+PREVIEW_SCANNED=false
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --manual)    TRIGGER=manual; shift ;;
+    --scheduled) TRIGGER=scheduled; shift ;;
+    --preview)   PREVIEW_MODE=1; TRIGGER=manual; shift ;;
+    --verbose)   PREVIEW_VERBOSE=1; shift ;;
+    --json)      PREVIEW_JSON=1; shift ;;
+    "")          break ;;
+    *)
+      printf 'usage: %s [--scheduled|--manual|--preview] [--verbose] [--json]\n' "$0" >&2
+      exit 2 ;;
+  esac
+done
+
+# --verbose only valid with --preview
+if [ "$PREVIEW_MODE" = "0" ] && { [ "$PREVIEW_VERBOSE" = "1" ] || [ "$PREVIEW_JSON" = "1" ]; }; then
+  printf 'error: --verbose and --json require --preview\n' >&2
+  exit 2
+fi
 
 CONFIG_ERROR=""
 if [ -r "$JANITOR_DIR/config.env" ]; then
@@ -127,7 +144,7 @@ fi
 
 ts()   { "$DATE" '+%F %T'; }
 iso()  { "$DATE" -u '+%Y-%m-%dT%H:%M:%SZ'; }
-log()  { printf '%s  %s\n' "$(ts)" "$*" >> "$LOG"; }
+log()  { [ "$PREVIEW_MODE" = "1" ] && return 0; printf '%s  %s\n' "$(ts)" "$*" >> "$LOG"; }
 vlog() { [ "$VERBOSE" = "1" ] && log "$*"; return 0; }
 
 is_uint() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
@@ -164,6 +181,7 @@ validate_config() {
 }
 
 rotate_log() {
+  [ "$PREVIEW_MODE" = "1" ] && return 0
   [ -f "$LOG" ] || return 0
   local sz
   sz=$("$STAT" -f%z "$LOG" 2>/dev/null || echo 0)
@@ -171,6 +189,139 @@ rotate_log() {
     "$MV" -f "$LOG" "$LOG.1" 2>/dev/null
     : > "$LOG"
     log "log rotated (previous ${sz}B -> janitor.log.1)"
+  fi
+}
+
+# ---------- preview formatting functions ----------
+format_bytes() {
+  local bytes="$1"
+  if [ "$bytes" -lt 1024 ]; then
+    printf '%d B' "$bytes"
+  elif [ "$bytes" -lt 1048576 ]; then
+    awk "BEGIN {printf \"%.1f KB\", $bytes/1024}"
+  elif [ "$bytes" -lt 1073741824 ]; then
+    awk "BEGIN {printf \"%.1f MB\", $bytes/1048576}"
+  else
+    awk "BEGIN {printf \"%.1f GB\", $bytes/1073741824}"
+  fi
+}
+
+format_age() {
+  local minutes="$1"
+  if [ "$minutes" -lt 60 ]; then
+    printf '%d min' "$minutes"
+  elif [ "$minutes" -lt 1440 ]; then
+    printf '%d hours' "$((minutes / 60))"
+  else
+    printf '%d days' "$((minutes / 1440))"
+  fi
+}
+
+print_preview() {
+  if [ "$PREVIEW_JSON" = "1" ]; then
+    # Only fixed reason codes and validated counters cross the JSON boundary.
+    printf '{"schema_version":1,"read_only":true,"reason":"%s","observed_at":"%s","scanned":%s,"safety_complete":%s,' \
+      "$PREVIEW_REASON" "$(iso)" "$PREVIEW_SCANNED" "$SAFETY_COMPLETE"
+    if [ "$PREVIEW_SCANNED" != "true" ]; then
+      printf '"counts":null,"quarantine":null,"limit":null}\n'
+      return 0
+    fi
+    printf '"counts":{"raw_sb":%s,"raw_staging":%s,"protected_directories":%s,"eligible":%s,"selected":%s,"would_dispose":%s,"would_dispose_sb":%s,"would_dispose_staging":%s,"skipped_moving":%s,"skipped_fresh":%s,"skipped_held":%s,"skipped_outside":%s},' \
+      "$C_RAW_SB" "$C_RAW_STAGING" "$C_PROTECTED_DIRS" "$C_ELIGIBLE" "$C_SELECTED" \
+      "$C_WOULD_DISPOSE" "$C_WOULD_SB" "$C_WOULD_STAGING" \
+      "$C_SKIP_MOVING" "$C_SKIP_FRESH" "$C_SKIP_HELD" "$C_SKIP_OUTSIDE"
+    printf '"quarantine":{"batch_count":%s,"would_expire_batches":%s,"would_expire_items":%s},"limit":%s}\n' \
+      "$Q_BATCHES" "$C_WOULD_EXP_B" "$C_WOULD_EXP_I" "$MAX_ITEMS_PER_RUN"
+    return 0
+  fi
+  printf '\n=== Janitor Preview ===\n'
+  printf 'Status: %s (read-only snapshot; apply rechecks every gate)\n' "$PREVIEW_REASON"
+  if [ "$PREVIEW_SCANNED" != "true" ]; then
+    printf 'Candidates: unknown (scan not performed)\n'
+    return 0
+  fi
+  printf 'Run ID: %s\n' "$RUN_ID"
+  printf 'Config: MODE=%s, SB_MIN_AGE_MIN=%s, STAGING_MIN_AGE_MIN=%s\n\n' \
+    "$MODE" "$SB_MIN_AGE_MIN" "$STAGING_MIN_AGE_MIN"
+
+  if [ "$PREVIEW_VERBOSE" = "1" ]; then
+    if [ "${#PREVIEW_SB_PATHS[@]}" -gt 0 ]; then
+      printf '[SB Temp Files]\n'
+      local limit=10 i=0
+      for path in "${PREVIEW_SB_PATHS[@]}"; do
+        [ "$i" -ge "$limit" ] && break
+        printf '  Age: %s | Size: %s | %s\n' \
+          "$(format_age "${PREVIEW_SB_AGES[$i]}")" \
+          "$(format_bytes "${PREVIEW_SB_SIZES[$i]}")" \
+          "$path"
+        i=$((i + 1))
+      done
+      if [ "${#PREVIEW_SB_PATHS[@]}" -gt "$limit" ]; then
+        printf '  ... (truncated, showing first %d of %d)\n' "$limit" "${#PREVIEW_SB_PATHS[@]}"
+      fi
+      printf '\n'
+    fi
+
+    if [ "${#PREVIEW_STAGING_PATHS[@]}" -gt 0 ]; then
+      printf '[Staging Directories]\n'
+      local limit=10 i=0
+      for path in "${PREVIEW_STAGING_PATHS[@]}"; do
+        [ "$i" -ge "$limit" ] && break
+        printf '  Age: %s | Size: %s | %s\n' \
+          "$(format_age "${PREVIEW_STAGING_AGES[$i]}")" \
+          "$(format_bytes "${PREVIEW_STAGING_SIZES[$i]}")" \
+          "$path"
+        i=$((i + 1))
+      done
+      if [ "${#PREVIEW_STAGING_PATHS[@]}" -gt "$limit" ]; then
+        printf '  ... (truncated, showing first %d of %d)\n' "$limit" "${#PREVIEW_STAGING_PATHS[@]}"
+      fi
+      printf '\n'
+    fi
+
+    if [ "${Q_BATCHES:-0}" -gt 0 ]; then
+      printf '[Quarantine Batches]\n'
+      printf '  Total batches: %d | Total size: %s\n' "$Q_BATCHES" "$(format_bytes "$Q_BYTES")"
+      if [ "${Q_OLDEST_JSON:-null}" != "null" ]; then
+        printf '  Oldest sealed: %s\n' "$Q_OLDEST_JSON"
+      fi
+      if [ "${Q_NEXT_JSON:-null}" != "null" ]; then
+        printf '  Next to expire: %s\n' "$Q_NEXT_JSON"
+      fi
+      printf '\n'
+    fi
+  fi
+
+  printf '=== Summary ===\n'
+  printf '%-20s | %5s | %10s | %13s\n' 'Category' 'Count' 'Total Size' 'Would Dispose'
+  printf '%s\n' '------------------------------------------------------------'
+  printf '%-20s | %5d | %10s | %13d\n' \
+    'SB Temp Files' "$C_RAW_SB" "$(format_bytes "$B_SB_TOTAL")" "$C_WOULD_SB"
+  printf '%-20s | %5d | %10s | %13d\n' \
+    'Staging Directories' "$C_RAW_STAGING" "$(format_bytes "$B_STAGING_TOTAL")" "$C_WOULD_STAGING"
+  printf '%s\n' '------------------------------------------------------------'
+  local total_count=$((C_RAW_SB + C_RAW_STAGING))
+  local total_bytes=$((B_SB_TOTAL + B_STAGING_TOTAL))
+  printf '%-20s | %5d | %10s | %13d\n' \
+    'Total' "$total_count" "$(format_bytes "$total_bytes")" "$C_WOULD_DISPOSE"
+  printf 'Protected directories: %s | Eligible: %s | Selected: %s (cap %s)\n' \
+    "$C_PROTECTED_DIRS" "$C_ELIGIBLE" "$C_SELECTED" "$MAX_ITEMS_PER_RUN"
+  printf 'Quarantine: %s batches | Would expire: %s batches / %s items\n' \
+    "$Q_BATCHES" "$C_WOULD_EXP_B" "$C_WOULD_EXP_I"
+
+  if [ "${C_SKIP_FRESH:-0}" -gt 0 ] || [ "${C_SKIP_HELD:-0}" -gt 0 ] || [ "${C_PROTECTED:-0}" -gt 0 ]; then
+    printf '\nSkipped:\n'
+    [ "${C_SKIP_FRESH:-0}" -gt 0 ] && printf '  - %d items too fresh\n' "$C_SKIP_FRESH"
+    [ "${C_SKIP_HELD:-0}" -gt 0 ] && printf '  - %d items held by process\n' "$C_SKIP_HELD"
+    [ "$C_PROTECTED_DIRS" -gt 0 ] && printf '  - %d directories protected by live store\n' "$C_PROTECTED_DIRS"
+  fi
+
+  printf '\nNext Steps:\n'
+  if [ "$MODE" = "dry" ]; then
+    printf '  To apply: Set MODE=apply in %s/config.env\n' "$JANITOR_DIR"
+    printf '  Then run: %s --manual\n' "$0"
+  else
+    printf '  Current MODE=apply. Run --manual to execute cleanup.\n'
   fi
 }
 
@@ -183,6 +334,7 @@ rotate_log() {
 # composes liveness from the sentinels instead.
 # R2-6: bounded. No paths, no file names, no per-batch list.
 publish_state() {
+  [ "$PREVIEW_MODE" = "1" ] && return 0
   local phase="$1" err="$2"
   local tmp
   tmp=$("$MKTEMP" "$JANITOR_DIR/.state.XXXXXX") || return 0
@@ -237,6 +389,7 @@ publish_state() {
 
 # R2-7: bounded metrics, no paths or file names.
 append_metrics() {
+  [ "$PREVIEW_MODE" = "1" ] && return 0
   local phase="$1"
   printf '{"observed_at":"%s","run_id":"%s","trigger":"%s","mode":"%s","phase":"%s","safety_complete":%s,"eligible":%s,"selected":%s,"disposed":%s,"would_dispose":%s,"expired_batches":%s,"expired_items":%s,"duration_ms":%s}\n' \
     "$(iso)" "$RUN_ID" "$TRIGGER" "$MODE" "$phase" "$SAFETY_COMPLETE" \
@@ -258,10 +411,21 @@ RUN_ID="$("$DATE" '+%Y%m%d-%H%M%S')-$$"
 SAFETY_COMPLETE=false
 C_RAW_SB=0; C_RAW_STAGING=0; C_ELIGIBLE=0; C_SELECTED=0
 C_WOULD_DISPOSE=0; C_DISPOSED=0
+C_WOULD_SB=0; C_WOULD_STAGING=0; C_PROTECTED_DIRS=0
 C_WOULD_EXP_B=0; C_WOULD_EXP_I=0; C_EXP_B=0; C_EXP_I=0
 C_SKIP_MOVING=0; C_SKIP_FRESH=0; C_SKIP_HELD=0; C_SKIP_OUTSIDE=0; C_PROTECTED=0
 B_SELECTED=0; P_SELECTED=unknown
 B_EXPIRED=0; P_EXPIRED=unknown
+
+# Preview data arrays (Bash 4+)
+declare -a PREVIEW_SB_PATHS=()
+declare -a PREVIEW_SB_AGES=()
+declare -a PREVIEW_SB_SIZES=()
+declare -a PREVIEW_STAGING_PATHS=()
+declare -a PREVIEW_STAGING_AGES=()
+declare -a PREVIEW_STAGING_SIZES=()
+B_SB_TOTAL=0
+B_STAGING_TOTAL=0
 Q_BATCHES=0; Q_BYTES=0; Q_PRECISION=unknown
 Q_OLDEST_JSON=null; Q_NEXT_JSON=null
 
@@ -269,15 +433,20 @@ Q_OLDEST_JSON=null; Q_NEXT_JSON=null
 # Absolute. Both scheduled and manual exit here; nothing is scanned, no mutex
 # is taken, and no state is published. A paused janitor is a silent janitor.
 if [ -e "$DISABLED" ]; then
+  if [ "$PREVIEW_MODE" = "1" ]; then PREVIEW_REASON=disabled; print_preview; exit 0; fi
   rotate_log
   log "SKIP disabled-by-user (DISABLED sentinel present) trigger=$TRIGGER"
   exit 0
 fi
 
-[ -d "$CM" ] || exit 0
-"$MKDIR" -p "$JANITOR_DIR" 2>/dev/null
+if [ ! -d "$CM" ]; then
+  if [ "$PREVIEW_MODE" = "1" ]; then PREVIEW_REASON=store_missing; print_preview; fi
+  exit 0
+fi
+[ "$PREVIEW_MODE" = "1" ] || "$MKDIR" -p "$JANITOR_DIR" 2>/dev/null
 
 if ! validate_config; then
+  if [ "$PREVIEW_MODE" = "1" ]; then PREVIEW_REASON=invalid_config; print_preview; exit 1; fi
   rotate_log
   log "ABORT config invalid: $CONFIG_ERROR"
   publish_state error "$CONFIG_ERROR"
@@ -357,6 +526,15 @@ owner_run_id() {
   LC_ALL=C "$GREP" -o '"run_id"[[:space:]]*:[[:space:]]*"[^"]*"' "$MUTEX_OWNER" 2>/dev/null | "$CUT" -d'"' -f4
 }
 
+if [ "$PREVIEW_MODE" = "1" ]; then
+  if [ -e "$MUTEX" ] || [ -L "$MUTEX" ]; then
+    PREVIEW_REASON=busy; print_preview; exit 0
+  fi
+  RUN_TMP=$("$MKTEMP" -d "/tmp/cmux-janitor.XXXXXX") || {
+    PREVIEW_REASON=scratch_unavailable; print_preview; exit 1;
+  }
+  trap '"$RM" -rf "$RUN_TMP" 2>/dev/null' EXIT
+else
 if ! "$MKDIR" "$MUTEX" 2>/dev/null; then
   if mutex_is_stale; then
     "$RM" -rf "$MUTEX" 2>/dev/null
@@ -385,6 +563,7 @@ release_mutex() {
   fi
 }
 trap '"$RM" -rf "$RUN_TMP" 2>/dev/null; release_mutex' EXIT
+fi
 
 rotate_log
 
@@ -397,18 +576,48 @@ SEL="$RUN_TMP/selected.txt"
 
 # ---------- collect .sb-* orphans (top level, files only) ----------
 # The live store's own name has no ".sb-" infix, so it cannot match this glob.
+CANDIDATE_SCAN_OK=true
 "$FIND" "$CM" -mindepth 1 -maxdepth 1 -type f -name '*.sb-*' -mmin "+$SB_MIN_AGE_MIN" \
-  2>/dev/null | "$SORT" > "$SB_CAND"
+  2>/dev/null | "$SORT" > "$SB_CAND" || CANDIDATE_SCAN_OK=false
 
 # ---------- collect aged, UUID-shaped staging dirs ----------
 if [ -d "$STAGING" ]; then
   "$FIND" "$STAGING" -mindepth 1 -maxdepth 1 -type d -mmin "+$STAGING_MIN_AGE_MIN" \
     -regex '.*/[0-9A-Fa-f]\{8\}-[0-9A-Fa-f]\{4\}-[0-9A-Fa-f]\{4\}-[0-9A-Fa-f]\{4\}-[0-9A-Fa-f]\{12\}$' \
-    2>/dev/null | "$SORT" > "$ST_AGED"
+    2>/dev/null | "$SORT" > "$ST_AGED" || CANDIDATE_SCAN_OK=false
+fi
+if [ "$PREVIEW_MODE" = "1" ] && [ "$CANDIDATE_SCAN_OK" != "true" ]; then
+  PREVIEW_REASON=candidate_scan_unverified; print_preview; exit 1
 fi
 
 C_RAW_SB=$("$WC" -l < "$SB_CAND" | "$TR" -d ' ')
 C_RAW_STAGING=$("$WC" -l < "$ST_AGED" | "$TR" -d ' ')
+PREVIEW_SCANNED=true
+
+# ---------- preview data collection ----------
+if [ "$PREVIEW_MODE" = "1" ]; then
+  NOW=$("$DATE" +%s)
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    age_min=$(( (NOW - $("$STAT" -f%m "$f" 2>/dev/null || echo "$NOW")) / 60 ))
+    size=$("$STAT" -f%z "$f" 2>/dev/null || echo 0)
+    PREVIEW_SB_PATHS+=("$f")
+    PREVIEW_SB_AGES+=("$age_min")
+    PREVIEW_SB_SIZES+=("$size")
+    B_SB_TOTAL=$((B_SB_TOTAL + size))
+  done < "$SB_CAND"
+
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    age_min=$(( (NOW - $("$STAT" -f%m "$d" 2>/dev/null || echo "$NOW")) / 60 ))
+    kb=$("$DU" -sk "$d" 2>/dev/null | "$AWK" '{print $1}')
+    size=$((kb * 1024))
+    PREVIEW_STAGING_PATHS+=("$d")
+    PREVIEW_STAGING_AGES+=("$age_min")
+    PREVIEW_STAGING_SIZES+=("$size")
+    B_STAGING_TOTAL=$((B_STAGING_TOTAL + size))
+  done < "$ST_AGED"
+fi
 
 # ---------- quarantine inventory (display only; never a disposal input) ----------
 # R2-6: aggregate counts plus oldest/next timestamps. No batch names.
@@ -493,7 +702,7 @@ expire_quarantine() {
     [ "$sealed" -le "$cutoff" ] || continue
     items=$("$FIND" "$b" -mindepth 1 -maxdepth 1 ! -name "$BATCH_META" 2>/dev/null | "$WC" -l | "$TR" -d ' ')
     kb=$("$DU" -sk "$b" 2>/dev/null | "$AWK" '{print $1}')
-    if [ "$MODE" != "apply" ]; then
+    if [ "$PREVIEW_MODE" = "1" ] || [ "$MODE" != "apply" ]; then
       C_WOULD_EXP_B=$((C_WOULD_EXP_B+1))
       C_WOULD_EXP_I=$((C_WOULD_EXP_I+items))
       is_uint "$kb" && B_EXPIRED=$((B_EXPIRED + kb*1024))
@@ -509,7 +718,7 @@ expire_quarantine() {
       log "WARN expire failed: $base"
     fi
   done < <("$FIND" "$QUARANTINE_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
-  [ "$MODE" = "apply" ] && "$RMDIR" "$QUARANTINE_DIR" 2>/dev/null
+  [ "$PREVIEW_MODE" = "0" ] && [ "$MODE" = "apply" ] && "$RMDIR" "$QUARANTINE_DIR" 2>/dev/null
   return 0
 }
 
@@ -518,6 +727,11 @@ if [ "$C_RAW_SB" -eq 0 ] && [ "$C_RAW_STAGING" -eq 0 ]; then
   SAFETY_COMPLETE=true
   expire_quarantine
   survey_quarantine
+  if [ "$PREVIEW_MODE" = "1" ]; then
+    C_WOULD_DISPOSE=0
+    print_preview
+    exit 0
+  fi
   log "run mode=$MODE trigger=$TRIGGER nothing-to-do expired_batches=$C_EXP_B expired_items=$C_EXP_I would_expire_batches=$C_WOULD_EXP_B"
   publish_state idle ""
   append_metrics idle
@@ -526,9 +740,10 @@ fi
 
 # ---------- GATE 2: exclude snapshot IDs the live store still references ----------
 # Streamed with grep -o. The 1.5GB store is never parsed as a whole.
-if [ "$C_RAW_STAGING" -gt 0 ] && [ -f "$LIVE" ]; then
+LIVE_SCAN_FAILED=0
+if [ "$C_RAW_STAGING" -gt 0 ] && [ -f "$LIVE" ] && [ -r "$LIVE" ] && [ -s "$LIVE" ]; then
   LC_ALL=C "$GREP" -o '"untrackedSnapshotId"[[:space:]]*:[[:space:]]*"[0-9A-Fa-f-]\{36\}"' "$LIVE" 2>/dev/null \
-    | LC_ALL=C "$GREP" -o '[0-9A-Fa-f-]\{36\}' | "$SORT" -u > "$PROT"
+    | LC_ALL=C "$GREP" -o '[0-9A-Fa-f-]\{36\}' | "$SORT" -u > "$PROT" || LIVE_SCAN_FAILED=1
 fi
 C_PROTECTED=$("$WC" -l < "$PROT" | "$TR" -d ' ')
 
@@ -542,6 +757,15 @@ if [ "$C_RAW_STAGING" -gt 0 ]; then
     log "ABORT-STAGING live store missing at $LIVE; skipping staging (fail closed)"
     : > "$ST_CAND"
     STAGING_SAFE=false
+    PREVIEW_REASON=live_store_missing
+  elif [ ! -r "$LIVE" ]; then
+    log "ABORT-STAGING live store unreadable; skipping staging"
+    STAGING_SAFE=false
+    PREVIEW_REASON=live_store_unreadable
+  elif [ "$LIVE_SCAN_FAILED" = "1" ]; then
+    log "ABORT-STAGING extracted 0 snapshot ids or live store scan failed; skipping staging"
+    STAGING_SAFE=false
+    PREVIEW_REASON=live_store_unverified
   elif [ "$C_PROTECTED" -gt 0 ]; then
     "$AWK" 'NR==FNR{p[$0]=1;next}{n=$0;sub(/.*\//,"",n); if(!(n in p)) print $0}' \
       "$PROT" "$ST_AGED" > "$ST_CAND"
@@ -551,10 +775,14 @@ if [ "$C_RAW_STAGING" -gt 0 ]; then
     log "ABORT-STAGING extracted 0 snapshot ids from a non-empty store; skipping staging"
     : > "$ST_CAND"
     STAGING_SAFE=false
+    PREVIEW_REASON=live_store_unverified
   else
     # Store exists and is 0 bytes: a verifiable "no active references".
     "$CP" "$ST_AGED" "$ST_CAND"
   fi
+fi
+if [ "$STAGING_SAFE" = "true" ]; then
+  C_PROTECTED_DIRS=$((C_RAW_STAGING - $("$WC" -l < "$ST_CAND" | "$TR" -d ' ')))
 fi
 
 # ---------- global selection: one shared cap, oldest first ----------
@@ -580,6 +808,11 @@ if [ "$C_SELECTED" -eq 0 ]; then
   SAFETY_COMPLETE=$STAGING_SAFE
   expire_quarantine
   survey_quarantine
+  if [ "$PREVIEW_MODE" = "1" ]; then
+    C_WOULD_DISPOSE=0
+    print_preview
+    exit 0
+  fi
   log "run mode=$MODE trigger=$TRIGGER raw_sb=$C_RAW_SB raw_staging=$C_RAW_STAGING protected=$C_PROTECTED eligible=0 selected=0 expired_batches=$C_EXP_B"
   publish_state idle ""
   append_metrics idle
@@ -624,7 +857,7 @@ stamp_of() { "$STAT" -f%m "$1" 2>/dev/null || echo x; }
 
 QDEST=""
 BATCH_CREATED_EPOCH=$("$DATE" +%s)
-if [ "$USE_QUARANTINE" = "1" ] && [ "$MODE" = "apply" ]; then
+if [ "$PREVIEW_MODE" = "0" ] && [ "$USE_QUARANTINE" = "1" ] && [ "$MODE" = "apply" ]; then
   # R2-4 two-phase seal: fill `.incomplete-<run_id>` first, write controlled
   # metadata, then atomically rename to the final name. An interrupted run
   # leaves an .incomplete-* directory that the expirer and uninstall both skip.
@@ -636,11 +869,16 @@ fi
 dispose() {
   local p="$1" base
   base=$("$BASENAME" "$p")
-  if [ "$MODE" != "apply" ]; then
+  if [ "$PREVIEW_MODE" = "1" ] || [ "$MODE" != "apply" ]; then
     # Truthful accounting: the old dry branch returned 0 and the caller then
     # incremented the disposed counter, so logs claimed disposed=514 while
     # nothing moved.
     C_WOULD_DISPOSE=$((C_WOULD_DISPOSE+1))
+    if [ -d "$p" ]; then
+      C_WOULD_STAGING=$((C_WOULD_STAGING+1))
+    else
+      C_WOULD_SB=$((C_WOULD_SB+1))
+    fi
     log "DRY would-remove $p"
     return 1
   fi
@@ -717,8 +955,10 @@ SAFETY_COMPLETE=$STAGING_SAFE
 
 expire_quarantine
 survey_quarantine
+if [ "$PREVIEW_MODE" = "1" ]; then print_preview; exit 0; fi
 
 log "run mode=$MODE trigger=$TRIGGER raw_sb=$C_RAW_SB raw_staging=$C_RAW_STAGING protected=$C_PROTECTED eligible=$C_ELIGIBLE selected=$C_SELECTED would_dispose=$C_WOULD_DISPOSE disposed=$C_DISPOSED would_expire_batches=$C_WOULD_EXP_B would_expire_items=$C_WOULD_EXP_I expired_batches=$C_EXP_B expired_items=$C_EXP_I skip_moving=$C_SKIP_MOVING skip_fresh=$C_SKIP_FRESH skip_held=$C_SKIP_HELD skip_outside=$C_SKIP_OUTSIDE safety_complete=$SAFETY_COMPLETE"
 publish_state idle ""
 append_metrics idle
+
 exit 0

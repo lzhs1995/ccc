@@ -1,0 +1,27 @@
+{
+  "capture": {
+    "incident": "2026-09-07 surface:148 retry-exhausted 429",
+    "note": "Viewport, cursor and row positions retained; request id and cwd sanitized, span widths normalized to sanitized text; unrelated transcript omitted."
+  },
+  "render_grid": {
+    "format": "cmux.render-grid.v1",
+    "surface_id": "surface-uuid",
+    "rows": 57,
+    "columns": 126,
+    "cursor": {"row": 54, "column": 2, "visible": true},
+    "styles": [
+      {"id": 0, "faint": false},
+      {"id": 1, "faint": false},
+      {"id": 2, "faint": true},
+      {"id": 3, "faint": false, "bold": true}
+    ],
+    "row_spans": [
+      {"row": 49, "column": 0, "cell_width": 90, "style_id": 3, "text": "■ exceeded retry limit, last status: 429 Too Many Requests, request id: fixture-request-id"},
+      {"row": 51, "column": 0, "cell_width": 62, "style_id": 2, "text": "  1 background terminal running · /ps to view · /stop to close"},
+      {"row": 54, "column": 0, "cell_width": 1, "style_id": 1, "text": "›"},
+      {"row": 54, "column": 1, "cell_width": 1, "style_id": 0, "text": " "},
+      {"row": 54, "column": 2, "cell_width": 24, "style_id": 2, "text": "Ask Codex to do anything"},
+      {"row": 56, "column": 0, "cell_width": 69, "style_id": 2, "text": "  gpt-6-astra max · ~/repo · Context 58% used · 258K window · Fast on"}
+    ]
+  }
+}

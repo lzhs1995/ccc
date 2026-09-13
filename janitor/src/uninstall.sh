@@ -8,8 +8,9 @@
 # janitor's own files are deleted, so nothing is stranded.
 set -uo pipefail
 
-LABEL="com.example.cmux-janitor"
-GUARD_LABEL="com.example.cmux-janitor-guard"
+LABEL_PREFIX="${CMUX_JANITOR_LABEL_PREFIX:-com.${USER}}"
+LABEL="${LABEL_PREFIX}.cmux-janitor"
+GUARD_LABEL="${LABEL_PREFIX}.cmux-janitor-guard"
 JANITOR_DIR="$HOME/.config/cmux-janitor"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 GUARD_PLIST="$HOME/Library/LaunchAgents/$GUARD_LABEL.plist"
