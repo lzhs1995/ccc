@@ -180,6 +180,55 @@ class RuntimeInstallTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "rollback failed: bootstrap unavailable"):
             core.launchctl("install")
 
+    def test_async_bootout_is_retried_before_rolling_back(self):
+        old, _ = self.old_install()
+        self.change_source()
+        attempts = []
+
+        def launch(args, check):
+            if args[0] == "bootstrap":
+                attempts.append(list(args))
+                if len(attempts) <= 2:
+                    return subprocess.CompletedProcess(args, 5, "", "Bootstrap failed: 5: Input/output error")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        self.launch.side_effect = launch
+        with mock.patch.object(core.time, "sleep") as sleep:
+            core.launchctl("install")
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual(sleep.call_count, 2)
+        self.assertNotEqual((self.runtime / "current").resolve(), old)
+        self.assertEqual(sum(call.args[0][0] == "bootout" for call in self.launch.call_args_list), 1)
+
+    def test_permanent_bootstrap_error_rolls_back_without_retry(self):
+        old, old_plist = self.old_install()
+        self.change_source()
+        attempts = []
+
+        def launch(args, check):
+            if args[0] == "bootstrap":
+                attempts.append(list(args))
+                if len(attempts) == 1:
+                    return subprocess.CompletedProcess(args, 13, "", "Permission denied")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        self.launch.side_effect = launch
+        with mock.patch.object(core.time, "sleep") as sleep:
+            with self.assertRaisesRegex(RuntimeError, "previous runtime pointer and plist restored"):
+                core.launchctl("install")
+            sleep.assert_not_called()
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual((self.runtime / "current").resolve(), old)
+        self.assertEqual(self.plist.read_bytes(), old_plist)
+
+    def test_bootstrap_busy_retry_has_a_deadline(self):
+        self.launch.return_value = subprocess.CompletedProcess([], 5, "", "Bootstrap failed: 5: Input/output error")
+        with mock.patch.object(core.time, "sleep") as sleep:
+            with self.assertRaisesRegex(RuntimeError, "Input/output error"):
+                core._bootstrap_runtime_service("gui/test", self.plist, timeout_sec=0)
+            sleep.assert_not_called()
+        self.assertEqual(self.launch.call_count, 1)
+
     def test_invalid_source_does_not_stop_old_service(self):
         old, old_plist = self.old_install()
         (self.source / "claude_ccc_protocol.py").write_text("invalid python ???\n")
