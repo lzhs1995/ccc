@@ -10,6 +10,8 @@
   uninitialized native runtimes and reject foreign processes attached by TTY reuse.
 - Install checksummed immutable watcher bundles outside Documents and retain
   rollback without restoring configuration, state or event ledgers.
+- Wait through launchd's asynchronous removal interval with bounded bootstrap
+  retries, including the rollback path.
 - Retain deferred Stop ordering, later-prompt supersession and HTTP retry guards.
 - Recover Codex provider `rate limit exceeded` banners without requiring a 429
   prefix, including wrapped text, while preserving working/input/queue guards.

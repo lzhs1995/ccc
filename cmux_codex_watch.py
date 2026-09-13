@@ -7932,7 +7932,7 @@ def install_runtime_service(domain: str, service: str) -> Path:
             _run_launchctl(["bootout", service], check=False)
             _set_runtime_pointer(DEFAULT_RUNTIME_ROOT, release)
             write_plist(runtime_dir=release)
-            _run_launchctl(["bootstrap", domain, str(DEFAULT_PLIST_PATH)], check=True)
+            _bootstrap_runtime_service(domain, DEFAULT_PLIST_PATH)
         except Exception as exc:
             rollback_errors: list[str] = []
             _run_launchctl(["bootout", service], check=False)
@@ -7944,7 +7944,7 @@ def install_runtime_service(domain: str, service: str) -> Path:
                 else:
                     _atomic_write_bytes(DEFAULT_PLIST_PATH, previous_plist)
                 if was_loaded and previous_plist is not None:
-                    _run_launchctl(["bootstrap", domain, str(DEFAULT_PLIST_PATH)], check=True)
+                    _bootstrap_runtime_service(domain, DEFAULT_PLIST_PATH)
             except Exception as rollback_exc:
                 rollback_errors.append(str(rollback_exc))
             detail = ("rollback failed: " + "; ".join(rollback_errors)
@@ -7964,6 +7964,26 @@ def _run_launchctl(args: Sequence[str], *, check: bool) -> subprocess.CompletedP
         detail = (result.stderr or result.stdout or "launchctl failed").strip()
         raise RuntimeError(detail)
     return result
+
+
+def _bootstrap_runtime_service(domain: str, path: Path, *, timeout_sec: float = 5.0) -> None:
+    """Allow launchd to finish an asynchronous bootout before registering again.
+
+    launchctl can return from bootout while the service is still being removed.
+    During that interval bootstrap reports I/O error 5 (launchd logs operation
+    already in progress). A bounded retry also protects the rollback bootstrap;
+    other failures still return immediately without masking their cause.
+    """
+    deadline = time.monotonic() + max(0.0, timeout_sec)
+    while True:
+        result = _run_launchctl(["bootstrap", domain, str(path)], check=False)
+        if result.returncode == 0:
+            return
+        remaining = deadline - time.monotonic()
+        if result.returncode not in {5, 37} or remaining <= 0:
+            detail = (result.stderr or result.stdout or "launchctl bootstrap failed").strip()
+            raise RuntimeError(detail)
+        time.sleep(min(0.25, remaining))
 
 
 def install_cli_link(path: Path = DEFAULT_CLI_LINK) -> None:

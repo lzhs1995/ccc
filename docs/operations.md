@@ -82,6 +82,12 @@ atomically updates `runtime/current`, and replaces the LaunchAgent. The service
 runs its immutable bundle from Application Support. `start` restarts that
 installed bundle; it does not install edits from a checkout.
 
+launchd can acknowledge `bootout` before it finishes unregistering the service.
+During that short interval `bootstrap` reports I/O error 5. Installation retries
+this transition for up to five seconds, including when reloading the previous
+version during rollback. Other errors fail immediately; persistent failures
+remain visible instead of being reported as a successful install.
+
 The automatic installation rollback restores the previous runtime pointer and
 plist. For a later operational rollback, install the previously verified source
 revision through the same installer. Never copy old `config.json`, `state.json`
