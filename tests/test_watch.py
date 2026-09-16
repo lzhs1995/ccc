@@ -64,6 +64,7 @@ def grid_payload(lines, *, composer="placeholder", cursor_visible=True, working=
         {"id": 1, "foreground": "#FFFFFF", "background": "#393939", "faint": False},
         {"id": 2, "foreground": "#FFFFFF", "background": "#1E1E1E", "faint": True},
         {"id": 3, "foreground": "#CC372E", "background": "#1E1E1E", "faint": False, "bold": True},
+        {"id": 4, "foreground": "#989898", "foreground_source": "rgb", "background": "#393939", "faint": False},
     ]
     rows = max(12, len(lines) + 3)
     row_spans = []
@@ -98,6 +99,39 @@ def grid_payload(lines, *, composer="placeholder", cursor_visible=True, working=
             "history_rows": 999,
         }
     }
+
+
+HIGH_DEMAND_TEXT = "We're currently experiencing high demand, which may cause temporary errors."
+
+
+def reconnect_payload(attempt="2/5", elapsed="1m 24s", spinner=False, stale_banner=False):
+    payload = grid_payload([])
+    composer_row = payload["render_grid"]["cursor"]["row"]
+    if attempt:
+        header = f"• Reconnecting... {attempt} ({elapsed} • esc to interrupt)"
+    else:
+        header = f"• Reconnecting... ({elapsed} • esc to interrupt)"
+    nested = "└ " + HIGH_DEMAND_TEXT
+    payload["render_grid"]["row_spans"].extend([
+        span(composer_row - 5, 0, header, 0, len(header)),
+        span(composer_row - 4, 2, nested, 3, len(nested)),
+    ])
+    if stale_banner:
+        payload["render_grid"]["row_spans"].append(
+            span(composer_row - 8, 0, "■ " + HIGH_DEMAND_TEXT, 3, len("■ " + HIGH_DEMAND_TEXT))
+        )
+        payload["render_grid"]["row_spans"].append(
+            span(composer_row - 7, 0, "› 任务请继续", 0, 8)
+        )
+    if spinner:
+        payload["render_grid"]["row_spans"].append(
+            span(composer_row - 1, 0, "⠁   ⠈         ⠄             ⠈     ⢀", 4)
+        )
+    return payload
+
+
+def visible_lines(payload):
+    return list(Grid.from_rpc(payload, "surface-uuid").lines)
 
 
 def claude_grid_payload(
@@ -1230,13 +1264,28 @@ class WatchTests(unittest.TestCase):
         )
         composer_row = payload["render_grid"]["cursor"]["row"]
         payload["render_grid"]["row_spans"].append(
-            span(composer_row - 2, 0, "› 任务请继续", 3)
+            span(composer_row - 2, 0, "› ordinary newer work", 3)
         )
         state = classify_grid(Grid.from_rpc(payload, "surface-uuid"))
         # Not plain "idle": the banner is a real error we are deliberately not
         # acting on, and saying so keeps a wrong suppression auditable.
         self.assertEqual(state.kind, "error_superseded")
         self.assertEqual(state.error_type, "high_demand")
+
+    def test_continue_echo_supersedes_old_high_demand(self):
+        payload = grid_payload([], error=HIGH_DEMAND_TEXT)
+        composer_row = payload["render_grid"]["cursor"]["row"]
+        payload["render_grid"]["row_spans"].extend([
+            span(composer_row - 2, 0, "› ", 1, 2),
+            span(composer_row - 2, 2, "任务请继续", 0, 10),
+        ])
+        state = classify_grid(Grid.from_rpc(payload, "surface-uuid"))
+        self.assertEqual((state.kind, state.error_type), ("error_superseded", "high_demand"))
+        with tempfile.TemporaryDirectory() as directory:
+            client = FakeClient(payload, "\n".join(visible_lines(payload)))
+            daemon = armed_daemon(directory, client)
+            daemon.process_once(client)
+            self.assertEqual(client.sent, [])
 
     def test_indented_error_tail_still_counts_as_current_block(self):
         # A real wrapped error detail remains eligible: it is indented and
@@ -1475,6 +1524,95 @@ class WatchTests(unittest.TestCase):
             self.assertEqual(client.sent, [])
             self.assertEqual(daemon.runtime["surface-uuid"].state, "queued_followup")
 
+    def test_renamed_queue_banner_is_recognized_as_queued_input(self):
+        """Codex renamed the banner; gate 1 only knew the old wording.
+
+        Live wording (2026-09-15):
+
+            • Messages to be submitted after next tool call (press esc to
+              interrupt and send immediately)
+              ↳ 任务请继续
+
+        Nothing was suppressing this on purpose.  The banner happens to contain
+        "esc to interrupt", so ``_working_present`` absorbed it and the surface
+        read as Working -- suppression by accident, from a rule about a
+        different thing.  Production still climbed 55 -> 66 sends.
+        """
+        banner = "• Messages to be submitted after next tool call (press esc to interrupt and send immediately)"
+        self.assertTrue(core._queued_followup_present([banner, "  ↳ 任务请继续"], 2))
+
+    def test_renamed_queue_banner_blocks_sending_without_relying_on_working(self):
+        """The residual the accident does not cover.
+
+        Once the banner scrolls off, a single ``↳`` row remains: the repeated-row
+        signature needs two, and there is no longer any "esc to interrupt" on
+        screen, so both the accidental guard and gate 1 fall through and the
+        daemon sends into a queue that already holds our message.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            payload = grid_payload(
+                ["• Messages to be submitted after next tool call", "  ↳ 任务请继续"],
+                error=HIGH_DEMAND_TEXT,
+            )
+            client = FakeClient(payload, "■ " + HIGH_DEMAND_TEXT)
+            daemon = armed_daemon(directory, client)
+            for _ in range(5):
+                daemon.process_once(client)
+            self.assertEqual(client.sent, [])
+            self.assertEqual(daemon.runtime["surface-uuid"].state, "queued_followup")
+
+    def test_exhausted_token_401_is_reported_and_never_sent(self):
+        """The provider token is out of quota; continuing cannot fix it.
+
+        Representative quota block, with synthetic account and request identifiers:
+
+            ■ unexpected status 401 Unauthorized: [test-token] 该令牌额度已用尽
+            !token.UnlimitedQuota && token.RemainQuota = -1 (request id:
+            fixture-request-id), url: https://provider.example/v1/responses
+
+        ``_is_error_marker`` accepted the ■ row but ``_match_error_block`` had no
+        401 rule, so the scan returned None and the Supervisor showed 空闲 --
+        identical to a healthy session, which is why this looked like the
+        watchdog had died.  RemainQuota is negative: another 任务请继续 buys the
+        same 401.  So this is a reporting state, never a send state.
+        """
+        block = (
+            "■ unexpected status 401 Unauthorized: [test-token] 该令牌额度已用尽\n"
+            "!token.UnlimitedQuota && token.RemainQuota = -1 (request id:\n"
+            "fixture-request-id), url: https://provider.example/v1/responses"
+        )
+        self.assertEqual(core._match_error_block(block), "token_exhausted")
+        self.assertNotIn("token_exhausted", core.SEND_ELIGIBLE_STATES)
+
+    def test_exhausted_token_surface_shows_its_own_state_not_idle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            lines = [
+                "■ unexpected status 401 Unauthorized: [test-token] 该令牌额度已用尽",
+                "!token.UnlimitedQuota && token.RemainQuota = -1 (request id:",
+                "fixture-request-id), url: https://provider.example/v1/responses",
+            ]
+            payload = grid_payload(lines)
+            client = FakeClient(payload, "\n".join(lines))
+            daemon = armed_daemon(directory, client)
+            for _ in range(5):
+                daemon.process_once(client)
+            runtime = daemon.runtime["surface-uuid"]
+            self.assertEqual(client.sent, [])
+            self.assertEqual(runtime.state, "token_exhausted")
+            # ``error_type`` is the *send episode* trigger and stays None here:
+            # this state never sends, so no episode opens.  The 错误 column reads
+            # ``observed_error_type`` for exactly this reason, so that is the
+            # field which has to carry the diagnostic to the Supervisor.
+            self.assertEqual(runtime.observed_error_type, "token_exhausted")
+            self.assertIsNone(runtime.error_type)
+
+    def test_healthy_401_prose_is_not_an_exhausted_token(self):
+        """Only the provider's quota banner counts, not any mention of 401."""
+        self.assertIsNone(core._match_error_block(
+            "■ unexpected status 401 Unauthorized: check your API key"))
+        self.assertIsNone(core._match_error_block(
+            "■ the docs explain 该令牌额度已用尽 as a billing state"))
+
     def test_repeat_send_delay_bounds_one_episode(self):
         # A changing error frame must still respect the one-second lower bound.
         # Once it expires, the same live error episode is retried without a
@@ -1709,6 +1847,87 @@ class WatchTests(unittest.TestCase):
         state = classify_grid(Grid.from_rpc(payload, "surface-uuid"))
         self.assertEqual(state.kind, "recoverable_error")
         self.assertEqual(state.error_type, "high_demand")
+
+    def test_reconnect_high_demand_is_not_working_and_sends_once(self):
+        payload = reconnect_payload("2/5")
+        text = "\n".join(visible_lines(payload))
+        self.assertEqual(classify_text_prefilter(text).kind, "candidate")
+        state = classify_grid(Grid.from_rpc(payload, "surface-uuid"))
+        self.assertEqual((state.kind, state.error_type), ("recoverable_error", "high_demand"))
+        with tempfile.TemporaryDirectory() as directory:
+            client = FakeClient(payload, text)
+            daemon = armed_daemon(directory, client)
+            daemon.process_once(client)
+            self.assertEqual(client.sent, [("workspace-uuid", "surface-uuid", "任务请继续")])
+            later = reconnect_payload("5/5", elapsed="2m 01s")
+            client.payload = later
+            client.text = "\n".join(visible_lines(later))
+            daemon.process_once(client)
+            self.assertEqual(len(client.sent), 1)
+            daemon.runtime["surface-uuid"].last_send_at -= 1.1
+            daemon.process_once(client)
+            self.assertEqual(len(client.sent), 1)
+            daemon.runtime["surface-uuid"].last_send_at -= 60
+            daemon.process_once(client)
+            self.assertEqual(len(client.sent), 2)
+
+    def test_high_demand_spinner_overlay_is_still_current(self):
+        payload = grid_payload([], error=HIGH_DEMAND_TEXT)
+        composer_row = payload["render_grid"]["cursor"]["row"]
+        payload["render_grid"]["row_spans"].append(
+            span(composer_row - 1, 0, "⠁   ⠈         ⠄             ⠈     ⢀              ⠐ ⠐", 4)
+        )
+        state = classify_grid(Grid.from_rpc(payload, "surface-uuid"))
+        self.assertEqual((state.kind, state.error_type), ("recoverable_error", "high_demand"))
+        with tempfile.TemporaryDirectory() as directory:
+            client = FakeClient(payload, "\n".join(visible_lines(payload)))
+            daemon = armed_daemon(directory, client)
+            daemon.process_once(client)
+            self.assertEqual(len(client.sent), 1)
+
+    def test_genuine_working_still_blocks_high_demand(self):
+        payload = grid_payload([], error=HIGH_DEMAND_TEXT, working=True)
+        self.assertEqual(classify_grid(Grid.from_rpc(payload, "surface-uuid")).kind, "working")
+        self.assertEqual(
+            classify_text_prefilter("\n".join(visible_lines(payload))).kind,
+            "working",
+        )
+
+    def test_reconnect_echo_below_stale_banner_uses_reconnect_block(self):
+        payload = reconnect_payload("5/5", stale_banner=True)
+        state = classify_grid(Grid.from_rpc(payload, "surface-uuid"))
+        self.assertEqual((state.kind, state.error_type), ("recoverable_error", "high_demand"))
+
+    def test_live_split_reconnect_spans_are_current_high_demand(self):
+        # 2026-09-14 capture: cmux splits the reconnect bullet from
+        # the word "Reconnecting", and puts the nested high-demand line in a
+        # column-0 span starting with two spaces.  The old validator required
+        # the column-0 span itself to be the marker phrase, so classify_grid
+        # returned idle while the exact ■ / └ high-demand sentence was visible.
+        payload = grid_payload([" "] * 20, columns=82)
+        composer_row = payload["render_grid"]["cursor"]["row"]
+        banner = "■ " + HIGH_DEMAND_TEXT
+        nested = "  └ " + HIGH_DEMAND_TEXT
+        payload["render_grid"]["row_spans"].extend([
+            span(composer_row - 10, 0, banner, 3, len(banner)),
+            span(composer_row - 8, 0, "› ", 1, 2),
+            span(composer_row - 8, 2, "任务请继续", 0, 10),
+            span(composer_row - 5, 0, "•", 3, 1),
+            span(composer_row - 5, 1, " ", 0, 1),
+            span(composer_row - 5, 2, "Reconnecting... 1/5", 3, 19),
+            span(composer_row - 5, 21, " ", 0, 1),
+            span(composer_row - 5, 22, "(1m 23s • esc to interrupt)", 1, 27),
+            span(composer_row - 4, 0, nested, 1, len(nested)),
+            span(composer_row - 1, 0, "⠁   ⠈         ⠄             ⠈     ⢀", 4),
+        ])
+        state = classify_grid(Grid.from_rpc(payload, "surface-uuid"))
+        self.assertEqual((state.kind, state.error_type), ("recoverable_error", "high_demand"))
+        self.assertEqual(classify_text_prefilter("\n".join(visible_lines(payload))).kind, "candidate")
+        with tempfile.TemporaryDirectory() as directory:
+            client = FakeClient(payload, "\n".join(visible_lines(payload)))
+            daemon = armed_daemon(directory, client)
+            daemon.process_once(client)
+            self.assertEqual(client.sent, [("workspace-uuid", "surface-uuid", "任务请继续")])
 
     def test_replay_requires_both_uuids(self):
         with self.assertRaises(IncompatibleError):

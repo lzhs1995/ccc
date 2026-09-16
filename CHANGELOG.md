@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.1
+
+- Recognize current Codex reconnect errors across split spans, wrapped status
+  lines and nested `high demand` details while retaining genuine Working guards.
+- Enforce a 60-second reconnect repeat floor across timer/request changes and
+  watcher restarts. Ordinary error retries keep their configured interval.
+- Recognize both queue headers across wraps and a lone pending continuation;
+  accepted prompt echoes supersede older errors until a new error appears.
+- Ignore verified RGB braille overlays with dim composer placeholders, while
+  protecting typed placeholder text and actual braille input.
+- Report provider quota-specific 401 errors as `token_exhausted` / `额度耗尽`
+  without sending or changing credentials, sessions or monitoring settings.
+
 ## 0.2.0
 
 - Revalidate the latest genuine Stop rejected before explicit Claude enrollment,

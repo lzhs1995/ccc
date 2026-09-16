@@ -70,6 +70,8 @@ ERROR_LABELS = {
     "http_405": "405",
     "stream": "断流",
     "prompt_cache": "缓存400",
+    # A provider quota blocker needs a different label from Claude's retry wait.
+    "token_exhausted": "额度耗尽",
     "claude_503": "503",
     "claude_model_unavailable": "模型错误",
     "claude_429": "429",
@@ -105,6 +107,8 @@ STATE_LABELS = {
     # than plain 空闲: if that judgement is ever wrong, it has to be visible
     # here instead of hiding among genuinely healthy sessions.
     "error_superseded": "已过时",
+    # Monitoring remains enabled while provider action is required.
+    "token_exhausted": "额度耗尽",
     # Registered Claude surface, but the Claude send path is switched off.
     # Distinct from 空转: the pane is Claude on purpose, we are choosing not
     # to nudge it.
@@ -318,6 +322,8 @@ def is_idling(candidate: Candidate) -> bool:
         "composer_busy",
         "queued_followup",
         "error_superseded",
+        # A live client with a provider blocker is not an unused registration.
+        "token_exhausted",
         "claude_stopped",
         "claude_input_guard",
         "claude_completed",
@@ -2162,6 +2168,11 @@ def selected_action_hint(candidate: Candidate | None) -> str:
             return (
                 "上下文压缩失败，需人工：守护器不会自动 /compact 或 /clear；"
                 "处理后自动恢复，无需重新登记"
+            )
+        if candidate.state == "token_exhausted":
+            return (
+                "供应商额度已耗尽，CCC 继续监控；"
+                "额度或授权恢复后在原会话重试，无需重新登记"
             )
         if candidate.state == "claude_completed":
             return "已完成但仍持续监控；下个任务自动恢复判断，无需按 r   ·   p 暂停   x 删除"
