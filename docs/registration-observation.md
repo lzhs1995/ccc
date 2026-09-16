@@ -54,6 +54,36 @@ qualify. Working indicators, queued follow-ups, user composer text and newer
 transcript output still suppress submission. An already working session needs
 no additional prompt; CCC send counters identify its own actions only.
 
+## Codex reconnect status and accepted prompts
+
+Codex can show a recoverable provider error beneath `• Reconnecting... N/M`,
+with the bullet, label and timer in separate cmux spans. The nested `└` detail
+can start inside a column-zero span. These rows belong to one current error
+block. Only a complete reconnect header is excluded from the Working check;
+genuine Working output underneath it still blocks a send.
+
+Reconnect retries have a 60-second minimum interval after the first send, even
+when the attempt counter, timer, request ID or viewport changes. The persisted
+last-send time keeps this protection through a watcher restart. Ordinary
+terminal error banners retain the configured repeat interval.
+
+Both `Queued follow-up inputs` and `Messages to be submitted after next tool
+call` block another submission, including wrapped headers and a lone pending
+continuation row. A newer `›` prompt echo supersedes an old error even when it
+contains the configured continuation phrase: text alone cannot prove who sent
+it. A new error or reconnect block below that prompt can become eligible again.
+
+## Overlay glyphs and provider quota blockers
+
+The current RGB braille overlay is ignored only with its span metadata; in the
+composer it additionally requires a visible dim placeholder. Typed placeholder
+words or braille at cursor Home remain protected user input.
+
+A quota-specific provider 401 is reported as `token_exhausted` / `额度耗尽` and
+never triggers a continuation. Monitoring stays enabled. Restore provider
+quota or authorization and retry within the original session; CCC does not
+change credentials or infer that a persistent 401 banner has become retryable.
+
 ## Earlier fixes retained in this release
 
 - Install the complete daemon bundle outside Documents, with manifests and

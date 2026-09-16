@@ -114,8 +114,24 @@ PERMISSION_RE = re.compile(
     re.IGNORECASE,
 )
 WORKING_RE = re.compile(r"(?:esc to interrupt|esc to cancel|\bworking\s*\()", re.IGNORECASE)
-# Codex's own banner for input it accepted but has not consumed yet.
-QUEUED_FOLLOWUP_RE = re.compile(r"queued\s+follow-?up\s+input", re.IGNORECASE)
+# Codex now auto-retries some provider stalls as a reconnect status.  The line
+# still contains ``esc to interrupt``, which used to make the whole viewport
+# look like genuine Working and suppress rescue.
+RECONNECT_MARKER_RE = re.compile(r"^•\s*Reconnecting(?:\.\.\.|…)", re.IGNORECASE)
+RECONNECT_HEADER_RE = re.compile(
+    r"^•\s*Reconnecting(?:\.\.\.|…)(?:\s+\d+\s*/\s*\d+)?"
+    r"(?:\s+\((?:\d+[hms]\s*)+[•·]\s*esc\s+to\s+(?:interrupt|cancel)\))?$",
+    re.IGNORECASE,
+)
+# After a reconnect stall is nudged, the timer in the status line still ticks.
+# Do not send every second; allow one safety retry per minute.
+RECONNECT_STALL_REPEAT_SEC = 60.0
+SPINNER_GLYPHS = frozenset("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯⣷")
+# Both Codex queue headers describe input already accepted but not consumed.
+QUEUED_FOLLOWUP_RE = re.compile(
+    r"queued\s+follow-?up\s+input|messages?\s+to\s+be\s+submitted",
+    re.IGNORECASE,
+)
 # Minimum seconds between continuation attempts while the current viewport is
 # still a recoverable error.  This is not a blind heartbeat: Working, menus,
 # queued input, user input and newer output all stop the send path first.
@@ -251,7 +267,7 @@ CLAUDE_CONTEXT_ABSOLUTE_TIMEOUT_SEC = 900.0
 # through TargetRuntime and suppresses duplicate Hook/fallback deliveries.
 # Human label only.  Acceptance always compares SHA-256 of the loaded source:
 # a revision string is hand-maintained and therefore can lie about what runs.
-FEATURE_REVISION = "0.2.0-registration-observation-provider-rate-limit"
+FEATURE_REVISION = "0.2.1-codex-high-demand-reconnect-spans"
 # How long after our own send a byte-identical UserPromptSubmit can still be
 # our echo.  Must exceed claude_submit_confirm_timeout_sec so that a late
 # echo arriving after the transaction timed out is not read as a human.
@@ -416,6 +432,8 @@ class ScreenState:
     evidence_row: int | None = None
     evidence_fingerprint: str | None = None
     ignored_chrome_rows: tuple[int, ...] = ()
+    # Reconnect stalls have a 60-second repeat floor even as their timers change.
+    allow_repeat: bool = True
 
 
 @dataclasses.dataclass(frozen=True)
@@ -666,8 +684,96 @@ def _menu_present(lines: Sequence[str]) -> bool:
     return any(pattern.lower() in text.lower() for pattern in MENU_PATTERNS) or bool(PERMISSION_RE.search(text))
 
 
+def _is_reconnect_marker(text: str) -> bool:
+    return bool(RECONNECT_MARKER_RE.match(text.lstrip()))
+
+
+def _is_error_marker(text: str) -> bool:
+    stripped = text.lstrip()
+    return stripped.startswith(("■", "⚠")) or _is_reconnect_marker(stripped)
+
+
+def _stable_error_block(block_text: str) -> str:
+    """Drop reconnect timers and attempt counters so fingerprints stay stable."""
+
+    collapsed = re.sub(r"\s+", " ", block_text).strip()
+    collapsed = re.sub(
+        r"•\s*reconnecting(?:\.\.\.|…)(?:\s*\d+\s*/\s*\d+)?",
+        "• reconnecting...",
+        collapsed,
+        flags=re.IGNORECASE,
+    )
+    return re.sub(
+        r"\((?:(?!\besc to (?:interrupt|cancel)).)*?\besc to (?:interrupt|cancel)\)",
+        "(esc to interrupt)",
+        collapsed,
+        flags=re.IGNORECASE,
+    ).lower()
+
+
+def _is_spinner_char(char: str) -> bool:
+    code = ord(char)
+    return 0x2800 <= code <= 0x28FF or char in SPINNER_GLYPHS
+
+
+def _is_spinner_chrome(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped or any(char.isalnum() for char in stripped):
+        return False
+    return any(_is_spinner_char(char) for char in stripped) and all(
+        char.isspace() or _is_spinner_char(char) or char in "·•" for char in stripped
+    )
+
+
+def _is_spinner_overlay_span(grid: Grid, span: Span) -> bool:
+    style = grid.style(span.style_id)
+    return bool(
+        _is_spinner_chrome(span.text)
+        and style.get("foreground_source") == "rgb"
+        and not style.get("bold", False)
+    )
+
+
+def _spinner_chrome_rows(grid: Grid, composer_row: int) -> frozenset[int]:
+    return frozenset(
+        index
+        for index, line in enumerate(grid.lines[:composer_row])
+        if _is_spinner_chrome(line)
+        and all(
+            _is_spinner_overlay_span(grid, span)
+            for span in grid.spans if span.row == index and span.text.strip()
+        )
+    )
+
+
+def _without_reconnect_status(lines: Sequence[str]) -> list[str]:
+    """Ignore only a complete reconnect header, including a wrapped timer."""
+
+    kept: list[str] = []
+    index = 0
+    while index < len(lines):
+        if _is_reconnect_marker(lines[index]):
+            # A status can wrap, but unrelated output beneath it must still
+            # participate in Working/input guards. Never skip a whole block.
+            end = index + 1
+            for candidate_end in range(index + 1, min(index + 3, len(lines)) + 1):
+                header = " ".join(line.strip() for line in lines[index:candidate_end])
+                if RECONNECT_HEADER_RE.fullmatch(header):
+                    end = candidate_end
+                    break
+            else:
+                kept.append(lines[index])
+                index += 1
+                continue
+            index = end
+        else:
+            kept.append(lines[index])
+            index += 1
+    return kept
+
+
 def _working_present(lines: Sequence[str]) -> bool:
-    return bool(WORKING_RE.search("\n".join(lines)))
+    return bool(WORKING_RE.search("\n".join(_without_reconnect_status(lines))))
 
 
 def _queued_followup_present(lines: Sequence[str], composer_row: int) -> bool:
@@ -685,17 +791,24 @@ def _queued_followup_present(lines: Sequence[str], composer_row: int) -> bool:
     piled one more copy onto the queue every second.  Codex is telling us plainly
     that it already has the message; that is a hard reason not to send another.
 
-    Two signatures, because the banner scrolls off once the queue is long:
-    the header itself, or a run of identical `↳` rows (Codex only stacks
-    identical rows like that when it is listing the same pending input).
+    The newer header can wrap across viewport rows:
+
+        • Messages to be submitted after next tool call (press esc to interrupt …)
+          ↳ 任务请继续
+
+    Match either header across line breaks. If the header has scrolled out,
+    a single pending continuation or repeated identical arrow rows still block
+    another send. The header's interrupt hint is not required for this gate.
     """
     head = [line.strip() for line in lines[:max(composer_row, 0)]]
-    if any(QUEUED_FOLLOWUP_RE.search(line) for line in head):
+    if QUEUED_FOLLOWUP_RE.search("\n".join(head)):
         return True
     previous = ""
     for line in head:
         if line.startswith("↳"):
             payload = line[1:].strip()
+            if payload == MESSAGE:
+                return True
             if payload and payload == previous:
                 return True
             previous = payload
@@ -738,6 +851,14 @@ def _match_error_block(block_text: str) -> str | None:
         return "http_405"
     if "prompt_cache_retention" in lower and ("400" in lower or "invalid_parameter" in lower):
         return "prompt_cache"
+    # A quota-specific 401 needs provider/account action, not another prompt.
+    if "401" in lower and (
+        "额度已用尽" in block_text
+        or "remainquota" in lower
+        or "insufficient_quota" in lower
+        or "quota exceeded" in lower
+    ):
+        return "token_exhausted"
     return None
 
 
@@ -776,10 +897,14 @@ def _is_transcript_row(text: str) -> bool:
 
     These start a new transcript item, so they can never be the wrapped tail of
     an error block -- not even when cmux happens to render them in the error
-    style, which it does after we send into a stalled session.
+    style, which it does after we send into a stalled session.  Reconnecting
+    status is an error marker, not a transcript item.
     """
 
-    return text.lstrip().startswith(("›", "•", "↳"))
+    stripped = text.lstrip()
+    if _is_reconnect_marker(stripped):
+        return False
+    return stripped.startswith(("›", "•", "↳"))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -830,35 +955,34 @@ def _find_last_error(
     """
 
     limit = composer_row if composer_row is not None else len(lines)
-    marker_rows = [index for index, line in enumerate(lines[:limit]) if line.lstrip().startswith(("■", "⚠"))]
+    marker_rows = [index for index, line in enumerate(lines[:limit]) if _is_error_marker(line)]
     if not marker_rows:
         return None
-    marker = marker_rows[-1]
-    if marker_validator is not None and not marker_validator(marker):
-        return None
-
-    block_end = marker + 1
-    for index in range(marker + 1, limit):
-        stripped = lines[index].strip()
-        if index in ignored_rows or not stripped or stripped.startswith(("■", "⚠")) or _is_transcript_row(stripped):
-            break
-        if continuation_validator is not None and not continuation_validator(index):
-            break
-        block_end = index + 1
-
-    superseding_row = next((
-        index for index in range(block_end, limit)
-        if index not in ignored_rows and lines[index].strip() and not _is_footer(lines[index].strip())
-    ), None)
-
-    block = [line.strip() for line in lines[marker:block_end] if line.strip()]
-    if not block:
-        return None
-    block_text = "\n".join(block)
-    error_type = _match_error_block(block_text)
-    if error_type is None:
-        return None
-    return ErrorScan(error_type, block_text, superseding_row is not None, superseding_row)
+    for marker in reversed(marker_rows):
+        if marker_validator is not None and not marker_validator(marker):
+            continue
+        block_end = marker + 1
+        for index in range(marker + 1, limit):
+            stripped = lines[index].strip()
+            if index in ignored_rows or not stripped or _is_error_marker(stripped) or _is_transcript_row(stripped):
+                break
+            if continuation_validator is not None and not continuation_validator(index):
+                break
+            block_end = index + 1
+        superseding_row = next((
+            index for index in range(block_end, limit)
+            if index not in ignored_rows
+            and lines[index].strip()
+            and not _is_footer(lines[index].strip())
+        ), None)
+        block = [line.strip() for line in lines[marker:block_end] if line.strip()]
+        if not block:
+            continue
+        error_type = _match_error_block("\n".join(block))
+        if error_type is None:
+            continue
+        return ErrorScan(error_type, "\n".join(block), superseding_row is not None, superseding_row)
+    return None
 
 
 def _codex_status_chrome_rows(grid: Grid, composer_row: int) -> frozenset[int]:
@@ -921,6 +1045,12 @@ def _composer_status(grid: Grid) -> tuple[str, int] | tuple[str, None]:
         return "incompatible", None
     if cursor.column != 2:
         return "composer_busy", cursor.row
+    # The live overlay draws RGB braille over a still-visible dim placeholder.
+    # Without that placeholder, braille can be actual user input at cursor Home.
+    has_placeholder = any(
+        span.column == 2 and span.text.strip() and grid.style(span.style_id).get("faint", False)
+        for span in row_spans
+    )
     for span in row_spans:
         span_end = span.column + span.cell_width
         if span_end <= 2:
@@ -929,6 +1059,8 @@ def _composer_status(grid: Grid) -> tuple[str, int] | tuple[str, None]:
         if span.column < 2:
             text = text[max(0, 2 - span.column):]
         if not text.strip():
+            continue
+        if has_placeholder and _is_spinner_overlay_span(grid, span):
             continue
         if not grid.style(span.style_id).get("faint", False):
             return "composer_busy", cursor.row
@@ -1687,7 +1819,7 @@ def classify_grid(grid: Grid) -> ScreenState:
             screen_signature=grid.signature(),
             reason="Codex already holds queued follow-up input",
         )
-    marker_rows = [row for row, line in enumerate(lines[:composer_row]) if line.lstrip().startswith(("■", "⚠"))]
+    marker_rows = [row for row, line in enumerate(lines[:composer_row]) if _is_error_marker(line)]
     if not marker_rows:
         return ScreenState("idle", screen_signature=grid.signature(), reason="empty composer without current recoverable error")
     marker_row = marker_rows[-1]
@@ -1698,11 +1830,13 @@ def classify_grid(grid: Grid) -> ScreenState:
     }
 
     def marker_validator(row: int) -> bool:
-        return any(
-            span.column == 0 and span.text.lstrip().startswith(("■", "⚠"))
-            for span in grid.spans
-            if span.row == row
-        )
+        # Live Codex splits "• Reconnecting..." into a column-0 bullet span
+        # and a later "Reconnecting..." span.  The joined row is the marker;
+        # requiring the column-0 span itself to be the full phrase dropped
+        # every reconnect stall as idle.
+        if not _is_error_marker(grid.lines[row]):
+            return False
+        return any(span.column == 0 and span.text.strip() for span in grid.spans if span.row == row)
 
     def continuation_validator(row: int) -> bool:
         """Whether this row is the wrapped tail of the row above it.
@@ -1732,8 +1866,14 @@ def classify_grid(grid: Grid) -> ScreenState:
         )
         if not content_spans:
             return False
-        if _is_transcript_row("".join(span.text for span in content_spans).strip()):
+        joined = "".join(span.text for span in content_spans).strip()
+        if _is_transcript_row(joined):
             return False
+        # Codex nests the live provider error under reconnect as
+        # ``  └ We're currently experiencing high demand...`` in a column-0
+        # span.  That is not a wrap of a full row and not the marker style.
+        if joined.startswith("└") or (row > 0 and _is_reconnect_marker(grid.lines[row - 1])):
+            return True
         if content_spans[0].column > 0:
             return True
         if _row_is_full(grid, row - 1):
@@ -1754,12 +1894,13 @@ def classify_grid(grid: Grid) -> ScreenState:
             span.style_id in marker_style_ids for span in content_spans
         )
 
+    chrome_rows = _codex_status_chrome_rows(grid, composer_row) | _spinner_chrome_rows(grid, composer_row)
     error = _find_last_error(
         lines,
         composer_row,
         marker_validator=marker_validator,
         continuation_validator=continuation_validator,
-        ignored_rows=(chrome_rows := _codex_status_chrome_rows(grid, composer_row)),
+        ignored_rows=chrome_rows,
     )
     if error is None:
         return ScreenState("idle", screen_signature=grid.signature(), reason="empty composer without current recoverable error")
@@ -1781,14 +1922,26 @@ def classify_grid(grid: Grid) -> ScreenState:
             evidence_fingerprint=evidence_hash,
             ignored_chrome_rows=tuple(sorted(chrome_rows)),
         )
+    if error.error_type == "token_exhausted":
+        # Keep monitoring and expose the provider blocker without sending.
+        return ScreenState(
+            "token_exhausted",
+            error_type=error.error_type,
+            fingerprint=_short_hash(_stable_error_block(error.block)),
+            screen_signature=grid.signature(),
+            reason="provider token out of quota; needs a new key or a top-up",
+            ignored_chrome_rows=tuple(sorted(chrome_rows)),
+        )
+    fingerprint = _short_hash(_stable_error_block(error.block))
     return ScreenState(
         "recoverable_error",
         error_type=error.error_type,
-        fingerprint=_short_hash(error.block),
+        fingerprint=fingerprint,
         screen_signature=grid.signature(),
         reason=f"current {error.error_type} error block",
         message_kind="codex",
         ignored_chrome_rows=tuple(sorted(chrome_rows)),
+        allow_repeat=not _is_reconnect_marker(error.block),
     )
 
 
@@ -7720,6 +7873,12 @@ class WatchDaemon:
                 if started_at <= 0 or now - started_at < interval:
                     return
         elif now - runtime.last_send_at < repeat_delay:
+            return
+        if (
+            runtime.send_count > 0
+            and not state.allow_repeat
+            and now - runtime.last_send_at < RECONNECT_STALL_REPEAT_SEC
+        ):
             return
         circuit_limit = int(self.config.get("circuit_pause_after", 0) or 0)
         if circuit_limit > 0 and runtime.send_count >= circuit_limit:
