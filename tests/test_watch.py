@@ -2448,6 +2448,12 @@ class WatchTests(unittest.TestCase):
         found = discover_pane_follow_targets(client, config)
         self.assertEqual([item["surface_id"] for item in found], ["codex-new"])
         self.assertEqual(found[0]["source"], "pane_follow")
+        config["workspace_rules"] = [{"workspace_id": "workspace-uuid",
+                                       "excluded_surface_ids": ["codex-new"]}]
+        self.assertEqual(discover_pane_follow_targets(client, config), [])
+        config["workspace_rules"] = []
+        config["targets"][0]["paused"] = True
+        self.assertEqual(discover_pane_follow_targets(client, config), [])
 
     def test_explicit_target_wins_over_discovered_duplicate(self):
         explicit = {

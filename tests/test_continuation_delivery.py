@@ -170,6 +170,26 @@ class DeliveryTests(unittest.TestCase):
             daemon.dynamic_targets["dynamic"] = target
             self.assertIsNone(daemon._active_send_target(target))
 
+    def test_pane_follow_cannot_bypass_a_workspace_surface_exclusion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            daemon = armed_daemon(directory, FakeClient(error_frame()))
+            daemon.config["targets"][0]["pane_id"] = "pane-uuid"
+            daemon.config["workspace_rules"] = [{"workspace_id": "workspace-uuid", "enabled": True,
+                                                  "excluded_surface_ids": ["dynamic"]}]
+            target = {"surface_id": "dynamic", "workspace_id": "workspace-uuid", "pane_id": "pane-uuid",
+                      "source": "pane_follow", "enabled": True}
+            daemon.dynamic_targets["dynamic"] = target
+            self.assertIsNone(daemon._active_send_target(target))
+
+    def test_persisted_resume_clears_a_failed_local_isolation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            daemon = armed_daemon(directory, FakeClient(error_frame()))
+            target = daemon.config["targets"][0]
+            daemon._local_paused_surface_ids.add("surface-uuid")
+            daemon.config_store.mutate(lambda c: c["targets"][0].update(paused=False))
+            self.assertIsNotNone(daemon._active_send_target(target))
+            self.assertNotIn("surface-uuid", daemon._local_paused_surface_ids)
+
     def test_production_scheduler_runs_with_injected_client_for_40_surfaces(self):
         items = [{"surface_id": str(i), "workspace_id": "workspace-uuid", "enabled": True} for i in range(40)]
         frame = error_frame()

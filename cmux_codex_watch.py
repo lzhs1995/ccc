@@ -4152,6 +4152,8 @@ def discover_pane_follow_targets(client: CmuxClient, config: Mapping[str, Any]) 
 
     explicit = [target for target in config.get("targets", [])
                 if target.get("enabled", True) and not target.get("paused", False)]
+    exclusions = {str(rule.get("workspace_id") or ""): set(rule.get("excluded_surface_ids", []))
+                  for rule in config.get("workspace_rules", [])}
     panes_by_workspace: dict[str, set[str]] = {}
     explicit_ids = set()
     for target in explicit:
@@ -4175,7 +4177,8 @@ def discover_pane_follow_targets(client: CmuxClient, config: Mapping[str, Any]) 
         for record in records:
             surface_id = str(record.get("surface_id") or "")
             pane_id = str(record.get("pane_id") or "")
-            if not surface_id or surface_id in explicit_ids or surface_id in seen:
+            if (not surface_id or surface_id in explicit_ids or surface_id in seen
+                    or surface_id in exclusions.get(workspace_id, set())):
                 continue
             if pane_id not in pane_ids:
                 continue
@@ -4725,6 +4728,11 @@ class WatchDaemon:
         for item in reloaded.get("targets", []):
             surface_id = str(item.get("surface_id") or "")
             paused = bool(item.get("paused"))
+            if not paused and item.get("enabled", True):
+                # A fresh persisted resume also clears isolation whose earlier
+                # config write failed. The old synchronous loop did this each
+                # pass; persistent scheduling must not retain it indefinitely.
+                self._local_paused_surface_ids.discard(surface_id)
             if surface_id in previous_targets and previous_targets[surface_id] != paused:
                 if previous_targets[surface_id] and not paused:
                     # A resumed target must not keep an old isolation reason in
@@ -5590,6 +5598,10 @@ class WatchDaemon:
             return None
         explicit = any(str(t.get("surface_id")) == sid for t in self.config.get("targets", []))
         if not explicit:
+            if any(str(r.get("workspace_id")) == str(current.get("workspace_id"))
+                   and sid in r.get("excluded_surface_ids", [])
+                   for r in self.config.get("workspace_rules", [])):
+                return None
             if current.get("source") == "workspace_rule":
                 allowed = any(r.get("enabled", True)
                               and str(r.get("workspace_id")) == str(current.get("source_workspace_id"))
