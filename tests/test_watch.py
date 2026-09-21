@@ -38,6 +38,7 @@ from cmux_codex_watch import (  # noqa: E402
     classify_text_prefilter,
     default_config,
     discover_codex_surfaces,
+    discover_pane_follow_targets,
     discover_rule_targets,
     effective_targets,
     find_surface,
@@ -1272,7 +1273,8 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(state.kind, "error_superseded")
         self.assertEqual(state.error_type, "high_demand")
 
-    def test_continue_echo_supersedes_old_high_demand(self):
+    def test_continue_echo_does_not_supersede_live_high_demand(self):
+        # Split › / 任务请继续 spans are still CCC's own echo, not newer work.
         payload = grid_payload([], error=HIGH_DEMAND_TEXT)
         composer_row = payload["render_grid"]["cursor"]["row"]
         payload["render_grid"]["row_spans"].extend([
@@ -1280,12 +1282,12 @@ class WatchTests(unittest.TestCase):
             span(composer_row - 2, 2, "任务请继续", 0, 10),
         ])
         state = classify_grid(Grid.from_rpc(payload, "surface-uuid"))
-        self.assertEqual((state.kind, state.error_type), ("error_superseded", "high_demand"))
+        self.assertEqual((state.kind, state.error_type), ("recoverable_error", "high_demand"))
         with tempfile.TemporaryDirectory() as directory:
             client = FakeClient(payload, "\n".join(visible_lines(payload)))
             daemon = armed_daemon(directory, client)
             daemon.process_once(client)
-            self.assertEqual(client.sent, [])
+            self.assertEqual(len(client.sent), 1)
 
     def test_indented_error_tail_still_counts_as_current_block(self):
         # A real wrapped error detail remains eligible: it is indented and
@@ -1540,6 +1542,7 @@ class WatchTests(unittest.TestCase):
         """
         banner = "• Messages to be submitted after next tool call (press esc to interrupt and send immediately)"
         self.assertTrue(core._queued_followup_present([banner, "  ↳ 任务请继续"], 2))
+        self.assertFalse(core._working_present([banner, "  ↳ 任务请继续", "■ " + HIGH_DEMAND_TEXT]))
 
     def test_renamed_queue_banner_blocks_sending_without_relying_on_working(self):
         """The residual the accident does not cover.
@@ -1555,6 +1558,30 @@ class WatchTests(unittest.TestCase):
                 error=HIGH_DEMAND_TEXT,
             )
             client = FakeClient(payload, "■ " + HIGH_DEMAND_TEXT)
+            daemon = armed_daemon(directory, client)
+            for _ in range(5):
+                daemon.process_once(client)
+            self.assertEqual(client.sent, [])
+            self.assertEqual(daemon.runtime["surface-uuid"].state, "queued_followup")
+
+    def test_queue_banner_with_interrupt_hint_is_queued_not_working(self):
+        # Live 8CD43148 / surface:145: reconnect + high demand + this banner.
+        # classify_grid used to return working because of "esc to interrupt".
+        banner = "• Messages to be submitted after next tool call (press esc to interrupt and send immediately)"
+        payload = grid_payload(
+            [
+                "■ " + HIGH_DEMAND_TEXT,
+                "› 任务请继续",
+                "• Reconnecting... 4/5 (1m 31s • esc to interrupt)",
+                "  └ " + HIGH_DEMAND_TEXT,
+                banner,
+                "  ↳ 任务请继续",
+            ],
+        )
+        state = classify_grid(Grid.from_rpc(payload, "surface-uuid"))
+        self.assertEqual(state.kind, "queued_followup")
+        with tempfile.TemporaryDirectory() as directory:
+            client = FakeClient(payload, "\n".join(visible_lines(payload)))
             daemon = armed_daemon(directory, client)
             for _ in range(5):
                 daemon.process_once(client)
@@ -1866,8 +1893,7 @@ class WatchTests(unittest.TestCase):
             self.assertEqual(len(client.sent), 1)
             daemon.runtime["surface-uuid"].last_send_at -= 1.1
             daemon.process_once(client)
-            self.assertEqual(len(client.sent), 1)
-            daemon.runtime["surface-uuid"].last_send_at -= 60
+            self.assertEqual(len(client.sent), 2)
             daemon.process_once(client)
             self.assertEqual(len(client.sent), 2)
 
@@ -2373,6 +2399,55 @@ class WatchTests(unittest.TestCase):
             }],
         }
         self.assertEqual(discover_rule_targets(client, config), [])
+
+    def test_pane_follow_picks_up_respawned_codex_on_the_same_pane(self):
+        tree = {
+            "windows": [{"workspaces": [{
+                "id": "workspace-uuid",
+                "ref": "workspace:12",
+                "panes": [{
+                    "id": "pane-uuid",
+                    "ref": "pane:27",
+                    "surfaces": [
+                        {"id": "codex-old", "ref": "surface:145", "type": "terminal", "title": "old"},
+                        {"id": "codex-new", "ref": "surface:213", "type": "terminal", "title": "new"},
+                    ],
+                }, {
+                    "id": "other-pane",
+                    "ref": "pane:1",
+                    "surfaces": [
+                        {"id": "other-pane-codex", "ref": "surface:99", "type": "terminal", "title": "other"},
+                    ],
+                }],
+            }]}],
+        }
+        top = {
+            "windows": [{"workspaces": [{"surfaces": [
+                {"kind": "surface", "id": "codex-old", "ref": "surface:145", "processes": [
+                    {"kind": "process", "name": "codex", "path": "/opt/homebrew/bin/codex"},
+                ]},
+                {"kind": "surface", "id": "codex-new", "ref": "surface:213", "processes": [
+                    {"kind": "process", "name": "codex", "path": "/opt/homebrew/bin/codex"},
+                ]},
+                {"kind": "surface", "id": "other-pane-codex", "ref": "surface:99", "processes": [
+                    {"kind": "process", "name": "codex", "path": "/opt/homebrew/bin/codex"},
+                ]},
+            ]}]}],
+        }
+        client = FakeClient({}, tree=tree, top=top)
+        config = {
+            "targets": [{
+                "surface_id": "codex-old",
+                "workspace_id": "workspace-uuid",
+                "pane_id": "pane-uuid",
+                "ref": "surface:145",
+                "enabled": True,
+            }],
+            "workspace_rules": [],
+        }
+        found = discover_pane_follow_targets(client, config)
+        self.assertEqual([item["surface_id"] for item in found], ["codex-new"])
+        self.assertEqual(found[0]["source"], "pane_follow")
 
     def test_explicit_target_wins_over_discovered_duplicate(self):
         explicit = {
@@ -5027,14 +5102,14 @@ class WatchTests(unittest.TestCase):
 
         A future edit could move the clock call into the ping()-failed branch
         and every behavioural test above would still pass, so pin the shape of
-        process_once itself.
+        the observation worker itself.
         """
 
         import ast
         import inspect
         import cmux_codex_watch as core
 
-        source = inspect.getsource(core.WatchDaemon.process_once)
+        source = inspect.getsource(core.WatchDaemon._process_one_target)
         tree = ast.parse("\n".join(
             line[4:] if line.startswith("    ") else line
             for line in source.splitlines()

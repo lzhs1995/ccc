@@ -72,6 +72,7 @@ ERROR_LABELS = {
     "prompt_cache": "缓存400",
     # A provider quota blocker needs a different label from Claude's retry wait.
     "token_exhausted": "额度耗尽",
+    "invalid_encrypted_content": "会话400",
     "claude_503": "503",
     "claude_model_unavailable": "模型错误",
     "claude_429": "429",
@@ -93,6 +94,9 @@ STATE_LABELS = {
     "menu": "菜单",
     "recoverable_error": "待续跑",
     "awaiting_transition": "等待恢复",
+    "delivery_unknown": "投递待验",
+    "send_failed": "发送失败",
+    "provider_blocked": "服务阻塞",
     "incompatible": "看不清",
     "missing": "已消失",
     "missing_or_error": "无画面",
@@ -269,6 +273,9 @@ class Candidate:
     # never recovered.  A parked event is now visible instead of silent.
     deferred_reason: str = ""
     deferred_sec: float = 0.0
+    continuation_status: str = ""
+    observation_age_sec: float | None = None
+    continuation_reason: str = ""
     # Resolved agent session identity.  Carried on the candidate rather than in
     # a side map so `filter_candidates` can search it: that function only ever
     # looks at `item.*`, so an id held anywhere else would be unsearchable.
@@ -375,7 +382,18 @@ def watch_kind(candidate: Candidate) -> str:
 
 
 def watch_label(candidate: Candidate) -> str:
+    if candidate.source not in {"untracked", "workspace_excluded", "workspace_non_codex"} and not candidate.paused:
+        health_labels = {"unknown": "待检测", "delayed": "检测延迟", "delivery_unknown": "投递待验",
+                         "send_failed": "发送失败", "unavailable": "读取异常", "blocked": "服务阻塞"}
+        if candidate.continuation_status in health_labels:
+            return health_labels[candidate.continuation_status]
     return WATCH_LABELS.get(watch_kind(candidate), "未登记")
+
+
+def continuation_fields(target, runtime, poll_interval=1.0):
+    row = core.observation_health.continuation_row(target, runtime, now=time.time(), poll_interval=poll_interval)
+    return {"continuation_status": row["status"], "observation_age_sec": row["observation_age_sec"],
+            "continuation_reason": row["last_send_error"] or row["reason_code"]}
 
 
 def state_label(state: str) -> str:
@@ -1832,7 +1850,11 @@ def focus_summary(candidate: Candidate | None, workspace_ref: str = "") -> str:
     facts = [location_text(candidate.record, workspace_ref)]
     if title:
         facts.append(clip_to_width(title, 30))
-    facts.append(WATCH_LABELS.get(watch_kind(candidate), "未登记"))
+    facts.append(watch_label(candidate))
+    if candidate.source != "untracked" and candidate.observation_age_sec is not None:
+        facts.append(f"上次检测 {max(0, candidate.observation_age_sec):.1f} 秒前")
+    if candidate.continuation_status not in {"", "ok", "paused"}:
+        facts.append(candidate.continuation_reason)
     if candidate.agent_kind == "claude" or candidate.state.startswith("claude"):
         facts.append(f"Hook {hook_label(candidate)}")
     if candidate.source != "untracked":
@@ -2386,6 +2408,11 @@ class SupervisorModel:
                     status_detail=str(runtime.get("paused_reason") or (target or {}).get("paused_reason") or exclusion_reason or observed_reason),
                     agent_kind=agent_kind,
                     process_summary=process_summary,
+                    **continuation_fields(
+                        {"surface_id": surface_id, "workspace_id": str(record.get("workspace_id") or ""),
+                         "paused": bool(target and target.get("paused")),
+                         "enabled": bool((target or {}).get("enabled", True))},
+                        runtime, float(self.config.get("poll_interval_sec", 1))),
                     hook_health=str(runtime.get("claude_hook_health") or ""),
                     consecutive_resumes=int(runtime.get("claude_consecutive_resumes") or 0),
                     repeat_warning=bool(runtime.get("claude_repeat_warning")),
@@ -2453,6 +2480,7 @@ class SupervisorModel:
                     # "Codex" here was a lie the 程序 column then printed.
                     agent_kind="unknown",
                     process_summary="目标已消失",
+                    **continuation_fields(target, runtime, float(self.config.get("poll_interval_sec", 1))),
                     hook_health="offline",
                     consecutive_resumes=int(runtime.get("claude_consecutive_resumes") or 0),
                     repeat_warning=bool(runtime.get("claude_repeat_warning")),
@@ -3650,6 +3678,9 @@ def attr(key: str) -> int:
 
 
 def row_attr(candidate: Candidate) -> int:
+    if (candidate.source not in {"untracked", "workspace_excluded", "workspace_non_codex"}
+            and not candidate.paused and candidate.continuation_status not in {"", "ok", "paused"}):
+        return attr("paused")
     return {
         "watching": attr("watching"),
         "pool": attr("pool"),

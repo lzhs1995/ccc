@@ -229,6 +229,14 @@ def probe_watcher() -> dict:
         } if isinstance(counts, dict) else {}
 
     targets = payload.get("explicit_targets")
+    continuation = payload.get("continuation_health")
+    if isinstance(continuation, dict):
+        row["continuation_health"] = {key: continuation.get(key) for key in ("status", "observed_at")}
+        counts = continuation.get("counts", {})
+        row["continuation_health"]["counts"] = {
+            key: counts.get(key) for key in ("ok", "paused", "unknown", "delayed", "delivery_unknown",
+                                            "send_failed", "unavailable", "blocked")
+        } if isinstance(counts, dict) else {}
     rules = payload.get("workspace_rules")
     row["explicit_target_count"] = len(targets) if isinstance(targets, list) else None
     row["workspace_rule_count"] = len(rules) if isinstance(rules, list) else None
@@ -270,8 +278,13 @@ def _watcher_verdict(row: dict) -> tuple[bool | None, str | None]:
         return False, "globally paused; no session will be continued"
     coverage = row.get("observation_coverage", {})
     hooks = row.get("claude_hook_coverage", {})
+    continuation = row.get("continuation_health", {})
+    if continuation.get("status") == "degraded":
+        return False, "continuation delayed, delivery unconfirmed, or provider blocked"
     if coverage.get("status") == "degraded" or hooks.get("status") == "degraded":
         return False, "authorized targets have an observation or Hook coverage gap"
+    if continuation.get("status") != "ok":
+        return None, "continuation timing or delivery state unknown"
     if coverage.get("status") != "ok" or hooks.get("status") != "ok":
         return None, "authorized target observation or Hook coverage unknown"
     # A watcher whose on-disk source differs from the running one is NOT judged

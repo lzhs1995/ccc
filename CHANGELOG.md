@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.2.7
+
+Includes the previously unpublished 0.2.2–0.2.6 working drafts.
+
+- Replace whole-batch polling with independent per-UUID deadlines, bounded
+  observation/send pools (32/8 by default), and completion wakeups. Slow readers
+  and sends no longer hold every target until a batch finishes. Share process
+  snapshots and their classification, and bound background maintenance work.
+- Coalesce concurrent durable state writes and publish health outside the
+  scheduler. Persist every send attempt before input; recheck authorization
+  after persistence. Ignore stale workers after pause or registration changes.
+- Re-read each send candidate and retain Working, composer, queue, Dock,
+  manager, completion and Claude Hook guards. A send timeout remains
+  `delivery_unknown` across restart until read-only progress evidence resolves
+  it. A lone prompt echo below an old error is insufficient confirmation.
+- Report actual read age, dispatch lag, send queue/persistence/transport times
+  and delivery outcomes in status and Supervisor. Stack health requires this
+  evidence, and status reads no longer run live process/discovery scans.
+- Recover current high-demand and rate-limit banners across wraps, reconnect
+  details and background-terminal chrome on the configured repeat interval.
+  Keep the 60-second floor for reconnect-only stalls. Recognize the renamed
+  tool-call queue banner and retain current errors beneath continuation echoes.
+- Follow live Codex tabs in explicitly monitored, unpaused panes while honoring
+  current registration and workspace exclusions at the input boundary.
+- Show a current `400 invalid_encrypted_content` as a provider blocker without
+  sending retry prompts or replacing the session.
+
 ## 0.2.1
 
 - Recognize current Codex reconnect errors across split spans, wrapped status

@@ -128,6 +128,60 @@ def summarize_observation(rows, *, now, stale_after):
             "stale_after_sec": stale_after, "counts": counts, "targets": projected}
 
 
+def continuation_row(target, runtime, *, now, poll_interval=1.0):
+    """Current scheduling/delivery health; enabling monitoring is not freshness."""
+    checked = float(runtime.get("viewport_checked_at") or 0)
+    age = now - checked if checked > 0 else None
+    status, reason = "ok", "current_observation"
+    phase = str(runtime.get("state") or "unknown")
+    delivery = str(runtime.get("delivery_status") or "")
+    if target.get("paused") or not target.get("enabled", True):
+        status, reason = "paused", "explicitly_paused_or_disabled"
+    elif age is None or age < 0:
+        status, reason = "unknown", "no_current_observation"
+    elif age > 2 * poll_interval:
+        status, reason = "delayed", "observation_deadline_missed"
+    elif delivery == "unknown":
+        status, reason = "delivery_unknown", "send_receipt_unconfirmed"
+    elif delivery == "sending" and now - float(runtime.get("send_started_at") or 0) > 2 * poll_interval:
+        status, reason = "delivery_unknown", "send_acknowledgement_overdue"
+    elif delivery == "failed":
+        status, reason = "send_failed", "cmux_rejected_send"
+    elif phase in {"cmux_unavailable", "send_guard_unavailable", "incompatible", "claude_viewport_blind"}:
+        status, reason = "unavailable", phase
+    elif phase in {"provider_blocked", "token_exhausted"}:
+        status, reason = "blocked", str(runtime.get("observed_error_type") or runtime.get("error_type") or phase)
+    return {
+        "surface_id": str(target["surface_id"]), "workspace_id": str(target["workspace_id"]),
+        "status": status, "reason_code": reason, "state": phase,
+        "viewport_checked_at": checked, "observation_age_sec": round(age, 3) if age is not None else None,
+        "poll_interval_sec": poll_interval,
+        "observation_interval_ms": runtime.get("observation_interval_ms", 0),
+        "scheduler_lag_ms": runtime.get("scheduler_lag_ms", 0),
+        "read_duration_ms": runtime.get("read_duration_ms", 0),
+        "send_queue_ms": runtime.get("send_queue_ms", 0),
+        "send_duration_ms": runtime.get("send_duration_ms", 0),
+        "send_persist_duration_ms": runtime.get("send_persist_duration_ms", 0),
+        "detection_to_send_ms": runtime.get("detection_to_send_ms", 0),
+        "delivery_status": delivery, "send_started_at": runtime.get("send_started_at", 0),
+        "send_io_started_at": runtime.get("send_io_started_at", 0),
+        "send_completed_at": runtime.get("send_completed_at", 0),
+        "last_send_error": runtime.get("last_send_error", ""),
+    }
+
+
+def continuation_report(targets, runtime, *, now, poll_interval=1.0):
+    rows = [continuation_row(t, runtime.get(str(t["surface_id"]), {}), now=now, poll_interval=poll_interval)
+            for t in targets]
+    counts = {key: 0 for key in ("ok", "paused", "unknown", "delayed", "delivery_unknown",
+                               "send_failed", "unavailable", "blocked")}
+    for row in rows:
+        counts[row["status"]] += 1
+    bad = sum(counts[key] for key in ("delayed", "delivery_unknown", "send_failed", "unavailable", "blocked"))
+    return {"status": "degraded" if bad else "unknown" if counts["unknown"] else "ok",
+            "observed_at": now, "scope": "authorized_targets", "counts": counts, "targets": rows}
+
+
 def registration_candidate(events, target, observation, runtime, ledger, *, now, max_age):
     """Return one original, genuine Stop; no evidence is synthesized here."""
     sid, wid = target["surface_id"], target["workspace_id"]

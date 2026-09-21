@@ -253,20 +253,20 @@ class DiagnosticSchedulingTests(unittest.TestCase):
         self.daemon._queue_registration_checks(previous, after)
         self.assertEqual(self.daemon._registration_due, {})
 
-    def test_diagnostics_and_registration_share_a_bounded_four_job_budget(self):
+    def test_registration_cannot_occupy_the_diagnostics_slot(self):
         self.daemon._diagnostics_next_at = time.time() + 30
         self.daemon._registration_due = {f"surface-{i}": 0 for i in range(8)}
         self.daemon._schedule_diagnostics()
-        self.assertEqual(self.pool.submit.call_count, 4)
+        self.assertEqual(self.pool.submit.call_count, 1)
         self.daemon._diagnostics_next_at = 0
         self.daemon._schedule_diagnostics()
-        self.assertEqual(self.pool.submit.call_count, 4)
-        self.assertIsNone(self.daemon._diagnostics_future)
+        self.assertEqual(self.pool.submit.call_count, 2)
+        self.assertIsNotNone(self.daemon._diagnostics_future)
         next(iter(self.daemon._registration_futures.values())).set_result(False)
         self.daemon._schedule_diagnostics()
-        self.assertEqual(self.pool.submit.call_count, 5)
-        self.assertEqual(self.pool.submit.call_args.args[0].__name__, "_refresh_observation_health")
-        self.assertEqual(len(self.daemon._registration_futures), 3)
+        self.assertEqual(self.pool.submit.call_count, 3)
+        self.assertEqual(self.pool.submit.call_args.args[0].__name__, "_reconcile_registration")
+        self.assertEqual(len(self.daemon._registration_futures), 1)
 
     def test_failed_registration_is_retried_without_queueing_another_same_surface(self):
         self.daemon._schedule_diagnostics()
