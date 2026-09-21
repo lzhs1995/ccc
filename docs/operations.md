@@ -80,6 +80,23 @@ five-second process snapshot and classification per workspace, a one-second
 topology snapshot, and a bounded two-job maintenance budget. Viewports are read
 fresh, including after a candidate reaches a send slot.
 
+After the configured CLI reports a v2 `cmux-socket` capability and its socket
+path, read-screen and viewport replay use independent socket connections. Every
+reply must match both the request ID and the explicit workspace/surface UUIDs.
+The transport accepts only viewport read methods, caps replies at 16 MiB, and
+uses a total request deadline. An unavailable protocol or authentication mode
+falls back to the CLI with a one-second shared probe backoff. A timed-out read
+does not start another full-duration CLI read. Terminal input keeps the existing
+CLI send path and durable delivery guards.
+
+Unchanged config checks do not acquire the reload lock. Routine observation
+checks the scheduler generation; durable isolation and input still revalidate
+the current disk config. Snapshot copying and Claude owner process inspection
+run outside the fleet lock. State writes reuse the canonical JSON encoding and
+retain atomic replacement, restricted permissions and fsync. These details
+matter under a full fleet: raising worker counts alone can hide lock contention
+or the cost of spawning hundreds of CLI processes per second in small tests.
+
 For the exact UUID, inspect `continuation_health.targets`:
 
 - `observation_age_sec`, `observation_interval_ms`, `scheduler_lag_ms` and
