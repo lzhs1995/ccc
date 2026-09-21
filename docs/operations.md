@@ -73,6 +73,10 @@ gaps visible and investigate their actual runtime or transport cause.
 32 observation workers and 8 send workers operate independently; a surface has
 at most one in-flight job. Slow transport can still exhaust those capacities.
 Increasing concurrency alone is not a repair for an overloaded cmux socket.
+First reads are immediate. Revisit deadlines are spread across the configured
+period and remain anchored after late reads, instead of repeatedly dispatching
+worker-sized bursts. Missed periods are skipped without a catch-up burst; retry
+spacing still comes from the independent send guards.
 
 `ccc status` reads published evidence and recalculates its age. It does not run
 `tree`, `top`, process inspections or workspace discovery. The daemon shares a
@@ -86,6 +90,14 @@ workspace-only clients retain the scoped fallback. Maintenance waits for that
 shared refresh before publishing complete Hook coverage. An expired cache entry
 at the five-second diagnostic boundary must not create a permanent unknown
 inventory while the readers themselves continue to work.
+
+Workspace discovery receives a cached slice of that shared inventory. It must
+not repeatedly classify the entire fleet for each workspace or followed pane.
+The watcher bounds CPython thread switching to one millisecond while its loop
+runs, so viewport parsing cannot repeatedly delay the scheduler's GIL reacquire
+after a filesystem check or condition wait. The previous interpreter setting
+is restored when the loop exits. The live setting is published as
+`scheduler.thread_switch_interval_sec`; it does not change polling/retry times.
 
 After the configured CLI reports a v2 `cmux-socket` capability and its socket
 path, read-screen and viewport replay use independent socket connections. Every
