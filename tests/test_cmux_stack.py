@@ -865,12 +865,16 @@ def case_never_touches_real_cmuxterm():
             "    path = os.path.abspath(os.fsdecode(value))\n"
             "    if any(path == root or path.startswith(root + os.sep) for root in protected):\n"
             "        raise RuntimeError('forbidden terminal storage access')\n"
-            "def wrap(fn):\n"
-            "    def checked(path, *args, **kwargs):\n"
+            # A callable object has no descriptor binding. Python 3.10's
+            # pathlib accessor stores os.stat on a class; a function wrapper
+            # would accidentally receive that accessor as an extra argument.
+            "class GuardedCall:\n"
+            "    def __init__(self, fn):\n"
+            "        self.fn = fn\n"
+            "    def __call__(self, path, *args, **kwargs):\n"
             "        guard(path)\n"
-            "        return fn(path, *args, **kwargs)\n"
-            "    return checked\n"
-            "os.stat, os.lstat = wrap(os.stat), wrap(os.lstat)\n"
+            "        return self.fn(path, *args, **kwargs)\n"
+            "os.stat, os.lstat = GuardedCall(os.stat), GuardedCall(os.lstat)\n"
             "def audit(event, args):\n"
             "    if event in {'open', 'os.listdir', 'os.scandir', 'os.mkdir', 'os.chmod',\n"
             "                 'os.remove', 'os.rmdir', 'os.rename', 'os.link', 'os.symlink'}:\n"
@@ -894,9 +898,16 @@ def case_never_touches_real_cmuxterm():
         for args in (["status", "--json"], ["doctor", "--json"], ["up", "--json"],
                      ["update", "--plan", "--json"]):
             responses.append(checked(args))
+        failures = []
+        for response in responses:
+            try:
+                valid = isinstance(json.loads(response.stdout), dict)
+            except ValueError:
+                valid = False
+            if not valid or "forbidden terminal storage access" in response.stderr:
+                failures.append(f"rc={response.returncode}: {response.stderr[-1500:]}")
         record("控制器未访问真实或隔离的 .cmuxterm 目录",
-               all("forbidden terminal storage access" not in p.stderr
-                   and isinstance(json.loads(p.stdout), dict) for p in responses))
+               not failures, "\n".join(failures))
 
         # 隔离区数据只可能来自 fake janitorctl
         data = json.loads(run_stack(sb, ["status", "--json"], env).stdout)
