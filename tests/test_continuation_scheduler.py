@@ -124,6 +124,26 @@ class SchedulerTests(unittest.TestCase):
         finally:
             scheduler.close()
 
+    def test_wait_uses_next_deadline_without_spinning_when_workers_are_full(self):
+        now, entered, release = [100.0], threading.Event(), threading.Event()
+        def observe(*args):
+            entered.set()
+            release.wait(3)
+        scheduler = SurfaceScheduler(observe, lambda *args: None, observe_workers=1,
+                                     clock=lambda: now[0])
+        try:
+            scheduler.tick(targets(2))
+            self.assertTrue(entered.wait(1))
+            self.assertEqual(scheduler.wait_timeout(0.1), 0.1)
+            release.set()
+            self.pump(scheduler, targets(2), lambda: scheduler.snapshot()["observing"] == 0,
+                      generation=None)
+            now[0] = 100.975
+            self.assertAlmostEqual(scheduler.wait_timeout(0.1), 0.025)
+        finally:
+            release.set()
+            scheduler.close()
+
 
 class SnapshotTests(unittest.TestCase):
     def test_process_classification_is_shared_and_tracks_replaced_workspace_snapshot(self):

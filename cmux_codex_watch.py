@@ -326,7 +326,7 @@ CLAUDE_CONTEXT_ABSOLUTE_TIMEOUT_SEC = 900.0
 # through TargetRuntime and suppresses duplicate Hook/fallback deliveries.
 # Human label only.  Acceptance always compares SHA-256 of the loaded source:
 # a revision string is hand-maintained and therefore can lie about what runs.
-FEATURE_REVISION = "0.2.7-continuation-deadlines"
+FEATURE_REVISION = "0.2.7-continuation-viewport-io"
 # How long after our own send a byte-identical UserPromptSubmit can still be
 # our echo.  Must exceed claude_submit_confirm_timeout_sec so that a late
 # echo arriving after the transaction timed out is not read as a human.
@@ -2213,11 +2213,15 @@ def load_json(path: Path, default: Any) -> Any:
 
 
 def atomic_write_json(path: Path, value: Any) -> None:
+    atomic_write_text(path, json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def atomic_write_text(path: Path, value: str) -> None:
     ensure_app_dir(path.parent)
     fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(value, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write(value)
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
@@ -3300,10 +3304,89 @@ class ClaudeEventWorkerPool:
             thread.join(timeout=1)
 
 
+class CmuxViewportSocket:
+    """Read-only v2 viewport transport, discovered by the configured CLI.
+
+    Each request owns its connection: no fleet lock or shared response stream.
+    Legacy/authenticated servers retain the CLI fallback. Input never uses this
+    path, so a failed read cannot cause an uncertain send to be replayed.
+    """
+
+    MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+
+    def __init__(self):
+        self.path: str | None = None
+        self.retry_at = 0.0
+
+    def configure(self, capabilities: Mapping[str, Any]) -> None:
+        path = capabilities.get("socket_path")
+        if (capabilities.get("protocol") == "cmux-socket"
+                and capabilities.get("version") == 2
+                and isinstance(path, str) and os.path.isabs(path)):
+            self.path, self.retry_at = path, 0.0
+
+    def request(self, method: str, params: Mapping[str, Any], *, timeout: float) -> Mapping[str, Any] | None:
+        if method not in {"surface.read_text", "terminal.replay"}:
+            raise ValueError("viewport transport only permits read methods")
+        if not params.get("workspace_id") or not params.get("surface_id"):
+            raise ValueError("viewport transport requires explicit workspace and surface UUIDs")
+        if (method == "surface.read_text" and params.get("scrollback") is not False
+                or method == "terminal.replay" and params.get("anchor") != "viewport"):
+            raise ValueError("viewport transport must not request history")
+        path = self.path
+        if path is None or time.monotonic() < self.retry_at:
+            return None
+        request_id = uuid.uuid4().hex
+        deadline = time.monotonic() + timeout
+        def remaining():
+            value = deadline - time.monotonic()
+            if value <= 0:
+                raise TimeoutError("viewport response deadline exceeded")
+            return value
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                connection.settimeout(remaining())
+                connection.connect(path)
+                connection.settimeout(remaining())
+                connection.sendall((json.dumps({"id": request_id, "method": method, "params": params}) + "\n").encode())
+                data = bytearray()
+                while b"\n" not in data:
+                    connection.settimeout(remaining())
+                    chunk = connection.recv(min(65536, self.MAX_RESPONSE_BYTES + 1 - len(data)))
+                    if not chunk:
+                        raise ValueError("incomplete viewport response")
+                    data.extend(chunk)
+                    if len(data) > self.MAX_RESPONSE_BYTES:
+                        raise ValueError("oversized viewport response")
+            reply = json.loads(data.split(b"\n", 1)[0])
+            if (not isinstance(reply, Mapping) or reply.get("id") != request_id
+                    or reply.get("ok") is not True or not isinstance(reply.get("result"), Mapping)):
+                raise ValueError("viewport socket response unavailable")
+            value = reply["result"]
+            for key in ("workspace_id", "surface_id"):
+                if not value.get(key):
+                    raise ValueError("viewport response identity missing")
+                if value[key] != params[key]:
+                    raise IncompatibleError(f"viewport socket {key} identity mismatch")
+            if method == "surface.read_text" and not isinstance(value.get("text"), str):
+                raise ValueError("viewport response text missing")
+            return value
+        except TimeoutError as exc:
+            # Do not double the deadline with a second CLI read after timeout.
+            raise CmuxError(f"{method} observation timed out") from exc
+        except (OSError, ValueError):
+            # Read-only fallback also lets the CLI handle password auth and
+            # socket rediscovery. Bound repeated failed probes across workers.
+            self.retry_at = time.monotonic() + 1.0
+            return None
+
+
 class CmuxClient:
-    def __init__(self, binary: str = DEFAULT_CMUX, runner: Any = subprocess.run):
+    def __init__(self, binary: str = DEFAULT_CMUX, runner: Any = subprocess.run,
+                 *, viewport_socket: CmuxViewportSocket | None = None):
         self.binary = binary
         self.runner = runner
+        self.viewport_socket = viewport_socket
 
     def _run(self, args: Sequence[str], timeout: float = 10.0) -> subprocess.CompletedProcess[str]:
         command = [self.binary, *args]
@@ -3470,6 +3553,13 @@ class CmuxClient:
             raise RuntimeError("read-screen must never request scrollback")
         self.last_viewport_source = "read-screen"
         try:
+            if self.viewport_socket is not None:
+                value = self.viewport_socket.request("surface.read_text", {
+                    "workspace_id": workspace_id, "surface_id": surface_id, "scrollback": False,
+                }, timeout=8)
+                if value is not None:
+                    self.last_viewport_source = "surface.read_text"
+                    return str(value["text"])
             result = self._run(args, timeout=8)
         except CmuxError as exc:
             if not WatchDaemon._is_transient_observation_error(exc):
@@ -3487,15 +3577,15 @@ class CmuxClient:
     def replay(self, workspace_id: str, surface_id: str) -> Mapping[str, Any]:
         if not workspace_id or not surface_id:
             raise IncompatibleError("terminal.replay requires workspace_id and surface_id")
-        params = json.dumps(
-            {"workspace_id": workspace_id, "surface_id": surface_id, "anchor": "viewport"},
-            ensure_ascii=False,
-        )
-        result = self._run(["--json", "rpc", "terminal.replay", params], timeout=12)
-        try:
-            value = json.loads(result.stdout)
-        except json.JSONDecodeError as exc:
-            raise IncompatibleError("terminal.replay is not JSON") from exc
+        params = {"workspace_id": workspace_id, "surface_id": surface_id, "anchor": "viewport"}
+        value = (self.viewport_socket.request("terminal.replay", params, timeout=12)
+                 if self.viewport_socket is not None else None)
+        if value is None:
+            result = self._run(["--json", "rpc", "terminal.replay", json.dumps(params, ensure_ascii=False)], timeout=12)
+            try:
+                value = json.loads(result.stdout)
+            except json.JSONDecodeError as exc:
+                raise IncompatibleError("terminal.replay is not JSON") from exc
         if not isinstance(value, Mapping):
             raise IncompatibleError("terminal.replay response is not an object")
         response = value.get("result", value)
@@ -4329,6 +4419,7 @@ class WatchDaemon:
         self._process_cache_lock = threading.RLock()
         self._config_reload_lock = threading.RLock()
         self._process_snapshots = SnapshotCache(workers=MAINTENANCE_WORKERS)
+        self._viewport_socket = CmuxViewportSocket()
         self._scheduler: SurfaceScheduler | None = None
         self._discovery_future: Any = None
         self._observation_metadata: dict[str, Any] = {}
@@ -4665,16 +4756,21 @@ class WatchDaemon:
         return self.config_store.mtime_ns()
 
     def _serialize_state(self) -> str:
+        return json.dumps(
+            self._runtime_snapshot(), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    def _runtime_snapshot(self) -> dict[str, Any]:
         with self._runtime_lock:
             items = list(self.runtime.items())
-        return json.dumps(
-            {key: value.to_dict() for key, value in items},
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
+        # Do not hold the fleet lock while copying every runtime record.
+        return {key: value.to_dict() for key, value in items}
 
     def _reload_config_if_changed(self) -> None:
+        # stat releases the GIL. Serializing unchanged checks behind one RLock
+        # creates a convoy across the scheduler and all 40 I/O workers.
+        # Changes still recheck inside the lock before publication.
+        if self._config_mtime() == self._config_mtime_ns:
+            return
         with self._config_reload_lock:
             self._reload_config_if_changed_locked()
 
@@ -4702,6 +4798,8 @@ class WatchDaemon:
                 self.logger.error("configuration rejected, keeping previous: %s", exc)
             return
         previous_mode = str(self.config.get("mode", ""))
+        if reloaded.get("cmux_path") != self.config.get("cmux_path"):
+            self._viewport_socket.path = None
         previous_targets = {
             str(item.get("surface_id")): bool(item.get("paused"))
             for item in self.config.get("targets", []) if item.get("surface_id")
@@ -4752,6 +4850,8 @@ class WatchDaemon:
     def _mutate_config(self, mutator: Any) -> Any:
         with self._config_reload_lock:
             config, result, mtime_ns = self.config_store.mutate(mutator)
+            if config.get("cmux_path") != self.config.get("cmux_path"):
+                self._viewport_socket.path = None
             self._queue_registration_checks(self.config, config)
             self.config = config
             self._config_mtime_ns = mtime_ns
@@ -4868,8 +4968,7 @@ class WatchDaemon:
                        for info in labels.values() if info.get("agent_kind") == "claude"}
         # Capture runtime after I/O. In the old implementation this copy could
         # already be minutes old when a supposedly fresh snapshot was published.
-        with self._runtime_lock:
-            state = {sid: rt.to_dict() for sid, rt in self.runtime.items()}
+        state = self._runtime_snapshot()
         owners = {}
         for target in targets:
             sid = str(target["surface_id"])
@@ -4915,8 +5014,7 @@ class WatchDaemon:
         config = copy.deepcopy(self.config)
         with self._targets_lock:
             targets = effective_targets(config, list(self.dynamic_targets.values()))
-        with self._runtime_lock:
-            state = {sid: rt.to_dict() for sid, rt in self.runtime.items()}
+        state = self._runtime_snapshot()
         with self._metadata_lock:
             metadata = self._observation_metadata
         records, labels = metadata.get("records", {}), metadata.get("labels", {})
@@ -5522,7 +5620,9 @@ class WatchDaemon:
         with self._state_save_lock:
             state_serialized = self._serialize_state()
             if state_serialized != self._last_state_serialized or not self.state_path.exists():
-                atomic_write_json(self.state_path, json.loads(state_serialized))
+                # The canonical snapshot is already JSON. Re-parsing it and
+                # streaming another encoding holds the GIL for every send.
+                atomic_write_text(self.state_path, state_serialized)
                 self._last_state_serialized = state_serialized
 
     def request_stop(self, *_: Any) -> None:
@@ -5531,7 +5631,8 @@ class WatchDaemon:
             self._scheduler.wakeup.set()
 
     def _observation_client(self):
-        base = self.client or CmuxClient(str(self.config.get("cmux_path", DEFAULT_CMUX)))
+        base = self.client or CmuxClient(str(self.config.get("cmux_path", DEFAULT_CMUX)),
+                                         viewport_socket=self._viewport_socket)
         return SnapshotClient(base, self._process_snapshots)
 
     def _start_scheduler(self) -> SurfaceScheduler:
@@ -5687,7 +5788,8 @@ class WatchDaemon:
         self._event_worker_pool = ClaudeEventWorkerPool(
             self.claude_event_inbox,
             self._handle_claude_event_safely,
-            lambda: CmuxClient(str(self.config.get("cmux_path", DEFAULT_CMUX))),
+            lambda: CmuxClient(str(self.config.get("cmux_path", DEFAULT_CMUX)),
+                               viewport_socket=self._viewport_socket),
             workers=int(self.config.get("claude_event_workers", CLAUDE_EVENT_WORKERS)),
         )
         self._event_worker_pool.start()
@@ -5710,7 +5812,9 @@ class WatchDaemon:
                     continue
                 if not capabilities_ok:
                     try:
-                        client.capabilities()
+                        capabilities = client.capabilities()
+                        if self.client is None:
+                            self._viewport_socket.configure(capabilities)
                         capabilities_ok = True
                     except (CmuxError, IncompatibleError) as exc:
                         self.logger.error("incompatible cmux: %s", exc)
@@ -5731,7 +5835,7 @@ class WatchDaemon:
                     self._request_health_publish()
                     self.save(wait=False)
                     last_publish = now
-                scheduler.wakeup.wait(0.1)
+                scheduler.wakeup.wait(scheduler.wait_timeout())
             return 0
         finally:
             scheduler.close()
@@ -5796,8 +5900,14 @@ class WatchDaemon:
         defer_send: bool = False,
         is_current: Callable[[], bool] | None = None,
     ) -> ScreenState | None:
-        def current():
-            return is_current is None or self._active_send_target(target, is_current) is not None
+        def current(*, fresh=False):
+            if is_current is None:
+                return True
+            # Observation bookkeeping only needs the scheduler/config generation.
+            # Durable isolation and input paths must still check the disk config.
+            if fresh:
+                return self._active_send_target(target, is_current) is not None
+            return is_current()
 
         if not current():
             return None
@@ -5840,6 +5950,8 @@ class WatchDaemon:
                 state = self._apply_claude_context_guard(surface_id, runtime, state)
                 if self._reconcile_codex_delivery(surface_id, runtime, state):
                     return None
+                if self._runtime_is_claude(runtime, state) and not current(fresh=True):
+                    return None
                 if self._reconcile_claude_submit(target, runtime, state, client):
                     return
                 self._restore_expired_claude_deferred(runtime)
@@ -5854,13 +5966,13 @@ class WatchDaemon:
                     return
         except GlobalIncompatibleError as exc:
             with self._surface_lock(surface_id):
-                if not current():
+                if not current(fresh=True):
                     return None
                 self._mark_global_incompatible(runtime, str(exc))
             return
         except IncompatibleError as exc:
             with self._surface_lock(surface_id):
-                if not current():
+                if not current(fresh=True):
                     return None
                 # A raised IncompatibleError is the same parser blind spot as
                 # a returned ``incompatible`` state, but it used to skip the
@@ -5896,7 +6008,7 @@ class WatchDaemon:
                     ))
                     runtime.state = "cmux_unavailable"
                 return
-            if isinstance(exc.__cause__, subprocess.TimeoutExpired):
+            if isinstance(exc.__cause__, (subprocess.TimeoutExpired, TimeoutError)):
                 with self._surface_lock(surface_id):
                     # A failed observation is not target removal or send acknowledgement.
                     self._record_observation(surface_id, runtime, ScreenState(
@@ -5913,7 +6025,7 @@ class WatchDaemon:
                     # restart into a fake "viewport unreadable" report.
                     self._record_state(surface_id, runtime, ScreenState("cmux_unavailable", reason="socket disappeared during poll"))
                 return
-            if self._refresh_workspace(target, client, is_current=current):
+            if self._refresh_workspace(target, client, is_current=lambda: current(fresh=True)):
                 try:
                     state = self._observe_target_viewport(target, runtime, client)
                     if not current():
@@ -5935,6 +6047,8 @@ class WatchDaemon:
                         state = self._apply_claude_context_guard(surface_id, runtime, state)
                         if self._reconcile_codex_delivery(surface_id, runtime, state):
                             return None
+                        if self._runtime_is_claude(runtime, state) and not current(fresh=True):
+                            return None
                         if self._reconcile_claude_submit(target, runtime, state, client):
                             return
                         self._restore_expired_claude_deferred(runtime)
@@ -5949,13 +6063,13 @@ class WatchDaemon:
                             return
                 except GlobalIncompatibleError as retry_exc:
                     with self._surface_lock(surface_id):
-                        if not current():
+                        if not current(fresh=True):
                             return None
                         self._mark_global_incompatible(runtime, str(retry_exc))
                     return
                 except IncompatibleError as retry_exc:
                     with self._surface_lock(surface_id):
-                        if not current():
+                        if not current(fresh=True):
                             return None
                         # Same blind spot, reached after a workspace refresh.
                         # Tagged distinctly so an audit can tell a first-read
@@ -5984,7 +6098,7 @@ class WatchDaemon:
                             ))
                             runtime.state = "cmux_unavailable"
                         return
-                    if isinstance(retry_exc.__cause__, subprocess.TimeoutExpired):
+                    if isinstance(retry_exc.__cause__, (subprocess.TimeoutExpired, TimeoutError)):
                         with self._surface_lock(surface_id):
                             self._record_observation(surface_id, runtime, ScreenState(
                                 "cmux_unavailable", reason="cmux observation timed out after refresh; still monitoring",
@@ -5998,13 +6112,13 @@ class WatchDaemon:
                             self._record_state(surface_id, runtime, ScreenState("cmux_unavailable", reason="socket disappeared during retry"))
                         return
                     with self._surface_lock(surface_id):
-                        if not current():
+                        if not current(fresh=True):
                             return None
                         self._pause_missing_or_error(target, runtime, str(retry_exc))
                     return
             else:
                 with self._surface_lock(surface_id):
-                    if not current():
+                    if not current(fresh=True):
                         return None
                     self._pause_missing_or_error(target, runtime, str(exc))
                 return
@@ -6027,10 +6141,35 @@ class WatchDaemon:
 
     def _event_target(self, surface_id: str) -> dict[str, Any] | None:
         with self._targets_lock:
-            for target in effective_targets(self.config, self.dynamic_targets.values()):
-                if str(target.get("surface_id") or "") == surface_id:
-                    return dict(target)
+            explicit = self.config.get("targets", [])
+            dynamic = self.dynamic_targets.get(surface_id)
+        # Explicit registrations win without sorting the whole fleet for
+        # every authorization check or doing that work under a shared lock.
+        for target in explicit:
+            if str(target.get("surface_id") or "") == surface_id:
+                return dict(target)
+        if dynamic is not None:
+            return dict(dynamic)
         return None
+
+    def _foreign_claude_session_owner(self, surface_id: str, session_id: str) -> str:
+        with self._runtime_lock:
+            candidates = [(sid, runtime, copy.copy(runtime)) for sid, runtime in self.runtime.items()
+                          if sid != surface_id and runtime.claude_session_id == session_id
+                          and runtime.claude_hook_health != "unverified"]
+        for sid, original, snapshot in candidates:
+            # Process inspection may spawn ps or wait on the OS. It must never
+            # prevent every Codex/Claude worker from obtaining its runtime.
+            alive = _claude_session_owner_is_live(snapshot)
+            with self._runtime_lock:
+                current = self.runtime.get(sid)
+                if (current is original and current.claude_session_id == session_id
+                        and current.claude_hook_health != "unverified"):
+                    changed = (current.claude_process_pid, current.claude_process_generation) != (
+                        snapshot.claude_process_pid, snapshot.claude_process_generation)
+                    if alive or changed:
+                        return sid  # A changed owner has not been proved stale.
+        return ""
 
     @staticmethod
     def _is_transient_observation_error(exc: BaseException) -> bool:
@@ -6102,8 +6241,9 @@ class WatchDaemon:
             self._handle_claude_event(event, client)
         except Exception as exc:
             surface_id = str(event.get("surface_id") or "")
-            with self._runtime_lock:
-                runtime = self.runtime.get(surface_id)
+            with self._surface_lock(surface_id):
+                with self._runtime_lock:
+                    runtime = self.runtime.get(surface_id)
                 self.logger.exception(
                     "surface=%s Claude hook event failed event=%s",
                     surface_id[:8] or "missing",
@@ -7171,18 +7311,7 @@ class WatchDaemon:
         # latch or send a prompt into the wrong pane.  Surface-local checks
         # alone are insufficient: surface:104 and surface:43 demonstrated the
         # exact cross-surface collision in production.
-        with self._runtime_lock:
-            foreign_surface = next(
-                (
-                    other_surface
-                    for other_surface, other_runtime in self.runtime.items()
-                    if other_surface != surface_id
-                    and str(other_runtime.claude_session_id or "") == session_id
-                    and str(other_runtime.claude_hook_health or "") != "unverified"
-                    and _claude_session_owner_is_live(other_runtime)
-                ),
-                "",
-            )
+        foreign_surface = self._foreign_claude_session_owner(surface_id, session_id)
         if foreign_surface:
             runtime.state = "claude_identity_conflict"
             self._mark_claude_event(

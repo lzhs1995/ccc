@@ -147,6 +147,16 @@ class SurfaceScheduler:
                     "sending": sum(s.phase == "send" for s in self._slots.values()),
                     "ready_to_send": sum(s.phase == "ready" for s in self._slots.values())}
 
+    def wait_timeout(self, maximum=0.1):
+        """Wake at the next deadline instead of rounding it to a polling tick."""
+        with self._lock:
+            if self._closed:
+                return 0.0
+            if sum(s.phase == "observe" for s in self._slots.values()) >= self.observe_workers:
+                return maximum  # Completion callbacks wake us when capacity returns.
+            due = [s.due for s in self._slots.values() if s.enabled and s.phase == "idle"]
+            return min(maximum, max(0, min(due) - self.clock())) if due else maximum
+
     def close(self, *, wait=True):
         with self._lock:
             self._closed = True

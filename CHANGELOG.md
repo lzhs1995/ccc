@@ -8,6 +8,12 @@ Includes the previously unpublished 0.2.2–0.2.6 working drafts.
   observation/send pools (32/8 by default), and completion wakeups. Slow readers
   and sends no longer hold every target until a batch finishes. Share process
   snapshots and their classification, and bound background maintenance work.
+- Read fresh viewports over the CLI-discovered cmux v2 socket without spawning
+  a process for every read/replay. Validate request and target identities, bound
+  response size and total timeout, and retain CLI fallback for legacy/auth modes.
+- Remove unchanged-config lock convoys and whole-fleet copies/owner inspections
+  from shared locks. Wake at observation deadlines, persist the already encoded
+  state once, and prevent Claude event-error persistence from deadlocking.
 - Coalesce concurrent durable state writes and publish health outside the
   scheduler. Persist every send attempt before input; recheck authorization
   after persistence. Ignore stale workers after pause or registration changes.
