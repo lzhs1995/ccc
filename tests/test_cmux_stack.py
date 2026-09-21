@@ -8,8 +8,8 @@
      【从未】出现真实 label 的 bootout。只断言「测试通过」不够 —— 必须证明
      沙箱操作没有溢出到真实域。
   2. **不扫真实 ~/.cmuxterm**。janitor 那侧的清扫面在真实隔离区上，控制器只读
-     janitorctl 的 JSON，永远不自己走目录。用例断言进程没有 stat 过真实路径
-     （通过 fake janitorctl 独占提供数据 + 真实路径 mtime 不变来证明）。
+     janitorctl 的 JSON，永远不自己走目录。用例拦截被测进程的目录访问并用
+     负向探针验证拦截有效；真实 cmux 并发写日志不能使隔离检查误报。
   3. **凭据不得出现在控制器输出里**。fake ccp 的 profile 里放一个哨兵 token，
      断言 cmux-stack 的任何输出（stdout/stderr/JSON 全文）都不含它。
      这是白名单投影的回归闸门：上游多一个字段也不能漏过来。
@@ -114,6 +114,7 @@ def watcher_status(*, pid_alive=True, paused=False, pid=4242,
                                  "counts": {"readable": targets, "live_unreadable": 0,
                                             "dormant": 0, "paused": 0, "missing": 0, "unknown": 0}},
         "claude_hook_coverage": {"status": "ok"},
+        "continuation_health": {"status": "ok", "counts": {"ok": targets}},
         # 控制器【绝不能】把这一坨投影出去：真实环境下这里是 ~300KB 会话状态。
         "runtime": {"sessions": {"secret-session": {"token": SENTINEL_TOKEN}}},
     }
@@ -850,22 +851,63 @@ def case_never_touches_real_cmuxterm():
     """控制器只读 janitorctl 的 JSON，绝不扫真实隔离区。"""
     sb = Sandbox()
     try:
-        before = None
-        if REAL_CMUXTERM.exists():
-            before = (REAL_CMUXTERM.stat().st_mtime, REAL_CMUXTERM.stat().st_mode)
-
+        # Directory mtime cannot attribute an access to this process: the real
+        # cmux logger and hooks legitimately update it while tests run. Guard
+        # this subprocess's actual I/O, including stat (which has no audit event).
+        guarded = sb.root / "guarded_stack.py"
+        protected = [str(REAL_CMUXTERM), str(sb.home / ".cmuxterm")]
+        guarded.write_text(
+            "import os, runpy, sys\n"
+            f"protected = {protected!r}\n"
+            "def guard(value):\n"
+            "    if not isinstance(value, (str, bytes, os.PathLike)):\n"
+            "        return\n"
+            "    path = os.path.abspath(os.fsdecode(value))\n"
+            "    if any(path == root or path.startswith(root + os.sep) for root in protected):\n"
+            "        raise RuntimeError('forbidden terminal storage access')\n"
+            # A callable object has no descriptor binding. Python 3.10's
+            # pathlib accessor stores os.stat on a class; a function wrapper
+            # would accidentally receive that accessor as an extra argument.
+            "class GuardedCall:\n"
+            "    def __init__(self, fn):\n"
+            "        self.fn = fn\n"
+            "    def __call__(self, path, *args, **kwargs):\n"
+            "        guard(path)\n"
+            "        return self.fn(path, *args, **kwargs)\n"
+            "os.stat, os.lstat = GuardedCall(os.stat), GuardedCall(os.lstat)\n"
+            "def audit(event, args):\n"
+            "    if event in {'open', 'os.listdir', 'os.scandir', 'os.mkdir', 'os.chmod',\n"
+            "                 'os.remove', 'os.rmdir', 'os.rename', 'os.link', 'os.symlink'}:\n"
+            "        for value in args:\n"
+            "            guard(value)\n"
+            "sys.addaudithook(audit)\n"
+            "if sys.argv[1:] == ['--prove-guard']:\n"
+            "    os.stat(protected[0])\n"
+            f"sys.argv[0] = {str(STACK)!r}\n"
+            "runpy.run_path(sys.argv[0], run_name='__main__')\n",
+            encoding="utf-8",
+        )
         env = sb.env(watcher=watcher_status(), janitor=janitor_status(), ccp=ccp_status())
+        def checked(args):
+            return subprocess.run([sys.executable, "-B", str(guarded), *args], env=env,
+                                  capture_output=True, text=True, timeout=30)
+        control = checked(["--prove-guard"])
+        record("隔离检测能在真实目录访问前阻断负向探针",
+               control.returncode != 0 and "forbidden terminal storage access" in control.stderr)
+        responses = []
         for args in (["status", "--json"], ["doctor", "--json"], ["up", "--json"],
                      ["update", "--plan", "--json"]):
-            run_stack(sb, args, env)
-
-        if before is None:
-            record("真实 ~/.cmuxterm 不存在 → 控制器也没创建它",
-                   not REAL_CMUXTERM.exists(), f"path={REAL_CMUXTERM}")
-        else:
-            after = (REAL_CMUXTERM.stat().st_mtime, REAL_CMUXTERM.stat().st_mode)
-            record("真实 ~/.cmuxterm mtime/mode 未变", after == before,
-                   f"before={before} after={after}")
+            responses.append(checked(args))
+        failures = []
+        for response in responses:
+            try:
+                valid = isinstance(json.loads(response.stdout), dict)
+            except ValueError:
+                valid = False
+            if not valid or "forbidden terminal storage access" in response.stderr:
+                failures.append(f"rc={response.returncode}: {response.stderr[-1500:]}")
+        record("控制器未访问真实或隔离的 .cmuxterm 目录",
+               not failures, "\n".join(failures))
 
         # 隔离区数据只可能来自 fake janitorctl
         data = json.loads(run_stack(sb, ["status", "--json"], env).stdout)
@@ -1608,7 +1650,7 @@ def case_install_does_not_reuse_watcher_link_helper():
 def case_terminal_and_hook_coverage_are_required_for_health():
     sb = Sandbox()
     try:
-        for field in ("observation_coverage", "claude_hook_coverage"):
+        for field in ("observation_coverage", "claude_hook_coverage", "continuation_health"):
             for verdict, expected in (("degraded", "degraded"), ("unknown", "unknown"), (None, "unknown")):
                 payload = watcher_status()
                 if verdict is None:
@@ -1627,6 +1669,7 @@ def case_terminal_and_hook_coverage_are_required_for_health():
         payload = watcher_status()
         payload["observation_coverage"]["status"] = "unknown"
         payload["claude_hook_coverage"]["status"] = "degraded"
+        payload["continuation_health"]["status"] = "unknown"
         response = run_stack(sb, ["status", "--json", "--component", "watcher"], sb.env(watcher=payload))
         record("definite Hook gap outranks unknown observation",
                json.loads(response.stdout)["overall"] == "degraded" and response.returncode == EXIT_DEGRADED)

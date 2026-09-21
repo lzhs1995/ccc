@@ -40,6 +40,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from claude_ccc_protocol import EVENT_JOURNAL_PATH, EVENT_SOCKET_PATH
 import ccc_observation as observation_health
+from ccc_scheduling import CoalescingWriter, SnapshotCache, SnapshotClient, SurfaceScheduler
 
 
 APP_NAME = "cmux-codex-continue"
@@ -57,7 +58,7 @@ DEFAULT_LABEL = f"{LABEL_PREFIX}.{APP_NAME}"
 PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_APP_DIR = Path.home() / "Library" / "Application Support" / APP_NAME
 DEFAULT_RUNTIME_ROOT = DEFAULT_APP_DIR / "runtime"
-RUNTIME_FILES = ("cmux_codex_watch.py", "claude_ccc_protocol.py", "claude_ccc_event_hook.py", "ccc_observation.py")
+RUNTIME_FILES = ("cmux_codex_watch.py", "claude_ccc_protocol.py", "claude_ccc_event_hook.py", "ccc_observation.py", "ccc_scheduling.py")
 DEFAULT_LOG_DIR = Path.home() / "Library" / "Logs" / APP_NAME
 DEFAULT_CONFIG_PATH = DEFAULT_APP_DIR / "config.json"
 DEFAULT_STATE_PATH = DEFAULT_APP_DIR / "state.json"
@@ -118,14 +119,70 @@ WORKING_RE = re.compile(r"(?:esc to interrupt|esc to cancel|\bworking\s*\()", re
 # still contains ``esc to interrupt``, which used to make the whole viewport
 # look like genuine Working and suppress rescue.
 RECONNECT_MARKER_RE = re.compile(r"^•\s*Reconnecting(?:\.\.\.|…)", re.IGNORECASE)
+# Codex appends the same dim status chrome used next to Working:
+# ``· 1 background terminal running · /ps to view · /stop to close``.
+# That suffix (and its truncated tail) must stay part of the header, or the
+# leftover ``esc to interrupt`` looks like genuine Working and suppresses rescue.
+# Bound the status chrome. ``running.*`` would swallow later Working rows
+# when the header is joined across the next few viewport lines.
+RECONNECT_STATUS_SUFFIX_RE = (
+    r"(?:\s*[·•]\s*\d+\s+background\s+terminals?"
+    r"(?:\s+runnin(?:g\b|(?:[.…])+))?"
+    r"(?:\s*[·•]\s*/ps(?:\s+to(?:\s+v(?:iew)?)?)?)?"
+    r"(?:\s*[·•]\s*/stop(?:\s+to(?:\s+c(?:lose)?)?)?)?"
+    r"(?:\s*[.…]+)?)?"
+)
 RECONNECT_HEADER_RE = re.compile(
     r"^•\s*Reconnecting(?:\.\.\.|…)(?:\s+\d+\s*/\s*\d+)?"
-    r"(?:\s+\((?:\d+[hms]\s*)+[•·]\s*esc\s+to\s+(?:interrupt|cancel)\))?$",
+    r"(?:\s+\((?:\d+[hms]\s*)+[•·]\s*esc\s+to\s+(?:interrupt|cancel)\))?"
+    + RECONNECT_STATUS_SUFFIX_RE
+    + r"$",
+    re.IGNORECASE,
+)
+PROVIDER_RATE_LIMIT_COMPACT_RE = re.compile(
+    r"ratelimitexceeded:yourrequeststo[a-z0-9][a-z0-9._:/-]{0,199}"
+    r"for[a-z0-9][a-z0-9._:/-]{0,199}"
+    r"in[a-z0-9][a-z0-9._-]{0,79}"
+    r"haveexceededratelimit\.$"
+)
+RECONNECT_COMPACT_PREFIX_RE = re.compile(
+    r"^•reconnecting(?:\.\.\.|…)?(?:\d+/\d+)?"
+    r"(?:\((?:\d+[hms])+[•·]escto(?:interrupt|cancel)\))?"
+    r"(?:[·•]\d+backgroundterminals?(?:runnin(?:g)?(?:[.…]+)?)?"
+    r"(?:[·•]/ps(?:tov(?:iew)?)?)?"
+    r"(?:[·•]/stop(?:toc(?:lose)?)?)?"
+    r"(?:[.…]+)?)?"
+    r"(?=[■⚠└]|ratelimitexceeded:|$)",
     re.IGNORECASE,
 )
 # After a reconnect stall is nudged, the timer in the status line still ticks.
 # Do not send every second; allow one safety retry per minute.
 RECONNECT_STALL_REPEAT_SEC = 60.0
+# Nested provider errors under reconnect are the stall the user asked to
+# rescue at ~1s. The 60s floor stays only for reconnect chrome with no
+# matched provider banner.
+PROVIDER_REPEAT_ERROR_TYPES = frozenset({
+    "high_demand",
+    "rate_limit",
+    "stream",
+    "http_503",
+    "http_405",
+    "prompt_cache",
+})
+# Parallel viewport observes so a fleet of stalled Codex tabs still sees
+# the 1s repeat instead of waiting for a serial pass of every UUID.
+OBSERVE_WORKERS = 32
+SEND_WORKERS = 8
+MAINTENANCE_WORKERS = 2
+HEALTHY_REVISIT_SEC = 1.0
+HEALTHY_SKIP_STATES = frozenset({
+    "working",
+    "menu",
+    "idle",
+    "queued_followup",
+    "composer_busy",
+    "non_codex_or_unknown",
+})
 SPINNER_GLYPHS = frozenset("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯⣷")
 # Both Codex queue headers describe input already accepted but not consumed.
 QUEUED_FOLLOWUP_RE = re.compile(
@@ -238,6 +295,8 @@ EPISODE_CONTINUITY_STATES = frozenset({
     "working",
     "queued_followup",
     "error_superseded",
+    "delivery_unknown",
+    "send_failed",
 })
 # Codex recoverable errors retain their existing retry policy.  Claude uses a
 # separate stop-event guard: an empty verified ❯ or a live Claude API error is
@@ -267,7 +326,7 @@ CLAUDE_CONTEXT_ABSOLUTE_TIMEOUT_SEC = 900.0
 # through TargetRuntime and suppresses duplicate Hook/fallback deliveries.
 # Human label only.  Acceptance always compares SHA-256 of the loaded source:
 # a revision string is hand-maintained and therefore can lie about what runs.
-FEATURE_REVISION = "0.2.1-codex-high-demand-reconnect-spans"
+FEATURE_REVISION = "0.2.7-continuation-deadlines"
 # How long after our own send a byte-identical UserPromptSubmit can still be
 # our echo.  Must exceed claude_submit_confirm_timeout_sec so that a late
 # echo arriving after the transaction timed out is not read as a human.
@@ -462,6 +521,24 @@ class TargetRuntime:
     viewport_readable: bool | None = None
     viewport_checked_at: float = 0.0
     viewport_source: str = ""
+    observation_started_at: float = 0.0
+    observation_completed_at: float = 0.0
+    observation_interval_ms: float = 0.0
+    scheduler_lag_ms: float = 0.0
+    read_duration_ms: float = 0.0
+    candidate_observed_at: float = 0.0
+    send_queue_ms: float = 0.0
+    send_started_at: float = 0.0
+    send_io_started_at: float = 0.0
+    send_persist_duration_ms: float = 0.0
+    send_completed_at: float = 0.0
+    send_duration_ms: float = 0.0
+    detection_to_send_ms: float = 0.0
+    delivery_status: str = ""
+    delivery_confirmed_at: float = 0.0
+    send_attempt_id: str = ""
+    send_attempt_evidence: str | None = None
+    last_send_error: str = ""
     registration_revalidation: dict[str, Any] = dataclasses.field(default_factory=dict)
     observed_screen_signature: str | None = None
     observed_evidence_row: int | None = None
@@ -688,6 +765,23 @@ def _is_reconnect_marker(text: str) -> bool:
     return bool(RECONNECT_MARKER_RE.match(text.lstrip()))
 
 
+def _is_reconnect_wrap_line(text: str) -> bool:
+    """True for a wrapped reconnect-header tail, not a new transcript row."""
+
+    stripped = text.strip()
+    if not stripped or stripped.startswith(("•", "■", "⚠", "›", "↳", "└")):
+        return False
+    if re.match(r"^(?:Working|Thinking)\b", stripped, re.IGNORECASE):
+        return False
+    return bool(
+        re.match(
+            r"^(?:esc to (?:interrupt|cancel)\)?|[·•]?\s*\d+\s+background\s+terminals?\s+runnin|/ps\b|/stop\b)",
+            stripped,
+            re.IGNORECASE,
+        )
+    )
+
+
 def _is_error_marker(text: str) -> bool:
     stripped = text.lstrip()
     return stripped.startswith(("■", "⚠")) or _is_reconnect_marker(stripped)
@@ -747,33 +841,57 @@ def _spinner_chrome_rows(grid: Grid, composer_row: int) -> frozenset[int]:
 
 
 def _without_reconnect_status(lines: Sequence[str]) -> list[str]:
-    """Ignore only a complete reconnect header, including a wrapped timer."""
+    """Drop the reconnect marker line plus at most two wrap-chrome tails.
+
+    Truncated ``runnin…`` may fail the full header regex, so the marker is
+    always removed. Later Working / nested errors / prompts are never joined.
+    """
 
     kept: list[str] = []
     index = 0
     while index < len(lines):
         if _is_reconnect_marker(lines[index]):
-            # A status can wrap, but unrelated output beneath it must still
-            # participate in Working/input guards. Never skip a whole block.
             end = index + 1
-            for candidate_end in range(index + 1, min(index + 3, len(lines)) + 1):
+            for candidate_end in range(index + 1, min(index + 4, len(lines)) + 1):
+                extra = lines[index + 1:candidate_end]
+                if any(not _is_reconnect_wrap_line(line) for line in extra):
+                    break
                 header = " ".join(line.strip() for line in lines[index:candidate_end])
                 if RECONNECT_HEADER_RE.fullmatch(header):
                     end = candidate_end
-                    break
-            else:
-                kept.append(lines[index])
-                index += 1
-                continue
+            wrap_limit = min(end + 2, len(lines))
+            while end < wrap_limit and _is_reconnect_wrap_line(lines[end]):
+                end += 1
             index = end
-        else:
-            kept.append(lines[index])
-            index += 1
+            continue
+        kept.append(lines[index])
+        index += 1
+    return kept
+
+
+def _without_queue_interrupt_chrome(lines: Sequence[str]) -> list[str]:
+    """Drop queue headers whose interrupt hint is not genuine Working."""
+
+    kept: list[str] = []
+    skipping = False
+    for line in lines:
+        stripped = line.strip()
+        if QUEUED_FOLLOWUP_RE.search(stripped):
+            skipping = True
+            continue
+        if skipping:
+            if not stripped or stripped.startswith(("›", "•", "↳", "■", "⚠")):
+                skipping = False
+            else:
+                continue
+        if not skipping:
+            kept.append(line)
     return kept
 
 
 def _working_present(lines: Sequence[str]) -> bool:
-    return bool(WORKING_RE.search("\n".join(_without_reconnect_status(lines))))
+    cleaned = _without_queue_interrupt_chrome(_without_reconnect_status(lines))
+    return bool(WORKING_RE.search("\n".join(cleaned)))
 
 
 def _queued_followup_present(lines: Sequence[str], composer_row: int) -> bool:
@@ -817,6 +935,18 @@ def _queued_followup_present(lines: Sequence[str], composer_row: int) -> bool:
     return False
 
 
+def _provider_rate_limit_banner(compact: str) -> bool:
+    """True for the complete provider banner, including reconnect-nested form.
+
+    Match the full compact payload, not the words "rate limit". Reconnect
+    chrome, tree ``└``, and ■/⚠ are prefixes; ``documentation:`` / ``example:``
+    quotes and extra prose after the period are not.
+    """
+
+    stripped = RECONNECT_COMPACT_PREFIX_RE.sub("", compact, count=1).lstrip("■⚠└")
+    return bool(PROVIDER_RATE_LIMIT_COMPACT_RE.match(stripped))
+
+
 def _match_error_block(block_text: str) -> str | None:
     lower = re.sub(r"\s+", " ", block_text).strip().lower()
     if "exceeded retry limit" in lower and ("429" in lower or "too many requests" in lower):
@@ -825,12 +955,10 @@ def _match_error_block(block_text: str) -> str | None:
     # HTTP status or a retry-exhausted prefix. Match the complete banner, not
     # prose mentioning rate limits. Geometry/adjacency is checked by the caller;
     # removing whitespace here also handles hard wraps inside words or models.
-    if re.fullmatch(
-        r"[■⚠]ratelimitexceeded:yourrequeststo[a-z0-9][a-z0-9._:/-]{0,199}"
-        r"for[a-z0-9][a-z0-9._:/-]{0,199}in[a-z0-9][a-z0-9._-]{0,79}"
-        r"haveexceededratelimit\.",
-        re.sub(r"\s+", "", lower),
-    ):
+    compact = re.sub(r"\s+", "", lower)
+    if "400" in compact and '"code":"invalid_encrypted_content"' in compact:
+        return "invalid_encrypted_content"
+    if _provider_rate_limit_banner(compact):
         return "rate_limit"
     if HIGH_DEMAND.lower() in lower:
         return "high_demand"
@@ -890,6 +1018,37 @@ def _row_is_full(grid: Grid, row: int) -> bool:
         default=0,
     )
     return occupied > 0 and grid.columns - occupied <= WRAP_SLACK_CELLS
+
+
+CONTINUE_ECHO_PHRASES = frozenset({
+    MESSAGE,
+    "请继续任务",
+    "请继续",
+})
+
+
+def _is_continue_echo(text: str) -> bool:
+    """True when the row is only a continuation prompt echo, not new work.
+
+    Live stall on D365940F: the last ``■ We're currently experiencing high
+    demand...`` was followed by ``› 任务请继续`` (CCC) and earlier ``› 请继续任务``.
+    Treating those echoes as newer transcript marked the still-visible banner
+    superseded and stopped the agreed auto-continue.  Other › rows still block.
+    """
+
+    stripped = text.strip()
+    if not stripped.startswith("›"):
+        return False
+    payload = "".join(ch for ch in stripped.lstrip("›") if not _is_spinner_char(ch)).strip()
+    return payload in CONTINUE_ECHO_PHRASES
+
+
+def _is_sparse_spinner_overlay(line: str) -> bool:
+    """Sparse braille overlay between error and composer, not dense content."""
+
+    if not _is_spinner_chrome(line):
+        return False
+    return " " in line or len(line.strip()) <= 2
 
 
 def _is_transcript_row(text: str) -> bool:
@@ -974,6 +1133,8 @@ def _find_last_error(
             if index not in ignored_rows
             and lines[index].strip()
             and not _is_footer(lines[index].strip())
+            and not _is_continue_echo(lines[index])
+            and not _is_sparse_spinner_overlay(lines[index])
         ), None)
         block = [line.strip() for line in lines[marker:block_end] if line.strip()]
         if not block:
@@ -1789,6 +1950,8 @@ def classify_text_prefilter(value: str | Iterable[str]) -> ScreenState:
     lines = _normalise_lines(value)
     if _menu_present(lines):
         return ScreenState("menu", reason="interactive menu")
+    if _queued_followup_present(lines, len(lines)):
+        return ScreenState("queued_followup", reason="Codex already holds queued follow-up input")
     if _working_present(lines):
         return ScreenState("working", reason="Codex is working")
     tail_count = max(12, len(lines) // 2)
@@ -1804,21 +1967,25 @@ def classify_grid(grid: Grid) -> ScreenState:
     lines = grid.lines
     if _menu_present(lines):
         return ScreenState("menu", screen_signature=grid.signature(), reason="interactive menu")
+    composer_kind, composer_row = _composer_status(grid)
+    # The renamed queue banner contains "esc to interrupt".  That used to match
+    # Working first, so the queue gate never ran and high-demand stalls looked
+    # busy while Codex already held 任务请继续.
+    queue_row = composer_row if composer_row is not None else len(lines)
+    if composer_kind != "composer_busy" and _queued_followup_present(lines, queue_row):
+        return ScreenState(
+            "queued_followup",
+            screen_signature=grid.signature(),
+            reason="Codex already holds queued follow-up input",
+        )
     if _working_present(lines):
         return ScreenState("working", screen_signature=grid.signature(), reason="Codex is working")
-    composer_kind, composer_row = _composer_status(grid)
     if composer_kind == "incompatible" or composer_row is None:
         return ScreenState("incompatible", screen_signature=grid.signature(), reason="composer cursor/prompt not verified")
     if not _is_codexish(lines, composer_row):
         return ScreenState("non_codex_or_unknown", screen_signature=grid.signature(), reason="Codex UI fingerprint missing")
     if composer_kind == "composer_busy":
         return ScreenState("composer_busy", screen_signature=grid.signature(), reason="composer contains user text")
-    if _queued_followup_present(lines, composer_row):
-        return ScreenState(
-            "queued_followup",
-            screen_signature=grid.signature(),
-            reason="Codex already holds queued follow-up input",
-        )
     marker_rows = [row for row, line in enumerate(lines[:composer_row]) if _is_error_marker(line)]
     if not marker_rows:
         return ScreenState("idle", screen_signature=grid.signature(), reason="empty composer without current recoverable error")
@@ -1932,7 +2099,23 @@ def classify_grid(grid: Grid) -> ScreenState:
             reason="provider token out of quota; needs a new key or a top-up",
             ignored_chrome_rows=tuple(sorted(chrome_rows)),
         )
+    if error.error_type == "invalid_encrypted_content":
+        return ScreenState(
+            "provider_blocked", error_type=error.error_type,
+            fingerprint=_short_hash(_stable_error_block(error.block)),
+            screen_signature=grid.signature(),
+            reason="provider rejected encrypted session content (400); session preserved",
+            message_kind="codex",
+        )
     fingerprint = _short_hash(_stable_error_block(error.block))
+    # A timeout needs causal progress, not a changing reconnect timer/braille
+    # overlay. Include transcript *before* the current error; an echo below an
+    # old error alone is deliberately insufficient to authorize another send.
+    evidence_prefix = "\n".join(line.strip() for row, line in enumerate(lines[:marker_row])
+                                if row not in chrome_rows and not _is_reconnect_marker(line))
+    evidence_error = RECONNECT_COMPACT_PREFIX_RE.sub(
+        "", re.sub(r"\s+", "", error.block.lower()), count=1,
+    )
     return ScreenState(
         "recoverable_error",
         error_type=error.error_type,
@@ -1940,8 +2123,12 @@ def classify_grid(grid: Grid) -> ScreenState:
         screen_signature=grid.signature(),
         reason=f"current {error.error_type} error block",
         message_kind="codex",
+        content_fingerprint=_short_hash(evidence_prefix + "\0" + evidence_error),
         ignored_chrome_rows=tuple(sorted(chrome_rows)),
-        allow_repeat=not _is_reconnect_marker(error.block),
+        allow_repeat=(
+            error.error_type in PROVIDER_REPEAT_ERROR_TYPES
+            or not _is_reconnect_marker(error.block)
+        ),
     )
 
 
@@ -1954,6 +2141,9 @@ def default_config() -> dict[str, Any]:
         "claude_message": CLAUDE_MESSAGE,
         "poll_interval_sec": 1.0,
         "send_interval_sec": 1.0,
+        "observe_workers": OBSERVE_WORKERS,
+        "send_workers": SEND_WORKERS,
+        "healthy_revisit_sec": HEALTHY_REVISIT_SEC,
         "circuit_pause_after": 0,
         "same_frame_guard_polls": 1,
         "repeat_send_delay_sec": REPEAT_SEND_DELAY_SEC,
@@ -2472,6 +2662,8 @@ def validate_config(value: Any) -> dict[str, Any]:
         "circuit_pause_after": (0.0, True),
         "same_frame_guard_polls": (0.0, True),
         "repeat_send_delay_sec": (0.0, True),
+        "observe_workers": (1.0, True),
+        "send_workers": (1.0, True),
         "claude_working_clear_polls": (1.0, True),
         "claude_background_input_grace_sec": (0.0, True),
         "claude_focused_input_grace_sec": (0.0, True),
@@ -2508,6 +2700,8 @@ def validate_config(value: Any) -> dict[str, Any]:
             operator = ">=" if inclusive else ">"
             raise RuntimeError(f"config {key} must be {operator} {minimum:g}")
     for key in (
+        "observe_workers",
+        "send_workers",
         "claude_event_workers",
         "claude_repeat_warning_after",
         "claude_hook_latency_window",
@@ -2522,6 +2716,9 @@ def validate_config(value: Any) -> dict[str, Any]:
             raise RuntimeError(f"config {key} must be an integer")
     if int(merged["claude_context_warning_percent"]) > 100:
         raise RuntimeError("config claude_context_warning_percent must be <= 100")
+    for key, maximum in (("observe_workers", 64), ("send_workers", 32)):
+        if merged[key] > maximum:
+            raise RuntimeError(f"config {key} must be <= {maximum}")
     return merged
 
 
@@ -3944,6 +4141,59 @@ def discover_rule_targets(client: CmuxClient, config: Mapping[str, Any]) -> list
     return targets
 
 
+def discover_pane_follow_targets(client: CmuxClient, config: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Watch live Codex on panes that already have an explicit registration.
+
+    ``track-surface`` pins a UUID.  When Codex respawns in the same pane it
+    gets a new UUID (surface:145 -> surface:213) and continue stops until
+    someone registers again.  Any pane that already has an enabled explicit
+    target therefore also contributes its other live Codex tabs.
+    """
+
+    explicit = [target for target in config.get("targets", [])
+                if target.get("enabled", True) and not target.get("paused", False)]
+    exclusions = {str(rule.get("workspace_id") or ""): set(rule.get("excluded_surface_ids", []))
+                  for rule in config.get("workspace_rules", [])}
+    panes_by_workspace: dict[str, set[str]] = {}
+    explicit_ids = set()
+    for target in explicit:
+        surface_id = str(target.get("surface_id") or "")
+        workspace_id = str(target.get("workspace_id") or "")
+        pane_id = str(target.get("pane_id") or "")
+        if surface_id:
+            explicit_ids.add(surface_id)
+        if workspace_id and pane_id:
+            panes_by_workspace.setdefault(workspace_id, set()).add(pane_id)
+    if not panes_by_workspace:
+        return []
+    tree = client.tree()
+    discovered: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for workspace_id, pane_ids in panes_by_workspace.items():
+        try:
+            records = discover_codex_surfaces(tree, client.top(workspace_id), workspace_id)
+        except CmuxError:
+            continue
+        for record in records:
+            surface_id = str(record.get("surface_id") or "")
+            pane_id = str(record.get("pane_id") or "")
+            if (not surface_id or surface_id in explicit_ids or surface_id in seen
+                    or surface_id in exclusions.get(workspace_id, set())):
+                continue
+            if pane_id not in pane_ids:
+                continue
+            seen.add(surface_id)
+            discovered.append({
+                **record,
+                "name": f"pane-follow:{record.get('ref') or surface_id[:8]}",
+                "enabled": True,
+                "paused": False,
+                "source": "pane_follow",
+                "source_workspace_id": workspace_id,
+            })
+    return discovered
+
+
 def effective_targets(
     config: Mapping[str, Any],
     dynamic_targets: Iterable[Mapping[str, Any]],
@@ -4070,10 +4320,19 @@ class WatchDaemon:
         self.stop_requested = False
         self.logger = logging.getLogger(APP_NAME)
         self._runtime_lock = threading.RLock()
+        self._state_save_lock = threading.Lock()
+        self._state_writer: CoalescingWriter | None = None
+        self._health_writer: CoalescingWriter | None = None
         self._surface_locks_guard = threading.Lock()
         self._surface_locks: dict[str, threading.RLock] = {}
         self._targets_lock = threading.RLock()
         self._process_cache_lock = threading.RLock()
+        self._config_reload_lock = threading.RLock()
+        self._process_snapshots = SnapshotCache(workers=MAINTENANCE_WORKERS)
+        self._scheduler: SurfaceScheduler | None = None
+        self._discovery_future: Any = None
+        self._observation_metadata: dict[str, Any] = {}
+        self._metadata_lock = threading.Lock()
         self.config = self._load_config_at_startup()
         self.runtime: dict[str, TargetRuntime] = self._load_runtime()
         self._clear_stale_runtime_pause_reasons()
@@ -4407,14 +4666,19 @@ class WatchDaemon:
 
     def _serialize_state(self) -> str:
         with self._runtime_lock:
-            return json.dumps(
-                {key: value.to_dict() for key, value in self.runtime.items()},
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
+            items = list(self.runtime.items())
+        return json.dumps(
+            {key: value.to_dict() for key, value in items},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
 
     def _reload_config_if_changed(self) -> None:
+        with self._config_reload_lock:
+            self._reload_config_if_changed_locked()
+
+    def _reload_config_if_changed_locked(self) -> None:
         current_mtime = self._config_mtime()
         if current_mtime == self._config_mtime_ns:
             return
@@ -4464,6 +4728,11 @@ class WatchDaemon:
         for item in reloaded.get("targets", []):
             surface_id = str(item.get("surface_id") or "")
             paused = bool(item.get("paused"))
+            if not paused and item.get("enabled", True):
+                # A fresh persisted resume also clears isolation whose earlier
+                # config write failed. The old synchronous loop did this each
+                # pass; persistent scheduling must not retain it indefinitely.
+                self._local_paused_surface_ids.discard(surface_id)
             if surface_id in previous_targets and previous_targets[surface_id] != paused:
                 if previous_targets[surface_id] and not paused:
                     # A resumed target must not keep an old isolation reason in
@@ -4481,12 +4750,13 @@ class WatchDaemon:
                 )
 
     def _mutate_config(self, mutator: Any) -> Any:
-        config, result, mtime_ns = self.config_store.mutate(mutator)
-        self._queue_registration_checks(self.config, config)
-        self.config = config
-        self._config_mtime_ns = mtime_ns
-        self._last_workspace_discovery_at = 0.0
-        return result
+        with self._config_reload_lock:
+            config, result, mtime_ns = self.config_store.mutate(mutator)
+            self._queue_registration_checks(self.config, config)
+            self.config = config
+            self._config_mtime_ns = mtime_ns
+            self._last_workspace_discovery_at = 0.0
+            return result
 
     def _queue_registration_checks(self, previous: Mapping[str, Any], current: Mapping[str, Any]) -> None:
         def keys(config):
@@ -4501,11 +4771,17 @@ class WatchDaemon:
             self._registration_due.pop(sid, None)
 
     def _schedule_diagnostics(self) -> None:
-        """At most four independent jobs; never queue a full workspace of I/O."""
+        """Two maintenance jobs, with at most one registration reconciliation."""
         pool = self._diagnostics_pool
         if pool is None or self.stop_requested:
             return
         now = time.time()
+        if self._discovery_future is not None and self._discovery_future.done():
+            try:
+                self._discovery_future.result()
+            except Exception as exc:
+                self.logger.warning("workspace discovery failed: %s", type(exc).__name__)
+            self._discovery_future = None
         if self._diagnostics_future is not None and self._diagnostics_future.done():
             try:
                 self._diagnostics_future.result()
@@ -4524,13 +4800,22 @@ class WatchDaemon:
             if retry:
                 self._registration_due.setdefault(sid, now + 5)
         def client():
-            return self.client or CmuxClient(str(self.config.get("cmux_path", DEFAULT_CMUX)))
+            return self._observation_client() if self._scheduler is not None else (
+                self.client or CmuxClient(str(self.config.get("cmux_path", DEFAULT_CMUX))))
+        def occupied():
+            return (len(self._registration_futures) + int(self._diagnostics_future is not None)
+                    + int(self._discovery_future is not None))
+        if (self._scheduler is not None and self._discovery_future is None
+                and occupied() < MAINTENANCE_WORKERS
+                and time.monotonic() - self._last_workspace_discovery_at >=
+                float(self.config.get("workspace_discovery_interval_sec", 5))):
+            self._discovery_future = pool.submit(self._refresh_dynamic_targets, client())
         if (self._diagnostics_future is None and now >= self._diagnostics_next_at
-                and len(self._registration_futures) < 4):
+                and occupied() < MAINTENANCE_WORKERS):
             self._diagnostics_future = pool.submit(self._refresh_observation_health, client())
             self._diagnostics_next_at = now + 5
         for sid, due in list(self._registration_due.items()):
-            if len(self._registration_futures) + int(self._diagnostics_future is not None) >= 4:
+            if occupied() >= MAINTENANCE_WORKERS or self._registration_futures:
                 break
             if due <= now and sid not in self._registration_futures:
                 self._registration_due.pop(sid, None)
@@ -4553,13 +4838,24 @@ class WatchDaemon:
         return inspected.get("generation") == runtime["claude_process_generation"]
 
     def _refresh_observation_health(self, client: CmuxClient) -> None:
+        """Refresh slow identity metadata outside the per-surface scheduler."""
+        metadata_at = time.time()
+        self._check_claude_hook_settings()
         config = copy.deepcopy(self.config)
         with self._targets_lock:
             targets = effective_targets(config, list(self.dynamic_targets.values()))
-        with self._runtime_lock:
-            state = {sid: rt.to_dict() for sid, rt in self.runtime.items()}
         records = {r["surface_id"]: r for r in main_surface_records(client.tree())}
-        top = client.top_all()
+        inventory_complete = True
+        if isinstance(client, SnapshotClient):
+            # The same per-workspace snapshots feed routing and discovery.
+            # Missing snapshots stay unknown and refresh asynchronously.
+            live_workspaces = {str(r["workspace_id"]) for r in records.values()}
+            workspaces = {str(t["workspace_id"]) for t in targets} & live_workspaces
+            snapshots = [client.cached_top(wid, wait=False) for wid in workspaces]
+            inventory_complete = all(value is not None for value in snapshots)
+            top = {"snapshots": [value for value in snapshots if value is not None]}
+        else:
+            top = client.top_all()
         labels = classify_surface_processes(top)
         process_owners = {p["pid"]: (p.get("cmux_surface_id"), p.get("cmux_workspace_id"))
                           for p in _walk_objects(top) if p.get("kind") == "process"
@@ -4568,22 +4864,91 @@ class WatchDaemon:
             terminals = {str(r["surface_id"]): r for r in client.terminal_diagnostics()["terminals"]}
         except (CmuxError, KeyError, TypeError):
             terminals = {}  # Unsupported debug RPC cannot prove dormancy.
+        inspections = {int(info.get("agent_pid") or 0): self._inspect_process_cached(int(info.get("agent_pid") or 0))
+                       for info in labels.values() if info.get("agent_kind") == "claude"}
+        # Capture runtime after I/O. In the old implementation this copy could
+        # already be minutes old when a supposedly fresh snapshot was published.
+        with self._runtime_lock:
+            state = {sid: rt.to_dict() for sid, rt in self.runtime.items()}
+        owners = {}
+        for target in targets:
+            sid = str(target["surface_id"])
+            runtime = state.get(sid, {})
+            explicit_owner = process_owners.get(runtime.get("claude_process_pid"))
+            if explicit_owner:
+                owner = explicit_owner == (sid, str(target["workspace_id"]))
+            elif isinstance(client, SnapshotClient):
+                # Absence from an incomplete process snapshot cannot prove exit.
+                pid = int(runtime.get("claude_process_pid") or 0)
+                owner = None if pid else False
+                if pid:
+                    try:
+                        os.kill(pid, 0)
+                    except ProcessLookupError:
+                        owner = False
+                    except (OSError, PermissionError):
+                        pass
+            else:
+                owner = self._observation_owner_alive(runtime)
+            owners[sid] = owner
+        if monitoring_config_key(config) != monitoring_config_key(self.config):
+            return
+        with self._metadata_lock:
+            self._observation_metadata = {"records": records, "labels": labels, "terminals": terminals,
+                                          "owners": owners, "observed_at": metadata_at,
+                                          "hook_inspections": inspections, "inventory_complete": inventory_complete,
+                                          "config_key": monitoring_config_key(config)}
+        self._request_health_publish()
+
+    def _request_health_publish(self):
+        if self._health_writer is not None:
+            self._health_writer.request(wait=False)
+        else:
+            self._publish_observation_health()
+
+    def _publish_runtime_health(self):
+        self._check_log_channel()
+        self._publish_observation_health()
+
+    def _publish_observation_health(self) -> None:
+        """Publish fresh runtime ages without waiting for discovery/diagnostics."""
+        config = copy.deepcopy(self.config)
+        with self._targets_lock:
+            targets = effective_targets(config, list(self.dynamic_targets.values()))
+        with self._runtime_lock:
+            state = {sid: rt.to_dict() for sid, rt in self.runtime.items()}
+        with self._metadata_lock:
+            metadata = self._observation_metadata
+        records, labels = metadata.get("records", {}), metadata.get("labels", {})
+        terminals, owners = metadata.get("terminals", {}), metadata.get("owners", {})
+        metadata_at = float(metadata.get("observed_at") or 0)
+        metadata_matches = metadata.get("config_key") == monitoring_config_key(config)
         now = time.time()
         stale_after = max(30.0, 3 * float(config.get("poll_interval_sec", 1)))
         rows = []
         for target in targets:
             sid = str(target["surface_id"])
-            runtime = state.get(sid, {})
-            owner = self._observation_owner_alive(runtime)
-            explicit_owner = process_owners.get(runtime.get("claude_process_pid"))
-            if explicit_owner and explicit_owner != (sid, str(target["workspace_id"])):
-                owner = False  # A live PID belonging elsewhere is not this slot's owner.
             rows.append(observation_health.observation_row(
-                target, records.get(sid), labels.get(sid, {}), terminals.get(sid, {}), runtime,
-                owner_alive=owner, now=now, stale_after=stale_after))
+                target, records.get(sid), labels.get(sid, {}), terminals.get(sid, {}), state.get(sid, {}),
+                owner_alive=owners.get(sid), now=now, stale_after=stale_after))
+            rows[-1]["observed_at"] = metadata_at
+            if (not metadata_matches or not 0 <= now - metadata_at <= stale_after) and rows[-1]["status"] != "paused":
+                rows[-1].update(status="unknown", reason_code="diagnostic_snapshot_stale")
         self._observation_rows = {r["surface_id"]: r for r in rows}
+        hooks = {"status": "unknown", "reason": "live surface/process inventory unavailable"}
+        if metadata_matches and metadata.get("inventory_complete") and 0 <= now - metadata_at <= stale_after:
+            hooks = claude_hook_coverage_from_inventory(
+                state, list(records.values()), labels, {str(t["surface_id"]): t for t in targets},
+                lambda pid: metadata.get("hook_inspections", {}).get(pid, {}),
+            )
         snapshot = {"version": 1, "config_key": monitoring_config_key(config), "rows": rows,
-                    "observed_at": now}
+                    "observed_at": now, "monitored_targets": [
+                        {k: t[k] for k in ("surface_id", "workspace_id", "enabled", "paused") if k in t}
+                        for t in targets],
+                    "continuation_health": observation_health.continuation_report(
+                        targets, state, now=now, poll_interval=float(config.get("poll_interval_sec", 1))),
+                    "claude_hook_coverage": hooks, "hook_coverage_at": metadata_at,
+                    "scheduler": self._scheduler.snapshot() if self._scheduler else {}}
         atomic_write_json(self.observation_health_path, snapshot)
 
     def _registration_events(self) -> list[dict[str, Any]]:
@@ -4706,18 +5071,21 @@ class WatchDaemon:
         workspace_id = str(target.get("workspace_id") or "")
         if not workspace_id:
             return {"agent_kind": "unknown", "summary": "workspace unavailable"}
-        now = time.monotonic()
-        with self._process_cache_lock:
-            cached = self._candidate_process_cache.get(workspace_id)
-        if cached is not None and now - cached[0] < CLAUDE_PROCESS_CACHE_SEC:
-            labels = cached[1]
-        else:
-            try:
-                labels = classify_surface_processes(client.top(workspace_id))
-            except CmuxError:
-                return {"agent_kind": "unknown", "summary": "process lookup unavailable"}
-            with self._process_cache_lock:
-                self._candidate_process_cache[workspace_id] = (now, labels)
+        try:
+            if isinstance(client, SnapshotClient):
+                # Adapter routing is advisory. A cold/slow process lookup must
+                # not hold every surface in this workspace behind the same RPC.
+                labels = client.process_labels(workspace_id, classify_surface_processes, wait=False)
+                if labels is None:
+                    return {"agent_kind": "unknown", "summary": "process refresh pending"}
+            else:
+                labels = self._process_snapshots.get(
+                    ("labels", workspace_id),
+                    lambda: classify_surface_processes(client.top(workspace_id)),
+                    ttl=CLAUDE_PROCESS_CACHE_SEC,
+                )
+        except CmuxError:
+            return {"agent_kind": "unknown", "summary": "process lookup unavailable"}
         return surface_process_label(labels, target)
 
     def _inspect_process_cached(self, pid: int) -> dict[str, Any]:
@@ -5144,8 +5512,14 @@ class WatchDaemon:
             return replay_claude()
         return replay_codex()
 
-    def save(self) -> None:
-        with self._runtime_lock:
+    def save(self, *, wait: bool = True) -> None:
+        if self._state_writer is not None:
+            self._state_writer.request(wait=wait)
+        else:
+            self._save_now()
+
+    def _save_now(self) -> None:
+        with self._state_save_lock:
             state_serialized = self._serialize_state()
             if state_serialized != self._last_state_serialized or not self.state_path.exists():
                 atomic_write_json(self.state_path, json.loads(state_serialized))
@@ -5153,6 +5527,125 @@ class WatchDaemon:
 
     def request_stop(self, *_: Any) -> None:
         self.stop_requested = True
+        if self._scheduler is not None:
+            self._scheduler.wakeup.set()
+
+    def _observation_client(self):
+        base = self.client or CmuxClient(str(self.config.get("cmux_path", DEFAULT_CMUX)))
+        return SnapshotClient(base, self._process_snapshots)
+
+    def _start_scheduler(self) -> SurfaceScheduler:
+        self._scheduler = SurfaceScheduler(
+            self._scheduled_observe, self._scheduled_send,
+            interval=float(self.config.get("poll_interval_sec", 1)),
+            observe_workers=int(self.config.get("observe_workers", OBSERVE_WORKERS)),
+            send_workers=int(self.config.get("send_workers", SEND_WORKERS)),
+            on_dispatch=self._record_dispatch, on_error=self._scheduled_error,
+        )
+        return self._scheduler
+
+    def _record_dispatch(self, target, phase, delay):
+        sid = str(target["surface_id"])
+        with self._runtime_lock:
+            runtime = self.runtime.setdefault(sid, TargetRuntime())
+        if phase == "observe":
+            runtime.scheduler_lag_ms = round(delay * 1000, 3)
+            runtime.observation_started_at = time.time()
+        else:
+            runtime.send_queue_ms = round(delay * 1000, 3)
+
+    def _scheduled_error(self, target, phase, exc):
+        sid = str(target["surface_id"])
+        with self._surface_lock(sid):
+            with self._runtime_lock:
+                runtime = self.runtime.setdefault(sid, TargetRuntime())
+            runtime.observed_reason = f"{phase} worker failed: {type(exc).__name__}: {str(exc)[:200]}"
+            runtime.state = "cmux_unavailable" if phase == "observe" else "send_guard_unavailable"
+        self.logger.error("surface=%s phase=%s worker failed: %s", sid[:8], phase, exc)
+
+    def _scheduled_observe(self, target, is_current):
+        if self.stop_requested or not is_current():
+            return None
+        sid = str(target["surface_id"])
+        with self._runtime_lock:
+            runtime = self.runtime.setdefault(sid, TargetRuntime())
+        previous = runtime.observation_completed_at
+        started = time.monotonic()
+        generation = self._config_mtime_ns
+        try:
+            return self._process_one_target(
+                target, self._observation_client(), None, "",
+                defer_send=True,
+                is_current=lambda: is_current() and generation == self._config_mtime_ns,
+            )
+        finally:
+            now = time.time()
+            runtime.read_duration_ms = round((time.monotonic() - started) * 1000, 3)
+            runtime.observation_completed_at = now
+            runtime.observation_interval_ms = round(max(0, now - previous) * 1000, 3) if previous else 0
+
+    def _active_send_target(self, target, is_current=None):
+        if self.stop_requested or (is_current is not None and not is_current()):
+            return None
+        self._reload_config_if_changed()
+        current = self._event_target(str(target["surface_id"]))
+        if (current is None or not current.get("enabled", True) or current.get("paused", False)
+                or str(current.get("workspace_id")) != str(target.get("workspace_id"))
+                or str(target["surface_id"]) in self._local_paused_surface_ids):
+            return None
+        sid = str(target["surface_id"])
+        if sid == str(self.config.get("manager_surface_id") or ""):
+            return None
+        explicit = any(str(t.get("surface_id")) == sid for t in self.config.get("targets", []))
+        if not explicit:
+            if any(str(r.get("workspace_id")) == str(current.get("workspace_id"))
+                   and sid in r.get("excluded_surface_ids", [])
+                   for r in self.config.get("workspace_rules", [])):
+                return None
+            if current.get("source") == "workspace_rule":
+                allowed = any(r.get("enabled", True)
+                              and str(r.get("workspace_id")) == str(current.get("source_workspace_id"))
+                              and sid not in r.get("excluded_surface_ids", [])
+                              for r in self.config.get("workspace_rules", []))
+            elif current.get("source") == "pane_follow":
+                allowed = any(t.get("enabled", True) and not t.get("paused", False)
+                              and t.get("pane_id") == current.get("pane_id")
+                              and t.get("workspace_id") == current.get("workspace_id")
+                              for t in self.config.get("targets", []))
+            else:
+                allowed = False
+            if not allowed:
+                return None
+        return current if is_current is None or is_current() else None
+
+    def _scheduled_send(self, target, candidate, is_current):
+        sid = str(target["surface_id"])
+        client = self._observation_client()
+        generation = self._config_mtime_ns
+        scheduler_current = is_current
+        is_current = lambda: scheduler_current() and generation == self._config_mtime_ns
+        # A waiting candidate is not input authorization. Re-read only when a
+        # send slot is available, then check registration again at the boundary.
+        with self._surface_lock(sid):
+            current = self._active_send_target(target, is_current)
+            if current is None:
+                return
+            runtime = self.runtime[sid]
+            try:
+                tree = client.tree()
+                state = self._observe_target_viewport(current, runtime, client)
+            except (CmuxError, IncompatibleError) as exc:
+                runtime.state = "send_guard_unavailable"
+                runtime.observed_reason = f"fresh send preflight unavailable: {exc}"
+                return
+            if self._active_send_target(current, is_current) is None:
+                return
+            if state.message_kind != candidate.message_kind or state.kind not in SEND_ELIGIBLE_STATES:
+                self._record_state(sid, runtime, state)
+                self._reconcile_codex_delivery(sid, runtime, state)
+                return
+            self._handle_state(current, runtime, state, client, send_guard_tree=tree,
+                               is_current=is_current)
 
     def run(self) -> int:
         ensure_app_dir(self.config_path.parent)
@@ -5198,13 +5691,18 @@ class WatchDaemon:
             workers=int(self.config.get("claude_event_workers", CLAUDE_EVENT_WORKERS)),
         )
         self._event_worker_pool.start()
-        self._diagnostics_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ccc-observation")
+        self._diagnostics_pool = ThreadPoolExecutor(max_workers=MAINTENANCE_WORKERS, thread_name_prefix="ccc-maintenance")
+        self._state_writer = CoalescingWriter(
+            self._save_now, on_error=lambda exc: self.logger.error("state persistence failed: %s", exc))
+        self._health_writer = CoalescingWriter(
+            self._publish_runtime_health, name="ccc-health", delay=0,
+            on_error=lambda exc: self.logger.error("health publication failed: %s", exc))
+        scheduler = self._start_scheduler()
+        last_publish = 0.0
         try:
             while not self.stop_requested:
-                self._check_log_channel()
-                self._check_claude_hook_settings()
-                if not client.ping():
-                    capabilities_ok = False
+                scheduler.wakeup.clear()
+                if not capabilities_ok and not client.ping():
                     if time.time() - last_unavailable_log >= 30:
                         self.logger.info("cmux unavailable; waiting")
                         last_unavailable_log = time.time()
@@ -5214,29 +5712,55 @@ class WatchDaemon:
                     try:
                         client.capabilities()
                         capabilities_ok = True
-                    except IncompatibleError as exc:
+                    except (CmuxError, IncompatibleError) as exc:
                         self.logger.error("incompatible cmux: %s", exc)
                         self._mark_global_incompatible(TargetRuntime(), str(exc))
                         self.save()
                         self.claude_event_inbox.wait(float(self.config.get("cmux_unavailable_poll_sec", 2)))
                         continue
-                cycle_started = time.monotonic()
-                self.process_once(client)
-                delay = remaining_poll_delay(
-                    float(self.config.get("poll_interval_sec", 1)),
-                    time.monotonic() - cycle_started,
+                self._reload_config_if_changed()
+                self._schedule_diagnostics()
+                with self._targets_lock:
+                    targets = effective_targets(self.config, self.dynamic_targets.values())
+                scheduler.tick(
+                    targets, generation=self._config_mtime_ns,
+                    interval=float(self.config.get("poll_interval_sec", 1)),
                 )
-                if delay:
-                    self.claude_event_inbox.wait(delay)
+                now = time.monotonic()
+                if now - last_publish >= 1:
+                    self._request_health_publish()
+                    self.save(wait=False)
+                    last_publish = now
+                scheduler.wakeup.wait(0.1)
             return 0
         finally:
+            scheduler.close()
             if self._diagnostics_pool is not None:
                 self._diagnostics_pool.shutdown(wait=True, cancel_futures=True)
             if self._event_worker_pool is not None:
                 self._event_worker_pool.close()
             self.claude_event_inbox.close()
+            self._process_snapshots.close()
+            self._health_writer.close()
+            self._health_writer = None
+            self._state_writer.close()
+            self._state_writer = None
+            self.save()
+
+    def _observation_due(self, runtime: TargetRuntime, now: float) -> bool:
+        last = float(runtime.observed_at or 0.0)
+        kind = runtime.observed_state or runtime.state or ""
+        if last <= 0 or kind not in HEALTHY_SKIP_STATES:
+            return True
+        revisit = float(self.config.get("poll_interval_sec", 1))
+        return now - last >= revisit
 
     def process_once(self, client: CmuxClient) -> None:
+        """Explicit synchronous pass for offline replay and compatibility tests.
+
+        Production uses SurfaceScheduler with the same observation/send methods;
+        injected clients are never excluded from its concurrency path.
+        """
         self._reload_config_if_changed()
         self._check_claude_hook_settings()
         self._refresh_dynamic_targets(client)
@@ -5249,6 +5773,7 @@ class WatchDaemon:
         except CmuxError as exc:
             send_guard_tree = None
             send_guard_error = str(exc)
+        due: list[dict[str, Any]] = []
         for target in targets:
             if not target.get("enabled", True) or target.get("paused", False):
                 continue
@@ -5256,184 +5781,249 @@ class WatchDaemon:
             self._local_paused_surface_ids.discard(surface_id)
             with self._runtime_lock:
                 runtime = self.runtime.setdefault(surface_id, TargetRuntime())
-            diagnostic = self._observation_rows.get(surface_id, {})
-            if (diagnostic.get("status") == "dormant"
-                    and diagnostic.get("workspace_id") == target.get("workspace_id")
-                    and 0 <= time.time() - float(diagnostic.get("observed_at") or 0) < 5):
-                with self._surface_lock(surface_id):
-                    self._record_state(surface_id, runtime, ScreenState(
-                        "terminal_dormant", reason="native terminal runtime uninitialized; no live agent"))
-                continue
-            try:
-                state = self._observe_target_viewport(target, runtime, client)
-                observation = (
-                    None
-                    if state.kind in {"working", "menu"} and not self._runtime_is_claude(runtime, state)
-                    else self._claude_process_observation(target, client)
-                )
-                with self._surface_lock(surface_id):
-                    self._apply_claude_process_observation(runtime, observation)
-                    self._reconcile_claude_hook_identity(target, runtime, observation)
-                    # Must run on the pre-guard kind: the guards below rewrite an
-                    # unreadable viewport into claude_hook_missing and friends,
-                    # which would hide the blind spot entirely.
-                    self._refresh_claude_unreadable_clock(
-                        surface_id, runtime, state.kind, entry="returned_main",
-                    )
-                    state = self._apply_claude_runtime_guards(surface_id, runtime, state)
-                    state = self._apply_claude_context_guard(surface_id, runtime, state)
-                    if self._reconcile_claude_submit(target, runtime, state, client):
-                        continue
-                    self._restore_expired_claude_deferred(runtime)
-                    if self._maybe_send_deferred_claude_stop(target, runtime, state, client):
-                        continue
-                    if self._runtime_is_claude(runtime, state) and self._maybe_send_claude_hook_gap_fallback(
-                        target, runtime, state, observation, client
-                    ):
-                        continue
-                    if state.kind not in SEND_ELIGIBLE_STATES:
-                        self._record_state(surface_id, runtime, state)
-                        continue
-            except GlobalIncompatibleError as exc:
-                with self._surface_lock(surface_id):
-                    self._mark_global_incompatible(runtime, str(exc))
-                continue
-            except IncompatibleError as exc:
-                with self._surface_lock(surface_id):
-                    # A raised IncompatibleError is the same parser blind spot as
-                    # a returned ``incompatible`` state, but it used to skip the
-                    # clock entirely: this branch pauses the target, and a paused
-                    # target is never polled again, so the exposure could never be
-                    # timed or restated.  Distinct entries keep the four entry
-                    # points apart in the log and in hook-audit.
-                    self._refresh_claude_unreadable_clock(
-                        surface_id, runtime, "unreadable:initial_read",
-                        entry="raised_initial",
-                    )
-                    if self._claude_blind_spot_keeps_monitoring(target, runtime, client):
-                        self._record_state(surface_id, runtime, ScreenState(
-                            "claude_viewport_blind",
-                            reason=f"viewport unreadable, still monitoring: {exc}",
-                            message_kind="claude",
-                        ))
-                    else:
-                        self._mark_target_incompatible(target, runtime, str(exc))
-                continue
-            except CmuxError as exc:
-                if self._is_transient_observation_error(exc):
-                    with self._surface_lock(surface_id):
-                        # A terminal can remain live while cmux temporarily
-                        # cannot materialize its viewport.  Do not turn that
-                        # observation gap into a durable pause: the next poll
-                        # must get another chance to classify and rescue it.
-                        self._record_observation(surface_id, runtime, ScreenState(
-                            "cmux_unavailable",
-                            reason="cmux viewport unavailable; still monitoring",
-                        ))
-                        runtime.state = "cmux_unavailable"
-                    continue
-                if isinstance(exc.__cause__, subprocess.TimeoutExpired):
-                    with self._surface_lock(surface_id):
-                        # A failed observation is not target removal or send acknowledgement.
-                        self._record_observation(surface_id, runtime, ScreenState(
-                            "cmux_unavailable", reason="cmux observation timed out; still monitoring",
-                        ))
-                        runtime.state = "cmux_unavailable"
-                    continue
-                if not client.ping():
-                    with self._surface_lock(surface_id):
-                        # Deliberately *not* a parser blind spot: cmux being gone
-                        # is infrastructure. Counting it would turn every socket
-                        # restart into a fake "viewport unreadable" report.
-                        self._record_state(surface_id, runtime, ScreenState("cmux_unavailable", reason="socket disappeared during poll"))
-                    continue
-                if self._refresh_workspace(target, client):
-                    try:
-                        state = self._observe_target_viewport(target, runtime, client)
-                        observation = (
-                            None
-                            if state.kind in {"working", "menu"} and not self._runtime_is_claude(runtime, state)
-                            else self._claude_process_observation(target, client)
-                        )
-                        with self._surface_lock(surface_id):
-                            self._apply_claude_process_observation(runtime, observation)
-                            self._reconcile_claude_hook_identity(target, runtime, observation)
-                            self._refresh_claude_unreadable_clock(
-                                surface_id, runtime, state.kind, entry="returned_retry",
-                            )
-                            state = self._apply_claude_runtime_guards(surface_id, runtime, state)
-                            state = self._apply_claude_context_guard(surface_id, runtime, state)
-                            if self._reconcile_claude_submit(target, runtime, state, client):
-                                continue
-                            self._restore_expired_claude_deferred(runtime)
-                            if self._maybe_send_deferred_claude_stop(target, runtime, state, client):
-                                continue
-                            if self._runtime_is_claude(runtime, state) and self._maybe_send_claude_hook_gap_fallback(
-                                target, runtime, state, observation, client
-                            ):
-                                continue
-                            if state.kind not in SEND_ELIGIBLE_STATES:
-                                self._record_state(surface_id, runtime, state)
-                                continue
-                    except GlobalIncompatibleError as retry_exc:
-                        with self._surface_lock(surface_id):
-                            self._mark_global_incompatible(runtime, str(retry_exc))
-                        continue
-                    except IncompatibleError as retry_exc:
-                        with self._surface_lock(surface_id):
-                            # Same blind spot, reached after a workspace refresh.
-                            # Tagged distinctly so an audit can tell a first-read
-                            # failure from one that survived a retry.
-                            self._refresh_claude_unreadable_clock(
-                                surface_id, runtime, "unreadable:retry_incompatible",
-                                entry="raised_retry",
-                            )
-                            if self._claude_blind_spot_keeps_monitoring(target, runtime, client):
-                                self._record_state(surface_id, runtime, ScreenState(
-                                    "claude_viewport_blind",
-                                    reason=f"viewport unreadable after retry, still monitoring: {retry_exc}",
-                                    message_kind="claude",
-                                ))
-                            else:
-                                self._mark_target_incompatible(target, runtime, str(retry_exc))
-                        continue
-                    except CmuxError as retry_exc:
-                        if self._is_transient_observation_error(retry_exc):
-                            with self._surface_lock(surface_id):
-                                self._record_observation(surface_id, runtime, ScreenState(
-                                    "cmux_unavailable",
-                                    reason="cmux viewport unavailable after refresh; still monitoring",
-                                ))
-                                runtime.state = "cmux_unavailable"
-                            continue
-                        if isinstance(retry_exc.__cause__, subprocess.TimeoutExpired):
-                            with self._surface_lock(surface_id):
-                                self._record_observation(surface_id, runtime, ScreenState(
-                                    "cmux_unavailable", reason="cmux observation timed out after refresh; still monitoring",
-                                ))
-                                runtime.state = "cmux_unavailable"
-                            continue
-                        if not client.ping():
-                            with self._surface_lock(surface_id):
-                                self._record_state(surface_id, runtime, ScreenState("cmux_unavailable", reason="socket disappeared during retry"))
-                            continue
-                        with self._surface_lock(surface_id):
-                            self._pause_missing_or_error(target, runtime, str(retry_exc))
-                        continue
-                else:
-                    with self._surface_lock(surface_id):
-                        self._pause_missing_or_error(target, runtime, str(exc))
-                    continue
-            with self._surface_lock(surface_id):
-                self._handle_state(
-                    target,
-                    runtime,
-                    state,
-                    client,
-                    send_guard_tree=send_guard_tree,
-                    send_guard_error=send_guard_error,
-                )
+            due.append(dict(target))
+        for target in due:
+            self._process_one_target(target, client, send_guard_tree, send_guard_error)
         self.save()
+
+    def _process_one_target(
+        self,
+        target: Mapping[str, Any],
+        client: CmuxClient | None,
+        send_guard_tree: Mapping[str, Any] | None,
+        send_guard_error: str,
+        *,
+        defer_send: bool = False,
+        is_current: Callable[[], bool] | None = None,
+    ) -> ScreenState | None:
+        def current():
+            return is_current is None or self._active_send_target(target, is_current) is not None
+
+        if not current():
+            return None
+        if client is None:
+            client = CmuxClient(str(self.config.get("cmux_path", DEFAULT_CMUX)))
+        surface_id = str(target["surface_id"])
+        with self._runtime_lock:
+            runtime = self.runtime.setdefault(surface_id, TargetRuntime())
+        diagnostic = self._observation_rows.get(surface_id, {})
+        if (diagnostic.get("status") == "dormant"
+                and diagnostic.get("workspace_id") == target.get("workspace_id")
+                and 0 <= time.time() - float(diagnostic.get("observed_at") or 0) < 5):
+            with self._surface_lock(surface_id):
+                if not current():
+                    return None
+                self._record_state(surface_id, runtime, ScreenState(
+                    "terminal_dormant", reason="native terminal runtime uninitialized; no live agent"))
+            return
+        try:
+            state = self._observe_target_viewport(target, runtime, client)
+            if not current():
+                return None
+            observation = (
+                None
+                if state.kind in {"working", "menu"} and not self._runtime_is_claude(runtime, state)
+                else self._claude_process_observation(target, client)
+            )
+            with self._surface_lock(surface_id):
+                if not current():
+                    return None
+                self._apply_claude_process_observation(runtime, observation)
+                self._reconcile_claude_hook_identity(target, runtime, observation)
+                # Must run on the pre-guard kind: the guards below rewrite an
+                # unreadable viewport into claude_hook_missing and friends,
+                # which would hide the blind spot entirely.
+                self._refresh_claude_unreadable_clock(
+                    surface_id, runtime, state.kind, entry="returned_main",
+                )
+                state = self._apply_claude_runtime_guards(surface_id, runtime, state)
+                state = self._apply_claude_context_guard(surface_id, runtime, state)
+                if self._reconcile_codex_delivery(surface_id, runtime, state):
+                    return None
+                if self._reconcile_claude_submit(target, runtime, state, client):
+                    return
+                self._restore_expired_claude_deferred(runtime)
+                if self._maybe_send_deferred_claude_stop(target, runtime, state, client):
+                    return
+                if self._runtime_is_claude(runtime, state) and self._maybe_send_claude_hook_gap_fallback(
+                    target, runtime, state, observation, client
+                ):
+                    return
+                if state.kind not in SEND_ELIGIBLE_STATES:
+                    self._record_state(surface_id, runtime, state)
+                    return
+        except GlobalIncompatibleError as exc:
+            with self._surface_lock(surface_id):
+                if not current():
+                    return None
+                self._mark_global_incompatible(runtime, str(exc))
+            return
+        except IncompatibleError as exc:
+            with self._surface_lock(surface_id):
+                if not current():
+                    return None
+                # A raised IncompatibleError is the same parser blind spot as
+                # a returned ``incompatible`` state, but it used to skip the
+                # clock entirely: this branch pauses the target, and a paused
+                # target is never polled again, so the exposure could never be
+                # timed or restated.  Distinct entries keep the four entry
+                # points apart in the log and in hook-audit.
+                self._refresh_claude_unreadable_clock(
+                    surface_id, runtime, "unreadable:initial_read",
+                    entry="raised_initial",
+                )
+                if self._claude_blind_spot_keeps_monitoring(target, runtime, client):
+                    self._record_state(surface_id, runtime, ScreenState(
+                        "claude_viewport_blind",
+                        reason=f"viewport unreadable, still monitoring: {exc}",
+                        message_kind="claude",
+                    ))
+                else:
+                    self._mark_target_incompatible(target, runtime, str(exc))
+            return
+        except CmuxError as exc:
+            if not current():
+                return None
+            if self._is_transient_observation_error(exc):
+                with self._surface_lock(surface_id):
+                    # A terminal can remain live while cmux temporarily
+                    # cannot materialize its viewport.  Do not turn that
+                    # observation gap into a durable pause: the next poll
+                    # must get another chance to classify and rescue it.
+                    self._record_observation(surface_id, runtime, ScreenState(
+                        "cmux_unavailable",
+                        reason="cmux viewport unavailable; still monitoring",
+                    ))
+                    runtime.state = "cmux_unavailable"
+                return
+            if isinstance(exc.__cause__, subprocess.TimeoutExpired):
+                with self._surface_lock(surface_id):
+                    # A failed observation is not target removal or send acknowledgement.
+                    self._record_observation(surface_id, runtime, ScreenState(
+                        "cmux_unavailable", reason="cmux observation timed out; still monitoring",
+                    ))
+                    runtime.state = "cmux_unavailable"
+                return
+            if not client.ping():
+                with self._surface_lock(surface_id):
+                    if not current():
+                        return None
+                    # Deliberately *not* a parser blind spot: cmux being gone
+                    # is infrastructure. Counting it would turn every socket
+                    # restart into a fake "viewport unreadable" report.
+                    self._record_state(surface_id, runtime, ScreenState("cmux_unavailable", reason="socket disappeared during poll"))
+                return
+            if self._refresh_workspace(target, client, is_current=current):
+                try:
+                    state = self._observe_target_viewport(target, runtime, client)
+                    if not current():
+                        return None
+                    observation = (
+                        None
+                        if state.kind in {"working", "menu"} and not self._runtime_is_claude(runtime, state)
+                        else self._claude_process_observation(target, client)
+                    )
+                    with self._surface_lock(surface_id):
+                        if not current():
+                            return None
+                        self._apply_claude_process_observation(runtime, observation)
+                        self._reconcile_claude_hook_identity(target, runtime, observation)
+                        self._refresh_claude_unreadable_clock(
+                            surface_id, runtime, state.kind, entry="returned_retry",
+                        )
+                        state = self._apply_claude_runtime_guards(surface_id, runtime, state)
+                        state = self._apply_claude_context_guard(surface_id, runtime, state)
+                        if self._reconcile_codex_delivery(surface_id, runtime, state):
+                            return None
+                        if self._reconcile_claude_submit(target, runtime, state, client):
+                            return
+                        self._restore_expired_claude_deferred(runtime)
+                        if self._maybe_send_deferred_claude_stop(target, runtime, state, client):
+                            return
+                        if self._runtime_is_claude(runtime, state) and self._maybe_send_claude_hook_gap_fallback(
+                            target, runtime, state, observation, client
+                        ):
+                            return
+                        if state.kind not in SEND_ELIGIBLE_STATES:
+                            self._record_state(surface_id, runtime, state)
+                            return
+                except GlobalIncompatibleError as retry_exc:
+                    with self._surface_lock(surface_id):
+                        if not current():
+                            return None
+                        self._mark_global_incompatible(runtime, str(retry_exc))
+                    return
+                except IncompatibleError as retry_exc:
+                    with self._surface_lock(surface_id):
+                        if not current():
+                            return None
+                        # Same blind spot, reached after a workspace refresh.
+                        # Tagged distinctly so an audit can tell a first-read
+                        # failure from one that survived a retry.
+                        self._refresh_claude_unreadable_clock(
+                            surface_id, runtime, "unreadable:retry_incompatible",
+                            entry="raised_retry",
+                        )
+                        if self._claude_blind_spot_keeps_monitoring(target, runtime, client):
+                            self._record_state(surface_id, runtime, ScreenState(
+                                "claude_viewport_blind",
+                                reason=f"viewport unreadable after retry, still monitoring: {retry_exc}",
+                                message_kind="claude",
+                            ))
+                        else:
+                            self._mark_target_incompatible(target, runtime, str(retry_exc))
+                    return
+                except CmuxError as retry_exc:
+                    if not current():
+                        return None
+                    if self._is_transient_observation_error(retry_exc):
+                        with self._surface_lock(surface_id):
+                            self._record_observation(surface_id, runtime, ScreenState(
+                                "cmux_unavailable",
+                                reason="cmux viewport unavailable after refresh; still monitoring",
+                            ))
+                            runtime.state = "cmux_unavailable"
+                        return
+                    if isinstance(retry_exc.__cause__, subprocess.TimeoutExpired):
+                        with self._surface_lock(surface_id):
+                            self._record_observation(surface_id, runtime, ScreenState(
+                                "cmux_unavailable", reason="cmux observation timed out after refresh; still monitoring",
+                            ))
+                            runtime.state = "cmux_unavailable"
+                        return
+                    if not client.ping():
+                        with self._surface_lock(surface_id):
+                            if not current():
+                                return None
+                            self._record_state(surface_id, runtime, ScreenState("cmux_unavailable", reason="socket disappeared during retry"))
+                        return
+                    with self._surface_lock(surface_id):
+                        if not current():
+                            return None
+                        self._pause_missing_or_error(target, runtime, str(retry_exc))
+                    return
+            else:
+                with self._surface_lock(surface_id):
+                    if not current():
+                        return None
+                    self._pause_missing_or_error(target, runtime, str(exc))
+                return
+        with self._surface_lock(surface_id):
+            if not current():
+                return None
+            if defer_send:
+                self._record_observation(surface_id, runtime, state)
+                runtime.candidate_observed_at = runtime.viewport_checked_at
+                return state
+            self._handle_state(
+                target,
+                runtime,
+                state,
+                client,
+                send_guard_tree=send_guard_tree,
+                send_guard_error=send_guard_error,
+                is_current=is_current,
+            )
 
     def _event_target(self, surface_id: str) -> dict[str, Any] | None:
         with self._targets_lock:
@@ -6927,12 +7517,18 @@ class WatchDaemon:
         if not force and now - self._last_workspace_discovery_at < interval:
             return
         self._last_workspace_discovery_at = now
+        config = copy.deepcopy(self.config)
+        revision = self._config_mtime_ns
         try:
-            discovered = discover_rule_targets(client, self.config)
+            discovered = discover_rule_targets(client, config)
+            discovered.extend(discover_pane_follow_targets(client, config))
         except CmuxError as exc:
             # Keep the last known set, but do not add or rebind anything from a
             # partial/failed discovery cycle.
             self.logger.error("workspace discovery failed; keeping previous targets: %s", exc)
+            return
+        if revision != self._config_mtime_ns:
+            self._last_workspace_discovery_at = 0.0
             return
         new_targets = {str(target["surface_id"]): target for target in discovered}
         with self._targets_lock:
@@ -6955,11 +7551,13 @@ class WatchDaemon:
         with self._targets_lock:
             self.dynamic_targets = new_targets
 
-    def _refresh_workspace(self, target: dict[str, Any], client: CmuxClient) -> bool:
+    def _refresh_workspace(self, target: dict[str, Any], client: CmuxClient, *, is_current=None) -> bool:
         """Refresh only the same UUID; never rebind a stale numeric ref."""
         try:
             record = find_surface(client.tree(), str(target["surface_id"]))
         except CmuxError:
+            return False
+        if is_current is not None and not is_current():
             return False
         old_workspace = str(target.get("workspace_id", ""))
         if record["workspace_id"] != old_workspace:
@@ -7776,6 +8374,29 @@ class WatchDaemon:
         runtime.claude_candidate_focused = False
         return final_state, fresh_tree
 
+    def _reconcile_codex_delivery(self, surface_id, runtime, state) -> bool:
+        if runtime.delivery_status not in {"sending", "unknown", "accepted", "failed"}:
+            return False
+        if self._runtime_is_claude(runtime, state):
+            return False
+        if state.kind in {"working", "queued_followup"}:
+            runtime.delivery_status = "confirmed"
+            runtime.delivery_confirmed_at = time.time()
+            runtime.last_send_error = ""
+            return False
+        if runtime.delivery_status in {"sending", "unknown"}:
+            if (state.kind == "recoverable_error" and state.content_fingerprint
+                    and runtime.send_attempt_evidence
+                    and state.content_fingerprint != runtime.send_attempt_evidence):
+                runtime.delivery_status = "retryable"
+                runtime.last_send_error = ""
+                return False
+            self._record_observation(surface_id, runtime, state)
+            runtime.delivery_status = "unknown"
+            runtime.state = "delivery_unknown"
+            return True
+        return False
+
     def _handle_state(
         self,
         target: Mapping[str, Any],
@@ -7785,8 +8406,11 @@ class WatchDaemon:
         *,
         send_guard_tree: Mapping[str, Any] | None,
         send_guard_error: str = "",
+        is_current: Callable[[], bool] | None = None,
     ) -> None:
         surface_id = str(target["surface_id"])
+        if self._reconcile_codex_delivery(surface_id, runtime, state):
+            return
         previous_state = runtime.state
         if state.kind not in SEND_ELIGIBLE_STATES:
             self._record_state(surface_id, runtime, state)
@@ -7874,6 +8498,10 @@ class WatchDaemon:
                     return
         elif now - runtime.last_send_at < repeat_delay:
             return
+        if (state.message_kind == "codex" and runtime.delivery_status in {"failed", "retryable"}
+                and runtime.send_started_at > 0
+                and now - runtime.send_started_at < repeat_delay):
+            return
         if (
             runtime.send_count > 0
             and not state.allow_repeat
@@ -7924,11 +8552,56 @@ class WatchDaemon:
             runtime.awaiting = False
             self.logger.error("surface=%s send blocked: Dock surfaces are management-only", surface_id[:8])
             return
+        if self._active_send_target(target, is_current) is None:
+            return
+        if self.config.get("mode") != "armed" or self.config.get("global_paused", False):
+            return
+        # Persist the attempt before I/O. A restart during a send must reconcile
+        # the viewport rather than blindly treating the attempt as never made.
+        runtime.send_started_at = time.time()
+        runtime.send_io_started_at = 0.0
+        runtime.send_completed_at = 0.0
+        runtime.send_attempt_id = uuid.uuid4().hex
+        runtime.send_attempt_evidence = state.content_fingerprint
+        runtime.delivery_status = "sending"
+        runtime.last_send_error = ""
+        persisted_at = time.monotonic()
+        try:
+            self.save()
+        except (OSError, RuntimeError) as exc:
+            runtime.delivery_status = "failed"
+            runtime.state = "send_failed"
+            runtime.last_send_error = f"attempt persistence failed; input not sent: {exc}"
+            self.logger.error("surface=%s %s", surface_id[:8], runtime.last_send_error)
+            return
+        runtime.send_persist_duration_ms = round((time.monotonic() - persisted_at) * 1000, 3)
+        # Persistence can wait behind an earlier write. Recheck authorization
+        # at the actual input boundary, including a pause written during fsync.
+        if (self._active_send_target(target, is_current) is None
+                or self.config.get("mode") != "armed" or self.config.get("global_paused", False)):
+            runtime.delivery_status = "cancelled"
+            self.save(wait=False)
+            return
+        runtime.send_io_started_at = time.time()
+        runtime.detection_to_send_ms = round(max(0, runtime.send_io_started_at -
+            (runtime.candidate_observed_at or runtime.observed_at)) * 1000, 3)
+        send_started = time.monotonic()
         try:
             client.send(str(target["workspace_id"]), surface_id, self._outgoing_message(state))
         except CmuxError as exc:
+            runtime.send_completed_at = time.time()
+            runtime.send_duration_ms = round((time.monotonic() - send_started) * 1000, 3)
+            runtime.last_send_error = str(exc)[-500:]
+            uncertain = isinstance(exc.__cause__, subprocess.TimeoutExpired)
+            runtime.delivery_status = "unknown" if uncertain else "failed"
+            runtime.state = "delivery_unknown" if uncertain else "send_failed"
             self.logger.error("surface=%s send failed: %s", surface_id[:8], exc)
+            self.save()
             return
+        now = time.time()
+        runtime.send_completed_at = now
+        runtime.send_duration_ms = round((time.monotonic() - send_started) * 1000, 3)
+        runtime.delivery_status = "accepted"
         runtime.last_send_at = now
         runtime.send_count += 1
         runtime.awaiting = True
@@ -7943,7 +8616,10 @@ class WatchDaemon:
         runtime.state = "claude_pending_input" if state.message_kind == "claude" else "awaiting_transition"
         if state.message_kind == "claude":
             runtime.awaiting = False
-        self.logger.info("surface=%s sent=%s count=%d", surface_id[:8], state.error_type, runtime.send_count)
+        self.logger.info("surface=%s sent=%s count=%d scheduler_lag_ms=%.1f detect_to_send_ms=%.1f send_ms=%.1f",
+                         surface_id[:8], state.error_type, runtime.send_count, runtime.scheduler_lag_ms,
+                         runtime.detection_to_send_ms, runtime.send_duration_ms)
+        self.save()
 
 
 def configure_logging() -> None:
@@ -8125,7 +8801,7 @@ def _run_launchctl(args: Sequence[str], *, check: bool) -> subprocess.CompletedP
     return result
 
 
-def _bootstrap_runtime_service(domain: str, path: Path, *, timeout_sec: float = 5.0) -> None:
+def _bootstrap_runtime_service(domain: str, path: Path, *, timeout_sec: float = 15.0) -> None:
     """Allow launchd to finish an asynchronous bootout before registering again.
 
     launchctl can return from bootout while the service is still being removed.
@@ -8456,6 +9132,18 @@ def observation_status(config: Mapping[str, Any], state: Mapping[str, Any], snap
     return report
 
 
+def continuation_status(config: Mapping[str, Any], state: Mapping[str, Any], snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    # Recompute ages at read time so a stopped daemon cannot leave a green
+    # health result indefinitely. Only a matching snapshot can add dynamic IDs.
+    dynamic = snapshot.get("monitored_targets", []) if snapshot.get("config_key") == monitoring_config_key(config) else []
+    targets = effective_targets(config, dynamic if isinstance(dynamic, list) else [])
+    result = observation_health.continuation_report(
+        targets, state, now=time.time(), poll_interval=float(config.get("poll_interval_sec", 1)))
+    if not targets and config.get("workspace_rules"):
+        result["status"] = "unknown"
+    return result
+
+
 def registration_readiness(
     config: Mapping[str, Any], coverage: Mapping[str, Any], state: Mapping[str, Any],
     hooks: Mapping[str, Any] | None = None,
@@ -8502,6 +9190,11 @@ def claude_hook_coverage(
             config, discover_rule_targets(client, config))}
     except (CmuxError, OSError):
         return {"status": "unknown", "reason": "live surface/process inventory unavailable"}
+    return claude_hook_coverage_from_inventory(state, records, labels, targets, inspect_claude_process)
+
+
+def claude_hook_coverage_from_inventory(state, records, labels, targets, inspect_process):
+    """One verdict implementation, shared by live audits and cached status."""
     rows = []
     for record in records:
         sid = str(record["surface_id"])
@@ -8510,7 +9203,7 @@ def claude_hook_coverage(
         if not target or process.get("agent_kind") != "claude":
             continue
         runtime = state.get(sid, {})
-        inspection = inspect_claude_process(int(process.get("agent_pid") or 0))
+        inspection = inspect_process(int(process.get("agent_pid") or 0))
         same_process = bool(
             inspection.get("started_epoch", 0) > 0
             and inspection.get("generation") == runtime.get("claude_process_generation")
@@ -8538,6 +9231,15 @@ def claude_hook_coverage(
             "paused_unverified": [row["surface_ref"] for row in rows
                                   if row["disposition"] == "paused" and not row["hook_verified"]],
             "targets": rows}
+
+
+def hook_coverage_status(config, snapshot):
+    at = float(snapshot.get("hook_coverage_at") or 0)
+    coverage = snapshot.get("claude_hook_coverage")
+    if (snapshot.get("config_key") == monitoring_config_key(config) and isinstance(coverage, Mapping)
+            and 0 <= time.time() - at <= 30):
+        return dict(coverage)
+    return {"status": "unknown", "reason": "Hook inventory missing or stale"}
 
 
 def audit_claude_surfaces(
@@ -9274,8 +9976,9 @@ def cli(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.command == "status":
         state = load_json(args.config.parent / "state.json", {})
-        coverage = claude_hook_coverage(config, state, CmuxClient(str(config.get("cmux_path", DEFAULT_CMUX))))
-        observation = observation_status(config, state, load_json(args.config.parent / "monitoring-health.json", {}))
+        health_snapshot = load_json(args.config.parent / "monitoring-health.json", {})
+        coverage = hook_coverage_status(config, health_snapshot)
+        observation = observation_status(config, state, health_snapshot)
         print(json.dumps({
             "mode": config.get("mode"),
             "global_paused": config.get("global_paused"),
@@ -9285,6 +9988,7 @@ def cli(argv: Sequence[str] | None = None) -> int:
             "runtime": state,
             "claude_hook_coverage": coverage,
             "observation_coverage": observation,
+            "continuation_health": continuation_status(config, state, health_snapshot),
             "registration_readiness": registration_readiness(config, observation, state, coverage),
         }, ensure_ascii=False, indent=2))
         return 0

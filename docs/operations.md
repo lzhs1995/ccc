@@ -67,6 +67,46 @@ Do not use scrollback, cached terminal frames, `surface.refresh` across an entir
 workspace, or replacement terminals as a generic repair. Keep unresolved live
 gaps visible and investigate their actual runtime or transport cause.
 
+## Investigate late or unconfirmed continuation
+
+`poll_interval_sec` is a per-surface observation deadline. With the defaults,
+32 observation workers and 8 send workers operate independently; a surface has
+at most one in-flight job. Slow transport can still exhaust those capacities.
+Increasing concurrency alone is not a repair for an overloaded cmux socket.
+
+`ccc status` reads published evidence and recalculates its age. It does not run
+`tree`, `top`, process inspections or workspace discovery. The daemon shares a
+five-second process snapshot and classification per workspace, a one-second
+topology snapshot, and a bounded two-job maintenance budget. Viewports are read
+fresh, including after a candidate reaches a send slot.
+
+For the exact UUID, inspect `continuation_health.targets`:
+
+- `observation_age_sec`, `observation_interval_ms`, `scheduler_lag_ms` and
+  `read_duration_ms` distinguish overdue scheduling from slow viewport I/O.
+- `send_queue_ms`, `send_persist_duration_ms`, `detection_to_send_ms` and
+  `send_duration_ms` distinguish send capacity, durable storage and transport.
+  Detection-to-send includes persistence and measures actual input initiation.
+- `delivery_status=unknown` means cmux timed out without an acknowledgement.
+  It survives restart. Working or a live queue confirms progress; a new current
+  error can permit another attempt. An unchanged error with a prompt echo is
+  insufficient evidence. Do not erase this record to force another send.
+- `provider_blocked` / `invalid_encrypted_content` and `token_exhausted` require
+  provider/session investigation; automatic retry cannot repair those errors.
+
+An enabled target with no observation is unknown. A viewport older than two
+poll intervals is delayed. Send failures, unconfirmed delivery and provider
+blockers also degrade health. `监控中` is therefore not a substitute for timing
+and delivery evidence. Stale or incomplete Hook inventory remains unknown.
+
+For acceptance, observe all authorized targets for at least 15 minutes, including
+the affected workspace. Record the actual maximum dispatch lag and detection to
+send time, not just averages. The normal-I/O targets are at most 100 ms dispatch
+lag and one second from detection to input initiation. Report slow transport,
+capacity exhaustion and provider blockers separately; do not claim these targets
+were achieved without the measurements. Preserve the original timing settings,
+pauses, sessions and ledgers throughout deployment and rollback.
+
 ## Install and roll back
 
 Run tests from the checkout that will be released, then install it:
