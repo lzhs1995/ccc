@@ -151,6 +151,10 @@ def continuation_row(target, runtime, *, now, poll_interval=1.0):
         status, reason = "unavailable", phase
     elif phase in {"provider_blocked", "token_exhausted"}:
         status, reason = "blocked", str(runtime.get("observed_error_type") or runtime.get("error_type") or phase)
+    elif phase in {"claude_hook_missing", "claude_hook_unverified", "claude_hook_legacy"}:
+        status, reason = "unknown", phase
+    elif phase in {"claude_hook_config_degraded", "claude_hook_gap_exhausted", "claude_model_unavailable"}:
+        status, reason = "blocked", phase
     return {
         "surface_id": str(target["surface_id"]), "workspace_id": str(target["workspace_id"]),
         "status": status, "reason_code": reason, "state": phase,

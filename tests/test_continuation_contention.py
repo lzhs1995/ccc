@@ -7,7 +7,8 @@ from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
 
 import cmux_codex_watch as core
-from ccc_scheduling import CoalescingWriter
+from ccc_scheduling import CoalescingWriter, SnapshotClient
+from tests.test_registration_observation import main_tree
 from tests.test_watch import FakeClient, armed_daemon, grid_payload, visible_lines
 
 
@@ -146,6 +147,33 @@ class ContentionTests(unittest.TestCase):
                 finally:
                     release.set()
                 self.assertEqual(lookup.result(2), "")
+
+    def test_cold_process_inventory_finishes_in_maintenance_without_holding_dispatch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            daemon, client = self.make_daemon(directory)
+            entered, release = threading.Event(), threading.Event()
+            calls = []
+            def top(workspace_id):
+                calls.append(workspace_id)
+                entered.set()
+                if not release.wait(3):
+                    raise TimeoutError("test inventory was not released")
+                return {"windows": []}
+            client.top = top
+            client.tree_data = main_tree()
+            client.terminal_diagnostics = lambda: {"terminals": []}
+            with mock.patch.object(daemon, "_check_claude_hook_settings"), ThreadPoolExecutor(2) as pool:
+                refresh = pool.submit(daemon._refresh_observation_health,
+                                      SnapshotClient(client, daemon._process_snapshots))
+                try:
+                    self.assertTrue(entered.wait(1))
+                    self.assertFalse(refresh.done())
+                    pool.submit(daemon._record_dispatch, daemon.config["targets"][0], "observe", 0).result(1)
+                finally:
+                    release.set()
+                refresh.result(2)
+            self.assertEqual(calls, ["workspace-uuid"])
+            self.assertTrue(daemon._observation_metadata["inventory_complete"])
 
     def test_changed_owner_process_is_not_mistaken_for_proven_stale_owner(self):
         with tempfile.TemporaryDirectory() as directory:
