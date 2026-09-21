@@ -76,9 +76,16 @@ Increasing concurrency alone is not a repair for an overloaded cmux socket.
 
 `ccc status` reads published evidence and recalculates its age. It does not run
 `tree`, `top`, process inspections or workspace discovery. The daemon shares a
-five-second process snapshot and classification per workspace, a one-second
+five-second fleet process snapshot and classification, a one-second
 topology snapshot, and a bounded two-job maintenance budget. Viewports are read
 fresh, including after a candidate reaches a send slot.
+
+cmux process queries inspect the process table even when scoped to a workspace.
+Fleet-capable clients therefore use one shared `top --all --processes` scan;
+workspace-only clients retain the scoped fallback. Maintenance waits for that
+shared refresh before publishing complete Hook coverage. An expired cache entry
+at the five-second diagnostic boundary must not create a permanent unknown
+inventory while the readers themselves continue to work.
 
 After the configured CLI reports a v2 `cmux-socket` capability and its socket
 path, read-screen and viewport replay use independent socket connections. Every
@@ -88,6 +95,18 @@ uses a total request deadline. An unavailable protocol or authentication mode
 falls back to the CLI with a one-second shared probe backoff. A timed-out read
 does not start another full-duration CLI read. Terminal input keeps the existing
 CLI send path and durable delivery guards.
+
+An already known error or other grid-dependent state can use one fresh replay
+for both text routing and grid guards. Idle/Working/menu observations retain the
+smaller text read; a new error still requires a validated grid. The previous
+state selects only the read method. No grid is cached across observations or
+between detection and a send preflight. Invalid grids preserve the text
+prefilter, while identity mismatches and timeouts remain failures.
+
+The watcher's LaunchAgent uses `ProcessType=Interactive` because it serves
+terminal input deadlines. The previous Background process class imposed CPU and
+I/O throttling even while the user was waiting for continuation. This changes
+only the watcher; agent sessions and other stack components keep their policies.
 
 Unchanged config checks do not acquire the reload lock. Routine observation
 checks the scheduler generation; durable isolation and input still revalidate
@@ -115,6 +134,9 @@ An enabled target with no observation is unknown. A viewport older than two
 poll intervals is delayed. Send failures, unconfirmed delivery and provider
 blockers also degrade health. `监控中` is therefore not a substitute for timing
 and delivery evidence. Stale or incomplete Hook inventory remains unknown.
+A readable Claude viewport with missing/unverified Hooks is also unknown;
+Hook configuration failures, exhausted fallback retries and unavailable Claude
+models are blocked. These must not appear as a healthy continuation channel.
 
 For acceptance, observe all authorized targets for at least 15 minutes, including
 the affected workspace. Record the actual maximum dispatch lag and detection to

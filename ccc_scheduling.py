@@ -260,7 +260,14 @@ class SnapshotClient:
         return self.cached_top(workspace_id, wait=True)
 
     def cached_top(self, workspace_id, *, wait=False):
+        if callable(getattr(self.client, "top_all", None)):
+            # cmux top scans the process table even with a workspace filter.
+            # Share one fleet scan; callers still join by exact surface UUID.
+            return self.cache.get(("top",), self.client.top_all, ttl=5.0, wait=wait)
         return self.cache.get(("top", workspace_id), lambda: self.client.top(workspace_id), ttl=5.0, wait=wait)
+
+    def top_all(self):
+        return self.cache.get(("top",), self.client.top_all, ttl=5.0)
 
     def process_labels(self, workspace_id, classify, *, wait=False):
         top = self.cached_top(workspace_id, wait=wait)
@@ -268,7 +275,8 @@ class SnapshotClient:
             return None
         # A bounded derived entry follows the exact raw snapshot. A new top
         # result invalidates old labels immediately, even within their TTL.
-        return self.cache.get(("labels", workspace_id), lambda: classify(top),
+        key = ("labels",) if callable(getattr(self.client, "top_all", None)) else ("labels", workspace_id)
+        return self.cache.get(key, lambda: classify(top),
                               ttl=5.0, wait=wait, source=top)
 
 

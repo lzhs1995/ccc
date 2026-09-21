@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 import cmux_codex_watch as core
-from tests.test_watch import FakeClient, armed_daemon, grid_payload
+from tests.test_watch import FakeClient, HIGH_DEMAND_TEXT, armed_daemon, grid_payload
 
 
 @contextlib.contextmanager
@@ -78,6 +78,58 @@ def send(connection, payload):
 
 
 class ViewportSocketTests(unittest.TestCase):
+    def test_observation_routes_and_guards_one_frame_then_reads_again(self):
+        frames = [grid_payload([], error=HIGH_DEMAND_TEXT), grid_payload([], working=True)]
+        def handle(connection, request):
+            payload = response(request)
+            payload["result"].update(frames.pop(0))
+            send(connection, payload)
+        with server(handle) as (transport, requests), tempfile.TemporaryDirectory() as directory:
+            client = core.CmuxClient(viewport_socket=transport,
+                                     runner=mock.Mock(side_effect=AssertionError("unexpected CLI call")))
+            daemon = armed_daemon(directory, client)
+            self.addCleanup(daemon._process_snapshots.close)
+            target = daemon.config["targets"][0]
+            runtime = core.TargetRuntime(observed_state="recoverable_error")
+            with mock.patch.object(daemon, "_candidate_process_label", return_value={"agent_kind": "codex"}):
+                first = daemon._observe_target_viewport(target, runtime, client)
+                second = daemon._observe_target_viewport(target, runtime, client)
+            self.assertEqual(first.kind, "recoverable_error")
+            self.assertEqual(second.kind, "working")
+            self.assertEqual([r["method"] for r in requests], ["terminal.replay", "terminal.replay"])
+            self.assertTrue(all(r["params"]["anchor"] == "viewport" for r in requests))
+            self.assertEqual(runtime.viewport_source, "terminal.replay")
+
+    def test_single_frame_keeps_draft_and_cursor_guards(self):
+        for frame, expected in ((grid_payload([], composer="busy", error=HIGH_DEMAND_TEXT), "composer_busy"),
+                                (grid_payload([], cursor_visible=False, error=HIGH_DEMAND_TEXT), "incompatible")):
+            with self.subTest(expected=expected):
+                def handle(connection, request):
+                    payload = response(request)
+                    send(connection, {**payload, "result": {**payload["result"], **frame}})
+                with server(handle) as (transport, requests), tempfile.TemporaryDirectory() as directory:
+                    client = core.CmuxClient(viewport_socket=transport)
+                    daemon = armed_daemon(directory, client)
+                    self.addCleanup(daemon._process_snapshots.close)
+                    with mock.patch.object(daemon, "_candidate_process_label", return_value={"agent_kind": "codex"}):
+                        state = daemon._observe_target_viewport(daemon.config["targets"][0],
+                                                               core.TargetRuntime(observed_state="recoverable_error"), client)
+                    self.assertEqual(state.kind, expected)
+                    self.assertEqual(len(requests), 1)
+
+    def test_malformed_grid_keeps_text_prefilter_without_sending(self):
+        def handle(connection, request):
+            payload = response(request, render_grid={"format": "unsupported"})
+            payload["result"]["text"] = "• Working (2s • esc to interrupt)"
+            send(connection, payload)
+        with server(handle) as (transport, _), tempfile.TemporaryDirectory() as directory:
+            client = core.CmuxClient(viewport_socket=transport)
+            daemon = armed_daemon(directory, client)
+            self.addCleanup(daemon._process_snapshots.close)
+            state = daemon._observe_target_viewport(daemon.config["targets"][0],
+                                                   core.TargetRuntime(observed_state="recoverable_error"), client)
+            self.assertEqual(state.kind, "working")
+
     def test_fragmented_unicode_read_and_replay_use_only_explicit_viewport_identity(self):
         def handle(connection, request):
             payload = response(request)

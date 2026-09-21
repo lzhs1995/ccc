@@ -146,6 +146,32 @@ class SchedulerTests(unittest.TestCase):
 
 
 class SnapshotTests(unittest.TestCase):
+    def test_fleet_process_scan_and_labels_are_shared_across_workspaces(self):
+        calls, classifications, now = [], [], [100.0]
+        class Client:
+            def top_all(self):
+                calls.append(now[0])
+                return {"sample": now[0]}
+            def top(self, workspace_id):
+                raise AssertionError("redundant workspace process scan")
+        cache = SnapshotCache(clock=lambda: now[0])
+        client = SnapshotClient(Client(), cache)
+        def classify(top):
+            classifications.append(top)
+            return {"surface": top["sample"]}
+        try:
+            for wid in ("a", "b", "c"):
+                self.assertEqual(client.process_labels(wid, classify, wait=True), {"surface": 100.0})
+            self.assertEqual(client.top_all(), {"sample": 100.0})
+            self.assertEqual(calls, [100.0])
+            self.assertEqual(len(classifications), 1)
+            now[0] = 106
+            self.assertEqual(client.process_labels("b", classify, wait=True), {"surface": 106})
+            self.assertEqual(calls, [100.0, 106])
+            self.assertEqual(len(classifications), 2)
+        finally:
+            cache.close()
+
     def test_process_classification_is_shared_and_tracks_replaced_workspace_snapshot(self):
         now, calls = [100.0], []
         class Client:

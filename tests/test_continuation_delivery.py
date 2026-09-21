@@ -281,6 +281,16 @@ class ContinuationHealthTests(unittest.TestCase):
             row = health.continuation_row(target, {"viewport_checked_at": 100, "delivery_status": delivery}, now=101)
             self.assertEqual(row["status"], expected)
 
+    def test_readable_claude_without_verified_hooks_is_not_reported_healthy(self):
+        target = {"surface_id": "s", "workspace_id": "w"}
+        for phase, expected in (("claude_hook_missing", "unknown"), ("claude_hook_unverified", "unknown"),
+                                ("claude_hook_legacy", "unknown"), ("claude_hook_config_degraded", "blocked"),
+                                ("claude_hook_gap_exhausted", "blocked"), ("claude_model_unavailable", "blocked")):
+            with self.subTest(phase=phase):
+                row = health.continuation_row(target, {"viewport_checked_at": 100, "state": phase}, now=101)
+                self.assertEqual(row["status"], expected)
+                self.assertEqual(row["reason_code"], phase)
+
     def test_status_recalculates_age_instead_of_reusing_cached_green_verdict(self):
         target = {"surface_id": "s", "workspace_id": "w"}
         config = {"targets": [target], "workspace_rules": []}

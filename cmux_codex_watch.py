@@ -326,7 +326,7 @@ CLAUDE_CONTEXT_ABSOLUTE_TIMEOUT_SEC = 900.0
 # through TargetRuntime and suppresses duplicate Hook/fallback deliveries.
 # Human label only.  Acceptance always compares SHA-256 of the loaded source:
 # a revision string is hand-maintained and therefore can lie about what runs.
-FEATURE_REVISION = "0.2.7-continuation-viewport-io"
+FEATURE_REVISION = "0.2.7-continuation-observation-evidence"
 # How long after our own send a byte-identical UserPromptSubmit can still be
 # our echo.  Must exceed claude_submit_confirm_timeout_sec so that a late
 # echo arriving after the transaction timed out is not read as a human.
@@ -3574,6 +3574,25 @@ class CmuxClient:
             return "\n".join(grid.lines)
         return result.stdout
 
+    def read_viewport(self, workspace_id: str, surface_id: str, *, structured: bool = False) -> tuple[str, Grid | None]:
+        """Use one current frame for text routing and the strict input guards.
+
+        The returned grid belongs to this observation only. A send preflight
+        calls this method again; no frame survives across jobs or deadlines.
+        Legacy clients keep their text prefilter. Structural replay failures
+        also retain that prefilter so Working/menu/Claude routing stays intact.
+        Identity errors and timeouts from replay must not fall back to text.
+        """
+        if not structured or self.viewport_socket is None or self.viewport_socket.path is None:
+            return self.read_screen(workspace_id, surface_id), None
+        payload = self.replay(workspace_id, surface_id)
+        try:
+            grid = Grid.from_rpc(payload, surface_id)
+        except IncompatibleError:
+            return self.read_screen(workspace_id, surface_id), None
+        self.last_viewport_source = "terminal.replay"
+        return "\n".join(grid.lines), grid
+
     def replay(self, workspace_id: str, surface_id: str) -> Mapping[str, Any]:
         if not workspace_id or not surface_id:
             raise IncompatibleError("terminal.replay requires workspace_id and surface_id")
@@ -4952,8 +4971,15 @@ class WatchDaemon:
             live_workspaces = {str(r["workspace_id"]) for r in records.values()}
             workspaces = {str(t["workspace_id"]) for t in targets} & live_workspaces
             snapshots = [client.cached_top(wid, wait=False) for wid in workspaces]
+            # The diagnostic cadence and process TTL are both five seconds.
+            # Merely requesting a refresh here can therefore publish an
+            # incomplete inventory forever. Only this maintenance worker waits
+            # for the shared refreshes; observation remains nonblocking.
+            snapshots = [value if value is not None else client.cached_top(wid, wait=True)
+                         for wid, value in zip(workspaces, snapshots)]
             inventory_complete = all(value is not None for value in snapshots)
-            top = {"snapshots": [value for value in snapshots if value is not None]}
+            # A fleet-capable client shares the same snapshot across workspaces.
+            top = {"snapshots": list({id(value): value for value in snapshots if value is not None}.values())}
         else:
             top = client.top_all()
         labels = classify_surface_processes(top)
@@ -5141,8 +5167,19 @@ class WatchDaemon:
 
     def _observe_target_viewport(self, target, runtime, client):
         try:
-            text = client.read_screen(str(target["workspace_id"]), str(target["surface_id"]))
-            state = self._classify_target_screen(target, text, client)
+            reader = getattr(client, "read_viewport", None)
+            if callable(reader):
+                kind = runtime.observed_state or runtime.state
+                # Idle/Working/menu text is much smaller than a render grid.
+                # A previously strict-grid state can skip the redundant text
+                # RPC. The old state only chooses a reader, never a verdict.
+                structured = kind not in {"unknown", "idle", "working", "menu", "terminal_dormant"}
+                text, grid = reader(str(target["workspace_id"]), str(target["surface_id"]),
+                                    structured=structured)
+            else:
+                text = client.read_screen(str(target["workspace_id"]), str(target["surface_id"]))
+                grid = None
+            state = self._classify_target_screen(target, text, client, grid=grid)
             runtime.viewport_readable = state.kind != "incompatible" and not state.kind.startswith("unreadable")
             runtime.viewport_source = str(getattr(client, "last_viewport_source", "read-screen"))
             return state
@@ -5525,6 +5562,8 @@ class WatchDaemon:
         target: Mapping[str, Any],
         screen_text: str,
         client: CmuxClient,
+        *,
+        grid: Grid | None = None,
     ) -> ScreenState:
         """Classify one visible viewport without letting Claude reach Codex replay.
 
@@ -5543,9 +5582,12 @@ class WatchDaemon:
 
         def replay_claude() -> ScreenState:
             try:
-                payload = client.replay(str(target["workspace_id"]), str(target["surface_id"]))
+                current_grid = grid or Grid.from_rpc(
+                    client.replay(str(target["workspace_id"]), str(target["surface_id"])),
+                    str(target["surface_id"]),
+                )
                 state = classify_claude_grid(
-                    Grid.from_rpc(payload, str(target["surface_id"])),
+                    current_grid,
                     claude_message=str(self.config.get("claude_message") or CLAUDE_MESSAGE),
                 )
                 if state.kind in {"claude_stopped", "recoverable_error"}:
@@ -5567,8 +5609,11 @@ class WatchDaemon:
                 return ScreenState("incompatible", reason=f"Claude replay unreadable: {exc}")
 
         def replay_codex() -> ScreenState:
-            payload = client.replay(str(target["workspace_id"]), str(target["surface_id"]))
-            return classify_grid(Grid.from_rpc(payload, str(target["surface_id"])))
+            current_grid = grid or Grid.from_rpc(
+                client.replay(str(target["workspace_id"]), str(target["surface_id"])),
+                str(target["surface_id"]),
+            )
+            return classify_grid(current_grid)
 
         if prefilter.kind in {"menu", "working"}:
             if claude_on:
@@ -8861,7 +8906,7 @@ def write_plist(
         "ProgramArguments": [DEFAULT_PYTHON, str(runtime_dir / "cmux_codex_watch.py"), "watch"],
         "RunAtLoad": True,
         "KeepAlive": True,
-        "ProcessType": "Background",
+        "ProcessType": "Interactive",
         "WorkingDirectory": str(runtime_dir),
         "EnvironmentVariables": {
             "HOME": str(Path.home()),

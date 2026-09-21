@@ -11,6 +11,12 @@ Includes the previously unpublished 0.2.2–0.2.6 working drafts.
 - Read fresh viewports over the CLI-discovered cmux v2 socket without spawning
   a process for every read/replay. Validate request and target identities, bound
   response size and total timeout, and retain CLI fallback for legacy/auth modes.
+- Reuse one current grid for known error candidates while retaining lightweight
+  text checks for idle/Working/menu states. Share a single fleet process scan,
+  finish diagnostic refreshes before declaring Hook inventory complete, and
+  remove launchd Background throttling from the deadline-sensitive watcher.
+- Keep missing/unverified Claude Hooks and known Hook/model blockers out of the
+  healthy continuation count even when the terminal viewport is readable.
 - Remove unchanged-config lock convoys and whole-fleet copies/owner inspections
   from shared locks. Wake at observation deadlines, persist the already encoded
   state once, and prevent Claude event-error persistence from deadlocking.
