@@ -326,7 +326,7 @@ CLAUDE_CONTEXT_ABSOLUTE_TIMEOUT_SEC = 900.0
 # through TargetRuntime and suppresses duplicate Hook/fallback deliveries.
 # Human label only.  Acceptance always compares SHA-256 of the loaded source:
 # a revision string is hand-maintained and therefore can lie about what runs.
-FEATURE_REVISION = "0.2.7-continuation-observation-evidence"
+FEATURE_REVISION = "0.2.7-continuation-scheduler-gil"
 # How long after our own send a byte-identical UserPromptSubmit can still be
 # our echo.  Must exceed claude_submit_confirm_timeout_sec so that a late
 # echo arriving after the transaction timed out is not read as a human.
@@ -5072,7 +5072,8 @@ class WatchDaemon:
                     "continuation_health": observation_health.continuation_report(
                         targets, state, now=now, poll_interval=float(config.get("poll_interval_sec", 1))),
                     "claude_hook_coverage": hooks, "hook_coverage_at": metadata_at,
-                    "scheduler": self._scheduler.snapshot() if self._scheduler else {}}
+                    "scheduler": {**self._scheduler.snapshot(), "thread_switch_interval_sec": sys.getswitchinterval()}
+                    if self._scheduler else {}}
         atomic_write_json(self.observation_health_path, snapshot)
 
     def _registration_events(self) -> list[dict[str, Any]]:
@@ -5846,7 +5847,14 @@ class WatchDaemon:
             on_error=lambda exc: self.logger.error("health publication failed: %s", exc))
         scheduler = self._start_scheduler()
         last_publish = 0.0
+        previous_switch_interval = sys.getswitchinterval()
         try:
+            # Viewport decoding and metadata work contend with the deadline
+            # thread for the GIL. With dozens of ready workers, CPython's
+            # default 5 ms slice can leave the scheduler waiting hundreds of
+            # milliseconds after a stat/condition wait. Bound each slice in
+            # this daemon only; do not change the user's polling cadence.
+            sys.setswitchinterval(min(previous_switch_interval, 0.001))
             while not self.stop_requested:
                 scheduler.wakeup.clear()
                 if not capabilities_ok and not client.ping():
@@ -5883,6 +5891,7 @@ class WatchDaemon:
                 scheduler.wakeup.wait(scheduler.wait_timeout())
             return 0
         finally:
+            sys.setswitchinterval(previous_switch_interval)
             scheduler.close()
             if self._diagnostics_pool is not None:
                 self._diagnostics_pool.shutdown(wait=True, cancel_futures=True)

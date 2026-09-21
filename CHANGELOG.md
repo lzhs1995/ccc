@@ -17,6 +17,10 @@ Includes the previously unpublished 0.2.2–0.2.6 working drafts.
   remove launchd Background throttling from the deadline-sensitive watcher.
 - Keep missing/unverified Claude Hooks and known Hook/model blockers out of the
   healthy continuation count even when the terminal viewport is readable.
+- Preserve workspace-scoped discovery over the shared fleet snapshot and bound
+  watcher thread switching to reduce deadline-thread GIL starvation.
+- Spread revisit deadlines across the configured period, retaining immediate
+  first reads and avoiding cadence drift or bursts after missed deadlines.
 - Remove unchanged-config lock convoys and whole-fleet copies/owner inspections
   from shared locks. Wake at observation deadlines, persist the already encoded
   state once, and prevent Claude event-error persistence from deadlocking.

@@ -20,6 +20,68 @@ class SchedulerTests(unittest.TestCase):
             scheduler.wakeup.wait(0.005)
         self.assertTrue(predicate(), scheduler.snapshot())
 
+    def test_first_reads_are_immediate_then_deadlines_are_spread_across_the_period(self):
+        now, counts = [100.0], {}
+        def observe(target, current):
+            sid = target['surface_id']
+            counts[sid] = counts.get(sid, 0) + 1
+        scheduler = SurfaceScheduler(observe, lambda *args: self.fail('unexpected send'),
+                                     clock=lambda: now[0])
+        items = targets(4)
+        try:
+            self.pump(scheduler, items, lambda: len(counts) == 4 and scheduler.snapshot()['observing'] == 0)
+            self.assertEqual(counts, {str(i): 1 for i in range(4)})
+            for at, sid in ((100.25, '1'), (100.5, '2'), (100.75, '3'), (101.0, '0')):
+                now[0] = at
+                before = dict(counts)
+                self.pump(scheduler, items, lambda: counts[sid] == 2 and scheduler.snapshot()['observing'] == 0)
+                self.assertEqual({key for key in counts if counts[key] != before[key]}, {sid})
+            self.assertEqual(counts, {str(i): 2 for i in range(4)})
+        finally:
+            scheduler.close()
+
+    def test_late_dispatch_keeps_the_original_cadence_without_replaying_missed_periods(self):
+        now, calls = [100.0], []
+        scheduler = SurfaceScheduler(lambda *_: calls.append(now[0]), lambda *_: None, clock=lambda: now[0])
+        items = targets(1)
+        try:
+            self.pump(scheduler, items, lambda: len(calls) == 1 and scheduler.snapshot()['observing'] == 0)
+            now[0] = 103.2
+            self.pump(scheduler, items, lambda: len(calls) == 2 and scheduler.snapshot()['observing'] == 0)
+            for _ in range(3):
+                scheduler.tick(items, generation=1)
+            self.assertEqual(calls, [100.0, 103.2])
+            now[0] = 104.0
+            self.pump(scheduler, items, lambda: len(calls) == 3)
+            self.assertEqual(calls[-1], 104.0)
+        finally:
+            scheduler.close()
+
+    def test_delayed_future_consumption_preserves_the_due_time_and_reports_lag(self):
+        now, calls, dispatch_lags = [100.0], [], []
+        scheduler = SurfaceScheduler(lambda *_: calls.append(now[0]), lambda *_: None,
+                                     clock=lambda: now[0],
+                                     on_dispatch=lambda target, phase, lag: dispatch_lags.append(lag))
+        items = targets(1)
+        try:
+            scheduler.tick(items, generation=1)
+            self.assertTrue(scheduler.wakeup.wait(2))
+            self.assertEqual(calls, [100.0])
+            # The read has completed, but the deadline thread cannot consume
+            # its Future until well after the next scheduled observation.
+            now[0] = 103.2
+            self.pump(scheduler, items, lambda: len(calls) == 2 and scheduler.snapshot()['observing'] == 0)
+            self.assertEqual(calls, [100.0, 103.2])
+            self.assertAlmostEqual(dispatch_lags[-1], 2.2)
+            for _ in range(3):
+                scheduler.tick(items, generation=1)
+            self.assertEqual(len(calls), 2)
+            now[0] = 104.0
+            self.pump(scheduler, items, lambda: len(calls) == 3)
+            self.assertAlmostEqual(dispatch_lags[-1], 0.0)
+        finally:
+            scheduler.close()
+
     def test_slow_observation_does_not_block_next_tick_of_39_peers(self):
         release, entered = threading.Event(), threading.Event()
         counts, lock = {}, threading.Lock()
@@ -138,7 +200,7 @@ class SchedulerTests(unittest.TestCase):
             release.set()
             self.pump(scheduler, targets(2), lambda: scheduler.snapshot()["observing"] == 0,
                       generation=None)
-            now[0] = 100.975
+            now[0] = 100.475
             self.assertAlmostEqual(scheduler.wait_timeout(0.1), 0.025)
         finally:
             release.set()
@@ -169,6 +231,30 @@ class SnapshotTests(unittest.TestCase):
             self.assertEqual(client.process_labels("b", classify, wait=True), {"surface": 106})
             self.assertEqual(calls, [100.0, 106])
             self.assertEqual(len(classifications), 2)
+        finally:
+            cache.close()
+
+    def test_workspace_discovery_receives_only_its_slice_of_the_shared_fleet(self):
+        calls, now = [], [100.0]
+        class Client:
+            def top_all(self):
+                calls.append(now[0])
+                return {"windows": [{"id": "window", "workspaces": [
+                    {"kind": "workspace", "id": "a", "surfaces": [{"id": "surface-a", "sample": now[0]}]},
+                    {"kind": "workspace", "id": "b", "surfaces": [{"id": "surface-b", "sample": now[0]}]},
+                ]}]}
+        cache = SnapshotCache(clock=lambda: now[0])
+        client = SnapshotClient(Client(), cache)
+        try:
+            a, b = client.top("a"), client.top("b")
+            self.assertEqual([ws["id"] for ws in a["windows"][0]["workspaces"]], ["a"])
+            self.assertEqual([ws["id"] for ws in b["windows"][0]["workspaces"]], ["b"])
+            self.assertEqual(client.top("closed"), {"windows": []})
+            self.assertEqual(calls, [100.0])
+            self.assertIs(client.top("a"), a)
+            now[0] = 106
+            self.assertEqual(client.top("a")["windows"][0]["workspaces"][0]["surfaces"][0]["sample"], 106)
+            self.assertEqual(calls, [100.0, 106])
         finally:
             cache.close()
 

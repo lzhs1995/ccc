@@ -7,6 +7,7 @@ with controlled clocks and clients.
 from __future__ import annotations
 
 import dataclasses
+import math
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -18,11 +19,13 @@ class _Slot:
     target: dict[str, Any]
     key: Any
     due: float
+    cadence_anchor: float = 0.0
     enabled: bool = True
     future: Future | None = None
     submitted_key: Any = None
     phase: str = "idle"
     started: float = 0.0
+    completed_at: float | None = None
     candidate: Any = None
     ready_at: float = 0.0
     revision: int = 0
@@ -75,16 +78,18 @@ class SurfaceScheduler:
                     slot.candidate = None
                     if slot.future:
                         slot.future.cancel()
-            for sid, target in active.items():
+            for index, (sid, target) in enumerate(active.items()):
                 key = (generation, str(target.get("workspace_id")),
                        str(target.get("source")), str(target.get("source_workspace_id")))
                 slot = self._slots.get(sid)
                 if slot is None:
-                    self._slots[sid] = _Slot(target, key, now)
+                    self._slots[sid] = _Slot(target, key, now,
+                        cadence_anchor=now + self.interval * index / max(1, len(active)))
                 else:
                     if slot.key != key:
                         slot.revision += 1
                         slot.due = now
+                        slot.cadence_anchor = now + self.interval * index / max(1, len(active))
                         slot.candidate = None
                         if slot.future:
                             slot.future.cancel()
@@ -108,8 +113,15 @@ class SurfaceScheduler:
                     if current and previous_phase == "observe" and result is not None:
                         slot.candidate, slot.ready_at, slot.phase = result, now, "ready"
                     else:
-                        # Retain cadence, but never replay missed ticks in a burst.
-                        slot.due = max(slot.started + self.interval, now)
+                        # First reads are immediate. Subsequent deadlines are
+                        # spread over the period and anchored independently of
+                        # I/O completion, so an initial worker-sized burst does
+                        # not repeat forever or drift after a slow read. Skip
+                        # missed periods; never replay them in a catch-up burst.
+                        completed = slot.completed_at if slot.completed_at is not None else now
+                        slot.due = (slot.cadence_anchor + self.interval *
+                                    (math.floor((completed - slot.cadence_anchor) / self.interval) + 1)
+                                    if current and self.interval > 0 else now)
                 if not slot.enabled and slot.future is None:
                     del self._slots[sid]
 
@@ -132,13 +144,23 @@ class SurfaceScheduler:
             due = slot.due if phase == "observe" else slot.ready_at
             self.on_dispatch(slot.target, phase, max(0, now - due))
         slot.phase, slot.submitted_key = phase, key
+        slot.completed_at = None
         if phase == "observe":
             slot.started = now
-            slot.future = self._observe_pool.submit(self.observe, dict(slot.target), current)
+            slot.future = self._observe_pool.submit(self._execute, self.observe, slot, dict(slot.target), current)
         else:
             candidate, slot.candidate = slot.candidate, None
-            slot.future = self._send_pool.submit(self.send, dict(slot.target), candidate, current)
+            slot.future = self._send_pool.submit(self._execute, self.send, slot, dict(slot.target), candidate, current)
         slot.future.add_done_callback(lambda _: self.wakeup.set())
+
+    def _execute(self, operation, slot, *args):
+        try:
+            return operation(*args)
+        finally:
+            # Capture completion before Future.done() becomes visible. The
+            # scheduler may consume that future late; consumption time is not
+            # the observation's completion time or its next cadence anchor.
+            slot.completed_at = self.clock()
 
     def snapshot(self):
         with self._lock:
@@ -257,7 +279,21 @@ class SnapshotClient:
         return self.cache.get(("tree",), self.client.tree, ttl=1.0)
 
     def top(self, workspace_id):
-        return self.cached_top(workspace_id, wait=True)
+        top = self.cached_top(workspace_id, wait=True)
+        if not callable(getattr(self.client, "top_all", None)):
+            return top
+        # Preserve the scoped API for discovery callers. Passing the full
+        # fleet through each pane/workspace discovery would reclassify it N
+        # times, undoing the benefit of sharing the process-table scan.
+        def scoped():
+            windows = []
+            for window in top.get("windows", []):
+                workspaces = [workspace for workspace in window.get("workspaces", [])
+                              if str(workspace.get("id") or workspace.get("workspace_id") or "") == workspace_id]
+                if workspaces:
+                    windows.append({"id": window.get("id"), "kind": "window", "workspaces": workspaces})
+            return {"windows": windows}
+        return self.cache.get(("workspace_top", workspace_id), scoped, ttl=5.0, source=top)
 
     def cached_top(self, workspace_id, *, wait=False):
         if callable(getattr(self.client, "top_all", None)):
