@@ -49,6 +49,7 @@ def transient_observation_error(error: BaseException | str) -> bool:
         "broken pipe", "connection reset by peer", "connection refused",
         "connection aborted", "socket is not connected", "no live cmux socket found",
         "socket closed before reply", "connection closed before reply",
+        "socket read error",
     ))
 
 

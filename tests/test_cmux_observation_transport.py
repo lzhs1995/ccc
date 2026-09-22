@@ -20,6 +20,7 @@ TRANSPORT_ERRORS = (
     "cmux read-screen --workspace failed: Error: Connection reset by peer",
     "cmux --json rpc failed: Error: Socket closed before reply",
     "cmux read-screen --workspace failed: Error: Connection closed before reply",
+    "cmux --json rpc failed: Error: Socket read error",
 )
 
 
