@@ -105,7 +105,7 @@ the source are documented in the source comments and are intentionally more
 conservative than the send path; a stale observation is never converted into
 an authorization.
 
-- **监控**：`未登记` / `监控中` / `空转` / `整池空转` / `已暂停` / `整池` / `已排除` / `待检测` / `检测延迟` / `投递待验` / `发送失败` / `读取异常` / `服务阻塞`。登记仍保留，检查延迟和投递异常直接显示；焦点行显示最近检查的年龄。
+- **监控**：`未登记` / `监控中` / `空转` / `整池空转` / `已暂停` / `整池` / `已排除` / `待检测` / `投递待验` / `发送失败` / `读取异常` / `服务阻塞`。登记仍保留，投递异常直接显示；焦点行显示最近检查的年龄。
 - **程序**：`Codex` / `Claude` / `grok` / `Copilot` / `gh` / `shell` / `其他` / `未知`。程序列只显示身份；空转属于「监控」列。
 - **画面**：`空闲` / `运行中` / `菜单` / `待续跑` / `已排队` / `已过时` / `额度耗尽` / `正在输入` / `看不清` / `非Codex` / `Claude关` / `Hook等待` / `输入保护` / `发送中` / `已完成` / `已续跑` / `Hook待验` / `Hook未验` / `配置待核` / `模型错误` / `身份冲突` / `需人工` / `未初始化` / `等待压缩` / `压缩中` / `读不出` / `提交中` / `未确认` / `投递待验` / `发送失败` / `服务阻塞`。完成、压缩和客户端重试不代表续跑器故障。
 - **Hook**：当前进程代次的 Hook 验证结果；历史身份记录本身不能授予发送权限。
@@ -114,7 +114,7 @@ an authorization.
 
 上下文读数过期阈值为 `CONTEXT_STALE_SEC` = 120 秒。终端观测采用独立阈值
 `max(30 秒, 3 × poll_interval_sec)`；过期或身份不明时显示未知。
-续跑时效另外按 `2 × poll_interval_sec` 检查，超过即显示检测延迟；后台身份诊断的宽限不能放宽续跑时限。
+续跑时效另外按 `2 × poll_interval_sec` 检查，诊断数据保留在 `ccc status` 中；后台身份诊断的宽限不能放宽续跑时限。
 
 ## Registration recovery and observation coverage (v0.2.0)
 
