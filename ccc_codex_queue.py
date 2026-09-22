@@ -59,13 +59,20 @@ def task_snapshot(path, session_id):
             "signature": [after.st_ino, after.st_size, after.st_mtime_ns]}
 
 
+def _retryable_completed_message(message):
+    normalized = " ".join(message.lower().split())
+    return (any(x in normalized for x in ("currently experiencing high demand", "rate limit exceeded",
+                                          "temporarily unavailable", "stream disconnected before completion"))
+            or normalized == "connection failed: error sending request")
+
+
 def completed_error(path, session_id, now):
     latest = task_snapshot(path, session_id)
     if not latest or latest["kind"] != "task_complete":
         return None
     error = latest["error"]
     message = str(error.get("message") or "").lower() if isinstance(error, dict) else ""
-    if not any(x in message for x in ("currently experiencing high demand", "rate limit exceeded", "temporarily unavailable")):
+    if not _retryable_completed_message(message):
         return None
     completed = latest["at"]
     if not 5 <= now - completed <= 24 * 3600:
@@ -406,7 +413,7 @@ class QueueRecovery:
             return None
         error = turn.get("error")
         message = str(error.get("message") or "").lower() if isinstance(error, dict) else ""
-        if (not any(x in message for x in ("currently experiencing high demand", "rate limit exceeded", "temporarily unavailable"))
+        if (not _retryable_completed_message(message)
                 or not 5 <= time.time() - turn["at"] <= 24 * 3600):
             return None
         return {"session_id": turn["session_id"], "pid": turn["pid"], "process_start": turn["process_start"],
