@@ -105,6 +105,18 @@ else
 fi
 say ""
 
+# Stop the independent expiry job before touching quarantine.
+EXPIRY_LABEL="${LABEL_PREFIX}.cmux-janitor-quarantine-purge"
+if label_is_ours "$EXPIRY_LABEL"; then
+  act "launchctl bootout gui/$(/usr/bin/id -u)/$EXPIRY_LABEL"
+  [ "$DRY" = "0" ] && /bin/launchctl bootout "gui/$(/usr/bin/id -u)/$EXPIRY_LABEL" 2>/dev/null
+fi
+EXPIRY_PLIST="$HOME/Library/LaunchAgents/$EXPIRY_LABEL.plist"
+if [ -f "$EXPIRY_PLIST" ]; then
+  act "rm $EXPIRY_PLIST"
+  [ "$DRY" = "0" ] && /bin/rm -f "$EXPIRY_PLIST"
+fi
+
 # ---------- 3. restore anything still in quarantine ----------
 # The restore loop enumerates depth 2 of the quarantine tree, and find does not
 # exclude dotfiles.  Two classes of entry there are the janitor's own bookkeeping

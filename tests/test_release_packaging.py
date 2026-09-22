@@ -97,6 +97,8 @@ class LaunchAgentRenderingTests(unittest.TestCase):
             self.assertEqual(payloads[0]["WorkingDirectory"], str(release))
             self.assertEqual(payloads[1]["StartInterval"], 1800)
             self.assertEqual(payloads[2]["StartInterval"], 60)
+            self.assertEqual(payloads[3]["StartInterval"], 300)
+            self.assertEqual(payloads[3]["ProgramArguments"][-1], str(root / "janitor" / "expire.sh"))
             self.assertNotIn(str(source), paths[0].read_text())
             (release / "ccc_observation.py").write_text("tampered\n")
             with self.assertRaisesRegex(RuntimeError, "incomplete or changed"):

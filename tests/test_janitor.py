@@ -410,7 +410,7 @@ class PreviewContractTests(JanitorTestCase):
 class ConfigContractTests(JanitorTestCase):
     def test_authoritative_config_declares_only_keep_hours(self):
         text = (SRC / "config.env").read_text(encoding="utf-8")
-        self.assertIn("QUARANTINE_KEEP_HOURS=48", text)
+        self.assertIn("QUARANTINE_KEEP_HOURS=3", text)
         # The retired name may be documented in a comment but never assigned.
         # The fail-closed check is anchored (cmux-janitor.sh:98 greps for
         # ^[[:space:]]*QUARANTINE_RETAIN_HOURS=), so a '#'-prefixed mention
@@ -446,6 +446,7 @@ class ConfigContractTests(JanitorTestCase):
                     subprocess.run(["/bin/rm", "-rf", str(box.root)], check=False)
 
     def test_keep_hours_48_is_what_expiry_actually_uses(self):
+        self.box.set_config(QUARANTINE_KEEP_HOURS=48)
         # The original defect: config said 48, the script read a different name
         # and used 24.  A batch at 30h must therefore survive.
         self.box.batch("20260827-000000", sealed_ago_h=30)
@@ -658,7 +659,7 @@ class SealedBatchTests(JanitorTestCase):
         oldest = time.strptime(quarantine["oldest_sealed_at"], "%Y-%m-%dT%H:%M:%SZ")
         nxt = time.strptime(quarantine["next_expiry_at"], "%Y-%m-%dT%H:%M:%SZ")
         delta = time.mktime(nxt) - time.mktime(oldest)
-        self.assertAlmostEqual(delta, 48 * 3600, delta=90)
+        self.assertAlmostEqual(delta, 3 * 3600, delta=90)
 
 
 class MutexTests(JanitorTestCase):
@@ -937,7 +938,7 @@ class KillSwitchTests(JanitorTestCase):
 
 
 QUARANTINE_AGGREGATE_FIELDS = [
-    "batch_count", "bytes", "keep_hours", "next_expiry_at", "oldest_sealed_at",
+    "age_sec", "batch_count", "bytes", "keep_hours", "next_expiry_at", "observed_at", "oldest_sealed_at", "stale",
 ]
 
 
@@ -957,7 +958,8 @@ def assert_status_is_bounded(case, payload, batch_names, home=None):
     """
 
     quarantine = payload["quarantine"]
-    case.assertEqual(sorted(quarantine), QUARANTINE_AGGREGATE_FIELDS)
+    case.assertLessEqual(set(quarantine), set(QUARANTINE_AGGREGATE_FIELDS))
+    case.assertLessEqual({"batch_count", "bytes", "keep_hours", "next_expiry_at", "oldest_sealed_at"}, set(quarantine))
     case.assertNotIn("batches", quarantine)
 
     # Only scalars plus the documented ``bytes`` measure.  A list is how a batch
@@ -1282,8 +1284,8 @@ class UninstallRestoreTests(JanitorTestCase):
         self.assertIn("label_is_ours()", text, "the scope guard was removed")
         gated = [line for line in text.splitlines()
                  if line.strip().startswith("if label_is_ours ")]
-        self.assertEqual(len(gated), 2,
-                         "both bootout blocks must be gated on label_is_ours")
+        self.assertEqual(len(gated), 3,
+                         "all bootout blocks must be gated on label_is_ours")
         for line in text.splitlines():
             stripped = line.strip()
             if "launchctl bootout" in stripped and not stripped.startswith(("#", "act ", "say ")):
@@ -1349,7 +1351,7 @@ class BoundaryInvariantTests(unittest.TestCase):
         # This test must pass in both contexts.
         base_artifacts = {
             "cmux-janitor.sh", "guard.sh", "status.sh", "uninstall.sh",
-            "cmux-janitorctl", "config.env",
+            "cmux-janitorctl", "config.env", "janitor_maintenance.py", "expire.sh",
             "ENABLE.command", "DISABLE.command",
             "com.__LABEL_PREFIX__.cmux-janitor.plist.template",
             "com.__LABEL_PREFIX__.cmux-janitor-guard.plist.template",

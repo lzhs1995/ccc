@@ -5,9 +5,63 @@ owns the verdict; controllers only project its public fields.
 """
 from __future__ import annotations
 
+import errno
 import math
+import subprocess
 from collections.abc import Mapping
 from typing import Any
+
+
+def transient_observation_error(error: BaseException | str) -> bool:
+    """Recognize a failed read transport, never an input delivery outcome.
+
+    CLI errors carry text; wrapped OS errors also carry a cause. Explicit target
+    identity failures take precedence over either transient representation.
+    """
+    # Bound traversal, including cycles; wrappers may use either exception link.
+    chain, pending, seen = [], [error], set()
+    while pending and len(chain) < 16:
+        cause = pending.pop()
+        if id(cause) in seen:
+            continue
+        seen.add(id(cause))
+        chain.append(cause)
+        for link in ("__cause__", "__context__"):
+            child = getattr(cause, link, None)
+            if child is not None:
+                pending.append(child)
+    detail = "\n".join(str(cause).lower() for cause in chain)
+    if any(marker in detail for marker in (
+        "surface not found", "surface_not_found", "workspace not found",
+        "workspace_not_found", "not a terminal", "invalid_params", "identity mismatch",
+    )):
+        return False
+    for cause in chain:
+        if isinstance(cause, (subprocess.TimeoutExpired, TimeoutError, ConnectionError)):
+            return True
+        if isinstance(cause, OSError) and cause.errno in {
+            errno.EPIPE, errno.ECONNRESET, errno.ECONNREFUSED,
+            errno.ECONNABORTED, errno.ENOTCONN, errno.ETIMEDOUT,
+        }:
+            return True
+    return any(marker in detail for marker in (
+        "failed to read terminal text", "command timed out", " timed out",
+        "broken pipe", "connection reset by peer", "connection refused",
+        "connection aborted", "socket is not connected", "no live cmux socket found",
+        "socket closed before reply", "connection closed before reply",
+    ))
+
+
+def pause_health(target):
+    """A transport message alone cannot establish who requested a pause."""
+    if not target.get("enabled", True):
+        return "paused", "explicitly_paused_or_disabled"
+    origin = str(target.get("pause_origin") or "")
+    if origin.startswith("automatic_"):
+        return "unavailable", "paused_after_observation_error"
+    if origin != "user" and transient_observation_error(str(target.get("paused_reason") or "")):
+        return "unknown", "pause_origin_unverified"
+    return "paused", "explicitly_paused_or_disabled"
 
 
 def objects(value: Any):
@@ -85,7 +139,8 @@ def observation_row(target, record, process, terminal, runtime, *, owner_alive, 
         "status": "unknown", "reason_code": "identity_or_observation_unknown",
     }
     if target.get("paused") or not target.get("enabled", True):
-        row.update(status="paused", reason_code="explicitly_paused_or_disabled")
+        health, reason = pause_health(target)
+        row.update(status="live_unreadable" if health == "unavailable" else health, reason_code=reason)
     elif record is None:
         if live_agent or owner_alive is True:
             row.update(status="live_unreadable", reason_code="live_owner_without_surface")
@@ -135,8 +190,10 @@ def continuation_row(target, runtime, *, now, poll_interval=1.0):
     status, reason = "ok", "current_observation"
     phase = str(runtime.get("state") or "unknown")
     delivery = str(runtime.get("delivery_status") or "")
-    if target.get("paused") or not target.get("enabled", True):
+    if not target.get("enabled", True):
         status, reason = "paused", "explicitly_paused_or_disabled"
+    elif target.get("paused"):
+        status, reason = pause_health(target)
     elif age is None or age < 0:
         status, reason = "unknown", "no_current_observation"
     elif age > 2 * poll_interval:
@@ -155,6 +212,12 @@ def continuation_row(target, runtime, *, now, poll_interval=1.0):
         status, reason = "unknown", phase
     elif phase in {"claude_hook_config_degraded", "claude_hook_gap_exhausted", "claude_model_unavailable"}:
         status, reason = "blocked", phase
+    elif phase in {"unknown", "error_superseded", "queued_followup", "queue_recovery_submitted"}:
+        status, reason = "unknown", "task_progress_unconfirmed"
+    elif phase == "missing_or_error":
+        status, reason = "unavailable", phase
+    elif phase == "queue_recovery_unconfirmed":
+        status, reason = "delivery_unknown", phase
     return {
         "surface_id": str(target["surface_id"]), "workspace_id": str(target["workspace_id"]),
         "status": status, "reason_code": reason, "state": phase,

@@ -24,6 +24,7 @@ def render(output: Path, runtime_root: Path, janitor_dir: Path) -> list[Path]:
     for component, script, interval, at_load in (
         ("cmux-janitor", "cmux-janitor.sh", 1800, False),
         ("cmux-janitor-guard", "guard.sh", 60, True),
+        ("cmux-janitor-quarantine-purge", "expire.sh", 300, False),
     ):
         label = f"{watcher.LABEL_PREFIX}.{component}"
         path = output / f"{label}.plist"
