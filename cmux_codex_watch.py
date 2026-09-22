@@ -167,6 +167,7 @@ PROVIDER_REPEAT_ERROR_TYPES = frozenset({
     "rate_limit",
     "stream",
     "http_503",
+    "http_408", "http_500", "http_502", "http_504",
     "http_405",
     "prompt_cache",
 })
@@ -975,6 +976,13 @@ def _match_error_block(block_text: str) -> str | None:
         "zzzcoding.org" in lower or "/v1/responses" in lower
     ):
         return "stream"
+    # These complete native status banners describe retryable transport/server
+    # failures. Compact matching also handles narrow-window hard wraps.
+    for status, phrase in ((408, "requesttimeout"), (429, "toomanyrequests"),
+                           (500, "internalservererror"), (502, "badgateway"),
+                           (503, "serviceunavailable"), (504, "gatewaytimeout")):
+        if f"unexpectedstatus{status}{phrase}" in compact:
+            return "rate_limit" if status == 429 else f"http_{status}"
     if any(token in lower for token in ("last status: 503", "http 503", "503 service unavailable")):
         return "http_503"
     has_405 = "405 not allowed" in lower or "405 method not allowed" in lower

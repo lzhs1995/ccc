@@ -217,6 +217,32 @@ class CodexReconnectRecoveryTests(unittest.TestCase):
                 self.assertEqual((state.kind, state.error_type), ("recoverable_error", "high_demand"))
                 self.assertEqual(core.classify_text_prefilter(visible_lines(payload)).kind, "candidate")
 
+    def test_new_transient_http_error_supersedes_older_high_demand(self):
+        for status, phrase in ((408, "Request Timeout"), (429, "Too Many Requests"),
+                              (500, "Internal Server Error"), (502, "Bad Gateway"),
+                              (503, "Service Unavailable"), (504, "Gateway Timeout")):
+            with self.subTest(status=status):
+                payload = covered_prompt_payload()
+                row = payload["render_grid"]["cursor"]["row"]
+                banner = f"■ unexpected status {status} {phrase}: Unknown error, url: https://example.test/v1/responses"
+                payload["render_grid"]["row_spans"].extend([
+                    span(row - 3, 0, banner[:38], 3),
+                    span(row - 2, 0, banner[38:], 3),
+                ])
+                state = core.classify_grid(core.Grid.from_rpc(payload, "surface-uuid"))
+                expected = "rate_limit" if status == 429 else f"http_{status}"
+                self.assertEqual((state.kind, state.error_type), ("recoverable_error", expected))
+
+    def test_non_retryable_http_status_stays_blocked(self):
+        for status in (400, 401, 403, 404, 409, 501):
+            with self.subTest(status=status):
+                payload = covered_prompt_payload()
+                row = payload["render_grid"]["cursor"]["row"]
+                payload["render_grid"]["row_spans"].append(
+                    span(row - 2, 0, f"■ unexpected status {status} Unknown error", 3))
+                state = core.classify_grid(core.Grid.from_rpc(payload, "surface-uuid"))
+                self.assertEqual(state.kind, "error_superseded")
+
     def test_covered_prompt_requires_native_placeholder_animation_and_footer(self):
         for missing in ("placeholder", "dim", "animation", "rgb", "footer", "model", "cursor", "home", "prefix"):
             with self.subTest(missing=missing):
