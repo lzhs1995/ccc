@@ -2324,10 +2324,11 @@ def atomic_write_text(path: Path, value: str) -> None:
 
 
 class FileLock:
-    def __init__(self, path: Path, *, timeout_sec: float = 0.0, purpose: str = "lock"):
+    def __init__(self, path: Path, *, timeout_sec: float = 0.0, purpose: str = "lock", shared=False):
         self.path = path
         self.timeout_sec = timeout_sec
         self.purpose = purpose
+        self.shared = shared
         self.handle: Any = None
 
     def __enter__(self) -> "FileLock":
@@ -2338,7 +2339,7 @@ class FileLock:
         deadline = time.monotonic() + max(0.0, self.timeout_sec)
         while True:
             try:
-                fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(self.handle.fileno(), (fcntl.LOCK_SH if self.shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
                 break
             except OSError as exc:
                 if exc.errno not in {errno.EACCES, errno.EAGAIN}:
@@ -3823,6 +3824,15 @@ class CmuxClient:
             "send-key", "--workspace", workspace_id, "--surface", surface_id, key,
         ], timeout=8)
 
+    def interrupt_codex(self, workspace_id: str, surface_id: str) -> None:
+        """The explicit pool action uses Codex's Escape binding, preserving its session."""
+        if not workspace_id or not surface_id:
+            raise CmuxError("interrupt requires explicit workspace and surface UUIDs")
+        if self._control_rpc("surface.send_key", {
+            "workspace_id": workspace_id, "surface_id": surface_id, "key": "escape",
+        }) is None:
+            self._run(["send-key", "--workspace", workspace_id, "--surface", surface_id, "escape"], timeout=8)
+
     def edit_codex_queued_prompt(self, workspace_id: str, surface_id: str) -> None:
         """Use Codex's displayed Alt+Up binding; caller verifies queue and draft."""
         if not workspace_id or not surface_id:
@@ -4492,7 +4502,53 @@ def effective_targets(
         surface_id = str(target.get("surface_id") or "")
         if surface_id:
             combined[surface_id] = target
-    return sorted(combined.values(), key=lambda target: _ref_number(str(target.get("ref") or "")))
+    return sorted((apply_workspace_pause(config, target) for target in combined.values()),
+                  key=lambda target: _ref_number(str(target.get("ref") or "")))
+
+
+def apply_workspace_pause(config, target):
+    """A pool pause overrides explicit, discovered and future registrations."""
+    if any(r.get("workspace_id") == target.get("workspace_id") and r.get("paused")
+           for r in config.get("workspace_rules", [])):
+        return {**target, "paused": True, "paused_reason": "workspace interrupt pause"}
+    return target
+
+
+def workspace_input_lock(config_path, workspace_id, *, shared=False):
+    digest = hashlib.sha256(str(workspace_id).encode()).hexdigest()[:24]
+    return FileLock(Path(config_path).parent / f"workspace-input-{digest}.lock",
+                    timeout_sec=10, purpose="workspace input boundary", shared=shared)
+
+
+def pause_workspace(store, workspace_id, client):
+    """Persist the gate first; drain in-flight input, then interrupt live pool Codex."""
+    def pause(config):
+        rule = workspace_rule_by_id(config, workspace_id)
+        rule.update(paused=True, paused_at=time.time())
+        return str(rule["workspace_id"])
+    config, wid, _ = store.mutate(pause)
+    result = {"workspace_id": wid, "paused": True, "interrupt_requested": [], "failed": []}
+    if getattr(client, "viewport_socket", None) is not None:
+        with contextlib.suppress(CmuxError):
+            client.viewport_socket.configure(client.capabilities())
+    with workspace_input_lock(store.path, wid):
+        targets = discover_codex_surfaces(client.tree(), client.top(wid), wid)
+        def interrupt(target):
+            sid = str(target["surface_id"])
+            if sid == str(config.get("manager_surface_id") or ""):
+                return sid, "manager surface excluded"
+            try:
+                client.interrupt_codex(wid, sid)
+                return sid, ""
+            except (CmuxError, RuntimeError) as exc:
+                return sid, str(exc)
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            for sid, error in pool.map(interrupt, targets):
+                if error:
+                    result["failed"].append({"surface_id": sid, "error": error})
+                else:
+                    result["interrupt_requested"].append(sid)
+    return result
 
 
 def target_by_id(config: Mapping[str, Any], target_id: str) -> dict[str, Any]:
@@ -5877,6 +5933,23 @@ class WatchDaemon:
             targets = effective_targets(self.config, self.dynamic_targets.values())
         return self.codex_queue_recovery.wakeup_sources(targets)
 
+    def _native_retry_needed(self, sid, wid, failed_at):
+        if self.config.get("global_paused") or self.config.get("mode") != "armed":
+            return False
+        target = self._event_target(sid)
+        if not target or target.get("workspace_id") != wid or target.get("paused"):
+            return False
+        with self._runtime_lock:
+            runtime = self.runtime.get(sid)
+        if runtime is None or runtime.observed_at < failed_at:
+            return True
+        if runtime.delivery_status == "unknown":
+            return False
+        if (runtime.send_io_started_at >= failed_at
+                and runtime.delivery_status in {"sending", "accepted", "confirmed"}):
+            return False
+        return runtime.observed_state not in {"composer_busy", "menu", "queued_followup"}
+
     def _record_dispatch(self, target, phase, delay):
         sid = str(target["surface_id"])
         with self._runtime_lock:
@@ -6032,7 +6105,8 @@ class WatchDaemon:
             self._publish_runtime_health, name="ccc-health", delay=0,
             on_error=lambda exc: self.logger.error("health publication failed: %s", exc))
         scheduler = self._start_scheduler()
-        native_wakeup = NativeCompletionWatcher(self._native_wakeup_sources, scheduler.request_observation)
+        native_wakeup = NativeCompletionWatcher(self._native_wakeup_sources, scheduler.request_observation,
+                                                retry_needed=self._native_retry_needed)
         native_wakeup.start()
         last_publish = 0.0
         previous_switch_interval = sys.getswitchinterval()
@@ -6377,9 +6451,9 @@ class WatchDaemon:
         # every authorization check or doing that work under a shared lock.
         for target in explicit:
             if str(target.get("surface_id") or "") == surface_id:
-                return dict(target)
+                return dict(apply_workspace_pause(self.config, target))
         if dynamic is not None:
-            return dict(dynamic)
+            return dict(apply_workspace_pause(self.config, dynamic))
         return None
 
     def _foreign_claude_session_owner(self, surface_id: str, session_id: str) -> str:
@@ -6437,10 +6511,16 @@ class WatchDaemon:
                     and str(target["surface_id"]) != str(self.config.get("manager_surface_id") or "")
                     and current(fresh=True))
 
+        def guarded_key(send):
+            with workspace_input_lock(self.config_path, target["workspace_id"], shared=True):
+                if not authorized():
+                    raise CmuxError("workspace input no longer authorized")
+                send()
+
         outcome = self.codex_queue_recovery.recover(
             target, runtime, read_view=view,
-            edit_queued=lambda: client.edit_codex_queued_prompt(target["workspace_id"], target["surface_id"]),
-            enter=lambda: client.send_key(target["workspace_id"], target["surface_id"], "enter"),
+            edit_queued=lambda: guarded_key(lambda: client.edit_codex_queued_prompt(target["workspace_id"], target["surface_id"])),
+            enter=lambda: guarded_key(lambda: client.send_key(target["workspace_id"], target["surface_id"], "enter")),
             authorized=authorized,
         )
         if outcome:
@@ -9006,8 +9086,16 @@ class WatchDaemon:
             (runtime.candidate_observed_at or runtime.observed_at)) * 1000, 3)
         send_started = time.monotonic()
         try:
-            client.send(str(target["workspace_id"]), surface_id, self._outgoing_message(state))
-        except CmuxError as exc:
+            with workspace_input_lock(self.config_path, target["workspace_id"], shared=True):
+                if self._active_send_target(target, is_current) is None:
+                    runtime.delivery_status = "cancelled"
+                    self.save(wait=False)
+                    return
+                runtime.send_io_started_at = time.time()
+                runtime.detection_to_send_ms = round(max(0, runtime.send_io_started_at -
+                    (runtime.candidate_observed_at or runtime.observed_at)) * 1000, 3)
+                client.send(str(target["workspace_id"]), surface_id, self._outgoing_message(state))
+        except (CmuxError, RuntimeError) as exc:
             runtime.send_completed_at = time.time()
             runtime.send_duration_ms = round((time.monotonic() - send_started) * 1000, 3)
             runtime.last_send_error = str(exc)[-500:]
@@ -10026,6 +10114,9 @@ def build_parser() -> argparse.ArgumentParser:
     remove_workspace.add_argument("workspace")
     untrack_workspace = sub.add_parser("untrack-workspace")
     untrack_workspace.add_argument("workspace")
+    for command in ("pause-workspace", "resume-workspace"):
+        item = sub.add_parser(command)
+        item.add_argument("workspace")
     discover = sub.add_parser("discover")
     discover.add_argument("workspace")
     exclude = sub.add_parser("exclude")
@@ -10276,6 +10367,21 @@ def cli(argv: Sequence[str] | None = None) -> int:
 
         _, rule, _ = store.mutate(add_rule)
         print(json.dumps({"rule": rule, "active_codex_surfaces": surfaces}, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "pause-workspace":
+        transport = CmuxViewportSocket()
+        client = CmuxClient(str(config.get("cmux_path", DEFAULT_CMUX)), viewport_socket=transport)
+        result = pause_workspace(store, args.workspace, client)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 1 if result["failed"] else 0
+    if args.command == "resume-workspace":
+        def resume_pool(latest):
+            rule = workspace_rule_by_id(latest, args.workspace)
+            rule["paused"] = False
+            rule.pop("paused_at", None)
+            return rule["workspace_id"]
+        _, wid, _ = store.mutate(resume_pool)
+        print(json.dumps({"workspace_id": wid, "paused": False}))
         return 0
     if args.command in {"remove-workspace", "untrack-workspace"}:
         def remove_rule(latest: dict[str, Any]) -> dict[str, Any]:

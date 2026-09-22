@@ -190,3 +190,23 @@ clipped to their display width before curses writes them.
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+### Workspace pause / Interrupt
+
+In the Supervisor, select a workspace header or any surface in that pool and
+press **P** to pause the whole pool and send **Escape** to its live main-area
+Codex sessions. **W** resumes pool monitoring. These actions use the same
+workspace UUID as whole-pool authorization. The pool pause covers explicit,
+discovered and newly opened surfaces; individual pauses/exclusions survive
+resume. A partial interrupt failure leaves the entire pool paused and reports
+the failed UUIDs. Transport acknowledgement reports an interrupt request,
+not proof that every native task has stopped.
+
+```sh
+cmux-codex-continue pause-workspace WORKSPACE_UUID
+cmux-codex-continue resume-workspace WORKSPACE_UUID
+```
+
+Native failure hints keep their priority when the first read or identity lookup
+is temporarily unavailable. Unchanged transcripts are not reread, and retrying
+a hint never authorizes input or clears a delivery record.

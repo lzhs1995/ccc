@@ -2233,6 +2233,10 @@ def selected_action_hint(candidate: Candidate | None) -> str:
 
 def confirm_prompt(action: str, candidate: Candidate, *, live_codex: int | None = None) -> str:
     location = f"{candidate.workspace_ref}/{candidate.ref}"
+    if action == "pause_workspace":
+        return f"确认整池暂停 {candidate.workspace_ref}？立即停发续跑，并 Interrupt 该池全部 Codex；保留 session"
+    if action == "resume_workspace":
+        return f"确认恢复 {candidate.workspace_ref} 的整池监控？保留单路暂停和排除设置"
     if action == "workspace":
         title = str(candidate.record.get("workspace_title") or "").strip()
         pool = f"{candidate.workspace_ref}{f'「{title}」' if title else ''}"
@@ -2268,6 +2272,10 @@ def workspace_confirm_prompt(row: ViewRow, action: str, *, live_codex: int | Non
     prompt at all.
     """
     pool = f"{row.workspace_ref}{f'「{clip_to_width(row.workspace_title, 20)}」' if row.workspace_title else ''}"
+    if action == "pause_workspace":
+        return f"确认整池暂停 {pool}？停发续跑并 Interrupt 全部 Codex，保留原 session"
+    if action == "resume_workspace":
+        return f"确认恢复 {pool} 整池监控？保留单路暂停和排除设置"
     if action == "untrack_workspace":
         return f"确认取消整个 {pool} 授权？该池将不再自动续跑"
     count = row.counts.get("all", 0) if live_codex is None else live_codex
@@ -2393,6 +2401,8 @@ class SupervisorModel:
                     target = {"paused": True}
                 else:
                     source = "untracked"
+                if rule is not None and rule.get("paused"):
+                    target = {**(target or {}), "paused": True, "paused_reason": "整池已暂停"}
                 runtime = self.runtime.get(surface_id, {}) if isinstance(self.runtime, Mapping) else {}
                 observed_error, observed_reason = runtime_observation(runtime)
                 exclusion = (rule or {}).get("excluded_surface_reasons", {}).get(surface_id, {})
@@ -2549,6 +2559,8 @@ class SupervisorModel:
             self.run_cli(args)
         elif action == "workspace":
             self.run_cli(["track-workspace", candidate.record["workspace_id"], "--name", workspace_rule_name(candidate.record)])
+        elif action in {"pause_workspace", "resume_workspace"}:
+            self.run_cli([action.replace("_", "-"), candidate.record["workspace_id"]])
         elif action == "pause":
             if candidate.source in {"workspace_rule", "workspace_excluded"}:
                 self.run_cli(["exclude", surface_id])
@@ -2584,6 +2596,8 @@ class SupervisorModel:
             if not row.counts.get("pool"):
                 raise RuntimeError(f"{row.workspace_ref} 没有整池授权，不用取消")
             self.run_cli(["untrack-workspace", row.workspace_id])
+        elif action in {"pause_workspace", "resume_workspace"}:
+            self.run_cli([action.replace("_", "-"), row.workspace_id])
         else:
             raise RuntimeError("组头只支持 w 授权整池 · u 取消整池 · Tab 折叠")
 
@@ -3836,7 +3850,7 @@ def row_action_hint(row: ViewRow | None) -> str:
     if row.kind == "group":
         fold = "Tab 展开" if row.collapsed else "Tab 折叠"
         if row.counts.get("pool"):
-            return f"u 取消整个 {row.workspace_ref} 授权   {fold}"
+            return f"P 整池暂停/Interrupt   W 整池恢复   u 取消整个 {row.workspace_ref} 授权   {fold}"
         return f"w 授权整个 {row.workspace_ref}（以后新开的 Codex 也会跟）   {fold}"
     return selected_action_hint(row.candidate)
 
@@ -3860,9 +3874,11 @@ def group_action_error(row: ViewRow, action: str) -> str:
     Checked before the confirmation box: a prompt that asks you to confirm an
     action which is about to be refused teaches you to distrust the prompt.
     """
-    if action not in {"workspace", "untrack_workspace"}:
+    if action not in {"workspace", "untrack_workspace", "pause_workspace", "resume_workspace"}:
         return f"这是 {row.workspace_ref} 的组头。整池用 w / u，单路请先按 j 进到组里"
     pooled = bool(row.counts.get("pool"))
+    if action in {"pause_workspace", "resume_workspace"} and not pooled:
+        return f"{row.workspace_ref} 尚未整池授权；请先按 w"
     if action == "workspace" and pooled:
         return f"{row.workspace_ref} 已经是整池授权。要取消请按 u"
     if action == "untrack_workspace" and not pooled:
@@ -3877,7 +3893,7 @@ def view_row_attr(row: ViewRow) -> int:
 
 
 GLOBAL_KEYS_1 = "↑↓ jk 移动   Tab 折/展   z 全折起   Z 全展开   [ ] 跳 workspace   / 查找   c 清除"
-GLOBAL_KEYS_2 = "f 筛选   R 刷新   G 存储   v 三件套   e 配置   A 开启发   S 全局停发   d 全局停发(只观察)   q 退出"
+GLOBAL_KEYS_2 = "P 整池停 W 整池恢复  f 筛选 R 刷新 G 存储 v 三件套 e 配置 A 开启发 S 停发 d 观察 q 退出"
 
 
 def _draw_compact(stdscr: Any, model: SupervisorModel, rows: list[ViewRow],
@@ -4683,7 +4699,7 @@ def _run(stdscr: Any, model: SupervisorModel) -> None:
             except Exception as exc:
                 status = f"失败: {exc}"
             continue
-        if not rows or key not in (ord("a"), ord("w"), ord("p"), ord("r"), ord("x"), ord("u")):
+        if not rows or key not in (ord("a"), ord("w"), ord("p"), ord("r"), ord("x"), ord("u"), ord("P"), ord("W")):
             continue
         action = {
             ord("a"): "add",
@@ -4692,6 +4708,8 @@ def _run(stdscr: Any, model: SupervisorModel) -> None:
             ord("r"): "resume",
             ord("x"): "remove",
             ord("u"): "untrack_workspace",
+            ord("P"): "pause_workspace",
+            ord("W"): "resume_workspace",
         }[key]
         row = rows[index]
         if row.kind == "group":
@@ -4707,6 +4725,9 @@ def _run(stdscr: Any, model: SupervisorModel) -> None:
                 model.mutate_workspace(row, action)
                 status = (f"已授权整个 {row.workspace_ref}" if action == "workspace"
                           else f"已取消整个 {row.workspace_ref} 授权")
+                if action in {"pause_workspace", "resume_workspace"}:
+                    status = (f"{row.workspace_ref} 已整池停发并发送 Interrupt" if action == "pause_workspace"
+                              else f"{row.workspace_ref} 已恢复整池监控")
                 model.refresh(force=True)
             except Exception as exc:
                 status = f"失败: {exc}"
@@ -4736,7 +4757,7 @@ def _run(stdscr: Any, model: SupervisorModel) -> None:
                 if item.agent_kind == "codex"
                 and str(item.record.get("workspace_id") or "") == workspace_id
             )
-        if action in {"pause", "remove", "add", "workspace", "untrack_workspace"} and not _confirm(
+        if action in {"pause", "remove", "add", "workspace", "untrack_workspace", "pause_workspace", "resume_workspace"} and not _confirm(
             stdscr, confirm_prompt(action, candidate, live_codex=live_codex)
         ):
             status = "已取消"
@@ -4751,6 +4772,8 @@ def _run(stdscr: Any, model: SupervisorModel) -> None:
                 "resume": f"已恢复监控 {where}，下一轮重新判定",
                 "remove": f"已删除 {where} 的单路登记",
                 "untrack_workspace": f"已取消整个 {candidate.workspace_ref} 授权",
+                "pause_workspace": f"{candidate.workspace_ref} 已整池停发并发送 Interrupt",
+                "resume_workspace": f"{candidate.workspace_ref} 已恢复整池监控",
             }.get(action, f"已处理 {where}")
             model.refresh(force=True)
         except Exception as exc:

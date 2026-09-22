@@ -90,10 +90,12 @@ class NativeCompletionWatcher:
     the live process, original failed turn, composer, authorization and ledger.
     This watcher has no terminal-input operation.
     """
-    def __init__(self, sources, wake, *, interval=0.25, tail_bytes=16384):
+    def __init__(self, sources, wake, *, interval=0.25, tail_bytes=16384,
+                 retry_needed=None, clock=time.monotonic):
         self.sources, self.wake = sources, wake
         self.interval, self.tail_bytes = interval, tail_bytes
         self.signatures, self.seen_turns = {}, {}
+        self.pending, self.retry_needed, self.clock = {}, retry_needed, clock
         self.stop = threading.Event()
         self.thread = None
 
@@ -109,6 +111,11 @@ class NativeCompletionWatcher:
                 before = path.stat()
                 signature = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
                 if self.signatures.get(key) == signature:
+                    pending = self.pending.get(key)
+                    if (pending and self.retry_needed and self.clock() >= pending[1]
+                            and self.retry_needed(key[0], key[1], pending[0])):
+                        self.wake(key[0], key[1])
+                        self.pending[key] = (pending[0], self.clock() + 1)
                     continue
                 with path.open("rb") as handle:
                     offset = max(0, before.st_size - self.tail_bytes)
@@ -138,11 +145,15 @@ class NativeCompletionWatcher:
                         if not self.wake(key[0], key[1]):
                             continue  # The scheduler may still be discovering this UUID.
                         self.seen_turns[key] = turn
+                        self.pending[key] = (epoch(latest.get("timestamp")), self.clock() + 1)
+                elif latest:
+                    self.pending.pop(key, None)
                 self.signatures[key] = signature
             except (OSError, ValueError, TypeError, AttributeError):
                 continue
         self.signatures = {key: value for key, value in self.signatures.items() if key in active}
         self.seen_turns = {key: value for key, value in self.seen_turns.items() if key in active}
+        self.pending = {key: value for key, value in self.pending.items() if key in active}
 
     def start(self):
         def run():

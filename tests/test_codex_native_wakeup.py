@@ -94,6 +94,35 @@ class NativeWakeupTests(unittest.TestCase):
             sources = queue.wakeup_sources([target])
             self.assertTrue(all(Path(s["path"]).is_relative_to(self.root) for s in sources))
 
+    def test_failed_observation_retries_cached_hint_until_native_turn_moves_on(self):
+        now = [0.0]
+        self.watcher.clock = lambda: now[0]
+        self.watcher.retry_needed = lambda *args: True
+        self.event()
+        self.watcher.scan()
+        now[0] = .5
+        self.watcher.scan()
+        self.assertEqual(len(self.woken), 1)
+        now[0] = 1.1
+        with patch.object(Path, "open", side_effect=AssertionError("unchanged transcript reread")):
+            self.watcher.scan()
+        self.assertEqual(len(self.woken), 2)
+        self.event("task_started", turn="next", error=False)
+        self.watcher.scan()
+        now[0] = 10
+        self.watcher.scan()
+        self.assertEqual(len(self.woken), 2)
+
+    def test_draft_or_confirmed_delivery_does_not_repeat_priority_work(self):
+        now = [0.0]
+        self.watcher.clock = lambda: now[0]
+        self.watcher.retry_needed = lambda *args: False
+        self.event()
+        self.watcher.scan()
+        now[0] = 10
+        self.watcher.scan()
+        self.assertEqual(len(self.woken), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2,6 +2,17 @@
 
 ## 0.2.8
 
+- Wake guarded observation from original native failures; retry a temporarily
+  unavailable observation every second without rereading unchanged transcripts.
+  Drafts, menus, queues and acknowledged input stop priority retries.
+- Use the advertised control socket for inventory and Codex continuation,
+  require process-inclusive inventory, and preserve uncertain delivery records.
+  Handle animated composer overlays, word-wrapped errors, native HTTP failures,
+  and stale Working text above a later failure.
+- Add `P` for workspace pause/Interrupt and `W` for workspace resume. Persist
+  the pool pause before input, drain in-flight Codex input with a workspace
+  barrier, then send Escape to live main-area Codex. Keep original sessions,
+  individual pauses/exclusions, and the pool gate on partial transport failure.
 - Retry transient cmux read/socket failures without permanently pausing authorized
   surfaces. Preserve explicit pauses and delivery records.
 - Scan the full visible viewport when terminal grids contain bottom padding.
