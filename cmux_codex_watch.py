@@ -59,7 +59,7 @@ DEFAULT_LABEL = f"{LABEL_PREFIX}.{APP_NAME}"
 PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_APP_DIR = Path.home() / "Library" / "Application Support" / APP_NAME
 DEFAULT_RUNTIME_ROOT = DEFAULT_APP_DIR / "runtime"
-RUNTIME_FILES = ("cmux_codex_watch.py", "claude_ccc_protocol.py", "claude_ccc_event_hook.py", "ccc_observation.py", "ccc_scheduling.py", "ccc_codex_queue.py")
+RUNTIME_FILES = ("cmux_codex_watch.py", "claude_ccc_protocol.py", "claude_ccc_event_hook.py", "ccc_observation.py", "ccc_scheduling.py", "ccc_codex_queue.py", "ccc_workspace_batch.py")
 DEFAULT_LOG_DIR = Path.home() / "Library" / "Logs" / APP_NAME
 DEFAULT_CONFIG_PATH = DEFAULT_APP_DIR / "config.json"
 DEFAULT_STATE_PATH = DEFAULT_APP_DIR / "state.json"
@@ -328,7 +328,7 @@ CLAUDE_CONTEXT_ABSOLUTE_TIMEOUT_SEC = 900.0
 # through TargetRuntime and suppresses duplicate Hook/fallback deliveries.
 # Human label only.  Acceptance always compares SHA-256 of the loaded source:
 # a revision string is hand-maintained and therefore can lie about what runs.
-FEATURE_REVISION = "0.2.9-native-event-cadence"
+FEATURE_REVISION = "0.2.10-responsive-pool-controls"
 # How long after our own send a byte-identical UserPromptSubmit can still be
 # our echo.  Must exceed claude_submit_confirm_timeout_sec so that a late
 # echo arriving after the transaction timed out is not read as a human.
@@ -3647,6 +3647,24 @@ class CmuxClient:
             raise CmuxError("new Dock surface response missing dock_surface_id")
         return surface_id
 
+    def new_codex_surface(self, window_id: str, workspace_id: str, pane_id: str, command: str) -> str:
+        if not all((window_id, workspace_id, pane_id, command)):
+            raise CmuxError("batch creation requires a pinned window, workspace and pane")
+        # The startup command registers this exact new tab, then starts an
+        # empty Codex. First-prompt delivery has its own durable guard.
+        result = self._run(["--json", "--id-format", "both", "new-surface",
+            "--type", "terminal", "--placement", "workspace", "--window", window_id,
+            "--workspace", workspace_id, "--pane", pane_id, "--focus", "false", "--command", command])
+        try:
+            value = json.loads(result.stdout)
+        except ValueError as exc:
+            raise CmuxError("create acknowledgement is not JSON") from exc
+        sid = _find_string_key(value, "surface_id")
+        wid = _find_string_key(value, "workspace_id")
+        if not sid or (wid and wid != workspace_id) or _find_string_key(value, "dock_surface_id"):
+            raise CmuxError("create acknowledgement identity mismatch")
+        return sid
+
     def rename_surface(self, window_id: str, surface_id: str, title: str) -> None:
         self._run([
             "rename-tab", "--window", window_id,
@@ -4525,6 +4543,8 @@ def pause_workspace(store, workspace_id, client):
     def pause(config):
         rule = workspace_rule_by_id(config, workspace_id)
         rule.update(paused=True, paused_at=time.time())
+        rule.pop("active_batch_id", None)
+        rule["batch_cancelled_at"] = time.time()
         return str(rule["workspace_id"])
     config, wid, _ = store.mutate(pause)
     result = {"workspace_id": wid, "paused": True, "interrupt_requested": [], "failed": []}
@@ -4532,7 +4552,20 @@ def pause_workspace(store, workspace_id, client):
         with contextlib.suppress(CmuxError):
             client.viewport_socket.configure(client.capabilities())
     with workspace_input_lock(store.path, wid):
-        targets = discover_codex_surfaces(client.tree(), client.top(wid), wid)
+        tree = client.tree()
+        for attempt in range(3):
+            top = client.top(wid)
+            labels = classify_surface_processes(top)
+            unresolved = [r for r in main_surface_records(tree)
+                          if r["workspace_id"] == wid and r["type"] == "terminal"
+                          and r["surface_id"] != str(config.get("manager_surface_id") or "")
+                          and surface_process_label(labels, r).get("agent_kind") == "unknown"]
+            if not unresolved or attempt == 2:
+                break
+            time.sleep(.2)
+        targets = discover_codex_surfaces(tree, top, wid)
+        result["failed"].extend({"surface_id": r["surface_id"], "error": "进程清单尚未确认；已停发，Interrupt 未确认"}
+                                for r in unresolved)
         def interrupt(target):
             sid = str(target["surface_id"])
             if sid == str(config.get("manager_surface_id") or ""):
@@ -10115,7 +10148,7 @@ def build_parser() -> argparse.ArgumentParser:
     remove_workspace.add_argument("workspace")
     untrack_workspace = sub.add_parser("untrack-workspace")
     untrack_workspace.add_argument("workspace")
-    for command in ("pause-workspace", "resume-workspace"):
+    for command in ("pause-workspace", "resume-workspace", "batch-workspace"):
         item = sub.add_parser(command)
         item.add_argument("workspace")
     discover = sub.add_parser("discover")
@@ -10375,6 +10408,10 @@ def cli(argv: Sequence[str] | None = None) -> int:
         result = pause_workspace(store, args.workspace, client)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 1 if result["failed"] else 0
+    if args.command == "batch-workspace":
+        from ccc_workspace_batch import start
+        print(json.dumps(start(config_path, args.workspace), ensure_ascii=False, indent=2))
+        return 0
     if args.command == "resume-workspace":
         def resume_pool(latest):
             rule = workspace_rule_by_id(latest, args.workspace)

@@ -10,6 +10,9 @@ from ccc_codex_queue import QueueRecovery
 
 class ProcessSessionTests(unittest.TestCase):
     def setUp(self):
+        portable = patch('ccc_codex_queue._procargs_sysctl', None)
+        portable.start()
+        self.addCleanup(portable.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
@@ -68,6 +71,50 @@ class ProcessSessionTests(unittest.TestCase):
             with self.subTest(label=label):
                 self.queue.process_lookup = lambda _, label=label: label
                 self.assertEqual(self.queue.current_turn(self.target), {"kind": "unknown"})
+
+    def test_verified_original_process_survives_gui_gap_with_fresh_native_guards(self):
+        with patch('ccc_codex_queue.subprocess.run', side_effect=self.run_command):
+            first = self.queue.current_turn(self.target)
+            self.queue.process_lookup = lambda _: {'agent_kind': 'unknown', 'summary': 'process refresh pending'}
+            with patch('ccc_codex_queue.codex_process_starts', return_value={123: first['process_start']}):
+                self.assertEqual(self.queue.current_turn(self.target)['session_id'], 'original')
+                self.command = self.command.replace('CMUX_SURFACE_ID=s', 'CMUX_SURFACE_ID=foreign')
+                self.assertEqual(self.queue.current_turn(self.target), {'kind': 'unknown'})
+
+    def test_gui_gap_cannot_reuse_changed_process_or_workspace(self):
+        with patch('ccc_codex_queue.subprocess.run', side_effect=self.run_command):
+            first = self.queue.current_turn(self.target)
+            self.queue.process_lookup = lambda _: {'agent_kind': 'unknown', 'summary': 'process lookup unavailable'}
+            with patch('ccc_codex_queue.codex_process_starts', return_value={123: first['process_start'] + 1}):
+                self.assertEqual(self.queue.current_turn(self.target), {'kind': 'unknown'})
+            with patch('ccc_codex_queue.codex_process_starts', return_value={123: first['process_start']}):
+                self.assertEqual(self.queue.current_turn({**self.target, 'workspace_id': 'other'}), {'kind': 'unknown'})
+
+    def test_fresh_conflicting_inventory_and_changed_open_session_still_veto_hint(self):
+        with patch('ccc_codex_queue.subprocess.run', side_effect=self.run_command):
+            first = self.queue.current_turn(self.target)
+            for label in ({'agent_kind': 'shell'}, {'agent_kind': 'codex', 'agent_pids': [123, 456]}):
+                self.queue.process_lookup = lambda _, label=label: label
+                self.assertEqual(self.queue.current_turn(self.target), {'kind': 'unknown'})
+            self.queue.process_lookup = lambda _: {'agent_kind': 'unknown', 'summary': 'process refresh pending'}
+            self.queue.open_file_cache.clear()
+            self.paths += 'n' + str(self.root / 'second.jsonl') + '\n'
+            with patch('ccc_codex_queue.codex_process_starts', return_value={123: first['process_start']}):
+                self.assertEqual(self.queue.current_turn(self.target), {'kind': 'unknown'})
+
+    def test_gui_gap_cannot_substitute_a_different_sole_transcript(self):
+        with patch('ccc_codex_queue.subprocess.run', side_effect=self.run_command):
+            first = self.queue.current_turn(self.target)
+            original = dict(self.queue.open_file_sources['s'])
+            self.queue.process_lookup = lambda _: {'agent_kind': 'unknown', 'summary': 'process refresh pending'}
+            replacement = self.root / 'replacement.jsonl'
+            for content in (self.path.read_text(), self.path.read_text().replace('original', 'replacement')):
+                replacement.write_text(content)
+                self.paths = 'n' + str(replacement) + '\n'
+                self.queue.open_file_cache.clear()
+                with patch('ccc_codex_queue.codex_process_starts', return_value={123: first['process_start']}):
+                    self.assertEqual(self.queue.current_turn(self.target), {'kind': 'unknown'})
+                self.assertEqual(self.queue.open_file_sources['s'], original)
 
 
 if __name__ == "__main__":

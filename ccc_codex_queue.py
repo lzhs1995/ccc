@@ -84,12 +84,23 @@ class _BsdInfo(ctypes.Structure):
 
 
 _proc_pidinfo = None
+_procargs_sysctl = None
+_procargs_bytes = 0
 if sys.platform == "darwin":
     try:
         _proc_pidinfo = ctypes.CDLL("/usr/lib/libproc.dylib").proc_pidinfo
         _proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
                                  ctypes.c_void_p, ctypes.c_int]
         _proc_pidinfo.restype = ctypes.c_int
+    except (OSError, AttributeError):
+        pass
+    try:
+        _procargs_sysctl = ctypes.CDLL(None, use_errno=True).sysctl
+        _procargs_sysctl.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_uint,
+                                    ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t),
+                                    ctypes.c_void_p, ctypes.c_size_t]
+        _procargs_sysctl.restype = ctypes.c_int
+        _procargs_bytes = os.sysconf("SC_ARG_MAX")
     except (OSError, AttributeError):
         pass
 
@@ -135,6 +146,76 @@ def process_matches(record):
         return False
     actual = codex_process_starts([pid]).get(pid)
     return actual is not None and abs(actual - started) < 1
+
+
+def _process_placement_args(data):
+    """Decode Darwin KERN_PROCARGS2, keeping only the two placement variables.
+
+    argv is length-delimited by argc, not by text that resembles environment
+    assignments. Never retain or log the rest of the process environment.
+    """
+    size = ctypes.sizeof(ctypes.c_int)
+    if len(data) <= size:
+        return None
+    argc = ctypes.c_int.from_buffer_copy(data[:size]).value
+    if not 1 <= argc <= 65536:
+        return None
+    end = data.find(b"\0", size)
+    if end < 0:
+        return None
+    position = end + 1
+    while position < len(data) and data[position] == 0:
+        position += 1
+    for index in range(argc):
+        end = data.find(b"\0", position)
+        if end < 0:
+            return None
+        if index == 0 and data[position:end].rsplit(b"/", 1)[-1] != b"codex":
+            return None
+        position = end + 1
+    placement = {}
+    for value in data[position:].split(b"\0"):
+        name, separator, content = value.partition(b"=")
+        if separator and name in {b"CMUX_SURFACE_ID", b"CMUX_WORKSPACE_ID"}:
+            if name.decode() in placement:
+                return None
+            placement[name.decode()] = content.decode("utf-8", errors="strict")
+    return placement
+
+
+def process_placement_start(pid, target):
+    """Uncached PID/start and exact surface ownership for a legacy session."""
+    if _procargs_sysctl is not None and _proc_pidinfo is not None:
+        started = codex_process_starts([pid]).get(pid)
+        if started is None:
+            return None
+        # Darwin rejects buffers larger than the host's ARG_MAX with EINVAL.
+        # One direct query avoids spawning ps twice for every old session.
+        if not 0 < _procargs_bytes <= 2 * 1024 * 1024:
+            return None
+        buffer = ctypes.create_string_buffer(_procargs_bytes)
+        length = ctypes.c_size_t(len(buffer))
+        mib = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN, KERN_PROCARGS2
+        if _procargs_sysctl(mib, 3, buffer, ctypes.byref(length), None, 0) != 0:
+            return None
+        if length.value > len(buffer):
+            return None
+        try:
+            placement = _process_placement_args(buffer.raw[:length.value])
+        except UnicodeError:
+            return None
+        if placement is None or any(placement.get(name) != str(target[key]) for name, key in (
+                ("CMUX_SURFACE_ID", "surface_id"), ("CMUX_WORKSPACE_ID", "workspace_id"))):
+            return None
+        return started
+    result = subprocess.run(["/bin/ps", "eww", "-o", "lstart=,command=", "-p", str(pid)],
+                            capture_output=True, text=True, timeout=2)
+    fields = result.stdout.strip().split(None, 5)
+    if (result.returncode or len(fields) != 6 or Path(fields[5].split()[0]).name != "codex"
+            or not all(re.search(r"(?:^|\s)" + name + "=" + re.escape(str(target[key])) + r"(?:\s|$)", fields[5])
+                       for name, key in (("CMUX_SURFACE_ID", "surface_id"), ("CMUX_WORKSPACE_ID", "workspace_id")))):
+        return None
+    return time.mktime(time.strptime(" ".join(fields[:5]), "%a %b %d %H:%M:%S %Y"))
 
 
 class NativeCompletionWatcher:
@@ -374,29 +455,37 @@ class QueueRecovery:
         if self.process_lookup is None or not self.sessions_root.is_dir():
             return None
         label = self.process_lookup(target)
+        hint_started = None
+        hint_source = None
         if label.get("agent_kind") != "codex":
-            # A cold/expired shared process snapshot is not proof of a legacy
-            # client. Returning None lets the caller submit from the viewport
-            # alone, including while the native task is still reconnecting.
-            return {"kind": "unknown"}
-        pids = label.get("agent_pids", [])
+            # A GUI refresh gap must not erase an already verified original
+            # process. Reuse only its PID hint, then recheck the native start,
+            # exact CMUX environment and actual open transcript below. A fresh
+            # conflicting/absent label still vetoes this path.
+            if label.get("summary") not in {"process refresh pending", "process lookup unavailable"}:
+                return {"kind": "unknown"}
+            with self.lock:
+                known = dict(self.open_file_sources.get(str(target["surface_id"]), {}))
+            pid = known.get("pid")
+            current = codex_process_starts([pid]).get(pid)
+            if (known.get("workspace_id") != str(target["workspace_id"])
+                    or known.get("surface_id") != str(target["surface_id"])
+                    or current is None or current != known.get("process_start")):
+                return {"kind": "unknown"}
+            hint_started, pids = current, [pid]
+            hint_source = known
+        else:
+            pids = label.get("agent_pids", [])
         if len(pids) != 1:
             return {"kind": "unknown"}
         pid = pids[0]
 
         def identity():
-            result = subprocess.run(["/bin/ps", "eww", "-o", "lstart=,command=", "-p", str(pid)],
-                                    capture_output=True, text=True, timeout=2)
-            fields = result.stdout.strip().split(None, 5)
-            if (result.returncode or len(fields) != 6 or Path(fields[5].split()[0]).name != "codex"
-                    or not all(re.search(r"(?:^|\s)" + name + "=" + re.escape(str(target[key])) + r"(?:\s|$)", fields[5])
-                               for name, key in (("CMUX_SURFACE_ID", "surface_id"), ("CMUX_WORKSPACE_ID", "workspace_id")))):
-                return None
-            return time.mktime(time.strptime(" ".join(fields[:5]), "%a %b %d %H:%M:%S %Y"))
+            return process_placement_start(pid, target)
 
         try:
             started = identity()
-            if started is None:
+            if started is None or (hint_started is not None and started != hint_started):
                 return {"kind": "unknown"}
             cache_key = (pid, started)
             with self.lock:
@@ -419,6 +508,10 @@ class QueueRecovery:
                     return {"kind": "unknown"}
                 with self.lock:
                     self.open_file_cache[cache_key] = (time.monotonic(), path, sid)
+            if hint_source is not None and (
+                    sid != hint_source.get("session_id")
+                    or path != Path(str(hint_source.get("path") or "")).resolve()):
+                return {"kind": "unknown"}
             snapshot = task_snapshot(path, sid)
             if identity() != started:
                 return {"kind": "unknown"}

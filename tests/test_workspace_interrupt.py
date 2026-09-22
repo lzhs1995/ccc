@@ -35,6 +35,8 @@ class WorkspaceInterruptTests(unittest.TestCase):
             store.mutate(lambda c: c['workspace_rules'].append({'workspace_id': 'pool', 'enabled': True}))
             client = mock.Mock()
             client.viewport_socket = None
+            client.tree.return_value = {"windows": []}
+            client.top.return_value = {"windows": []}
             def interrupt(wid, sid):
                 self.assertTrue(store.load()['workspace_rules'][0]['paused'])
                 self.assertEqual(wid, 'pool')
@@ -103,6 +105,32 @@ class WorkspaceInterruptTests(unittest.TestCase):
         model.mutate_selected(candidate, 'pause_workspace')
         model.run_cli.assert_called_once_with(['pause-workspace', 'pool'])
         self.assertIn('Interrupt', tui.confirm_prompt('pause_workspace', candidate))
+
+    def test_unknown_process_inventory_cannot_report_an_empty_successful_interrupt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = core.ConfigStore(Path(directory) / 'config.json')
+            store.mutate(lambda c: c['workspace_rules'].append({'workspace_id': 'pool', 'enabled': True}))
+            client = mock.Mock(viewport_socket=None)
+            client.tree.return_value = {'windows': [{'id': 'window', 'workspaces': [{
+                'id': 'pool', 'ref': 'workspace:1', 'panes': [{'id': 'pane', 'surfaces': [
+                    {'id': 'surface', 'ref': 'surface:1', 'type': 'terminal'}]}]}]}]}
+            client.top.return_value = {'windows': []}
+            with mock.patch.object(core.time, 'sleep'):
+                result = core.pause_workspace(store, 'pool', client)
+            self.assertEqual(result['failed'][0]['surface_id'], 'surface')
+            self.assertEqual(result['interrupt_requested'], [])
+            self.assertTrue(store.load()['workspace_rules'][0]['paused'])
+            client.interrupt_codex.assert_not_called()
+
+    def test_all_explicit_surfaces_still_show_their_workspace_authorization(self):
+        candidate = tui.Candidate({'surface_id': 'surface', 'workspace_id': 'pool',
+            'workspace_ref': 'workspace:2', 'ref': 'surface:3', 'workspace_authorized': True},
+            'explicit', '', '', 0, False)
+        row = tui.build_view_rows([candidate], set(), tui.DEFAULT_FILTER, '')[0]
+        self.assertEqual(row.counts['pool'], 0)
+        self.assertEqual(tui.group_action_error(row, 'pause_workspace'), '')
+        self.assertIn('整池授权', tui.group_row_text(row, 100))
+        self.assertEqual(tui.group_action_error(row, 'batch_workspace'), '')
 
 
 if __name__ == '__main__':

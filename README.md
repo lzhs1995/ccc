@@ -105,6 +105,26 @@ the source are documented in the source comments and are intentionally more
 conservative than the send path; a stale observation is never converted into
 an authorization.
 
+Inventory refreshes and control commands run outside the keyboard thread. A
+slow cmux scan or pool interrupt therefore leaves navigation, refresh and quit
+available. Repeated refreshes coalesce and old results cannot overwrite newer
+requests. The selected workspace has clickable controls (the same keys work):
+
+- `w` 整池授权：覆盖该池现有和后续 Codex，保留单路排除。
+- `P` 暂停 + Interrupt：先落盘停止整池续跑、取消批量创建，再向本池 Codex 请求 Escape；保留原 session。未确认的进程或投递单独报失败。
+- `W` 恢复整池：恢复续跑，保留单路暂停、排除；不会自行重启被取消的创建任务。
+- `B` 新开50 + 授权：在选定 workspace 的主区域 pane 新建50个后台 Codex 标签页。每路确认原 session 和空输入框后发送一次 `show me u power`，再按原 transcript 的 `task_started` 确认启动并交给续跑器。
+
+`B` requires global sending to be enabled and the selected pool to be unpaused.
+It never changes another pool or silently clears existing pauses. At most four
+new sessions wait for startup together. Progress reports created, ready,
+submitted, started and incomplete counts. Startup dialogs and drafts are left
+for the operator. Repeating `B` resumes an incomplete batch; a lost create reply
+is recovered from its startup receipt and an uncertain prompt is not resent.
+After all 50 slots finish, another confirmed `B` starts a new batch. Jobs run in
+the background and survive closing the panel; `P` cancels their authorization.
+CLI equivalent: `ccc batch-workspace FULL_WORKSPACE_UUID`.
+
 - **监控**：`未登记` / `监控中` / `空转` / `整池空转` / `已暂停` / `整池` / `已排除` / `待检测` / `投递待验` / `发送失败` / `读取异常` / `服务阻塞`。登记仍保留，投递异常直接显示；焦点行显示最近检查的年龄。
 - **程序**：`Codex` / `Claude` / `grok` / `Copilot` / `gh` / `shell` / `其他` / `未知`。程序列只显示身份；空转属于「监控」列。
 - **画面**：`空闲` / `运行中` / `菜单` / `待续跑` / `已排队` / `已过时` / `额度耗尽` / `正在输入` / `看不清` / `非Codex` / `Claude关` / `Hook等待` / `输入保护` / `发送中` / `已完成` / `已续跑` / `Hook待验` / `Hook未验` / `配置待核` / `模型错误` / `身份冲突` / `需人工` / `未初始化` / `等待压缩` / `压缩中` / `读不出` / `提交中` / `未确认` / `投递待验` / `发送失败` / `服务阻塞`。完成、压缩和客户端重试不代表续跑器故障。
@@ -132,6 +152,13 @@ the configured regular scan interval. On macOS, identity checks use the public
 `libproc` API directly: even a PID-filtered `ps` can stall under fleet load.
 The send boundary checks the process identity again without using the advisory
 monitoring cache. No native monitoring state authorizes a terminal write.
+
+Legacy sessions without a SessionStart binding revalidate their original open
+transcript. During a missing GUI inventory refresh, the previous PID is only a
+hint: PID/start, exact workspace/surface environment and the open transcript
+must still agree. Darwin reads these placement variables through
+`KERN_PROCARGS2`, keeping process checks off the slow `ps` path. Conflicting
+fresh inventory, reused PIDs and multiple open sessions still block input.
 
 Recovery recognizes the native dim placeholder when styled animation covers the
 composer prompt, including narrow-window high-demand banners split inside words.
