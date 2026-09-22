@@ -123,3 +123,14 @@ Validate recovery over a complete time window: enumerate each original failed
 turn, correlate its recorded send and the subsequent `task_started` in that
 same transcript. Keep protected drafts, menus and user-aborted turns separate.
 Counting only the last acknowledged send per surface misses earlier delays.
+
+## Original sessions without a SessionStart Hook (v0.2.10)
+
+The remaining long recoveries used a live open transcript instead of a native
+Hook binding. Their process lookup could become unknown on every GUI inventory
+refresh, even after the original PID and transcript had been verified. During
+an explicit refresh-pending/unavailable gap, CCC now reuses that PID only as a
+hint. It verifies the native process start, exact workspace/surface environment,
+actual open transcript and process identity again. A fresh conflicting process
+label, multiple agents, changed PID/start, moved workspace or multiple open
+transcripts still blocks input. No Hook record is synthesized.

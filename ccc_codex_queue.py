@@ -374,12 +374,25 @@ class QueueRecovery:
         if self.process_lookup is None or not self.sessions_root.is_dir():
             return None
         label = self.process_lookup(target)
+        hint_started = None
         if label.get("agent_kind") != "codex":
-            # A cold/expired shared process snapshot is not proof of a legacy
-            # client. Returning None lets the caller submit from the viewport
-            # alone, including while the native task is still reconnecting.
-            return {"kind": "unknown"}
-        pids = label.get("agent_pids", [])
+            # A GUI refresh gap must not erase an already verified original
+            # process. Reuse only its PID hint, then recheck the native start,
+            # exact CMUX environment and actual open transcript below. A fresh
+            # conflicting/absent label still vetoes this path.
+            if label.get("summary") not in {"process refresh pending", "process lookup unavailable"}:
+                return {"kind": "unknown"}
+            with self.lock:
+                known = dict(self.open_file_sources.get(str(target["surface_id"]), {}))
+            pid = known.get("pid")
+            current = codex_process_starts([pid]).get(pid)
+            if (known.get("workspace_id") != str(target["workspace_id"])
+                    or known.get("surface_id") != str(target["surface_id"])
+                    or current is None or current != known.get("process_start")):
+                return {"kind": "unknown"}
+            hint_started, pids = current, [pid]
+        else:
+            pids = label.get("agent_pids", [])
         if len(pids) != 1:
             return {"kind": "unknown"}
         pid = pids[0]
@@ -396,7 +409,7 @@ class QueueRecovery:
 
         try:
             started = identity()
-            if started is None:
+            if started is None or (hint_started is not None and started != hint_started):
                 return {"kind": "unknown"}
             cache_key = (pid, started)
             with self.lock:
