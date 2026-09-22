@@ -221,7 +221,9 @@ class BatchWorker:
                         return False
                     prompt = True
                 if (event.get("type") == "event_msg" and event.get("payload", {}).get("type") == "task_started"
-                        and epoch(event["timestamp"]) >= slot["submit_at"]):
+                        # Native timestamps are milliseconds; the byte offset
+                        # and exact prompt still prove this is a new task.
+                        and epoch(event["timestamp"]) >= slot["submit_at"] - .001):
                     started = True
                 if started and prompt:
                     return True

@@ -209,6 +209,18 @@ class WorkspaceBatchTests(unittest.TestCase):
         self.assertEqual(self.worker.job['slots'][0]['phase'], 'submitted')
         self.assertEqual(batch.counts(self.worker.job)['started'], 0)
 
+    def test_native_millisecond_timestamp_can_confirm_the_new_task(self):
+        self.worker.step()
+        slot = self.worker.job['slots'][0]
+        with patch.object(self.client, 'send'):
+            self.worker._advance(slot)
+        stamp = datetime.fromtimestamp(slot['submit_at'], timezone.utc).isoformat(timespec='milliseconds')
+        with Path(slot['transcript']).open('a') as handle:
+            for payload in ({'type': 'task_started'}, {'type': 'user_message', 'message': batch.PROMPT}):
+                handle.write(json.dumps({'type': 'event_msg', 'timestamp': stamp, 'payload': payload}) + '\n')
+        self.worker._advance(slot)
+        self.assertEqual(slot['phase'], 'confirmed')
+
 
 if __name__ == '__main__':
     unittest.main()
