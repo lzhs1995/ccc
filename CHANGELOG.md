@@ -11,6 +11,8 @@
   that task at the input boundary. Persist one submission per failed task.
   Recover missing Hook identity from the live process's original open transcript,
   checking PID/start time and both cmux UUIDs without fabricating Hook events.
+- Keep the native-task guard active while shared process identity is refreshing;
+  a missing Hook plus a pending process snapshot is not a legacy-client bypass.
 - Reconcile timed-out input using two fresh empty-composer observations and an
   unchanged failed task. Verified absent input can retry instead of remaining
   blocked forever. Queued CCC prompts retain a durable, single-attempt recovery

@@ -43,6 +43,18 @@ class CodexTurnGateTests(unittest.TestCase):
         self.assertEqual(self.client.sent, [])
         self.assertEqual(self.daemon.runtime["surface-uuid"].delivery_status, "cancelled")
 
+    def test_missing_hook_and_pending_process_snapshot_do_not_bypass_native_gate(self):
+        # Exercise the real QueueRecovery wiring, including the advisory
+        # nonblocking process lookup used by the production daemon.
+        recovery = self.daemon.codex_queue_recovery
+        del recovery.current_turn
+        recovery.sessions_root.mkdir(parents=True)
+        with patch.object(self.daemon, "_candidate_process_label", return_value={
+                "agent_kind": "unknown", "summary": "process refresh pending"}):
+            self.daemon.process_once(self.client)
+        self.assertEqual(self.client.sent, [])
+        self.assertEqual(self.daemon.runtime["surface-uuid"].state, "awaiting_transition")
+
     def test_success_and_different_native_failure_do_not_revive_old_banner(self):
         for error in (None, {"message": "Permission denied"}, {"message": ERRORS["rate_limit"]}):
             with self.subTest(error=error):

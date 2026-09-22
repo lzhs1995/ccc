@@ -163,7 +163,10 @@ class QueueRecovery:
             return None
         label = self.process_lookup(target)
         if label.get("agent_kind") != "codex":
-            return None
+            # A cold/expired shared process snapshot is not proof of a legacy
+            # client. Returning None lets the caller submit from the viewport
+            # alone, including while the native task is still reconnecting.
+            return {"kind": "unknown"}
         pids = label.get("agent_pids", [])
         if len(pids) != 1:
             return {"kind": "unknown"}
