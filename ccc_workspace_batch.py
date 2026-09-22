@@ -205,6 +205,12 @@ class BatchWorker:
         return str(self.queue.open_file_sources.get(sid, {}).get("path") or "")
 
     def _confirm(self, slot):
+        if not slot.get("transcript") and slot.get("native_uninitialized"):
+            target = self._target(slot)
+            native = self.queue.current_turn(target)
+            if not native or any(native.get(key) != slot.get(key) for key in ("session_id", "pid", "process_start")):
+                return False
+            slot["transcript"] = self._transcript(slot["surface_id"], native)
         path = Path(slot.get("transcript") or "/nonexistent")
         try:
             with path.open("rb") as handle:
@@ -220,6 +226,15 @@ class BatchWorker:
                     if event["payload"].get("message") != PROMPT:
                         return False
                     prompt = True
+                if event.get("type") == "response_item" and event.get("payload", {}).get("role") == "user":
+                    content = event["payload"].get("content", [])
+                    message = "\n".join(part.get("text", "") for part in content if part.get("type") == "input_text")
+                    if message == PROMPT:
+                        prompt = True
+                    elif not ((message.startswith("<environment_context>") and message.endswith("</environment_context>"))
+                              or (message.startswith("# AGENTS.md instructions for ") and "<INSTRUCTIONS>" in message
+                                  and message.rstrip().endswith("</INSTRUCTIONS>"))):
+                        return False
                 if (event.get("type") == "event_msg" and event.get("payload", {}).get("type") == "task_started"
                         # Native timestamps are milliseconds; the byte offset
                         # and exact prompt still prove this is a new task.
@@ -242,6 +257,68 @@ class BatchWorker:
                 rule["excluded_surface_ids"] = [s for s in rule.get("excluded_surface_ids", []) if s != sid]
         self.store.mutate(release)
 
+    def _native(self, target, slot):
+        native = self.queue.current_turn(target)
+        if (not native or not native.get("session_id")) and hasattr(self.queue, "initial_session"):
+            native = self.queue.initial_session(target, slot.get("launched_at", slot["created_at"]))
+        return native
+
+    @staticmethod
+    def _own_prompt_draft(grid):
+        """Only the exact recorded ASCII prompt, including a legacy pasted newline."""
+        cursor = grid.cursor
+        if not cursor.visible or core._menu_present(grid.lines) or core._working_present(grid.lines):
+            return False
+        if core._queued_followup_present(grid.lines, cursor.row):
+            return False
+        starts = [s.row for s in grid.spans if cursor.row - 1 <= s.row <= cursor.row
+                  and s.column == 0 and s.text.startswith("›")
+                  and not grid.style(s.style_id).get("faint", False)]
+        if not starts:
+            return False
+        row = max(starts)
+        if cursor.column != (2 + len(PROMPT) if row == cursor.row else 2):
+            return False
+        cells = [" "] * grid.columns
+        for span in grid.spans:
+            if not row <= span.row <= cursor.row or span.column < 2:
+                continue
+            if not span.text.strip() or core._is_spinner_overlay_span(grid, span):
+                continue
+            style = grid.style(span.style_id)
+            if (span.row != row or style.get("faint") or style.get("invisible")
+                    or not span.text.isascii() or len(span.text) != span.cell_width):
+                return False
+            cells[span.column:span.column + span.cell_width] = span.text
+        return "".join(cells[2:]).rstrip() == PROMPT
+
+    def _finish_submission(self, slot):
+        if slot.get("enter_attempt_at") or self.clock() - slot.get("submit_at", self.clock()) < .2:
+            return
+        with core.workspace_input_lock(self.config_path, self.job["workspace_id"], shared=True):
+            config = self.store.load()
+            if not allowed(config, self.job):
+                return
+            rule = core.workspace_rule_by_id(config, self.job["workspace_id"])
+            if (rule.get("excluded_surface_reasons", {}).get(slot["surface_id"]) != f"batch:{self.job['id']}:initial"
+                    or any(t.get("surface_id") == slot["surface_id"] and (t.get("paused") or not t.get("enabled", True))
+                           for t in config["targets"])):
+                return
+            target = self._target(slot)
+            native = self._native(target, slot)
+            if (not native or native.get("kind") not in {"unknown", "uninitialized"}
+                    or any(native.get(k) != slot.get(k) for k in ("session_id", "pid", "process_start"))):
+                return
+            grid = core.Grid.from_rpc(self.client.replay(target["workspace_id"], target["surface_id"]), target["surface_id"])
+            if not self._own_prompt_draft(grid) or self._native(target, slot) != native:
+                return
+            slot["enter_attempt_at"] = self.clock()
+            self.save()  # A missing Enter acknowledgement is never retried.
+            try:
+                self.client.send_key(target["workspace_id"], target["surface_id"], "enter")
+            except (core.CmuxError, RuntimeError) as exc:
+                slot.update(phase="uncertain", error=str(exc))
+
     def _advance(self, slot):
         receipt = core.load_json(self.path.parent / f"surface-{slot['index']}.json", {})
         if receipt and receipt.get("workspace_id") == self.job["workspace_id"]:
@@ -254,23 +331,26 @@ class BatchWorker:
             if self._confirm(slot):
                 self._release(slot)
                 slot["phase"] = "confirmed"
+                slot.pop("error", None)
+            else:
+                self._finish_submission(slot)
             return
         if slot["phase"] != "created":
             return
         target = self._target(slot)
-        native = self.queue.current_turn(target)
+        grid = core.Grid.from_rpc(self.client.replay(target["workspace_id"], target["surface_id"]), target["surface_id"])
+        if core.classify_grid(grid).kind != "idle" or core._composer_status(grid)[0] != "empty":
+            slot["error"] = "等待空输入框；启动确认、草稿或运行中任务不会被覆盖"
+            return
+        native = self._native(target, slot)
         if not native or not native.get("session_id") or not native.get("pid"):
             slot["error"] = "等待 Codex 原 session 就绪"
             return
         slot["session_id"] = native["session_id"]
         # Any existing task/user message belongs to an operator, not this
         # unsubmitted batch slot. Never inject the initial prompt into it.
-        if native.get("kind") != "unknown":
+        if native.get("kind") not in {"unknown", "uninitialized"}:
             slot.update(phase="blocked", error="此 session 已有任务，未发送批量 prompt")
-            return
-        grid = core.Grid.from_rpc(self.client.replay(target["workspace_id"], target["surface_id"]), target["surface_id"])
-        if core.classify_grid(grid).kind != "idle" or core._composer_status(grid)[0] != "empty":
-            slot["error"] = "等待空输入框；启动确认、草稿或运行中任务不会被覆盖"
             return
         with core.workspace_input_lock(self.config_path, self.job["workspace_id"], shared=True):
             config = self.store.load()
@@ -286,16 +366,18 @@ class BatchWorker:
             target = self._target(slot)
             grid = core.Grid.from_rpc(self.client.replay(target["workspace_id"], target["surface_id"]), target["surface_id"])
             if (core.classify_grid(grid).kind != "idle" or core._composer_status(grid)[0] != "empty"
-                    or self.queue.current_turn(target) != native):
+                    or self._native(target, slot) != native):
                 return
             path = self._transcript(slot["surface_id"], native)
-            if not path:
+            uninitialized = native.get("kind") == "uninitialized"
+            if not path and not uninitialized:
                 return
             slot.update(phase="submitting", submit_at=self.clock(), transcript=path,
-                        transcript_offset=Path(path).stat().st_size, pid=native["pid"])
+                        transcript_offset=Path(path).stat().st_size if path else 0, pid=native["pid"],
+                        process_start=native.get("process_start"), native_uninitialized=uninitialized)
             self.save()
             try:
-                self.client.send(target["workspace_id"], target["surface_id"], PROMPT)
+                self.client.send_text(target["workspace_id"], target["surface_id"], PROMPT)
                 slot["phase"] = "submitted"
             except (core.CmuxError, RuntimeError) as exc:
                 slot.update(phase="uncertain", error=str(exc))
@@ -344,6 +426,7 @@ class BatchWorker:
             self.job.update(status="running", worker_pid=os.getpid())
             for slot in self.job["slots"]:
                 if slot["phase"] == "blocked" and not slot.get("submit_at"):
+                    slot.setdefault("launched_at", slot["created_at"])
                     slot.update(phase="created", created_at=self.clock())
             self.save()
             deadline = self.clock() + 360

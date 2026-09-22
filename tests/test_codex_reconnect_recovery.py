@@ -27,6 +27,20 @@ def covered_prompt_payload(prefix="  "):
 
 
 class CodexReconnectRecoveryTests(unittest.TestCase):
+    def test_native_rate_limit_prefix_added_to_provider_prefix_is_recoverable(self):
+        banner = ('rate limit exceeded: rate limit exceeded: Your requests to gpt-6-astra '
+                  'for gpt-6-astra in eastus2 have exceeded rate limit.')
+        payload = grid_payload([], error=banner, columns=160)
+        state = core.classify_grid(core.Grid.from_rpc(payload, 'surface-uuid'))
+        self.assertEqual((state.kind, state.error_type), ('recoverable_error', 'rate_limit'))
+        self.assertEqual(core.classify_text_prefilter(visible_lines(payload)).kind, 'candidate')
+        for text in ('documentation: ' + banner, banner + ' This is an example.',
+                     'rate limit exceeded: ' + banner):
+            self.assertIsNone(core._match_error_block('■ ' + text))
+        for options, expected in (({'composer': 'busy'}, 'composer_busy'), ({'menu': True}, 'menu'),
+                                  ({'working': True}, 'working')):
+            self.check_without_send(grid_payload([], error=banner, columns=160, **options), expected)
+
     def check_without_send(self, payload, expected):
         with tempfile.TemporaryDirectory() as directory:
             client = FakeClient(payload, "\n".join(visible_lines(payload)))
