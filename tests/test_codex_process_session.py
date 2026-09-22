@@ -61,6 +61,14 @@ class ProcessSessionTests(unittest.TestCase):
         with patch("ccc_codex_queue.subprocess.run", side_effect=subprocess.TimeoutExpired("ps", 2)):
             self.assertEqual(self.queue.current_turn(self.target), {"kind": "unknown"})
 
+    def test_process_refresh_gap_cannot_be_treated_as_a_legacy_client(self):
+        for label in ({"agent_kind": "unknown", "summary": "process refresh pending"},
+                      {"agent_kind": "unknown", "summary": "process lookup unavailable"},
+                      {"agent_kind": "shell"}):
+            with self.subTest(label=label):
+                self.queue.process_lookup = lambda _, label=label: label
+                self.assertEqual(self.queue.current_turn(self.target), {"kind": "unknown"})
+
 
 if __name__ == "__main__":
     unittest.main()
