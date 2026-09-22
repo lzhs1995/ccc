@@ -40,7 +40,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from claude_ccc_protocol import EVENT_JOURNAL_PATH, EVENT_SOCKET_PATH
 import ccc_observation as observation_health
-from ccc_codex_queue import QueueRecovery
+from ccc_codex_queue import NativeCompletionWatcher, QueueRecovery
 from ccc_scheduling import CoalescingWriter, SnapshotCache, SnapshotClient, SurfaceScheduler
 
 
@@ -167,6 +167,7 @@ PROVIDER_REPEAT_ERROR_TYPES = frozenset({
     "rate_limit",
     "stream",
     "http_503",
+    "http_408", "http_500", "http_502", "http_504",
     "http_405",
     "prompt_cache",
 })
@@ -364,6 +365,10 @@ CLAUDE_ORPHAN_ENTER_MAX = 3
 
 class CmuxError(RuntimeError):
     """An expected cmux command or protocol failure."""
+
+
+class UncertainDeliveryError(CmuxError):
+    """Input may have reached cmux; never retry via another transport."""
 
 
 class IncompatibleError(CmuxError):
@@ -899,6 +904,14 @@ def _working_present(lines: Sequence[str]) -> bool:
     return bool(WORKING_RE.search("\n".join(cleaned)))
 
 
+def _current_working_present(lines: Sequence[str]) -> bool:
+    # Codex can leave an old Working row above its terminal failure card.
+    # Only work at/after the newest error marker can supersede that failure.
+    # The send boundary still requires the original native task_complete.
+    latest = max((i for i, line in enumerate(lines) if _is_error_marker(line)), default=0)
+    return _working_present(lines[latest:])
+
+
 def _queued_followup_present(lines: Sequence[str], composer_row: int) -> bool:
     """True when Codex is already holding queued input of its own accounting.
 
@@ -965,7 +978,9 @@ def _match_error_block(block_text: str) -> str | None:
         return "invalid_encrypted_content"
     if _provider_rate_limit_banner(compact):
         return "rate_limit"
-    if HIGH_DEMAND.lower() in lower:
+    # A narrow native viewport can hard-wrap inside "cause" ("c\nause").
+    # The caller verifies contiguous error rows before normalizing whitespace.
+    if HIGH_DEMAND.lower().replace(" ", "") in compact:
         return "high_demand"
     if "stream disconnected before completion" in lower:
         return "stream"
@@ -973,6 +988,13 @@ def _match_error_block(block_text: str) -> str | None:
         "zzzcoding.org" in lower or "/v1/responses" in lower
     ):
         return "stream"
+    # These complete native status banners describe retryable transport/server
+    # failures. Compact matching also handles narrow-window hard wraps.
+    for status, phrase in ((408, "requesttimeout"), (429, "toomanyrequests"),
+                           (500, "internalservererror"), (502, "badgateway"),
+                           (503, "serviceunavailable"), (504, "gatewaytimeout")):
+        if f"unexpectedstatus{status}{phrase}" in compact:
+            return "rate_limit" if status == 429 else f"http_{status}"
     if any(token in lower for token in ("last status: 503", "http 503", "503 service unavailable")):
         return "http_503"
     has_405 = "405 not allowed" in lower or "405 method not allowed" in lower
@@ -1217,6 +1239,45 @@ def _is_codexish(lines: Sequence[str], composer_row: int) -> bool:
     return "gpt-" in lower or "context" in lower or "plan mode" in lower or "esc to interrupt" in lower
 
 
+def _overlay_hides_composer_prompt(grid: Grid, row_spans: Sequence[Span]) -> bool:
+    """Recognize the native empty composer under Codex's RGB animation.
+
+    The animation can replace even the prompt glyph with a blank or braille.
+    Require the complete dim placeholder, adjacent styled animation and the
+    native footer below it; plain braille or a typed placeholder proves nothing.
+    """
+    cursor = grid.cursor
+    if not cursor.visible or cursor.column != 2 or cursor.row < grid.rows - 5:
+        return False
+    if not any(
+        span.column == 2 and span.text.strip() == "Ask Codex to do anything"
+        and grid.style(span.style_id).get("faint", False)
+        and not grid.style(span.style_id).get("invisible", False)
+        for span in row_spans
+    ):
+        return False
+    prefix = [span for span in row_spans if span.column < 2]
+    covered: set[int] = set()
+    for span in prefix:
+        if (span.column < 0 or span.column + span.cell_width > 2
+                or grid.style(span.style_id).get("faint", False)
+                or grid.style(span.style_id).get("invisible", False)
+                or (span.text.strip() and not _is_spinner_overlay_span(grid, span))):
+            return False
+        covered.update(range(span.column, span.column + span.cell_width))
+    if covered != {0, 1} or cursor.row - 1 not in _spinner_chrome_rows(grid, cursor.row):
+        return False
+    footer = "\n".join(grid.lines[cursor.row + 1:cursor.row + 4])
+    return bool(
+        re.search(r"\bContext\s+\d{1,3}%\s+used\b", footer, re.IGNORECASE)
+        and any(
+            cursor.row < span.row <= cursor.row + 3 and span.column == 2
+            and re.match(r"gpt-[\w.-]+\b", span.text)
+            for span in grid.spans
+        )
+    )
+
+
 def _composer_status(grid: Grid) -> tuple[str, int] | tuple[str, None]:
     cursor = grid.cursor
     if not cursor.visible:
@@ -1224,12 +1285,14 @@ def _composer_status(grid: Grid) -> tuple[str, int] | tuple[str, None]:
     row_spans = sorted((span for span in grid.spans if span.row == cursor.row), key=lambda span: span.column)
     prompt = next((span for span in row_spans if span.column == 0 and "›" in span.text), None)
     if prompt is None:
-        return "incompatible", None
-    if grid.style(prompt.style_id).get("faint", False):
-        return "incompatible", None
-    space_span = next((span for span in row_spans if span.column <= 1 < span.column + span.cell_width), None)
-    if space_span is None or grid.style(space_span.style_id).get("faint", False):
-        return "incompatible", None
+        if not _overlay_hides_composer_prompt(grid, row_spans):
+            return "incompatible", None
+    else:
+        if grid.style(prompt.style_id).get("faint", False):
+            return "incompatible", None
+        space_span = next((span for span in row_spans if span.column <= 1 < span.column + span.cell_width), None)
+        if space_span is None or grid.style(space_span.style_id).get("faint", False):
+            return "incompatible", None
     if cursor.column != 2:
         return "composer_busy", cursor.row
     # The live overlay draws RGB braille over a still-visible dim placeholder.
@@ -1978,7 +2041,7 @@ def classify_text_prefilter(value: str | Iterable[str]) -> ScreenState:
         return ScreenState("menu", reason="interactive menu")
     if _queued_followup_present(lines, len(lines)):
         return ScreenState("queued_followup", reason="Codex already holds queued follow-up input")
-    if _working_present(lines):
+    if _current_working_present(lines):
         return ScreenState("working", reason="Codex is working")
     # This is already a viewport-only read. The native grid can pad the lower
     # half with empty rows; slicing it by height drops a current error above
@@ -2004,7 +2067,7 @@ def classify_grid(grid: Grid) -> ScreenState:
             screen_signature=grid.signature(),
             reason="Codex already holds queued follow-up input",
         )
-    if _working_present(lines):
+    if _current_working_present(lines):
         return ScreenState("working", screen_signature=grid.signature(), reason="Codex is working")
     if composer_kind == "incompatible" or composer_row is None:
         return ScreenState("incompatible", screen_signature=grid.signature(), reason="composer cursor/prompt not verified")
@@ -2261,10 +2324,11 @@ def atomic_write_text(path: Path, value: str) -> None:
 
 
 class FileLock:
-    def __init__(self, path: Path, *, timeout_sec: float = 0.0, purpose: str = "lock"):
+    def __init__(self, path: Path, *, timeout_sec: float = 0.0, purpose: str = "lock", shared=False):
         self.path = path
         self.timeout_sec = timeout_sec
         self.purpose = purpose
+        self.shared = shared
         self.handle: Any = None
 
     def __enter__(self) -> "FileLock":
@@ -2275,7 +2339,7 @@ class FileLock:
         deadline = time.monotonic() + max(0.0, self.timeout_sec)
         while True:
             try:
-                fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(self.handle.fileno(), (fcntl.LOCK_SH if self.shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
                 break
             except OSError as exc:
                 if exc.errno not in {errno.EACCES, errno.EAGAIN}:
@@ -3345,13 +3409,19 @@ class CmuxViewportSocket:
     def __init__(self):
         self.path: str | None = None
         self.retry_at = 0.0
+        self.control_methods: frozenset[str] = frozenset()
 
     def configure(self, capabilities: Mapping[str, Any]) -> None:
         path = capabilities.get("socket_path")
+        self.control_methods = frozenset()
         if (capabilities.get("protocol") == "cmux-socket"
                 and capabilities.get("version") == 2
                 and isinstance(path, str) and os.path.isabs(path)):
             self.path, self.retry_at = path, 0.0
+            if capabilities.get("access_mode") == "automation":
+                self.control_methods = frozenset(capabilities.get("methods", ())) & {
+                    "system.tree", "system.top", "surface.send_text", "surface.send_key",
+                }
 
     def request(self, method: str, params: Mapping[str, Any], *, timeout: float) -> Mapping[str, Any] | None:
         if method not in {"surface.read_text", "terminal.replay"}:
@@ -3416,6 +3486,61 @@ class CmuxClient:
         self.runner = runner
         self.viewport_socket = viewport_socket
 
+    def _control_rpc(self, method: str, params: Mapping[str, Any], *, timeout: float = 8):
+        """Use the advertised endpoint without CLI selector-resolution RPCs.
+
+        Input has one attempt and no transport fallback. A missing or malformed
+        acknowledgement after writing remains uncertain in the delivery ledger.
+        """
+        transport = self.viewport_socket
+        if (transport is None or not transport.path
+                or method not in getattr(transport, "control_methods", ())):
+            return None
+        is_input = method in {"surface.send_text", "surface.send_key"}
+        if is_input and (not params.get("workspace_id") or not params.get("surface_id")):
+            raise ValueError("input requires explicit workspace and surface UUIDs")
+        request_id = uuid.uuid4().hex
+        deadline, attempted = time.monotonic() + timeout, False
+        def remaining():
+            seconds = deadline - time.monotonic()
+            if seconds <= 0:
+                raise TimeoutError("control response deadline exceeded")
+            return seconds
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                connection.settimeout(remaining())
+                connection.connect(transport.path)
+                connection.settimeout(remaining())
+                attempted = True
+                connection.sendall((json.dumps({"id": request_id, "method": method, "params": params}) + "\n").encode())
+                data = bytearray()
+                while b"\n" not in data:
+                    connection.settimeout(remaining())
+                    chunk = connection.recv(min(65536, transport.MAX_RESPONSE_BYTES + 1 - len(data)))
+                    if not chunk:
+                        raise ValueError("incomplete control response")
+                    data.extend(chunk)
+                    if len(data) > transport.MAX_RESPONSE_BYTES:
+                        raise ValueError("oversized control response")
+            reply = json.loads(data.split(b"\n", 1)[0])
+            if (not isinstance(reply, Mapping) or reply.get("id") != request_id
+                    or reply.get("ok") is not True or not isinstance(reply.get("result"), Mapping)):
+                raise ValueError("control acknowledgement unavailable")
+            result = reply["result"]
+            if is_input:
+                for key in ("workspace_id", "surface_id"):
+                    if key in result and result[key] != params[key]:
+                        raise ValueError("control acknowledgement identity mismatch")
+            elif not isinstance(result.get("windows"), list):
+                raise ValueError("control snapshot missing windows")
+            if method == "system.top" and result.get("include_processes") is not True:
+                raise ValueError("control snapshot omitted requested processes")
+            return result
+        except (OSError, ValueError) as exc:
+            if is_input and attempted:
+                raise UncertainDeliveryError(f"{method} acknowledgement uncertain: {exc}") from exc
+            raise CmuxError(f"{method} control request failed: {exc}") from exc
+
     def _run(self, args: Sequence[str], timeout: float = 10.0) -> subprocess.CompletedProcess[str]:
         command = [self.binary, *args]
         try:
@@ -3449,6 +3574,9 @@ class CmuxClient:
         return value
 
     def tree(self) -> Mapping[str, Any]:
+        value = self._control_rpc("system.tree", {"all": True})
+        if value is not None:
+            return value
         result = self._run(["--json", "--id-format", "both", "tree", "--all"])
         try:
             value = json.loads(result.stdout)
@@ -3461,6 +3589,9 @@ class CmuxClient:
     def top(self, workspace_id: str) -> Mapping[str, Any]:
         if not workspace_id:
             raise CmuxError("cmux top requires workspace UUID")
+        value = self._control_rpc("system.top", {"workspace_id": workspace_id, "include_processes": True})
+        if value is not None:
+            return value
         # --id-format both is what puts the stable surface UUID in the payload;
         # without it cmux returns refs only and process labels can only be
         # joined on a handle that renumbers.
@@ -3477,6 +3608,9 @@ class CmuxClient:
         return value
 
     def top_all(self) -> Mapping[str, Any]:
+        value = self._control_rpc("system.top", {"all": True, "include_processes": True})
+        if value is not None:
+            return value
         result = self._run(["--json", "--id-format", "both", "top", "--all", "--processes"], timeout=20)
         try:
             value = json.loads(result.stdout)
@@ -3665,6 +3799,10 @@ class CmuxClient:
         # Keep the newline in the argv value. cmux maps it to Enter without
         # requiring focus or a separate send-key operation.
         self._reject_unapproved_command(message)
+        if self._control_rpc("surface.send_text", {
+            "workspace_id": workspace_id, "surface_id": surface_id, "text": f"{message}\n",
+        }) is not None:
+            return
         self._run(["send", "--workspace", workspace_id, "--surface", surface_id, f"{message}\n"], timeout=8)
 
     def send_text(self, workspace_id: str, surface_id: str, message: str) -> None:
@@ -3685,6 +3823,15 @@ class CmuxClient:
         self._run([
             "send-key", "--workspace", workspace_id, "--surface", surface_id, key,
         ], timeout=8)
+
+    def interrupt_codex(self, workspace_id: str, surface_id: str) -> None:
+        """The explicit pool action uses Codex's Escape binding, preserving its session."""
+        if not workspace_id or not surface_id:
+            raise CmuxError("interrupt requires explicit workspace and surface UUIDs")
+        if self._control_rpc("surface.send_key", {
+            "workspace_id": workspace_id, "surface_id": surface_id, "key": "escape",
+        }) is None:
+            self._run(["send-key", "--workspace", workspace_id, "--surface", surface_id, "escape"], timeout=8)
 
     def edit_codex_queued_prompt(self, workspace_id: str, surface_id: str) -> None:
         """Use Codex's displayed Alt+Up binding; caller verifies queue and draft."""
@@ -4355,7 +4502,53 @@ def effective_targets(
         surface_id = str(target.get("surface_id") or "")
         if surface_id:
             combined[surface_id] = target
-    return sorted(combined.values(), key=lambda target: _ref_number(str(target.get("ref") or "")))
+    return sorted((apply_workspace_pause(config, target) for target in combined.values()),
+                  key=lambda target: _ref_number(str(target.get("ref") or "")))
+
+
+def apply_workspace_pause(config, target):
+    """A pool pause overrides explicit, discovered and future registrations."""
+    if any(r.get("workspace_id") == target.get("workspace_id") and r.get("paused")
+           for r in config.get("workspace_rules", [])):
+        return {**target, "paused": True, "paused_reason": "workspace interrupt pause"}
+    return target
+
+
+def workspace_input_lock(config_path, workspace_id, *, shared=False):
+    digest = hashlib.sha256(str(workspace_id).encode()).hexdigest()[:24]
+    return FileLock(Path(config_path).parent / f"workspace-input-{digest}.lock",
+                    timeout_sec=10, purpose="workspace input boundary", shared=shared)
+
+
+def pause_workspace(store, workspace_id, client):
+    """Persist the gate first; drain in-flight input, then interrupt live pool Codex."""
+    def pause(config):
+        rule = workspace_rule_by_id(config, workspace_id)
+        rule.update(paused=True, paused_at=time.time())
+        return str(rule["workspace_id"])
+    config, wid, _ = store.mutate(pause)
+    result = {"workspace_id": wid, "paused": True, "interrupt_requested": [], "failed": []}
+    if getattr(client, "viewport_socket", None) is not None:
+        with contextlib.suppress(CmuxError):
+            client.viewport_socket.configure(client.capabilities())
+    with workspace_input_lock(store.path, wid):
+        targets = discover_codex_surfaces(client.tree(), client.top(wid), wid)
+        def interrupt(target):
+            sid = str(target["surface_id"])
+            if sid == str(config.get("manager_surface_id") or ""):
+                return sid, "manager surface excluded"
+            try:
+                client.interrupt_codex(wid, sid)
+                return sid, ""
+            except (CmuxError, RuntimeError) as exc:
+                return sid, str(exc)
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            for sid, error in pool.map(interrupt, targets):
+                if error:
+                    result["failed"].append({"surface_id": sid, "error": error})
+                else:
+                    result["interrupt_requested"].append(sid)
+    return result
 
 
 def target_by_id(config: Mapping[str, Any], target_id: str) -> dict[str, Any]:
@@ -5735,6 +5928,28 @@ class WatchDaemon:
         )
         return self._scheduler
 
+    def _native_wakeup_sources(self):
+        with self._targets_lock:
+            targets = effective_targets(self.config, self.dynamic_targets.values())
+        return self.codex_queue_recovery.wakeup_sources(targets)
+
+    def _native_retry_needed(self, sid, wid, failed_at):
+        if self.config.get("global_paused") or self.config.get("mode") != "armed":
+            return False
+        target = self._event_target(sid)
+        if not target or target.get("workspace_id") != wid or target.get("paused"):
+            return False
+        with self._runtime_lock:
+            runtime = self.runtime.get(sid)
+        if runtime is None or runtime.observed_at < failed_at:
+            return True
+        if runtime.delivery_status == "unknown":
+            return False
+        if (runtime.send_io_started_at >= failed_at
+                and runtime.delivery_status in {"sending", "accepted", "confirmed"}):
+            return False
+        return runtime.observed_state not in {"composer_busy", "menu", "queued_followup"}
+
     def _record_dispatch(self, target, phase, delay):
         sid = str(target["surface_id"])
         with self._runtime_lock:
@@ -5890,6 +6105,9 @@ class WatchDaemon:
             self._publish_runtime_health, name="ccc-health", delay=0,
             on_error=lambda exc: self.logger.error("health publication failed: %s", exc))
         scheduler = self._start_scheduler()
+        native_wakeup = NativeCompletionWatcher(self._native_wakeup_sources, scheduler.request_observation,
+                                                retry_needed=self._native_retry_needed)
+        native_wakeup.start()
         last_publish = 0.0
         previous_switch_interval = sys.getswitchinterval()
         try:
@@ -5936,6 +6154,7 @@ class WatchDaemon:
             return 0
         finally:
             sys.setswitchinterval(previous_switch_interval)
+            native_wakeup.close()
             scheduler.close()
             if self._diagnostics_pool is not None:
                 self._diagnostics_pool.shutdown(wait=True, cancel_futures=True)
@@ -6232,9 +6451,9 @@ class WatchDaemon:
         # every authorization check or doing that work under a shared lock.
         for target in explicit:
             if str(target.get("surface_id") or "") == surface_id:
-                return dict(target)
+                return dict(apply_workspace_pause(self.config, target))
         if dynamic is not None:
-            return dict(dynamic)
+            return dict(apply_workspace_pause(self.config, dynamic))
         return None
 
     def _foreign_claude_session_owner(self, surface_id: str, session_id: str) -> str:
@@ -6292,10 +6511,16 @@ class WatchDaemon:
                     and str(target["surface_id"]) != str(self.config.get("manager_surface_id") or "")
                     and current(fresh=True))
 
+        def guarded_key(send):
+            with workspace_input_lock(self.config_path, target["workspace_id"], shared=True):
+                if not authorized():
+                    raise CmuxError("workspace input no longer authorized")
+                send()
+
         outcome = self.codex_queue_recovery.recover(
             target, runtime, read_view=view,
-            edit_queued=lambda: client.edit_codex_queued_prompt(target["workspace_id"], target["surface_id"]),
-            enter=lambda: client.send_key(target["workspace_id"], target["surface_id"], "enter"),
+            edit_queued=lambda: guarded_key(lambda: client.edit_codex_queued_prompt(target["workspace_id"], target["surface_id"])),
+            enter=lambda: guarded_key(lambda: client.send_key(target["workspace_id"], target["surface_id"], "enter")),
             authorized=authorized,
         )
         if outcome:
@@ -8861,12 +9086,20 @@ class WatchDaemon:
             (runtime.candidate_observed_at or runtime.observed_at)) * 1000, 3)
         send_started = time.monotonic()
         try:
-            client.send(str(target["workspace_id"]), surface_id, self._outgoing_message(state))
-        except CmuxError as exc:
+            with workspace_input_lock(self.config_path, target["workspace_id"], shared=True):
+                if self._active_send_target(target, is_current) is None:
+                    runtime.delivery_status = "cancelled"
+                    self.save(wait=False)
+                    return
+                runtime.send_io_started_at = time.time()
+                runtime.detection_to_send_ms = round(max(0, runtime.send_io_started_at -
+                    (runtime.candidate_observed_at or runtime.observed_at)) * 1000, 3)
+                client.send(str(target["workspace_id"]), surface_id, self._outgoing_message(state))
+        except (CmuxError, RuntimeError) as exc:
             runtime.send_completed_at = time.time()
             runtime.send_duration_ms = round((time.monotonic() - send_started) * 1000, 3)
             runtime.last_send_error = str(exc)[-500:]
-            uncertain = isinstance(exc.__cause__, subprocess.TimeoutExpired)
+            uncertain = isinstance(exc, UncertainDeliveryError) or isinstance(exc.__cause__, subprocess.TimeoutExpired)
             runtime.delivery_status = "unknown" if uncertain else "failed"
             runtime.state = "delivery_unknown" if uncertain else "send_failed"
             self.logger.error("surface=%s send failed: %s", surface_id[:8], exc)
@@ -9881,6 +10114,9 @@ def build_parser() -> argparse.ArgumentParser:
     remove_workspace.add_argument("workspace")
     untrack_workspace = sub.add_parser("untrack-workspace")
     untrack_workspace.add_argument("workspace")
+    for command in ("pause-workspace", "resume-workspace"):
+        item = sub.add_parser(command)
+        item.add_argument("workspace")
     discover = sub.add_parser("discover")
     discover.add_argument("workspace")
     exclude = sub.add_parser("exclude")
@@ -10131,6 +10367,21 @@ def cli(argv: Sequence[str] | None = None) -> int:
 
         _, rule, _ = store.mutate(add_rule)
         print(json.dumps({"rule": rule, "active_codex_surfaces": surfaces}, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "pause-workspace":
+        transport = CmuxViewportSocket()
+        client = CmuxClient(str(config.get("cmux_path", DEFAULT_CMUX)), viewport_socket=transport)
+        result = pause_workspace(store, args.workspace, client)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 1 if result["failed"] else 0
+    if args.command == "resume-workspace":
+        def resume_pool(latest):
+            rule = workspace_rule_by_id(latest, args.workspace)
+            rule["paused"] = False
+            rule.pop("paused_at", None)
+            return rule["workspace_id"]
+        _, wid, _ = store.mutate(resume_pool)
+        print(json.dumps({"workspace_id": wid, "paused": False}))
         return 0
     if args.command in {"remove-workspace", "untrack-workspace"}:
         def remove_rule(latest: dict[str, Any]) -> dict[str, Any]:

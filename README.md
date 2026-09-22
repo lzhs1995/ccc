@@ -116,6 +116,29 @@ an authorization.
 `max(30 秒, 3 × poll_interval_sec)`；过期或身份不明时显示未知。
 续跑时效另外按 `2 × poll_interval_sec` 检查，诊断数据保留在 `ccc status` 中；后台身份诊断的宽限不能放宽续跑时限。
 
+Codex failed-turn events also wake the matching workspace/surface observation
+ahead of the fleet scan. A read-only watcher checks known original transcript
+metadata every 250 ms and reads at most 16 KiB only after a file changes. This is
+a scheduling hint: fresh viewport, current native failed turn, input protection,
+authorization and delivery deduplication still gate every send. Pending hints
+survive in-flight reads; regular scans retain capacity under a stream of errors.
+The interval is a scheduling target, not a guaranteed end-to-end latency.
+
+Recovery recognizes the native dim placeholder when styled animation covers the
+composer prompt, including narrow-window high-demand banners split inside words.
+Complete native HTTP 408/429/500/502/503/504 error banners are retryable. User
+drafts, menus, aborted turns, quotas and non-retryable status codes remain blocked.
+Older Working chrome above a newer failure card does not hide that failure;
+the original native turn must still have completed before any continuation.
+
+On advertised v2 automation sockets, tree/process snapshots and Codex delivery
+use the official RPC endpoint with explicit UUIDs. This avoids CLI selector
+resolution timeouts. Process snapshots require `include_processes: true` both
+in the request and response; missing process data is an unavailable observation,
+never an empty agent inventory. Input uses one connection and one attempt. A
+lost, malformed or mismatched acknowledgement remains uncertain in the ledger;
+CCC never retries that write through a second transport.
+
 ## Registration recovery and observation coverage (v0.2.0)
 
 Explicit registration triggers background readiness checks. If the latest genuine
@@ -167,3 +190,23 @@ clipped to their display width before curses writes them.
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+### Workspace pause / Interrupt
+
+In the Supervisor, select a workspace header or any surface in that pool and
+press **P** to pause the whole pool and send **Escape** to its live main-area
+Codex sessions. **W** resumes pool monitoring. These actions use the same
+workspace UUID as whole-pool authorization. The pool pause covers explicit,
+discovered and newly opened surfaces; individual pauses/exclusions survive
+resume. A partial interrupt failure leaves the entire pool paused and reports
+the failed UUIDs. Transport acknowledgement reports an interrupt request,
+not proof that every native task has stopped.
+
+```sh
+cmux-codex-continue pause-workspace WORKSPACE_UUID
+cmux-codex-continue resume-workspace WORKSPACE_UUID
+```
+
+Native failure hints keep their priority when the first read or identity lookup
+is temporarily unavailable. Unchanged transcripts are not reread, and retrying
+a hint never authorizes input or clears a delivery record.
