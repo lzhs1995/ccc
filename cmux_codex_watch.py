@@ -965,7 +965,9 @@ def _match_error_block(block_text: str) -> str | None:
         return "invalid_encrypted_content"
     if _provider_rate_limit_banner(compact):
         return "rate_limit"
-    if HIGH_DEMAND.lower() in lower:
+    # A narrow native viewport can hard-wrap inside "cause" ("c\nause").
+    # The caller verifies contiguous error rows before normalizing whitespace.
+    if HIGH_DEMAND.lower().replace(" ", "") in compact:
         return "high_demand"
     if "stream disconnected before completion" in lower:
         return "stream"
@@ -1217,6 +1219,45 @@ def _is_codexish(lines: Sequence[str], composer_row: int) -> bool:
     return "gpt-" in lower or "context" in lower or "plan mode" in lower or "esc to interrupt" in lower
 
 
+def _overlay_hides_composer_prompt(grid: Grid, row_spans: Sequence[Span]) -> bool:
+    """Recognize the native empty composer under Codex's RGB animation.
+
+    The animation can replace even the prompt glyph with a blank or braille.
+    Require the complete dim placeholder, adjacent styled animation and the
+    native footer below it; plain braille or a typed placeholder proves nothing.
+    """
+    cursor = grid.cursor
+    if not cursor.visible or cursor.column != 2 or cursor.row < grid.rows - 5:
+        return False
+    if not any(
+        span.column == 2 and span.text.strip() == "Ask Codex to do anything"
+        and grid.style(span.style_id).get("faint", False)
+        and not grid.style(span.style_id).get("invisible", False)
+        for span in row_spans
+    ):
+        return False
+    prefix = [span for span in row_spans if span.column < 2]
+    covered: set[int] = set()
+    for span in prefix:
+        if (span.column < 0 or span.column + span.cell_width > 2
+                or grid.style(span.style_id).get("faint", False)
+                or grid.style(span.style_id).get("invisible", False)
+                or (span.text.strip() and not _is_spinner_overlay_span(grid, span))):
+            return False
+        covered.update(range(span.column, span.column + span.cell_width))
+    if covered != {0, 1} or cursor.row - 1 not in _spinner_chrome_rows(grid, cursor.row):
+        return False
+    footer = "\n".join(grid.lines[cursor.row + 1:cursor.row + 4])
+    return bool(
+        re.search(r"\bContext\s+\d{1,3}%\s+used\b", footer, re.IGNORECASE)
+        and any(
+            cursor.row < span.row <= cursor.row + 3 and span.column == 2
+            and re.match(r"gpt-[\w.-]+\b", span.text)
+            for span in grid.spans
+        )
+    )
+
+
 def _composer_status(grid: Grid) -> tuple[str, int] | tuple[str, None]:
     cursor = grid.cursor
     if not cursor.visible:
@@ -1224,12 +1265,14 @@ def _composer_status(grid: Grid) -> tuple[str, int] | tuple[str, None]:
     row_spans = sorted((span for span in grid.spans if span.row == cursor.row), key=lambda span: span.column)
     prompt = next((span for span in row_spans if span.column == 0 and "›" in span.text), None)
     if prompt is None:
-        return "incompatible", None
-    if grid.style(prompt.style_id).get("faint", False):
-        return "incompatible", None
-    space_span = next((span for span in row_spans if span.column <= 1 < span.column + span.cell_width), None)
-    if space_span is None or grid.style(space_span.style_id).get("faint", False):
-        return "incompatible", None
+        if not _overlay_hides_composer_prompt(grid, row_spans):
+            return "incompatible", None
+    else:
+        if grid.style(prompt.style_id).get("faint", False):
+            return "incompatible", None
+        space_span = next((span for span in row_spans if span.column <= 1 < span.column + span.cell_width), None)
+        if space_span is None or grid.style(space_span.style_id).get("faint", False):
+            return "incompatible", None
     if cursor.column != 2:
         return "composer_busy", cursor.row
     # The live overlay draws RGB braille over a still-visible dim placeholder.

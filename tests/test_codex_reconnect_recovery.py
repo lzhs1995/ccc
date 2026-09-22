@@ -11,6 +11,21 @@ from tests.test_watch import (
 )
 
 
+def covered_prompt_payload(prefix="  "):
+    payload = grid_payload([], error=HIGH_DEMAND_TEXT)
+    grid = payload["render_grid"]
+    row = grid["cursor"]["row"]
+    grid["row_spans"] = [s for s in grid["row_spans"] if s["row"] < row]
+    grid["row_spans"].extend([
+        span(row - 1, 0, "⠁       ⠈       ⢀", 4),
+        span(row, 0, prefix, 4 if prefix.strip() else 1),
+        span(row, 2, "Ask Codex to do anything", 2),
+        span(row, 80, "⠈", 4),
+        span(row + 2, 2, "gpt-6-astra xhigh · Context 0% used · Fast on", 0),
+    ])
+    return payload
+
+
 class CodexReconnectRecoveryTests(unittest.TestCase):
     def check_without_send(self, payload, expected):
         with tempfile.TemporaryDirectory() as directory:
@@ -176,6 +191,77 @@ class CodexReconnectRecoveryTests(unittest.TestCase):
         payload["render_grid"]["row_spans"].append(span(row, 80, "⠈", 4))
         state = core.classify_grid(core.Grid.from_rpc(payload, "surface-uuid"))
         self.assertEqual(state.kind, "recoverable_error")
+
+    def test_rgb_overlay_can_cover_prompt_with_blank_or_braille(self):
+        for prefix in ("  ", "⡀ "):
+            with self.subTest(prefix=prefix), tempfile.TemporaryDirectory() as directory:
+                payload = covered_prompt_payload(prefix)
+                client = FakeClient(payload, "\n".join(visible_lines(payload)))
+                daemon = armed_daemon(directory, client)
+                daemon.process_once(client)
+                self.assertEqual(len(client.sent), 1)
+
+    def test_high_demand_hard_wrap_at_every_character_stays_current(self):
+        banner = "■ " + HIGH_DEMAND_TEXT
+        for split in range(3, len(banner)):
+            with self.subTest(split=split):
+                payload = covered_prompt_payload("⡀ ")
+                grid = payload["render_grid"]
+                row = grid["cursor"]["row"]
+                grid["row_spans"] = [s for s in grid["row_spans"] if s["row"] != row - 4]
+                grid["row_spans"].extend([
+                    span(row - 4, 0, banner[:split], 3),
+                    span(row - 3, 0, banner[split:], 3),
+                ])
+                state = core.classify_grid(core.Grid.from_rpc(payload, "surface-uuid"))
+                self.assertEqual((state.kind, state.error_type), ("recoverable_error", "high_demand"))
+                self.assertEqual(core.classify_text_prefilter(visible_lines(payload)).kind, "candidate")
+
+    def test_covered_prompt_requires_native_placeholder_animation_and_footer(self):
+        for missing in ("placeholder", "dim", "animation", "rgb", "footer", "model", "cursor", "home", "prefix"):
+            with self.subTest(missing=missing):
+                payload = covered_prompt_payload()
+                grid = payload["render_grid"]
+                row = grid["cursor"]["row"]
+                for item in grid["row_spans"]:
+                    if item["row"] == row and item["column"] == 2:
+                        if missing == "placeholder":
+                            item["text"] = "Ask Codex"
+                        if missing == "dim":
+                            item["style_id"] = 0
+                    if item["row"] == row - 1:
+                        if missing == "animation":
+                            item["text"] = ""
+                        if missing == "rgb":
+                            item["style_id"] = 0
+                    if item["row"] == row + 2:
+                        if missing == "footer":
+                            item["text"] = "gpt-6-astra xhigh"
+                        if missing == "model":
+                            item["text"] = "Context 0% used"
+                    if item["row"] == row and item["column"] == 0 and missing == "prefix":
+                        item["text"] = "x "
+                if missing == "cursor":
+                    grid["cursor"]["visible"] = False
+                if missing == "home":
+                    grid["cursor"]["column"] = 3
+                self.check_without_send(payload, "incompatible")
+
+    def test_covered_prompt_preserves_user_input_menu_working_and_queue_gates(self):
+        for expected, text in (
+            ("composer_busy", "my unfinished task"),
+            ("menu", "Implement this plan?"),
+            ("working", "• Working (4s • esc to interrupt)"),
+            ("queued_followup", "• Queued follow-up inputs"),
+        ):
+            with self.subTest(expected=expected):
+                payload = covered_prompt_payload()
+                row = payload["render_grid"]["cursor"]["row"]
+                payload["render_grid"]["row_spans"].append(
+                    span(row, 30, text, 0) if expected == "composer_busy"
+                    else span(row - 2, 0, text, 0)
+                )
+                self.check_without_send(payload, expected)
 
     def test_unverified_braille_transcript_is_not_ignored(self):
         payload = grid_payload([], error=HIGH_DEMAND_TEXT)
