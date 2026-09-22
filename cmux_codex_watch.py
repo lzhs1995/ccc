@@ -367,6 +367,10 @@ class CmuxError(RuntimeError):
     """An expected cmux command or protocol failure."""
 
 
+class UncertainDeliveryError(CmuxError):
+    """Input may have reached cmux; never retry via another transport."""
+
+
 class IncompatibleError(CmuxError):
     """The connected cmux does not expose the required protocol shape."""
 
@@ -3396,13 +3400,19 @@ class CmuxViewportSocket:
     def __init__(self):
         self.path: str | None = None
         self.retry_at = 0.0
+        self.control_methods: frozenset[str] = frozenset()
 
     def configure(self, capabilities: Mapping[str, Any]) -> None:
         path = capabilities.get("socket_path")
+        self.control_methods = frozenset()
         if (capabilities.get("protocol") == "cmux-socket"
                 and capabilities.get("version") == 2
                 and isinstance(path, str) and os.path.isabs(path)):
             self.path, self.retry_at = path, 0.0
+            if capabilities.get("access_mode") == "automation":
+                self.control_methods = frozenset(capabilities.get("methods", ())) & {
+                    "system.tree", "system.top", "surface.send_text", "surface.send_key",
+                }
 
     def request(self, method: str, params: Mapping[str, Any], *, timeout: float) -> Mapping[str, Any] | None:
         if method not in {"surface.read_text", "terminal.replay"}:
@@ -3467,6 +3477,59 @@ class CmuxClient:
         self.runner = runner
         self.viewport_socket = viewport_socket
 
+    def _control_rpc(self, method: str, params: Mapping[str, Any], *, timeout: float = 8):
+        """Use the advertised endpoint without CLI selector-resolution RPCs.
+
+        Input has one attempt and no transport fallback. A missing or malformed
+        acknowledgement after writing remains uncertain in the delivery ledger.
+        """
+        transport = self.viewport_socket
+        if (transport is None or not transport.path
+                or method not in getattr(transport, "control_methods", ())):
+            return None
+        is_input = method in {"surface.send_text", "surface.send_key"}
+        if is_input and (not params.get("workspace_id") or not params.get("surface_id")):
+            raise ValueError("input requires explicit workspace and surface UUIDs")
+        request_id = uuid.uuid4().hex
+        deadline, attempted = time.monotonic() + timeout, False
+        def remaining():
+            seconds = deadline - time.monotonic()
+            if seconds <= 0:
+                raise TimeoutError("control response deadline exceeded")
+            return seconds
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                connection.settimeout(remaining())
+                connection.connect(transport.path)
+                connection.settimeout(remaining())
+                attempted = True
+                connection.sendall((json.dumps({"id": request_id, "method": method, "params": params}) + "\n").encode())
+                data = bytearray()
+                while b"\n" not in data:
+                    connection.settimeout(remaining())
+                    chunk = connection.recv(min(65536, transport.MAX_RESPONSE_BYTES + 1 - len(data)))
+                    if not chunk:
+                        raise ValueError("incomplete control response")
+                    data.extend(chunk)
+                    if len(data) > transport.MAX_RESPONSE_BYTES:
+                        raise ValueError("oversized control response")
+            reply = json.loads(data.split(b"\n", 1)[0])
+            if (not isinstance(reply, Mapping) or reply.get("id") != request_id
+                    or reply.get("ok") is not True or not isinstance(reply.get("result"), Mapping)):
+                raise ValueError("control acknowledgement unavailable")
+            result = reply["result"]
+            if is_input:
+                for key in ("workspace_id", "surface_id"):
+                    if key in result and result[key] != params[key]:
+                        raise ValueError("control acknowledgement identity mismatch")
+            elif not isinstance(result.get("windows"), list):
+                raise ValueError("control snapshot missing windows")
+            return result
+        except (OSError, ValueError) as exc:
+            if is_input and attempted:
+                raise UncertainDeliveryError(f"{method} acknowledgement uncertain: {exc}") from exc
+            raise CmuxError(f"{method} control request failed: {exc}") from exc
+
     def _run(self, args: Sequence[str], timeout: float = 10.0) -> subprocess.CompletedProcess[str]:
         command = [self.binary, *args]
         try:
@@ -3500,6 +3563,9 @@ class CmuxClient:
         return value
 
     def tree(self) -> Mapping[str, Any]:
+        value = self._control_rpc("system.tree", {"all": True})
+        if value is not None:
+            return value
         result = self._run(["--json", "--id-format", "both", "tree", "--all"])
         try:
             value = json.loads(result.stdout)
@@ -3512,6 +3578,9 @@ class CmuxClient:
     def top(self, workspace_id: str) -> Mapping[str, Any]:
         if not workspace_id:
             raise CmuxError("cmux top requires workspace UUID")
+        value = self._control_rpc("system.top", {"workspace_id": workspace_id, "processes": True})
+        if value is not None:
+            return value
         # --id-format both is what puts the stable surface UUID in the payload;
         # without it cmux returns refs only and process labels can only be
         # joined on a handle that renumbers.
@@ -3528,6 +3597,9 @@ class CmuxClient:
         return value
 
     def top_all(self) -> Mapping[str, Any]:
+        value = self._control_rpc("system.top", {"all": True, "processes": True})
+        if value is not None:
+            return value
         result = self._run(["--json", "--id-format", "both", "top", "--all", "--processes"], timeout=20)
         try:
             value = json.loads(result.stdout)
@@ -3716,6 +3788,10 @@ class CmuxClient:
         # Keep the newline in the argv value. cmux maps it to Enter without
         # requiring focus or a separate send-key operation.
         self._reject_unapproved_command(message)
+        if self._control_rpc("surface.send_text", {
+            "workspace_id": workspace_id, "surface_id": surface_id, "text": f"{message}\n",
+        }) is not None:
+            return
         self._run(["send", "--workspace", workspace_id, "--surface", surface_id, f"{message}\n"], timeout=8)
 
     def send_text(self, workspace_id: str, surface_id: str, message: str) -> None:
@@ -8925,7 +9001,7 @@ class WatchDaemon:
             runtime.send_completed_at = time.time()
             runtime.send_duration_ms = round((time.monotonic() - send_started) * 1000, 3)
             runtime.last_send_error = str(exc)[-500:]
-            uncertain = isinstance(exc.__cause__, subprocess.TimeoutExpired)
+            uncertain = isinstance(exc, UncertainDeliveryError) or isinstance(exc.__cause__, subprocess.TimeoutExpired)
             runtime.delivery_status = "unknown" if uncertain else "failed"
             runtime.state = "delivery_unknown" if uncertain else "send_failed"
             self.logger.error("surface=%s send failed: %s", surface_id[:8], exc)
