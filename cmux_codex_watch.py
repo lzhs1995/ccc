@@ -3524,6 +3524,8 @@ class CmuxClient:
                         raise ValueError("control acknowledgement identity mismatch")
             elif not isinstance(result.get("windows"), list):
                 raise ValueError("control snapshot missing windows")
+            if method == "system.top" and result.get("include_processes") is not True:
+                raise ValueError("control snapshot omitted requested processes")
             return result
         except (OSError, ValueError) as exc:
             if is_input and attempted:
@@ -3578,7 +3580,7 @@ class CmuxClient:
     def top(self, workspace_id: str) -> Mapping[str, Any]:
         if not workspace_id:
             raise CmuxError("cmux top requires workspace UUID")
-        value = self._control_rpc("system.top", {"workspace_id": workspace_id, "processes": True})
+        value = self._control_rpc("system.top", {"workspace_id": workspace_id, "include_processes": True})
         if value is not None:
             return value
         # --id-format both is what puts the stable surface UUID in the payload;
@@ -3597,7 +3599,7 @@ class CmuxClient:
         return value
 
     def top_all(self) -> Mapping[str, Any]:
-        value = self._control_rpc("system.top", {"all": True, "processes": True})
+        value = self._control_rpc("system.top", {"all": True, "include_processes": True})
         if value is not None:
             return value
         result = self._run(["--json", "--id-format", "both", "top", "--all", "--processes"], timeout=20)

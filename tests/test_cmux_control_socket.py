@@ -17,15 +17,26 @@ class ControlSocketTests(unittest.TestCase):
 
     def test_tree_and_top_are_single_scoped_rpc_calls(self):
         def handle(connection, request):
-            send(connection, {"id": request["id"], "ok": True, "result": {"windows": []}})
+            result = {"windows": []}
+            if request["method"] == "system.top":
+                result["include_processes"] = request["params"].get("include_processes", False)
+            send(connection, {"id": request["id"], "ok": True, "result": result})
         with server(handle) as (transport, requests):
             client = self.client(transport)
             self.assertEqual(client.tree(), {"windows": []})
-            self.assertEqual(client.top_all(), {"windows": []})
-            self.assertEqual(client.top("workspace"), {"windows": []})
+            self.assertEqual(client.top_all(), {"windows": [], "include_processes": True})
+            self.assertEqual(client.top("workspace"), {"windows": [], "include_processes": True})
             self.assertEqual([(r["method"], r["params"]) for r in requests], [
-                ("system.tree", {"all": True}), ("system.top", {"all": True, "processes": True}),
-                ("system.top", {"workspace_id": "workspace", "processes": True})])
+                ("system.tree", {"all": True}), ("system.top", {"all": True, "include_processes": True}),
+                ("system.top", {"workspace_id": "workspace", "include_processes": True})])
+
+    def test_top_without_processes_is_unavailable_not_an_empty_agent_inventory(self):
+        def handle(connection, request):
+            send(connection, {"id": request["id"], "ok": True,
+                              "result": {"windows": [], "include_processes": False}})
+        with server(handle) as (transport, _):
+            with self.assertRaisesRegex(core.CmuxError, "omitted requested processes"):
+                self.client(transport).top_all()
 
     def test_send_preserves_explicit_identity_and_ordered_newline(self):
         with server(lambda connection, request: send(connection, response(request))) as (transport, requests):
