@@ -7,12 +7,14 @@ proves the turn ended. Every key is write-ahead recorded; ambiguity stops here.
 from __future__ import annotations
 
 from datetime import datetime
+import ctypes
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import threading
 import time
 
@@ -32,7 +34,7 @@ def task_snapshot(path, session_id):
         handle.seek(max(0, before.st_size - 1024 * 1024))
         tail = handle.read().decode("utf-8", errors="replace")
     latest = None
-    for line in tail.splitlines():
+    for line in reversed(tail.splitlines()):
         try:
             event = json.loads(line)
         except ValueError:
@@ -42,6 +44,7 @@ def task_snapshot(path, session_id):
             "task_started", "task_complete", "turn_aborted", "user_message",
         }:
             latest = event
+            break
     if not latest:
         return None
     after = path.stat()
@@ -70,17 +73,68 @@ def completed_error(path, session_id, now):
     return {"completed_at": completed, "turn_id": latest["turn_id"], "signature": latest["signature"]}
 
 
+class _BsdInfo(ctypes.Structure):
+    # Darwin sys/proc_info.h: PROC_PIDTBSDINFO, stable public 136-byte ABI.
+    _fields_ = [("flags", ctypes.c_uint32), ("status", ctypes.c_uint32),
+                ("xstatus", ctypes.c_uint32), ("pid", ctypes.c_uint32),
+                ("ppid", ctypes.c_uint32), ("ids", ctypes.c_uint32 * 7),
+                ("comm", ctypes.c_char * 16), ("name", ctypes.c_char * 32),
+                ("misc", ctypes.c_uint32 * 6), ("start_sec", ctypes.c_uint64),
+                ("start_usec", ctypes.c_uint64)]
+
+
+_proc_pidinfo = None
+if sys.platform == "darwin":
+    try:
+        _proc_pidinfo = ctypes.CDLL("/usr/lib/libproc.dylib").proc_pidinfo
+        _proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+                                 ctypes.c_void_p, ctypes.c_int]
+        _proc_pidinfo.restype = ctypes.c_int
+    except (OSError, AttributeError):
+        pass
+
+
+def codex_process_starts(pids):
+    """Read only the requested live PID identities, without enumerating the OS.
+
+    On a busy Mac even `ps -p` can stall for seconds. libproc reads each bound
+    PID directly; failed/short reads never become identity evidence. The same
+    uncached check is used at the send boundary, preserving PID reuse guards.
+    """
+    pids = {pid for pid in pids if type(pid) is int and 0 < pid < 2**31}
+    starts = {}
+    if _proc_pidinfo is not None:
+        for pid in pids:
+            info = _BsdInfo()
+            size = ctypes.sizeof(info)
+            if (_proc_pidinfo(pid, 3, 0, ctypes.byref(info), size) == size
+                    and info.pid == pid and info.status != 5
+                    and (info.name or info.comm) == b"codex" and info.start_sec > 0):
+                starts[pid] = info.start_sec
+        return starts
+    if not pids:
+        return starts
+    try:
+        result = subprocess.run(["/bin/ps", "-o", "pid=,lstart=,comm=", "-p",
+            ",".join(str(pid) for pid in sorted(pids))], capture_output=True, text=True, timeout=1)
+        for line in result.stdout.splitlines():
+            fields = line.split(None, 6)
+            try:
+                if len(fields) == 7 and int(fields[0]) in pids and Path(fields[6]).name == "codex":
+                    starts[int(fields[0])] = time.mktime(time.strptime(" ".join(fields[1:6]), "%a %b %d %H:%M:%S %Y"))
+            except ValueError:
+                continue
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return starts
+
+
 def process_matches(record):
     pid, started = record.get("pid"), record.get("pidStartSeconds")
     if type(pid) is not int or type(started) not in (int, float):
         return False
-    result = subprocess.run(["/bin/ps", "-o", "lstart=,comm=", "-p", str(pid)],
-                            capture_output=True, text=True, timeout=2)
-    fields = result.stdout.strip().split(None, 5)
-    if result.returncode or len(fields) != 6 or Path(fields[5]).name != "codex":
-        return False
-    actual = time.mktime(time.strptime(" ".join(fields[:5]), "%a %b %d %H:%M:%S %Y"))
-    return abs(actual - started) < 1
+    actual = codex_process_starts([pid]).get(pid)
+    return actual is not None and abs(actual - started) < 1
 
 
 class NativeCompletionWatcher:
@@ -96,12 +150,14 @@ class NativeCompletionWatcher:
         self.interval, self.tail_bytes = interval, tail_bytes
         self.signatures, self.seen_turns = {}, {}
         self.pending, self.retry_needed, self.clock = {}, retry_needed, clock
+        self.lifecycle, self.coverage = {}, {}
         self.stop = threading.Event()
         self.thread = None
 
     def scan(self):
         sources = self.sources()
         active = set()
+        covered = {}
         for source in sources:
             key = (source["surface_id"], source["workspace_id"],
                    source["session_id"], str(source["path"]))
@@ -111,6 +167,8 @@ class NativeCompletionWatcher:
                 before = path.stat()
                 signature = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
                 if self.signatures.get(key) == signature:
+                    if key in self.lifecycle and source.get("identity_current"):
+                        covered[key[:2]] = self.clock()
                     pending = self.pending.get(key)
                     if (pending and self.retry_needed and self.clock() >= pending[1]
                             and self.retry_needed(key[0], key[1], pending[0])):
@@ -148,12 +206,31 @@ class NativeCompletionWatcher:
                         self.pending[key] = (epoch(latest.get("timestamp")), self.clock() + 1)
                 elif latest:
                     self.pending.pop(key, None)
+                if latest:
+                    self.lifecycle[key] = latest["payload"]["type"]
+                    if source.get("identity_current"):
+                        covered[key[:2]] = self.clock()
+                else:
+                    self.lifecycle.pop(key, None)
                 self.signatures[key] = signature
             except (OSError, ValueError, TypeError, AttributeError):
                 continue
         self.signatures = {key: value for key, value in self.signatures.items() if key in active}
         self.seen_turns = {key: value for key, value in self.seen_turns.items() if key in active}
         self.pending = {key: value for key, value in self.pending.items() if key in active}
+        self.lifecycle = {key: value for key, value in self.lifecycle.items() if key in active}
+        self.coverage = covered
+
+    def observation_interval(self, target, fallback):
+        """Healthy native monitoring replaces redundant reads, never send guards.
+
+        A missing/stalled source immediately falls back to regular viewport
+        polling. Native failures still request an immediate priority read.
+        """
+        checked = self.coverage.get((str(target["surface_id"]), str(target["workspace_id"])))
+        if checked is not None and 0 <= self.clock() - checked <= max(1, 3 * self.interval):
+            return max(fallback, 10.0)
+        return fallback
 
     def start(self):
         def run():
@@ -182,6 +259,7 @@ class QueueRecovery:
         self.process_lookup = None
         self.open_file_cache = {}
         self.open_file_sources = {}
+        self.wakeup_process_cache = (0.0, frozenset(), {})
         try:
             self.attempts = json.loads(self.ledger.read_text())
         except FileNotFoundError:
@@ -199,8 +277,9 @@ class QueueRecovery:
 
     def wakeup_sources(self, targets):
         """Latest known original transcript for each currently enabled UUID."""
-        active = {str(t["surface_id"]): str(t["workspace_id"]) for t in targets
-                  if t.get("enabled", True) and not t.get("paused", False)}
+        active_targets = {str(t["surface_id"]): t for t in targets
+                          if t.get("enabled", True) and not t.get("paused", False)}
+        active = {sid: str(t["workspace_id"]) for sid, t in active_targets.items()}
         try:
             records = self.records()
         except (OSError, ValueError):
@@ -209,6 +288,7 @@ class QueueRecovery:
             candidates = list(self.open_file_sources.values())
         candidates.extend({"surface_id": r.get("surfaceId"), "workspace_id": r.get("workspaceId"),
                            "session_id": sid, "path": r.get("transcriptPath"),
+                           "pid": r.get("pid"),
                            "process_start": r.get("pidStartSeconds", 0)}
                           for sid, r in records.items())
         chosen = {}
@@ -224,7 +304,20 @@ class QueueRecovery:
                     chosen[sid] = source
             except (OSError, ValueError, TypeError):
                 continue
-        return list(chosen.values())
+        # Scheduling must not depend on cmux's expensive GUI process snapshot:
+        # its normal refresh gap used to discard every healthy native monitor
+        # at once, producing another full-fleet burst of viewport requests.
+        # Direct OS queries check the already-bound PID/start identities.
+        # This is advisory coverage only; send still performs its full guards.
+        pids = frozenset(s["pid"] for s in chosen.values() if type(s.get("pid")) is int and s["pid"] > 0)
+        cached_at, cached_pids, starts = self.wakeup_process_cache
+        now = time.monotonic()
+        if pids != cached_pids or now - cached_at >= 1:
+            starts = codex_process_starts(pids)
+            self.wakeup_process_cache = (now, pids, starts)
+        return [{**source, "identity_current": bool(source.get("pid") in starts
+                  and abs(starts[source["pid"]] - source["process_start"]) < 1)}
+                for source in chosen.values()]
 
     def evidence(self, target):
         turn = self.current_turn(target)
@@ -333,6 +426,7 @@ class QueueRecovery:
                 self.open_file_sources[str(target["surface_id"])] = {
                     "surface_id": str(target["surface_id"]), "workspace_id": str(target["workspace_id"]),
                     "session_id": sid, "path": path, "process_start": started,
+                    "pid": pid,
                 }
             return {"session_id": sid, "pid": pid, "process_start": started,
                     **(snapshot or {"kind": "unknown"})}

@@ -124,6 +124,15 @@ authorization and delivery deduplication still gate every send. Pending hints
 survive in-flight reads; regular scans retain capacity under a stream of errors.
 The interval is a scheduling target, not a guaranteed end-to-end latency.
 
+When that original transcript has a known lifecycle and its bound PID/start
+identity is current, redundant routine viewport reads run every 10 seconds.
+Failure events still request an immediate read and retry failed observations
+every second. Missing, unreadable, mismatched or stale native coverage restores
+the configured regular scan interval. On macOS, identity checks use the public
+`libproc` API directly: even a PID-filtered `ps` can stall under fleet load.
+The send boundary checks the process identity again without using the advisory
+monitoring cache. No native monitoring state authorizes a terminal write.
+
 Recovery recognizes the native dim placeholder when styled animation covers the
 composer prompt, including narrow-window high-demand banners split inside words.
 Complete native HTTP 408/429/500/502/503/504 error banners are retryable. User

@@ -97,3 +97,29 @@ The general lesson is to verify the entire chain: explicit authorization,
 correct live identity, current observation, safe input state, one submit
 transaction, and actual prompt acceptance. File installation, a live PID, a
 ledger write or a green summary alone proves only part of that chain.
+
+## Native observation cadence and slow process queries (v0.2.9)
+
+On a busy Mac, `ps -p` for just three bound processes exceeded eight seconds.
+Using a one-second `ps` timeout for event-monitor coverage therefore removed
+every native monitor at once. Using the GUI process snapshot for the same
+purpose had a similar failure during its refresh gaps. Both approaches caused
+redundant fleet-wide viewport reads and delayed recovery observations.
+
+Native coverage now uses direct `PROC_PIDTBSDINFO` reads of already-bound PIDs.
+A complete response, matching PID, Codex name, live process and original start
+time are required. Short reads, exited processes and PID reuse cannot supply
+coverage. Sending performs the same identity check again without a cache.
+The existing original transcript, UUID, draft, pause and delivery guards remain
+in force. Native task snapshots stop parsing at the newest lifecycle record.
+
+Only healthy native coverage reduces routine viewport polling. An error wakes
+its surface immediately, even while an observation is in flight. Coverage loss
+restores ordinary polling; it never disables observation. Regression cases cover
+coverage expiry, source removal, process reuse, unavailable GUI metadata, short
+native reads and priority wakes during the slower routine cadence.
+
+Validate recovery over a complete time window: enumerate each original failed
+turn, correlate its recorded send and the subsequent `task_started` in that
+same transcript. Keep protected drafts, menus and user-aborted turns separate.
+Counting only the last acknowledged send per surface misses earlier delays.
