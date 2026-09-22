@@ -117,6 +117,26 @@ class QueueRecoveryTests(unittest.TestCase):
             h.write(json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}) + "\n")
         self.assertIsNone(completed_error(path, "original", now))
 
+    def test_transport_failure_eligibility_is_shared_by_queue_and_transcript_checks(self):
+        now = time.time()
+        path = self.root / "session.jsonl"
+        recovery = QueueRecovery(self.ledger, self.root / "bindings", self.root, "任务请继续")
+        for message, allowed in (("Connection failed: error sending request", True),
+                                 ("stream disconnected before completion", True),
+                                 ("Connection failed: permission denied", False),
+                                 ("Example: Connection failed: error sending request", False)):
+            with self.subTest(message=message):
+                turn = {"kind": "task_complete", "at": now - 10, "turn_id": "original-turn",
+                        "error": {"message": message}, "session_id": "original", "pid": 123,
+                        "process_start": 1, "signature": [1, 2, 3]}
+                recovery.current_turn = Mock(return_value=turn)
+                finished = {"timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 10)),
+                            "type": "event_msg", "payload": {"type": "task_complete", "error": turn["error"]}}
+                path.write_text("\n".join(json.dumps(x) for x in [
+                    {"type": "session_meta", "payload": {"id": "original"}}, finished]) + "\n")
+                self.assertEqual(recovery.evidence(self.target) is not None, allowed)
+                self.assertEqual(completed_error(path, "original", now) is not None, allowed)
+
 
 if __name__ == "__main__":
     unittest.main()

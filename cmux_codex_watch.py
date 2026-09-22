@@ -328,7 +328,7 @@ CLAUDE_CONTEXT_ABSOLUTE_TIMEOUT_SEC = 900.0
 # through TargetRuntime and suppresses duplicate Hook/fallback deliveries.
 # Human label only.  Acceptance always compares SHA-256 of the loaded source:
 # a revision string is hand-maintained and therefore can lie about what runs.
-FEATURE_REVISION = "0.2.10-responsive-pool-controls"
+FEATURE_REVISION = "0.2.11-native-startup-notice"
 # How long after our own send a byte-identical UserPromptSubmit can still be
 # our echo.  Must exceed claude_submit_confirm_timeout_sec so that a late
 # echo arriving after the transaction timed out is not read as a human.
@@ -982,6 +982,8 @@ def _match_error_block(block_text: str) -> str | None:
     # The caller verifies contiguous error rows before normalizing whitespace.
     if HIGH_DEMAND.lower().replace(" ", "") in compact:
         return "high_demand"
+    if RECONNECT_COMPACT_PREFIX_RE.sub("", compact, count=1).lstrip("■⚠└") == "connectionfailed:errorsendingrequest":
+        return "stream"
     if "stream disconnected before completion" in lower:
         return "stream"
     if "error sending request for url" in lower and (
@@ -1141,7 +1143,8 @@ def _find_last_error(
     """
 
     limit = composer_row if composer_row is not None else len(lines)
-    marker_rows = [index for index, line in enumerate(lines[:limit]) if _is_error_marker(line)]
+    marker_rows = [index for index, line in enumerate(lines[:limit])
+                   if index not in ignored_rows and _is_error_marker(line)]
     if not marker_rows:
         return None
     for marker in reversed(marker_rows):
@@ -1227,6 +1230,39 @@ def _codex_hook_timeout_rows(grid: Grid, composer_row: int) -> frozenset[int]:
             continue
         rows.update((row, row + 1))
     return frozenset(rows)
+
+
+def _codex_startup_notice_rows(grid: Grid, composer_row: int) -> frozenset[int]:
+    """The complete native Hook trust notice is not new model output.
+
+    Resuming Codex prints this notice after the previous turn's failure. Only
+    its exact text, column-zero warning marker and native yellow palette style
+    qualify; partial/other warnings, quotes and later output remain blocking.
+    Contiguous word/hard wraps may split the option name or any other word.
+    """
+    expected = re.sub(r"\s+", "", "⚠ `--dangerously-bypass-hook-trust` is enabled. "
+                      "Enabled hooks may run without review for this invocation.")
+    ignored: set[int] = set()
+    for start, line in enumerate(grid.lines[:composer_row]):
+        if not line.startswith("⚠ "):
+            continue
+        compact = ""
+        for row in range(start, min(start + 8, composer_row)):
+            spans = [span for span in grid.spans if span.row == row and span.text.strip()]
+            if not spans or any(
+                    grid.style(span.style_id).get("foreground_source") != "palette"
+                    or grid.style(span.style_id).get("foreground_palette_index") != 3
+                    or any(grid.style(span.style_id).get(flag, False)
+                           for flag in ("faint", "bold", "invisible", "italic", "inverse"))
+                    for span in spans):
+                break
+            compact += re.sub(r"\s+", "", grid.lines[row])
+            if compact == expected:
+                ignored.update(range(start, row + 1))
+                break
+            if not expected.startswith(compact):
+                break
+    return frozenset(ignored)
 
 
 def _is_footer(line: str) -> bool:
@@ -2075,7 +2111,12 @@ def classify_grid(grid: Grid) -> ScreenState:
         return ScreenState("non_codex_or_unknown", screen_signature=grid.signature(), reason="Codex UI fingerprint missing")
     if composer_kind == "composer_busy":
         return ScreenState("composer_busy", screen_signature=grid.signature(), reason="composer contains user text")
-    marker_rows = [row for row, line in enumerate(lines[:composer_row]) if _is_error_marker(line)]
+    chrome_rows = (_codex_status_chrome_rows(grid, composer_row)
+                   | _spinner_chrome_rows(grid, composer_row)
+                   | _codex_hook_timeout_rows(grid, composer_row)
+                   | _codex_startup_notice_rows(grid, composer_row))
+    marker_rows = [row for row, line in enumerate(lines[:composer_row])
+                   if row not in chrome_rows and _is_error_marker(line)]
     if not marker_rows:
         return ScreenState("idle", screen_signature=grid.signature(), reason="empty composer without current recoverable error")
     marker_row = marker_rows[-1]
@@ -2150,9 +2191,6 @@ def classify_grid(grid: Grid) -> ScreenState:
             span.style_id in marker_style_ids for span in content_spans
         )
 
-    chrome_rows = (_codex_status_chrome_rows(grid, composer_row)
-                   | _spinner_chrome_rows(grid, composer_row)
-                   | _codex_hook_timeout_rows(grid, composer_row))
     error = _find_last_error(
         lines,
         composer_row,

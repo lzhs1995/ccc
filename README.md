@@ -162,6 +162,13 @@ fresh inventory, reused PIDs and multiple open sessions still block input.
 
 Recovery recognizes the native dim placeholder when styled animation covers the
 composer prompt, including narrow-window high-demand banners split inside words.
+After a Codex resume, the native Hook trust notice can appear below the previous
+provider failure. Its complete text and native warning style (including wrapped
+lines) do not count as newer model output. Other warnings, partial notices, user
+drafts, menus and queued input keep their existing guards. The complete native
+`Connection failed: error sending request` banner is a retryable transport error;
+stranded-prompt recovery recognizes it using the same original-session checks.
+
 Complete native HTTP 408/429/500/502/503/504 error banners are retryable. User
 drafts, menus, aborted turns, quotas and non-retryable status codes remain blocked.
 Older Working chrome above a newer failure card does not hide that failure;
