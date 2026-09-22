@@ -9,11 +9,11 @@ import tempfile
 import time
 import unittest
 import uuid
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import ccc_workspace_batch as batch
 import cmux_codex_watch as core
-from tests.test_watch import grid_payload
+from tests.test_watch import grid_payload, span
 
 
 class BatchFixture:
@@ -91,6 +91,9 @@ class BatchFixture:
             self.on_send()
         if self.lose_send:
             raise core.UncertainDeliveryError('send acknowledgement lost')
+
+    def send_text(self, wid, sid, message):
+        self.send(wid, sid, message)
 
 
 class WorkspaceBatchTests(unittest.TestCase):
@@ -220,6 +223,77 @@ class WorkspaceBatchTests(unittest.TestCase):
                 handle.write(json.dumps({'type': 'event_msg', 'timestamp': stamp, 'payload': payload}) + '\n')
         self.worker._advance(slot)
         self.assertEqual(slot['phase'], 'confirmed')
+
+    def test_lazy_native_session_is_confirmed_only_by_its_later_original_transcript(self):
+        self.worker.step()
+        slot = self.worker.job['slots'][0]
+        sid = slot['surface_id']
+        native = {**self.client.states[sid], 'kind': 'uninitialized', 'process_start': slot['created_at']}
+        binding = self.client.bindings[native['session_id']]
+        path = Path(binding['transcriptPath'])
+        path.unlink()
+        with patch.object(self.client, 'current_turn', return_value={'kind': 'unknown'}), \
+                patch.object(self.client, 'initial_session', return_value=native, create=True), \
+                patch.object(self.client, 'records', return_value={}), patch.object(self.client, 'send_text') as send:
+            self.worker._advance(slot)
+            self.assertEqual(slot['phase'], 'submitted')
+            self.assertEqual(slot['transcript'], '')
+            send.assert_called_once()
+        self.client.states[sid] = {**native, 'kind': 'task_started'}
+        stamp = datetime.now(timezone.utc).isoformat()
+        rows = [
+            {'type': 'session_meta', 'payload': {'id': native['session_id']}},
+            {'type': 'event_msg', 'timestamp': stamp, 'payload': {'type': 'task_started'}},
+            {'type': 'response_item', 'payload': {'type': 'message', 'role': 'user', 'content': [
+                {'type': 'input_text', 'text': '<environment_context>test</environment_context>'}]}},
+            {'type': 'response_item', 'payload': {'type': 'message', 'role': 'user', 'content': [
+                {'type': 'input_text', 'text': batch.PROMPT}]}},
+        ]
+        path.write_text('\n'.join(json.dumps(row) for row in rows) + '\n')
+        self.worker._advance(slot)
+        self.assertEqual(slot['phase'], 'confirmed')
+        self.assertNotIn(sid, self.store.load()['workspace_rules'][0]['excluded_surface_ids'])
+
+    def test_separate_enter_requires_exact_recorded_draft_and_is_never_repeated(self):
+        self.worker.step()
+        slot = self.worker.job['slots'][0]
+        with patch.object(self.client, 'send_text'):
+            self.worker._advance(slot)
+        self.worker.clock = lambda: slot['submit_at'] + 1
+        frame = grid_payload([])
+        grid = frame['render_grid']
+        row = grid['cursor']['row']
+        grid['row_spans'] = [s for s in grid['row_spans'] if not (s['row'] == row and s['column'] >= 2)]
+        draft = span(row, 2, batch.PROMPT, 0)
+        grid['row_spans'].append(draft)
+        grid['cursor']['column'] = 2 + len(batch.PROMPT)
+        grid['surface_id'] = slot['surface_id']
+        with patch.object(self.client, 'replay', return_value=frame), \
+                patch.object(self.client, 'send_key', create=True, side_effect=core.UncertainDeliveryError('reply lost')) as enter:
+            draft['text'] = 'x' + batch.PROMPT[1:]
+            self.worker._advance(slot)
+            enter.assert_not_called()
+            draft['text'] = batch.PROMPT
+            self.worker._advance(slot)
+            self.assertIn('enter_attempt_at', slot)
+            self.worker._advance(slot)
+            enter.assert_called_once_with(self.wid, slot['surface_id'], 'enter')
+        self.assertEqual(slot['phase'], 'uncertain')
+
+    def test_response_item_from_a_different_human_prompt_is_not_batch_confirmation(self):
+        self.worker.step()
+        slot = self.worker.job['slots'][0]
+        with patch.object(self.client, 'send_text'):
+            self.worker._advance(slot)
+        stamp = datetime.now(timezone.utc).isoformat()
+        with Path(slot['transcript']).open('a') as out:
+            for row in [
+                {'type': 'event_msg', 'timestamp': stamp, 'payload': {'type': 'task_started'}},
+                *({'type': 'response_item', 'payload': {'role': 'user', 'content': [{'type': 'input_text', 'text': text}]}}
+                  for text in ('another user task', batch.PROMPT)),
+            ]:
+                out.write(json.dumps(row) + '\n')
+        self.assertFalse(self.worker._confirm(slot))
 
 
 if __name__ == '__main__':

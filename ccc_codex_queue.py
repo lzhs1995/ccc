@@ -17,10 +17,25 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 
 
 def epoch(value):
     return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+
+
+def writable_open_files(output):
+    """lsof names alone include unrelated history being indexed at startup."""
+    descriptor, access = "", ""
+    paths = set()
+    for line in output.splitlines():
+        if line.startswith("f"):
+            descriptor, access = line[1:], ""
+        elif line.startswith("a"):
+            access = line[1:]
+        elif line.startswith("n") and descriptor.isdecimal() and access in {"w", "u"}:
+            paths.add(Path(line[1:]).resolve())
+    return paths
 
 
 def task_snapshot(path, session_id):
@@ -500,11 +515,10 @@ class QueueRecovery:
             if cached and time.monotonic() - cached[0] < 1:
                 path, sid = cached[1:]
             else:
-                result = subprocess.run(["/usr/sbin/lsof", "-n", "-P", "-a", "-p", str(pid), "-Fn"],
+                result = subprocess.run(["/usr/sbin/lsof", "-n", "-P", "-a", "-p", str(pid), "-Ffan"],
                                         capture_output=True, text=True, timeout=2)
-                paths = {Path(line[1:]).resolve() for line in result.stdout.splitlines()
-                         if line.startswith("n") and line.endswith(".jsonl")
-                         and Path(line[1:]).resolve().is_relative_to(self.sessions_root.resolve())}
+                paths = {path for path in writable_open_files(result.stdout)
+                         if path.suffix == ".jsonl" and path.is_relative_to(self.sessions_root.resolve())}
                 if result.returncode or len(paths) != 1:
                     return {"kind": "unknown"}
                 path = paths.pop()
@@ -532,6 +546,49 @@ class QueueRecovery:
                     **(snapshot or {"kind": "unknown"})}
         except (OSError, ValueError, subprocess.SubprocessError):
             return {"kind": "unknown"}
+
+    def initial_session(self, target, created_after):
+        """Identify a newly created, still empty CLI for the explicit batch action.
+
+        Codex 0.154 holds its native UUID writer lock before it creates a rollout.
+        This is never failed-turn evidence and cannot authorize guard retries.
+        Require the exact live process, a newly minted UUID, and no prior rollout.
+        """
+        if self.process_lookup is None:
+            return None
+        label = self.process_lookup(target)
+        pids = label.get("agent_pids", [])
+        if label.get("agent_kind") != "codex" or len(pids) != 1:
+            return None
+        pid = pids[0]
+        try:
+            started = process_placement_start(pid, target)
+            if started is None or started < created_after - 1:
+                return None
+            result = subprocess.run(["/usr/sbin/lsof", "-n", "-P", "-a", "-p", str(pid), "-Ffan"],
+                                    capture_output=True, text=True, timeout=2)
+            if result.returncode:
+                return None
+            files = writable_open_files(result.stdout)
+            root = self.sessions_root.resolve()
+            if any(p.suffix == ".jsonl" and p.is_relative_to(root) for p in files):
+                return None
+            locks = [p for p in files if p.suffix == ".lock" and p.parent.name == "thread-writer-locks"]
+            if len(locks) != 1:
+                return None
+            lock = locks[0]
+            session = uuid.UUID(lock.stem)
+            minted = (session.int >> 80) / 1000
+            native_sessions = lock.parent.parent / "sessions"
+            if (session.version != 7 or not created_after - .001 <= minted <= time.time() + 1
+                    or not native_sessions.resolve().is_relative_to(root)
+                    or not native_sessions.is_dir()
+                    or next(native_sessions.rglob(f"*{session}.jsonl"), None) is not None
+                    or process_placement_start(pid, target) != started):
+                return None
+            return {"kind": "uninitialized", "session_id": str(session), "pid": pid, "process_start": started}
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return None
 
     def write_attempt(self, key, record):
         with self.lock:

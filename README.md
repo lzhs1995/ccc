@@ -125,6 +125,15 @@ After all 50 slots finish, another confirmed `B` starts a new batch. Jobs run in
 the background and survive closing the panel; `P` cancels their authorization.
 CLI equivalent: `ccc batch-workspace FULL_WORKSPACE_UUID`.
 
+Codex 0.154 creates its first rollout only after the first prompt. For a newly
+created batch slot, CCC verifies the native writer lock's new session UUID and
+the original process before writing text. It then checks the exact draft and
+presses Enter separately; a pasted newline alone is not submission evidence.
+The original rollout must contain both the exact prompt and `task_started`,
+including the current `response_item` user-message format, before that slot is
+released to the guard. An uncertain Enter is never repeated. Process fallback
+ignores read-only history files that Codex opens while indexing older sessions.
+
 - **监控**：`未登记` / `监控中` / `空转` / `整池空转` / `已暂停` / `整池` / `已排除` / `待检测` / `投递待验` / `发送失败` / `读取异常` / `服务阻塞`。登记仍保留，投递异常直接显示；焦点行显示最近检查的年龄。
 - **程序**：`Codex` / `Claude` / `grok` / `Copilot` / `gh` / `shell` / `其他` / `未知`。程序列只显示身份；空转属于「监控」列。
 - **画面**：`空闲` / `运行中` / `菜单` / `待续跑` / `已排队` / `已过时` / `额度耗尽` / `正在输入` / `看不清` / `非Codex` / `Claude关` / `Hook等待` / `输入保护` / `发送中` / `已完成` / `已续跑` / `Hook待验` / `Hook未验` / `配置待核` / `模型错误` / `身份冲突` / `需人工` / `未初始化` / `等待压缩` / `压缩中` / `读不出` / `提交中` / `未确认` / `投递待验` / `发送失败` / `服务阻塞`。完成、压缩和客户端重试不代表续跑器故障。
@@ -171,6 +180,9 @@ stranded-prompt recovery recognizes it using the same original-session checks.
 
 Complete native HTTP 408/429/500/502/503/504 error banners are retryable. User
 drafts, menus, aborted turns, quotas and non-retryable status codes remain blocked.
+Provider rate-limit banners also accept the one extra `rate limit exceeded:`
+prefix added by the native CLI. Quoted examples and extra prose still fail the
+complete-banner check.
 Older Working chrome above a newer failure card does not hide that failure;
 the original native turn must still have completed before any continuation.
 
