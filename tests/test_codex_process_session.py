@@ -10,6 +10,9 @@ from ccc_codex_queue import QueueRecovery
 
 class ProcessSessionTests(unittest.TestCase):
     def setUp(self):
+        portable = patch('ccc_codex_queue._procargs_sysctl', None)
+        portable.start()
+        self.addCleanup(portable.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)

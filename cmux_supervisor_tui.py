@@ -9,6 +9,7 @@ mutations.
 from __future__ import annotations
 
 import contextlib
+import copy
 import curses
 import datetime as dt
 import io
@@ -1948,6 +1949,8 @@ def group_counts(candidates: list[Candidate]) -> dict[str, int]:
                       if not is_idling(item)
                       and (item.paused or item.source == "workspace_excluded")),
         "pool": sum(1 for item in candidates if item.source in POOL_SOURCES),
+        "pool_authorized": int(any(item.record.get("workspace_authorized") or item.source in POOL_SOURCES
+                                   for item in candidates)),
         "untracked": sum(1 for item in candidates if item.source == "untracked"),
         "warnings": sum(1 for item in candidates if item.repeat_warning),
         "all": len(candidates),
@@ -2117,6 +2120,10 @@ def index_for_key(rows: list[ViewRow], key: str, suggested_surface: str = "") ->
     return 0
 
 
+def has_pool_rule(row: ViewRow) -> bool:
+    return bool(row.counts.get("pool_authorized", row.counts.get("pool", 0)))
+
+
 def group_row_text(row: ViewRow, width: int) -> str:
     marker = "+" if row.collapsed else "-"
     # Compact "ws9" matches the position column below it; the canonical
@@ -2125,7 +2132,7 @@ def group_row_text(row: ViewRow, width: int) -> str:
     if row.workspace_title:
         left = f"{left}  {row.workspace_title}"
     bits = []
-    if row.counts.get("pool"):
+    if has_pool_rule(row):
         bits.append("整池授权")
     watched = row.counts.get("watching", 0) + row.counts.get("pool", 0)
     if watched:
@@ -2237,6 +2244,8 @@ def confirm_prompt(action: str, candidate: Candidate, *, live_codex: int | None 
         return f"确认整池暂停 {candidate.workspace_ref}？立即停发续跑，并 Interrupt 该池全部 Codex；保留 session"
     if action == "resume_workspace":
         return f"确认恢复 {candidate.workspace_ref} 的整池监控？保留单路暂停和排除设置"
+    if action == "batch_workspace":
+        return f"确认在 {candidate.workspace_ref} 新开50个Codex并整池授权？每路发送 show me u power；未完成批次会继续补做"
     if action == "workspace":
         title = str(candidate.record.get("workspace_title") or "").strip()
         pool = f"{candidate.workspace_ref}{f'「{title}」' if title else ''}"
@@ -2276,6 +2285,8 @@ def workspace_confirm_prompt(row: ViewRow, action: str, *, live_codex: int | Non
         return f"确认整池暂停 {pool}？停发续跑并 Interrupt 全部 Codex，保留原 session"
     if action == "resume_workspace":
         return f"确认恢复 {pool} 整池监控？保留单路暂停和排除设置"
+    if action == "batch_workspace":
+        return f"确认在 {pool} 新开50个Codex并整池授权？每路发送 show me u power；未完成批次会继续补做"
     if action == "untrack_workspace":
         return f"确认取消整个 {pool} 授权？该池将不再自动续跑"
     count = row.counts.get("all", 0) if live_codex is None else live_codex
@@ -2296,7 +2307,9 @@ class SupervisorModel:
                  stack: Any | None = None, collab: Any | None = None):
         self.config_path = config_path
         self.store = core.ConfigStore(config_path)
-        self.client = client or core.CmuxClient()
+        self._control_socket = core.CmuxViewportSocket() if client is None else None
+        self.client = client or core.CmuxClient(viewport_socket=self._control_socket)
+        self._control_ready = client is not None
         # The janitor panel's only data source.  Constructed here so the draw
         # path has nothing to build and nothing to wait for; see JanitorClient.
         self.janitor = janitor if janitor is not None else JanitorClient()
@@ -2313,13 +2326,111 @@ class SupervisorModel:
         self.config: dict[str, Any] = {}
         self.runtime: dict[str, Any] = {}
         self.hook_config: dict[str, Any] = {}
+        self.batch_jobs: dict[str, Any] = {}
         self.candidates: list[Candidate] = []
         self.error = ""
         self.last_top_refresh = 0.0
         self.online = False
+        self._refresh_lock = threading.Lock()
+        self._refresh_thread: threading.Thread | None = None
+        self._refresh_result = None
+        self._refresh_generation = 0
+        self._refresh_requested = False
+        self._last_async_refresh = 0.0
+        self._refresh_closed = False
+        self._action_lock = threading.Lock()
+        self._action_thread = None
+        self._action_result = None
+        self._action_generation = 0
+
+    def start_action(self, operation, success: str, *, priority: bool = False) -> str:
+        """Keep CLI mutations and pool interrupts off the keyboard thread."""
+        with self._action_lock:
+            if not priority and self._action_thread is not None and self._action_thread.is_alive():
+                return "上一操作仍在处理，可继续浏览"
+            self._action_result = None
+            self._action_generation += 1
+            generation = self._action_generation
+            def work():
+                try:
+                    result = operation()
+                    message = success
+                    if isinstance(result, str):
+                        with contextlib.suppress(ValueError, TypeError):
+                            details = json.loads(result)
+                            if isinstance(details, dict) and "interrupt_requested" in details:
+                                message = f"已整池停发；已向 {len(details['interrupt_requested'])} 路请求 Interrupt"
+                except Exception as exc:
+                    message = f"失败: {exc}"
+                with self._action_lock:
+                    if generation == self._action_generation:
+                        self._action_result = message
+            self._action_thread = threading.Thread(target=work, name="ccc-panel-action", daemon=True)
+            self._action_thread.start()
+        return "操作已提交，可继续浏览"
+
+    def poll_action(self) -> str | None:
+        with self._action_lock:
+            result, self._action_result = self._action_result, None
+        if result is not None:
+            self.maybe_refresh(force=True)
+        return result
+
+    def maybe_refresh(self, *, force: bool = False) -> bool:
+        """Publish a completed snapshot and schedule I/O without blocking keys.
+
+        One worker owns discovery. Repeated R presses coalesce; a result from
+        before an explicit refresh/mutation cannot overwrite the newer request.
+        Only the curses thread publishes fields used by drawing/navigation.
+        """
+        with self._refresh_lock:
+            if self._refresh_closed:
+                return False
+            if force:
+                self._refresh_generation += 1
+                self._refresh_requested = True
+            if self._refresh_result is not None:
+                generation, values = self._refresh_result
+                self._refresh_result = None
+                if generation == self._refresh_generation:
+                    for name, value in values.items():
+                        setattr(self, name, value)
+            if self._refresh_thread is not None and self._refresh_thread.is_alive():
+                return False
+            now = time.monotonic()
+            if not self._refresh_requested and now - self._last_async_refresh < 1:
+                return False
+            requested = self._refresh_requested
+            self._refresh_requested = False
+            self._last_async_refresh = now
+            generation = self._refresh_generation
+            snapshot = copy.copy(self)
+
+            def collect():
+                try:
+                    snapshot.refresh(force=requested)
+                except Exception as exc:
+                    snapshot.online, snapshot.error = False, str(exc)
+                values = {name: getattr(snapshot, name) for name in (
+                    "config", "runtime", "hook_config", "candidates", "error",
+                    "online", "last_top_refresh", "_control_ready", "batch_jobs")}
+                with self._refresh_lock:
+                    if not self._refresh_closed:
+                        self._refresh_result = (generation, values)
+
+            self._refresh_thread = threading.Thread(target=collect, name="ccc-panel-refresh", daemon=True)
+            self._refresh_thread.start()
+            return True
+
+    def close(self) -> None:
+        with self._refresh_lock:
+            self._refresh_closed = True
+            self._refresh_result = None
 
     def refresh(self, *, force: bool = False) -> None:
         self.config = self.store.load()
+        from ccc_workspace_batch import snapshots
+        self.batch_jobs = snapshots(self.config_path, self.config)
         self.runtime = core.load_json(self.config_path.parent / "state.json", {})
         self.hook_config = core.ClaudeHookSettingsManager().inspect()
         # Kicks off a background ctl read when the cached snapshot is due; it
@@ -2334,6 +2445,9 @@ class SupervisorModel:
             return
         self.last_top_refresh = now
         try:
+            if not self._control_ready:
+                self._control_socket.configure(self.client.capabilities())
+                self._control_ready = True
             tree = self.client.tree()
             top = self.client.top_all()
             candidates = core.main_surface_records(tree, allow_ref_only=True)
@@ -2381,6 +2495,7 @@ class SupervisorModel:
                 surface_id = record["surface_id"]
                 target = explicit_by_id.get(surface_id)
                 rule = rules_by_workspace.get(str(record.get("workspace_id") or ""))
+                record = {**record, "workspace_authorized": rule is not None}
                 process_info = core.surface_process_label(process_by_id, record)
                 agent_kind = str(process_info.get("agent_kind") or "unknown")
                 process_summary = str(process_info.get("summary") or "无进程信息")
@@ -2536,12 +2651,15 @@ class SupervisorModel:
             self.error = str(exc)
 
     def run_cli(self, args: list[str]) -> str:
-        output = io.StringIO()
-        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
-            code = core.cli(["--config", str(self.config_path), *args])
-        if code:
-            raise RuntimeError(output.getvalue().strip() or f"command failed: {' '.join(args)}")
-        return output.getvalue().strip()
+        # Redirecting Python's global stdout on a worker would capture curses
+        # output. Give each action its own bounded CLI process instead.
+        result = subprocess.run([sys.executable, "-B", str(Path(core.__file__).resolve()),
+                                 "--config", str(self.config_path), *args],
+                                capture_output=True, text=True, timeout=180)
+        if result.returncode:
+            raise RuntimeError((result.stderr or result.stdout).strip()[-1000:]
+                               or f"command failed: {' '.join(args)}")
+        return result.stdout.strip()
 
     def mutate_selected(self, candidate: Candidate, action: str) -> None:
         surface_id = candidate.surface_id
@@ -2560,7 +2678,9 @@ class SupervisorModel:
         elif action == "workspace":
             self.run_cli(["track-workspace", candidate.record["workspace_id"], "--name", workspace_rule_name(candidate.record)])
         elif action in {"pause_workspace", "resume_workspace"}:
-            self.run_cli([action.replace("_", "-"), candidate.record["workspace_id"]])
+            return self.run_cli([action.replace("_", "-"), candidate.record["workspace_id"]])
+        elif action == "batch_workspace":
+            self.run_cli(["batch-workspace", candidate.record["workspace_id"]])
         elif action == "pause":
             if candidate.source in {"workspace_rule", "workspace_excluded"}:
                 self.run_cli(["exclude", surface_id])
@@ -2576,7 +2696,8 @@ class SupervisorModel:
                 raise RuntimeError("只有单路登记能用 x 删除")
             self.run_cli(["remove", surface_id])
         elif action == "untrack_workspace":
-            if candidate.source not in {"workspace_rule", "workspace_excluded", "workspace_non_codex"}:
+            if (candidate.source not in {"workspace_rule", "workspace_excluded", "workspace_non_codex"}
+                    and not candidate.record.get("workspace_authorized")):
                 raise RuntimeError("只有整池目标才能取消 workspace 授权")
             selector = candidate.record.get("workspace_id") or candidate.record.get("workspace_ref")
             if not selector:
@@ -2588,16 +2709,18 @@ class SupervisorModel:
     def mutate_workspace(self, row: ViewRow, action: str) -> None:
         """Pool-level actions taken from a workspace header row."""
         if action == "workspace":
-            if row.counts.get("pool"):
+            if has_pool_rule(row):
                 raise RuntimeError(f"{row.workspace_ref} 已经是整池授权")
             self.run_cli(["track-workspace", row.workspace_id,
                           "--name", row.workspace_title or row.workspace_ref])
         elif action == "untrack_workspace":
-            if not row.counts.get("pool"):
+            if not has_pool_rule(row):
                 raise RuntimeError(f"{row.workspace_ref} 没有整池授权，不用取消")
             self.run_cli(["untrack-workspace", row.workspace_id])
         elif action in {"pause_workspace", "resume_workspace"}:
-            self.run_cli([action.replace("_", "-"), row.workspace_id])
+            return self.run_cli([action.replace("_", "-"), row.workspace_id])
+        elif action == "batch_workspace":
+            self.run_cli(["batch-workspace", row.workspace_id])
         else:
             raise RuntimeError("组头只支持 w 授权整池 · u 取消整池 · Tab 折叠")
 
@@ -3838,7 +3961,7 @@ def row_focus_summary(row: ViewRow | None) -> str:
         parts = [row.workspace_ref]
         if row.workspace_title:
             parts.append(clip_to_width(row.workspace_title, 30))
-        parts.append("整池授权" if row.counts.get("pool") else "无整池授权")
+        parts.append("整池授权" if has_pool_rule(row) else "无整池授权")
         parts.append(f"共 {row.counts.get('all', 0)} 路")
         return "  |  ".join(parts)
     return focus_summary(row.candidate, row.workspace_ref)
@@ -3849,7 +3972,7 @@ def row_action_hint(row: ViewRow | None) -> str:
         return "/ 搜索   f 切换筛选"
     if row.kind == "group":
         fold = "Tab 展开" if row.collapsed else "Tab 折叠"
-        if row.counts.get("pool"):
+        if has_pool_rule(row):
             return f"P 整池暂停/Interrupt   W 整池恢复   u 取消整个 {row.workspace_ref} 授权   {fold}"
         return f"w 授权整个 {row.workspace_ref}（以后新开的 Codex 也会跟）   {fold}"
     return selected_action_hint(row.candidate)
@@ -3874,9 +3997,9 @@ def group_action_error(row: ViewRow, action: str) -> str:
     Checked before the confirmation box: a prompt that asks you to confirm an
     action which is about to be refused teaches you to distrust the prompt.
     """
-    if action not in {"workspace", "untrack_workspace", "pause_workspace", "resume_workspace"}:
+    if action not in {"workspace", "untrack_workspace", "pause_workspace", "resume_workspace", "batch_workspace"}:
         return f"这是 {row.workspace_ref} 的组头。整池用 w / u，单路请先按 j 进到组里"
-    pooled = bool(row.counts.get("pool"))
+    pooled = has_pool_rule(row)
     if action in {"pause_workspace", "resume_workspace"} and not pooled:
         return f"{row.workspace_ref} 尚未整池授权；请先按 w"
     if action == "workspace" and pooled:
@@ -3894,6 +4017,17 @@ def view_row_attr(row: ViewRow) -> int:
 
 GLOBAL_KEYS_1 = "↑↓ jk 移动   Tab 折/展   z 全折起   Z 全展开   [ ] 跳 workspace   / 查找   c 清除"
 GLOBAL_KEYS_2 = "P 整池停 W 整池恢复  f 筛选 R 刷新 G 存储 v 三件套 e 配置 A 开启发 S 停发 d 观察 q 退出"
+
+
+def workspace_buttons():
+    column = 0
+    result = []
+    for key, label in (("w", "整池授权"), ("P", "暂停+Interrupt"),
+                       ("B", "新开50+授权"), ("W", "恢复整池")):
+        text = f"[{key} {label}]"
+        result.append((ord(key), column, column + display_width(text), text))
+        column += display_width(text) + 2
+    return result
 
 
 def _draw_compact(stdscr: Any, model: SupervisorModel, rows: list[ViewRow],
@@ -4110,11 +4244,20 @@ def _draw(
             focus_line = f"{focus_line}  |  {note}"
     _safe_addnstr(stdscr, at["focus"], 0, focus_line, clip,
                   view_row_attr(focus) if focus else attr("dim"))
-    _safe_addnstr(stdscr, at["focus_keys"], 0, f"  {row_action_hint(focus)}", clip)
+    if focus is not None:
+        for _, start, end, label in workspace_buttons():
+            if end <= clip:
+                _safe_addnstr(stdscr, at["focus_keys"], start, label, end - start, curses.A_REVERSE)
+    else:
+        _safe_addnstr(stdscr, at["focus_keys"], 0, f"  {row_action_hint(focus)}", clip)
     if model.error:
         _safe_addnstr(stdscr, at["message"], 0, f"错误: {model.error}", clip, attr("paused") | curses.A_BOLD)
     elif status:
         _safe_addnstr(stdscr, at["message"], 0, status, clip, attr("error"))
+    elif focus and (batch := getattr(model, "batch_jobs", {}).get(focus.workspace_id)):
+        progress = (f"批量50 {batch['status']} | 创建 {batch['created']}/50 | 就绪 {batch['ready']} | "
+                    f"已提交 {batch['submitted']} | 已启动 {batch['started']} | 未完成 {50 - batch['started']} | 异常 {batch['failed']}")
+        _safe_addnstr(stdscr, at["message"], 0, progress, clip, attr("dim"))
     _safe_addnstr(stdscr, at["keys_rule"], 0, rule("-", clip), clip, attr("rule"))
     _safe_addnstr(stdscr, at["keys1"], 0, GLOBAL_KEYS_1, clip, attr("dim"))
     _safe_addnstr(stdscr, at["keys2"], 0, GLOBAL_KEYS_2, clip, attr("dim"))
@@ -4574,7 +4717,10 @@ def _run(stdscr: Any, model: SupervisorModel) -> None:
     stdscr.keypad(True)
     stdscr.timeout(500)
     init_colors()
-    model.refresh(force=True)
+    with contextlib.suppress(curses.error):
+        curses.mousemask(curses.BUTTON1_RELEASED | curses.BUTTON1_CLICKED)
+        curses.mouseinterval(0)
+    model.maybe_refresh(force=True)
     view = DEFAULT_FILTER
     query = ""
     status = ""
@@ -4588,7 +4734,10 @@ def _run(stdscr: Any, model: SupervisorModel) -> None:
     cursor_key = ""
     while True:
         try:
-            model.refresh()
+            model.maybe_refresh()
+            completed = model.poll_action()
+            if completed is not None:
+                status = completed
         except Exception as exc:  # keep the management surface alive
             model.error = str(exc)
         collapsed = reconcile_collapsed(collapsed, manual, model.candidates, model.suggested_surface)
@@ -4603,6 +4752,22 @@ def _run(stdscr: Any, model: SupervisorModel) -> None:
             cursor_key = rows[index].key
         _draw(stdscr, model, rows, index, view, query, status)
         key = stdscr.getch()
+        if key == curses.KEY_MOUSE:
+            try:
+                _, mx, my, _, buttons = curses.getmouse()
+                if buttons & (curses.BUTTON1_RELEASED | curses.BUTTON1_CLICKED):
+                    height, width = stdscr.getmaxyx()
+                    at = layout(height)
+                    if my == at["focus_keys"] and rows:
+                        key = next((key for key, left, right, _ in workspace_buttons()
+                                    if left <= mx < right <= width - 1), -1)
+                    elif at["first_row"] <= my < at["first_row"] + at["visible"]:
+                        clicked = window_start(index, len(rows), at["visible"]) + my - at["first_row"]
+                        if 0 <= clicked < len(rows):
+                            cursor_key = rows[clicked].key
+                        continue
+            except curses.error:
+                continue
         status = next_status_after_key(key, status)
         if key in (ord("q"), ord("Q")):
             return
@@ -4678,11 +4843,8 @@ def _run(stdscr: Any, model: SupervisorModel) -> None:
                 cursor_key = rows[target].key
             continue
         if key == ord("R"):
-            model.refresh(force=True)
-            current = surface_ids(model.candidates)
-            groups = len({str(item.record.get("workspace_id") or "") for item in model.candidates})
-            status = refresh_report(seen_surfaces, current, groups)
-            seen_surfaces = current
+            model.maybe_refresh(force=True)
+            status = "已请求刷新，可继续操作"
             continue
         if key in (ord("A"), ord("S"), ord("d")):
             action = {ord("A"): "arm", ord("S"): "stop-all", ord("d"): "dry-run"}[key]
@@ -4693,13 +4855,12 @@ def _run(stdscr: Any, model: SupervisorModel) -> None:
                 status = "已取消"
                 continue
             try:
-                model.set_mode(action)
-                status = {"arm": "已开始真实发送", "stop-all": "已全局停发", "dry-run": "已改为只观察"}[action]
-                model.refresh(force=True)
+                status = model.start_action(lambda action=action: model.set_mode(action),
+                    {"arm": "已开始真实发送", "stop-all": "已全局停发", "dry-run": "已改为只观察"}[action])
             except Exception as exc:
                 status = f"失败: {exc}"
             continue
-        if not rows or key not in (ord("a"), ord("w"), ord("p"), ord("r"), ord("x"), ord("u"), ord("P"), ord("W")):
+        if not rows or key not in (ord("a"), ord("w"), ord("p"), ord("r"), ord("x"), ord("u"), ord("P"), ord("W"), ord("B")):
             continue
         action = {
             ord("a"): "add",
@@ -4710,6 +4871,7 @@ def _run(stdscr: Any, model: SupervisorModel) -> None:
             ord("u"): "untrack_workspace",
             ord("P"): "pause_workspace",
             ord("W"): "resume_workspace",
+            ord("B"): "batch_workspace",
         }[key]
         row = rows[index]
         if row.kind == "group":
@@ -4722,13 +4884,15 @@ def _run(stdscr: Any, model: SupervisorModel) -> None:
                 status = "已取消"
                 continue
             try:
-                model.mutate_workspace(row, action)
-                status = (f"已授权整个 {row.workspace_ref}" if action == "workspace"
+                success = (f"已授权整个 {row.workspace_ref}" if action == "workspace"
                           else f"已取消整个 {row.workspace_ref} 授权")
                 if action in {"pause_workspace", "resume_workspace"}:
-                    status = (f"{row.workspace_ref} 已整池停发并发送 Interrupt" if action == "pause_workspace"
+                    success = (f"{row.workspace_ref} 已整池停发并发送 Interrupt" if action == "pause_workspace"
                               else f"{row.workspace_ref} 已恢复整池监控")
-                model.refresh(force=True)
+                elif action == "batch_workspace":
+                    success = f"{row.workspace_ref} 批量任务已提交；创建50路并整池授权，P 可停止"
+                status = model.start_action(lambda row=row, action=action: model.mutate_workspace(row, action), success,
+                                            priority=action == "pause_workspace")
             except Exception as exc:
                 status = f"失败: {exc}"
             continue
@@ -4746,7 +4910,8 @@ def _run(stdscr: Any, model: SupervisorModel) -> None:
             else:
                 status = "整池目标不能用 x 删除；按 p 排除这一路，或按 u 取消整个 workspace"
             continue
-        if action == "untrack_workspace" and candidate.source not in {"workspace_rule", "workspace_excluded", "workspace_non_codex"}:
+        if (action == "untrack_workspace" and candidate.source not in {"workspace_rule", "workspace_excluded", "workspace_non_codex"}
+                and not candidate.record.get("workspace_authorized")):
             status = "只有整池行才能按 u。单路请用 x，未登记不用取消"
             continue
         live_codex = None
@@ -4757,15 +4922,14 @@ def _run(stdscr: Any, model: SupervisorModel) -> None:
                 if item.agent_kind == "codex"
                 and str(item.record.get("workspace_id") or "") == workspace_id
             )
-        if action in {"pause", "remove", "add", "workspace", "untrack_workspace", "pause_workspace", "resume_workspace"} and not _confirm(
+        if action in {"pause", "remove", "add", "workspace", "untrack_workspace", "pause_workspace", "resume_workspace", "batch_workspace"} and not _confirm(
             stdscr, confirm_prompt(action, candidate, live_codex=live_codex)
         ):
             status = "已取消"
             continue
         try:
-            model.mutate_selected(candidate, action)
             where = f"{candidate.workspace_ref}/{candidate.ref}"
-            status = {
+            success = {
                 "add": f"已登记 {where}",
                 "workspace": f"已授权整个 {candidate.workspace_ref}",
                 "pause": f"已暂停 {where}" if candidate.source == "explicit" else f"已排除 {where}",
@@ -4774,8 +4938,10 @@ def _run(stdscr: Any, model: SupervisorModel) -> None:
                 "untrack_workspace": f"已取消整个 {candidate.workspace_ref} 授权",
                 "pause_workspace": f"{candidate.workspace_ref} 已整池停发并发送 Interrupt",
                 "resume_workspace": f"{candidate.workspace_ref} 已恢复整池监控",
+                "batch_workspace": f"{candidate.workspace_ref} 批量任务已提交；创建50路并整池授权，P 可停止",
             }.get(action, f"已处理 {where}")
-            model.refresh(force=True)
+            status = model.start_action(lambda candidate=candidate, action=action: model.mutate_selected(candidate, action), success,
+                                        priority=action == "pause_workspace")
         except Exception as exc:
             status = f"失败: {exc}"
 
@@ -4790,7 +4956,10 @@ def run_tui(config_path: Path, suggested_surface: str = "") -> int:
     sys.stdout.write("\x1b]0;Supervisor\x07")
     sys.stdout.flush()
     model = SupervisorModel(config_path, suggested_surface)
-    curses.wrapper(_run, model)
+    try:
+        curses.wrapper(_run, model)
+    finally:
+        model.close()
     return 0
 
 

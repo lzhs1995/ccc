@@ -84,12 +84,23 @@ class _BsdInfo(ctypes.Structure):
 
 
 _proc_pidinfo = None
+_procargs_sysctl = None
+_procargs_bytes = 0
 if sys.platform == "darwin":
     try:
         _proc_pidinfo = ctypes.CDLL("/usr/lib/libproc.dylib").proc_pidinfo
         _proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
                                  ctypes.c_void_p, ctypes.c_int]
         _proc_pidinfo.restype = ctypes.c_int
+    except (OSError, AttributeError):
+        pass
+    try:
+        _procargs_sysctl = ctypes.CDLL(None, use_errno=True).sysctl
+        _procargs_sysctl.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_uint,
+                                    ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t),
+                                    ctypes.c_void_p, ctypes.c_size_t]
+        _procargs_sysctl.restype = ctypes.c_int
+        _procargs_bytes = os.sysconf("SC_ARG_MAX")
     except (OSError, AttributeError):
         pass
 
@@ -135,6 +146,76 @@ def process_matches(record):
         return False
     actual = codex_process_starts([pid]).get(pid)
     return actual is not None and abs(actual - started) < 1
+
+
+def _process_placement_args(data):
+    """Decode Darwin KERN_PROCARGS2, keeping only the two placement variables.
+
+    argv is length-delimited by argc, not by text that resembles environment
+    assignments. Never retain or log the rest of the process environment.
+    """
+    size = ctypes.sizeof(ctypes.c_int)
+    if len(data) <= size:
+        return None
+    argc = ctypes.c_int.from_buffer_copy(data[:size]).value
+    if not 1 <= argc <= 65536:
+        return None
+    end = data.find(b"\0", size)
+    if end < 0:
+        return None
+    position = end + 1
+    while position < len(data) and data[position] == 0:
+        position += 1
+    for index in range(argc):
+        end = data.find(b"\0", position)
+        if end < 0:
+            return None
+        if index == 0 and data[position:end].rsplit(b"/", 1)[-1] != b"codex":
+            return None
+        position = end + 1
+    placement = {}
+    for value in data[position:].split(b"\0"):
+        name, separator, content = value.partition(b"=")
+        if separator and name in {b"CMUX_SURFACE_ID", b"CMUX_WORKSPACE_ID"}:
+            if name.decode() in placement:
+                return None
+            placement[name.decode()] = content.decode("utf-8", errors="strict")
+    return placement
+
+
+def process_placement_start(pid, target):
+    """Uncached PID/start and exact surface ownership for a legacy session."""
+    if _procargs_sysctl is not None and _proc_pidinfo is not None:
+        started = codex_process_starts([pid]).get(pid)
+        if started is None:
+            return None
+        # Darwin rejects buffers larger than the host's ARG_MAX with EINVAL.
+        # One direct query avoids spawning ps twice for every old session.
+        if not 0 < _procargs_bytes <= 2 * 1024 * 1024:
+            return None
+        buffer = ctypes.create_string_buffer(_procargs_bytes)
+        length = ctypes.c_size_t(len(buffer))
+        mib = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN, KERN_PROCARGS2
+        if _procargs_sysctl(mib, 3, buffer, ctypes.byref(length), None, 0) != 0:
+            return None
+        if length.value > len(buffer):
+            return None
+        try:
+            placement = _process_placement_args(buffer.raw[:length.value])
+        except UnicodeError:
+            return None
+        if placement is None or any(placement.get(name) != str(target[key]) for name, key in (
+                ("CMUX_SURFACE_ID", "surface_id"), ("CMUX_WORKSPACE_ID", "workspace_id"))):
+            return None
+        return started
+    result = subprocess.run(["/bin/ps", "eww", "-o", "lstart=,command=", "-p", str(pid)],
+                            capture_output=True, text=True, timeout=2)
+    fields = result.stdout.strip().split(None, 5)
+    if (result.returncode or len(fields) != 6 or Path(fields[5].split()[0]).name != "codex"
+            or not all(re.search(r"(?:^|\s)" + name + "=" + re.escape(str(target[key])) + r"(?:\s|$)", fields[5])
+                       for name, key in (("CMUX_SURFACE_ID", "surface_id"), ("CMUX_WORKSPACE_ID", "workspace_id")))):
+        return None
+    return time.mktime(time.strptime(" ".join(fields[:5]), "%a %b %d %H:%M:%S %Y"))
 
 
 class NativeCompletionWatcher:
@@ -398,14 +479,7 @@ class QueueRecovery:
         pid = pids[0]
 
         def identity():
-            result = subprocess.run(["/bin/ps", "eww", "-o", "lstart=,command=", "-p", str(pid)],
-                                    capture_output=True, text=True, timeout=2)
-            fields = result.stdout.strip().split(None, 5)
-            if (result.returncode or len(fields) != 6 or Path(fields[5].split()[0]).name != "codex"
-                    or not all(re.search(r"(?:^|\s)" + name + "=" + re.escape(str(target[key])) + r"(?:\s|$)", fields[5])
-                               for name, key in (("CMUX_SURFACE_ID", "surface_id"), ("CMUX_WORKSPACE_ID", "workspace_id")))):
-                return None
-            return time.mktime(time.strptime(" ".join(fields[:5]), "%a %b %d %H:%M:%S %Y"))
+            return process_placement_start(pid, target)
 
         try:
             started = identity()
