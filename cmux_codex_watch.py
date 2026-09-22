@@ -904,6 +904,14 @@ def _working_present(lines: Sequence[str]) -> bool:
     return bool(WORKING_RE.search("\n".join(cleaned)))
 
 
+def _current_working_present(lines: Sequence[str]) -> bool:
+    # Codex can leave an old Working row above its terminal failure card.
+    # Only work at/after the newest error marker can supersede that failure.
+    # The send boundary still requires the original native task_complete.
+    latest = max((i for i, line in enumerate(lines) if _is_error_marker(line)), default=0)
+    return _working_present(lines[latest:])
+
+
 def _queued_followup_present(lines: Sequence[str], composer_row: int) -> bool:
     """True when Codex is already holding queued input of its own accounting.
 
@@ -2033,7 +2041,7 @@ def classify_text_prefilter(value: str | Iterable[str]) -> ScreenState:
         return ScreenState("menu", reason="interactive menu")
     if _queued_followup_present(lines, len(lines)):
         return ScreenState("queued_followup", reason="Codex already holds queued follow-up input")
-    if _working_present(lines):
+    if _current_working_present(lines):
         return ScreenState("working", reason="Codex is working")
     # This is already a viewport-only read. The native grid can pad the lower
     # half with empty rows; slicing it by height drops a current error above
@@ -2059,7 +2067,7 @@ def classify_grid(grid: Grid) -> ScreenState:
             screen_signature=grid.signature(),
             reason="Codex already holds queued follow-up input",
         )
-    if _working_present(lines):
+    if _current_working_present(lines):
         return ScreenState("working", screen_signature=grid.signature(), reason="Codex is working")
     if composer_kind == "incompatible" or composer_row is None:
         return ScreenState("incompatible", screen_signature=grid.signature(), reason="composer cursor/prompt not verified")

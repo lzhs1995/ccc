@@ -243,6 +243,25 @@ class CodexReconnectRecoveryTests(unittest.TestCase):
                 state = core.classify_grid(core.Grid.from_rpc(payload, "surface-uuid"))
                 self.assertEqual(state.kind, "error_superseded")
 
+    def test_old_working_above_new_error_waits_for_native_completion_then_recovers(self):
+        payload = covered_prompt_payload()
+        row = payload["render_grid"]["cursor"]["row"]
+        payload["render_grid"]["row_spans"].append(span(row - 6, 0, "• Working (0s • esc to interrupt)"))
+        self.assertEqual(core.classify_grid(core.Grid.from_rpc(payload, "surface-uuid")).kind, "recoverable_error")
+        self.assertEqual(core.classify_text_prefilter(visible_lines(payload)).kind, "candidate")
+        with tempfile.TemporaryDirectory() as directory:
+            client = FakeClient(payload, "\n".join(visible_lines(payload)))
+            daemon = armed_daemon(directory, client)
+            turn = {"kind": "task_started", "session_id": "original", "turn_id": "turn", "at": 900}
+            daemon.codex_queue_recovery.current_turn = lambda _: dict(turn)
+            daemon.process_once(client)
+            self.assertEqual(client.sent, [])
+            turn.update(kind="task_complete", error={"message": HIGH_DEMAND_TEXT})
+            daemon.process_once(client)
+            self.assertEqual(len(client.sent), 1)
+            daemon.process_once(client)
+            self.assertEqual(len(client.sent), 1)
+
     def test_covered_prompt_requires_native_placeholder_animation_and_footer(self):
         for missing in ("placeholder", "dim", "animation", "rgb", "footer", "model", "cursor", "home", "prefix"):
             with self.subTest(missing=missing):
