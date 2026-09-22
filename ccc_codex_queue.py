@@ -456,6 +456,7 @@ class QueueRecovery:
             return None
         label = self.process_lookup(target)
         hint_started = None
+        hint_source = None
         if label.get("agent_kind") != "codex":
             # A GUI refresh gap must not erase an already verified original
             # process. Reuse only its PID hint, then recheck the native start,
@@ -472,6 +473,7 @@ class QueueRecovery:
                     or current is None or current != known.get("process_start")):
                 return {"kind": "unknown"}
             hint_started, pids = current, [pid]
+            hint_source = known
         else:
             pids = label.get("agent_pids", [])
         if len(pids) != 1:
@@ -506,6 +508,10 @@ class QueueRecovery:
                     return {"kind": "unknown"}
                 with self.lock:
                     self.open_file_cache[cache_key] = (time.monotonic(), path, sid)
+            if hint_source is not None and (
+                    sid != hint_source.get("session_id")
+                    or path != Path(str(hint_source.get("path") or "")).resolve()):
+                return {"kind": "unknown"}
             snapshot = task_snapshot(path, sid)
             if identity() != started:
                 return {"kind": "unknown"}

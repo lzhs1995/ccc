@@ -102,6 +102,20 @@ class ProcessSessionTests(unittest.TestCase):
             with patch('ccc_codex_queue.codex_process_starts', return_value={123: first['process_start']}):
                 self.assertEqual(self.queue.current_turn(self.target), {'kind': 'unknown'})
 
+    def test_gui_gap_cannot_substitute_a_different_sole_transcript(self):
+        with patch('ccc_codex_queue.subprocess.run', side_effect=self.run_command):
+            first = self.queue.current_turn(self.target)
+            original = dict(self.queue.open_file_sources['s'])
+            self.queue.process_lookup = lambda _: {'agent_kind': 'unknown', 'summary': 'process refresh pending'}
+            replacement = self.root / 'replacement.jsonl'
+            for content in (self.path.read_text(), self.path.read_text().replace('original', 'replacement')):
+                replacement.write_text(content)
+                self.paths = 'n' + str(replacement) + '\n'
+                self.queue.open_file_cache.clear()
+                with patch('ccc_codex_queue.codex_process_starts', return_value={123: first['process_start']}):
+                    self.assertEqual(self.queue.current_turn(self.target), {'kind': 'unknown'})
+                self.assertEqual(self.queue.open_file_sources['s'], original)
+
 
 if __name__ == "__main__":
     unittest.main()
