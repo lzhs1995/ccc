@@ -128,6 +128,16 @@ Recovery recognizes the native dim placeholder when styled animation covers the
 composer prompt, including narrow-window high-demand banners split inside words.
 Complete native HTTP 408/429/500/502/503/504 error banners are retryable. User
 drafts, menus, aborted turns, quotas and non-retryable status codes remain blocked.
+Older Working chrome above a newer failure card does not hide that failure;
+the original native turn must still have completed before any continuation.
+
+On advertised v2 automation sockets, tree/process snapshots and Codex delivery
+use the official RPC endpoint with explicit UUIDs. This avoids CLI selector
+resolution timeouts. Process snapshots require `include_processes: true` both
+in the request and response; missing process data is an unavailable observation,
+never an empty agent inventory. Input uses one connection and one attempt. A
+lost, malformed or mismatched acknowledgement remains uncertain in the ledger;
+CCC never retries that write through a second transport.
 
 ## Registration recovery and observation coverage (v0.2.0)
 
