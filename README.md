@@ -116,6 +116,19 @@ an authorization.
 `max(30 秒, 3 × poll_interval_sec)`；过期或身份不明时显示未知。
 续跑时效另外按 `2 × poll_interval_sec` 检查，诊断数据保留在 `ccc status` 中；后台身份诊断的宽限不能放宽续跑时限。
 
+Codex failed-turn events also wake the matching workspace/surface observation
+ahead of the fleet scan. A read-only watcher checks known original transcript
+metadata every 250 ms and reads at most 16 KiB only after a file changes. This is
+a scheduling hint: fresh viewport, current native failed turn, input protection,
+authorization and delivery deduplication still gate every send. Pending hints
+survive in-flight reads; regular scans retain capacity under a stream of errors.
+The interval is a scheduling target, not a guaranteed end-to-end latency.
+
+Recovery recognizes the native dim placeholder when styled animation covers the
+composer prompt, including narrow-window high-demand banners split inside words.
+Complete native HTTP 408/429/500/502/503/504 error banners are retryable. User
+drafts, menus, aborted turns, quotas and non-retryable status codes remain blocked.
+
 ## Registration recovery and observation coverage (v0.2.0)
 
 Explicit registration triggers background readiness checks. If the latest genuine

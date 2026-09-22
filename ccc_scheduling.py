@@ -29,6 +29,7 @@ class _Slot:
     candidate: Any = None
     ready_at: float = 0.0
     revision: int = 0
+    urgent_at: float | None = None
 
 
 class SurfaceScheduler:
@@ -54,7 +55,25 @@ class SurfaceScheduler:
         self._slots: dict[str, _Slot] = {}
         self._lock = threading.RLock()
         self._closed = False
+        self._urgent_streak = 0
         self.wakeup = threading.Event()
+
+    def request_observation(self, surface_id: str, workspace_id: str) -> bool:
+        """A native completion is a scheduling hint, never input permission.
+
+        Keep hints arriving during I/O until a subsequent fresh observation.
+        UUID/workspace matching and normal generation checks still apply.
+        """
+        with self._lock:
+            slot = self._slots.get(surface_id)
+            if (self._closed or slot is None or not slot.enabled
+                    or str(slot.target.get("workspace_id")) != workspace_id):
+                return False
+            if slot.urgent_at is None:
+                slot.urgent_at = self.clock()
+            slot.due = min(slot.due, slot.urgent_at)
+            self.wakeup.set()
+            return True
 
     def _current(self, sid, key):
         with self._lock:
@@ -76,6 +95,7 @@ class SurfaceScheduler:
                 slot.enabled = sid in active
                 if not slot.enabled:
                     slot.candidate = None
+                    slot.urgent_at = None
                     if slot.future:
                         slot.future.cancel()
             for index, (sid, target) in enumerate(active.items()):
@@ -91,6 +111,7 @@ class SurfaceScheduler:
                         slot.due = now
                         slot.cadence_anchor = now + self.interval * index / max(1, len(active))
                         slot.candidate = None
+                        slot.urgent_at = None
                         if slot.future:
                             slot.future.cancel()
                         elif slot.phase == "ready":
@@ -122,6 +143,8 @@ class SurfaceScheduler:
                         slot.due = (slot.cadence_anchor + self.interval *
                                     (math.floor((completed - slot.cadence_anchor) / self.interval) + 1)
                                     if current and self.interval > 0 else now)
+                        if current and slot.urgent_at is not None:
+                            slot.due = min(slot.due, slot.urgent_at)
                 if not slot.enabled and slot.future is None:
                     del self._slots[sid]
 
@@ -134,7 +157,20 @@ class SurfaceScheduler:
             due = sorted(((sid, s) for sid, s in self._slots.items()
                           if s.enabled and s.phase == "idle" and s.due <= now),
                          key=lambda pair: pair[1].due)
-            for sid, slot in due[:max(0, self.observe_workers - reads)]:
+            urgent = sorted((pair for pair in due if pair[1].urgent_at is not None),
+                            key=lambda pair: pair[1].urgent_at)
+            regular = [pair for pair in due if pair[1].urgent_at is None]
+            for _ in range(max(0, self.observe_workers - reads)):
+                # Bound priority traffic so ordinary scans cannot starve even
+                # under continuous errors. No extra threads or queued I/O.
+                if urgent and (not regular or self._urgent_streak < 3):
+                    sid, slot = urgent.pop(0)
+                    self._urgent_streak += 1
+                elif regular:
+                    sid, slot = regular.pop(0)
+                    self._urgent_streak = 0
+                else:
+                    break
                 self._submit(sid, slot, "observe", now)
 
     def _submit(self, sid, slot, phase, now):
@@ -146,6 +182,7 @@ class SurfaceScheduler:
         slot.phase, slot.submitted_key = phase, key
         slot.completed_at = None
         if phase == "observe":
+            slot.urgent_at = None
             slot.started = now
             slot.future = self._observe_pool.submit(self._execute, self.observe, slot, dict(slot.target), current)
         else:

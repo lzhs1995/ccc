@@ -83,6 +83,84 @@ def process_matches(record):
     return abs(actual - started) < 1
 
 
+class NativeCompletionWatcher:
+    """Wake existing viewport checks from bounded, read-only transcript tails.
+
+    Source identities are advisory here. The existing send path re-verifies
+    the live process, original failed turn, composer, authorization and ledger.
+    This watcher has no terminal-input operation.
+    """
+    def __init__(self, sources, wake, *, interval=0.25, tail_bytes=16384):
+        self.sources, self.wake = sources, wake
+        self.interval, self.tail_bytes = interval, tail_bytes
+        self.signatures, self.seen_turns = {}, {}
+        self.stop = threading.Event()
+        self.thread = None
+
+    def scan(self):
+        sources = self.sources()
+        active = set()
+        for source in sources:
+            key = (source["surface_id"], source["workspace_id"],
+                   source["session_id"], str(source["path"]))
+            active.add(key)
+            path = Path(source["path"])
+            try:
+                before = path.stat()
+                signature = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+                if self.signatures.get(key) == signature:
+                    continue
+                with path.open("rb") as handle:
+                    offset = max(0, before.st_size - self.tail_bytes)
+                    handle.seek(offset)
+                    tail = handle.read(self.tail_bytes)
+                after = path.stat()
+                if signature != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+                    continue
+                lines = tail.splitlines()
+                if offset:
+                    lines = lines[1:]  # Never parse a partial leading record.
+                latest = None
+                for line in reversed(lines):
+                    try:
+                        event = json.loads(line)
+                    except (ValueError, UnicodeError):
+                        continue
+                    payload = event.get("payload", {})
+                    if event.get("type") == "event_msg" and payload.get("type") in {
+                        "task_started", "task_complete", "turn_aborted", "user_message",
+                    }:
+                        latest = event
+                        break
+                if latest and latest["payload"].get("type") == "task_complete" and latest["payload"].get("error"):
+                    turn = (latest["payload"].get("turn_id"), latest.get("timestamp"))
+                    if self.seen_turns.get(key) != turn:
+                        if not self.wake(key[0], key[1]):
+                            continue  # The scheduler may still be discovering this UUID.
+                        self.seen_turns[key] = turn
+                self.signatures[key] = signature
+            except (OSError, ValueError, TypeError, AttributeError):
+                continue
+        self.signatures = {key: value for key, value in self.signatures.items() if key in active}
+        self.seen_turns = {key: value for key, value in self.seen_turns.items() if key in active}
+
+    def start(self):
+        def run():
+            while not self.stop.is_set():
+                try:
+                    self.scan()
+                except (OSError, ValueError, TypeError, AttributeError, KeyError):
+                    pass  # A hint failure cannot disable regular viewport scans.
+                self.stop.wait(self.interval)
+        self.thread = threading.Thread(target=run, name="ccc-native-wakeup", daemon=True)
+        self.thread.start()
+
+    def close(self):
+        self.stop.set()
+        if self.thread is not None:
+            self.thread.join()
+
+
 class QueueRecovery:
     def __init__(self, ledger, bindings, sessions_root, message):
         self.ledger, self.bindings, self.sessions_root = Path(ledger), Path(bindings), Path(sessions_root)
@@ -92,6 +170,7 @@ class QueueRecovery:
         self.binding_cache = (0.0, {})
         self.process_lookup = None
         self.open_file_cache = {}
+        self.open_file_sources = {}
         try:
             self.attempts = json.loads(self.ledger.read_text())
         except FileNotFoundError:
@@ -106,6 +185,35 @@ class QueueRecovery:
                 data = json.loads(self.bindings.read_text()).get("sessions", {})
                 self.binding_cache = (now, data)
             return self.binding_cache[1]
+
+    def wakeup_sources(self, targets):
+        """Latest known original transcript for each currently enabled UUID."""
+        active = {str(t["surface_id"]): str(t["workspace_id"]) for t in targets
+                  if t.get("enabled", True) and not t.get("paused", False)}
+        try:
+            records = self.records()
+        except (OSError, ValueError):
+            records = {}
+        with self.lock:
+            candidates = list(self.open_file_sources.values())
+        candidates.extend({"surface_id": r.get("surfaceId"), "workspace_id": r.get("workspaceId"),
+                           "session_id": sid, "path": r.get("transcriptPath"),
+                           "process_start": r.get("pidStartSeconds", 0)}
+                          for sid, r in records.items())
+        chosen = {}
+        root = self.sessions_root.resolve()
+        for source in candidates:
+            sid = source["surface_id"]
+            if active.get(sid) != source["workspace_id"] or not source["path"]:
+                continue
+            try:
+                if not Path(source["path"]).resolve().is_relative_to(root):
+                    continue
+                if sid not in chosen or source["process_start"] > chosen[sid]["process_start"]:
+                    chosen[sid] = source
+            except (OSError, ValueError, TypeError):
+                continue
+        return list(chosen.values())
 
     def evidence(self, target):
         turn = self.current_turn(target)
@@ -210,6 +318,11 @@ class QueueRecovery:
             snapshot = task_snapshot(path, sid)
             if identity() != started:
                 return {"kind": "unknown"}
+            with self.lock:
+                self.open_file_sources[str(target["surface_id"])] = {
+                    "surface_id": str(target["surface_id"]), "workspace_id": str(target["workspace_id"]),
+                    "session_id": sid, "path": path, "process_start": started,
+                }
             return {"session_id": sid, "pid": pid, "process_start": started,
                     **(snapshot or {"kind": "unknown"})}
         except (OSError, ValueError, subprocess.SubprocessError):

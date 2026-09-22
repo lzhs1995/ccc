@@ -40,7 +40,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from claude_ccc_protocol import EVENT_JOURNAL_PATH, EVENT_SOCKET_PATH
 import ccc_observation as observation_health
-from ccc_codex_queue import QueueRecovery
+from ccc_codex_queue import NativeCompletionWatcher, QueueRecovery
 from ccc_scheduling import CoalescingWriter, SnapshotCache, SnapshotClient, SurfaceScheduler
 
 
@@ -5786,6 +5786,11 @@ class WatchDaemon:
         )
         return self._scheduler
 
+    def _native_wakeup_sources(self):
+        with self._targets_lock:
+            targets = effective_targets(self.config, self.dynamic_targets.values())
+        return self.codex_queue_recovery.wakeup_sources(targets)
+
     def _record_dispatch(self, target, phase, delay):
         sid = str(target["surface_id"])
         with self._runtime_lock:
@@ -5941,6 +5946,8 @@ class WatchDaemon:
             self._publish_runtime_health, name="ccc-health", delay=0,
             on_error=lambda exc: self.logger.error("health publication failed: %s", exc))
         scheduler = self._start_scheduler()
+        native_wakeup = NativeCompletionWatcher(self._native_wakeup_sources, scheduler.request_observation)
+        native_wakeup.start()
         last_publish = 0.0
         previous_switch_interval = sys.getswitchinterval()
         try:
@@ -5987,6 +5994,7 @@ class WatchDaemon:
             return 0
         finally:
             sys.setswitchinterval(previous_switch_interval)
+            native_wakeup.close()
             scheduler.close()
             if self._diagnostics_pool is not None:
                 self._diagnostics_pool.shutdown(wait=True, cancel_futures=True)

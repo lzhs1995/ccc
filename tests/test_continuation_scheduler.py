@@ -40,6 +40,65 @@ class SchedulerTests(unittest.TestCase):
         finally:
             scheduler.close()
 
+    def test_native_hint_jumps_full_scan_backlog_without_starving_regular_reads(self):
+        entered, release = threading.Event(), threading.Event()
+        seen = []
+        def observe(target, current):
+            seen.append(target["surface_id"])
+            if len(seen) == 1:
+                entered.set()
+                release.wait(4)
+        scheduler = SurfaceScheduler(observe, lambda *_: self.fail("hint authorized a send"),
+                                     observe_workers=1, clock=lambda: 100)
+        items = targets(40)
+        try:
+            scheduler.tick(items, generation=1)
+            self.assertTrue(entered.wait(2))
+            for sid in ("39", "38", "37", "36"):
+                self.assertTrue(scheduler.request_observation(sid, "workspace"))
+            release.set()
+            self.pump(scheduler, items, lambda: len(seen) == 40)
+            self.assertEqual(seen[:6], ["0", "36", "37", "38", "1", "39"])
+            self.assertEqual(len(set(seen)), 40)
+        finally:
+            release.set()
+            scheduler.close()
+
+    def test_native_hint_during_observation_is_kept_for_next_fresh_read(self):
+        entered, release = threading.Event(), threading.Event()
+        seen = []
+        def observe(target, current):
+            seen.append(target["surface_id"])
+            if len(seen) == 1:
+                entered.set()
+                release.wait(4)
+        scheduler = SurfaceScheduler(observe, lambda *_: self.fail("unexpected send"),
+                                     observe_workers=1, clock=lambda: 100)
+        items = targets(1)
+        try:
+            scheduler.tick(items, generation=1)
+            self.assertTrue(entered.wait(2))
+            scheduler.request_observation("0", "workspace")
+            release.set()
+            self.pump(scheduler, items, lambda: len(seen) == 2 and scheduler.snapshot()["observing"] == 0)
+            for _ in range(5):
+                scheduler.tick(items, generation=1)
+            self.assertEqual(seen, ["0", "0"])
+        finally:
+            release.set()
+            scheduler.close()
+
+    def test_native_hint_cannot_revive_paused_removed_or_moved_target(self):
+        scheduler = SurfaceScheduler(lambda *_: None, lambda *_: self.fail("unexpected send"), clock=lambda: 100)
+        try:
+            self.pump(scheduler, targets(1), lambda: scheduler.snapshot()["targets"] == 1)
+            self.assertFalse(scheduler.request_observation("0", "wrong-workspace"))
+            self.assertFalse(scheduler.request_observation("missing", "workspace"))
+            scheduler.tick([], generation=2)
+            self.assertFalse(scheduler.request_observation("0", "workspace"))
+        finally:
+            scheduler.close()
+
     def test_late_dispatch_keeps_the_original_cadence_without_replaying_missed_periods(self):
         now, calls = [100.0], []
         scheduler = SurfaceScheduler(lambda *_: calls.append(now[0]), lambda *_: None, clock=lambda: now[0])
