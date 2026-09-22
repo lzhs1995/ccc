@@ -280,6 +280,33 @@ class WorkspaceBatchTests(unittest.TestCase):
             enter.assert_called_once_with(self.wid, slot['surface_id'], 'enter')
         self.assertEqual(slot['phase'], 'uncertain')
 
+    def test_exact_draft_accepts_text_merged_with_prompt_padding(self):
+        for column, prefix in ((0, '› '), (1, ' '), (2, '')):
+            with self.subTest(column=column):
+                frame = grid_payload([])
+                grid = frame['render_grid']
+                row = grid['cursor']['row']
+                grid['row_spans'] = [s for s in grid['row_spans'] if s['row'] != row]
+                if column:
+                    grid['row_spans'].append(span(row, 0, '›', 0))
+                grid['row_spans'].append(span(row, column, prefix + batch.PROMPT + '   ', 0))
+                grid['cursor']['column'] = 2 + len(batch.PROMPT)
+                self.assertTrue(batch.BatchWorker._own_prompt_draft(core.Grid.from_rpc(frame, 'test')))
+
+    def test_merged_prompt_padding_does_not_hide_extra_draft_text(self):
+        for column, text in ((0, '›x' + batch.PROMPT), (1, 'x' + batch.PROMPT),
+                             (1, ' ' + batch.PROMPT + 'x')):
+            with self.subTest(column=column, text=text):
+                frame = grid_payload([])
+                grid = frame['render_grid']
+                row = grid['cursor']['row']
+                grid['row_spans'] = [s for s in grid['row_spans'] if s['row'] != row]
+                if column:
+                    grid['row_spans'].append(span(row, 0, '›', 0))
+                grid['row_spans'].append(span(row, column, text, 0))
+                grid['cursor']['column'] = 2 + len(batch.PROMPT)
+                self.assertFalse(batch.BatchWorker._own_prompt_draft(core.Grid.from_rpc(frame, 'test')))
+
     def test_response_item_from_a_different_human_prompt_is_not_batch_confirmation(self):
         self.worker.step()
         slot = self.worker.job['slots'][0]

@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.12
+
+- Confirm a new native Codex session before its first rollout exists, using the
+  original process and UUIDv7 writer lock. Ignore read-only history index files
+  when recovering the active transcript.
+- Submit each batch prompt with a separately recorded Enter after verifying
+  its exact draft. Handle terminal spans that merge prompt padding and text;
+  preserve extra user text and ambiguous delivery instead of resubmitting.
+- Confirm first-task starts from both native user-message formats. Retain the
+  original launch time when retrying a paused batch.
+- Recognize the complete rate-limit banner when native Codex adds a second
+  prefix, while retaining draft, menu and quoted-example protection.
+
 ## 0.2.8
 
 - Wake guarded observation from original native failures; retry a temporarily

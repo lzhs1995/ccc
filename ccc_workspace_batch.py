@@ -281,15 +281,22 @@ class BatchWorker:
             return False
         cells = [" "] * grid.columns
         for span in grid.spans:
-            if not row <= span.row <= cursor.row or span.column < 2:
+            if not row <= span.row <= cursor.row or span.column + span.cell_width <= 2:
                 continue
             if not span.text.strip() or core._is_spinner_overlay_span(grid, span):
                 continue
+            # cmux coalesces adjacent cells of the same style.  The padding
+            # at column 1 can therefore share a span with the entire draft.
+            # Clip only verified prompt chrome, never arbitrary input text.
+            offset = max(0, 2 - span.column)
+            if offset and span.text[:offset] != "› "[span.column:2]:
+                return False
+            text = span.text[offset:]
             style = grid.style(span.style_id)
             if (span.row != row or style.get("faint") or style.get("invisible")
-                    or not span.text.isascii() or len(span.text) != span.cell_width):
+                    or not text.isascii() or len(span.text) != span.cell_width):
                 return False
-            cells[span.column:span.column + span.cell_width] = span.text
+            cells[max(2, span.column):span.column + span.cell_width] = text
         return "".join(cells[2:]).rstrip() == PROMPT
 
     def _finish_submission(self, slot):
