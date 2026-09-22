@@ -1,11 +1,14 @@
 """Native completions accelerate observation without granting input permission."""
+import ctypes
 import json
 from pathlib import Path
 import tempfile
+import subprocess
+import time
 import unittest
 from unittest.mock import patch
 
-from ccc_codex_queue import NativeCompletionWatcher, QueueRecovery
+from ccc_codex_queue import NativeCompletionWatcher, QueueRecovery, _BsdInfo, codex_process_starts, process_matches
 
 
 class NativeWakeupTests(unittest.TestCase):
@@ -122,6 +125,83 @@ class NativeWakeupTests(unittest.TestCase):
         now[0] = 10
         self.watcher.scan()
         self.assertEqual(len(self.woken), 1)
+
+    def test_native_coverage_requires_fresh_matching_readable_source(self):
+        now = [0.0]
+        self.watcher.clock = lambda: now[0]
+        self.sources[0]['identity_current'] = True
+        target = {'surface_id': 'surface', 'workspace_id': 'workspace'}
+        self.assertEqual(self.watcher.observation_interval(target, 1), 1)
+        self.event('task_started', error=False)
+        self.watcher.scan()
+        self.assertEqual(self.watcher.observation_interval(target, 1), 10)
+        self.assertEqual(self.watcher.observation_interval({**target, 'workspace_id': 'moved'}, 1), 1)
+        now[0] = 1.1
+        self.assertEqual(self.watcher.observation_interval(target, 1), 1)
+        self.watcher.scan()
+        self.assertEqual(self.watcher.observation_interval(target, 1), 10)
+        self.sources[0]['identity_current'] = False
+        self.watcher.scan()
+        self.assertEqual(self.watcher.observation_interval(target, 1), 1)
+        self.sources[0]['identity_current'] = True
+        self.watcher.scan()
+        self.path.unlink()
+        self.watcher.scan()
+        self.assertEqual(self.watcher.observation_interval(target, 1), 1)
+
+    def test_malformed_or_unrecognized_tail_cannot_claim_native_coverage(self):
+        self.path.write_text('not json\n')
+        self.watcher.scan()
+        self.assertEqual(self.watcher.coverage, {})
+        self.path.write_text(json.dumps({'type': 'event_msg', 'payload': {'type': 'token_count'}})+'\n')
+        self.watcher.scan()
+        self.assertEqual(self.watcher.coverage, {})
+
+    def test_bound_process_coverage_survives_gui_refresh_but_rejects_pid_reuse(self):
+        queue = QueueRecovery(self.root / 'ledger', self.root / 'bindings', self.root, 'continue')
+        start = time.mktime(time.strptime('Tue Sep 22 08:00:00 2026', '%a %b %d %H:%M:%S %Y'))
+        records = {'session': {'surfaceId': 'surface', 'workspaceId': 'workspace', 'pid': 123,
+            'pidStartSeconds': start, 'transcriptPath': str(self.path)}}
+        queue.process_lookup = lambda _: self.fail('native coverage waited on cmux GUI inventory')
+        target = {'surface_id': 'surface', 'workspace_id': 'workspace'}
+        with patch.object(queue, 'records', return_value=records), patch('ccc_codex_queue.codex_process_starts', return_value={123: start}) as run:
+            self.assertTrue(queue.wakeup_sources([target])[0]['identity_current'])
+            self.assertTrue(queue.wakeup_sources([target])[0]['identity_current'])
+            self.assertEqual(run.call_count, 1)
+            records['session']['pidStartSeconds'] = start - 10
+            self.assertFalse(queue.wakeup_sources([target])[0]['identity_current'])
+
+    def test_native_identity_checks_do_not_spawn_ps_and_reject_partial_or_foreign_records(self):
+        def read(pid, flavor, arg, buffer, size):
+            info = ctypes.cast(buffer, ctypes.POINTER(_BsdInfo)).contents
+            info.pid, info.name, info.start_sec = pid, b'codex', 12345
+            if pid == 2:
+                return 0  # Process disappeared.
+            if pid == 3:
+                return size - 1  # Never trust an incomplete ABI response.
+            if pid == 4:
+                info.name = b'zsh'
+            if pid == 5:
+                info.pid = 6
+            if pid == 6:
+                info.status = 5  # Zombie.
+            return size
+        with patch('ccc_codex_queue._proc_pidinfo', side_effect=read), patch('ccc_codex_queue.subprocess.run', side_effect=AssertionError('ps must not run')):
+            self.assertEqual(codex_process_starts([1, 2, 3, 4, 5, 6, -1, True, 2**40]), {1: 12345})
+            self.assertTrue(process_matches({'pid': 1, 'pidStartSeconds': 12345}))
+            self.assertFalse(process_matches({'pid': 1, 'pidStartSeconds': 12344}))
+            self.assertFalse(process_matches({'pid': 2, 'pidStartSeconds': 12345}))
+
+    def test_portable_identity_fallback_is_bounded_and_ignores_malformed_lines(self):
+        reply = subprocess.CompletedProcess([], 0,
+            '123 Tue Sep 22 08:00:00 2026 /opt/homebrew/bin/codex\n'
+            'bad Tue Sep 22 08:00:00 2026 codex\n'
+            '124 Tue Sep 22 08:00:00 2026 /bin/zsh\n', '')
+        with patch('ccc_codex_queue._proc_pidinfo', None), patch('ccc_codex_queue.subprocess.run', return_value=reply) as run:
+            self.assertEqual(set(codex_process_starts([123, 124])), {123})
+            self.assertEqual(run.call_args.kwargs['timeout'], 1)
+            run.side_effect = subprocess.TimeoutExpired('ps', 1)
+            self.assertEqual(codex_process_starts([123]), {})
 
 
 if __name__ == "__main__":

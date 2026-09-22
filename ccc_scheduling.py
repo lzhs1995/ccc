@@ -30,6 +30,7 @@ class _Slot:
     ready_at: float = 0.0
     revision: int = 0
     urgent_at: float | None = None
+    observation_interval: float = 1.0
 
 
 class SurfaceScheduler:
@@ -45,11 +46,13 @@ class SurfaceScheduler:
                  observe_workers: int = 32, send_workers: int = 8,
                  clock: Callable[[], float] = time.monotonic,
                  on_dispatch: Callable | None = None,
-                 on_error: Callable | None = None):
+                 on_error: Callable | None = None,
+                 observation_interval: Callable | None = None):
         self.observe, self.send, self.clock = observe, send, clock
         self.interval = interval
         self.observe_workers, self.send_workers = observe_workers, send_workers
         self.on_dispatch, self.on_error = on_dispatch, on_error
+        self.observation_interval = observation_interval
         self._observe_pool = ThreadPoolExecutor(observe_workers, thread_name_prefix="ccc-read")
         self._send_pool = ThreadPoolExecutor(send_workers, thread_name_prefix="ccc-send")
         self._slots: dict[str, _Slot] = {}
@@ -102,14 +105,22 @@ class SurfaceScheduler:
                 key = (generation, str(target.get("workspace_id")),
                        str(target.get("source")), str(target.get("source_workspace_id")))
                 slot = self._slots.get(sid)
+                cadence = (self.observation_interval(target, self.interval)
+                           if self.observation_interval else self.interval)
                 if slot is None:
                     self._slots[sid] = _Slot(target, key, now,
-                        cadence_anchor=now + self.interval * index / max(1, len(active)))
+                        cadence_anchor=now + cadence * index / max(1, len(active)),
+                        observation_interval=cadence)
                 else:
+                    if slot.observation_interval != cadence:
+                        if cadence < slot.observation_interval:
+                            slot.due = min(slot.due, now)
+                        slot.observation_interval = cadence
+                        slot.cadence_anchor = now + cadence * index / max(1, len(active))
                     if slot.key != key:
                         slot.revision += 1
                         slot.due = now
-                        slot.cadence_anchor = now + self.interval * index / max(1, len(active))
+                        slot.cadence_anchor = now + cadence * index / max(1, len(active))
                         slot.candidate = None
                         slot.urgent_at = None
                         if slot.future:
@@ -140,9 +151,10 @@ class SurfaceScheduler:
                         # not repeat forever or drift after a slow read. Skip
                         # missed periods; never replay them in a catch-up burst.
                         completed = slot.completed_at if slot.completed_at is not None else now
-                        slot.due = (slot.cadence_anchor + self.interval *
-                                    (math.floor((completed - slot.cadence_anchor) / self.interval) + 1)
-                                    if current and self.interval > 0 else now)
+                        cadence = slot.observation_interval
+                        slot.due = (slot.cadence_anchor + cadence *
+                                    (math.floor((completed - slot.cadence_anchor) / cadence) + 1)
+                                    if current and cadence > 0 else now)
                         if current and slot.urgent_at is not None:
                             slot.due = min(slot.due, slot.urgent_at)
                 if not slot.enabled and slot.future is None:
@@ -202,6 +214,8 @@ class SurfaceScheduler:
     def snapshot(self):
         with self._lock:
             return {"targets": sum(s.enabled for s in self._slots.values()),
+                    "native_event_monitored": sum(s.enabled and s.observation_interval > self.interval
+                                                   for s in self._slots.values()),
                     "observing": sum(s.phase == "observe" for s in self._slots.values()),
                     "sending": sum(s.phase == "send" for s in self._slots.values()),
                     "ready_to_send": sum(s.phase == "ready" for s in self._slots.values())}

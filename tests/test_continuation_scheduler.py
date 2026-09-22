@@ -40,6 +40,29 @@ class SchedulerTests(unittest.TestCase):
         finally:
             scheduler.close()
 
+    def test_native_coverage_reduces_regular_reads_but_failure_and_lost_coverage_are_immediate(self):
+        now, covered, calls = [100.0], [True], []
+        scheduler = SurfaceScheduler(lambda *_: calls.append(now[0]), lambda *_: None,
+            clock=lambda: now[0], observation_interval=lambda target, base: 10 if covered[0] else base)
+        items = targets(1)
+        try:
+            self.pump(scheduler, items, lambda: len(calls) == 1 and scheduler.snapshot()['observing'] == 0)
+            now[0] = 101
+            for _ in range(5):
+                scheduler.tick(items, generation=1)
+            self.assertEqual(calls, [100])
+            self.assertTrue(scheduler.request_observation('0', 'workspace'))
+            self.pump(scheduler, items, lambda: len(calls) == 2 and scheduler.snapshot()['observing'] == 0)
+            self.assertEqual(calls[-1], 101)
+            now[0] = 102
+            covered[0] = False
+            self.pump(scheduler, items, lambda: len(calls) == 3 and scheduler.snapshot()['observing'] == 0)
+            self.assertEqual(calls[-1], 102)
+            now[0] = 103
+            self.pump(scheduler, items, lambda: len(calls) == 4)
+        finally:
+            scheduler.close()
+
     def test_native_hint_jumps_full_scan_backlog_without_starving_regular_reads(self):
         entered, release = threading.Event(), threading.Event()
         seen = []

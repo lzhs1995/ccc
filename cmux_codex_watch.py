@@ -328,7 +328,7 @@ CLAUDE_CONTEXT_ABSOLUTE_TIMEOUT_SEC = 900.0
 # through TargetRuntime and suppresses duplicate Hook/fallback deliveries.
 # Human label only.  Acceptance always compares SHA-256 of the loaded source:
 # a revision string is hand-maintained and therefore can lie about what runs.
-FEATURE_REVISION = "0.2.8-transport-pause-recovery"
+FEATURE_REVISION = "0.2.9-native-event-cadence"
 # How long after our own send a byte-identical UserPromptSubmit can still be
 # our echo.  Must exceed claude_submit_confirm_timeout_sec so that a late
 # echo arriving after the transaction timed out is not read as a human.
@@ -6107,6 +6107,7 @@ class WatchDaemon:
         scheduler = self._start_scheduler()
         native_wakeup = NativeCompletionWatcher(self._native_wakeup_sources, scheduler.request_observation,
                                                 retry_needed=self._native_retry_needed)
+        scheduler.observation_interval = native_wakeup.observation_interval
         native_wakeup.start()
         last_publish = 0.0
         previous_switch_interval = sys.getswitchinterval()
