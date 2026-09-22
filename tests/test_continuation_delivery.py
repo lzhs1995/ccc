@@ -257,10 +257,10 @@ class ContinuationHealthTests(unittest.TestCase):
                 snapshot = json.loads(daemon.observation_health_path.read_text())
                 self.assertEqual(snapshot["claude_hook_coverage"]["status"], "unknown")
 
-    def test_supervisor_displays_delayed_observation_and_unconfirmed_delivery(self):
+    def test_supervisor_keeps_monitoring_label_and_shows_unconfirmed_delivery(self):
         import cmux_supervisor_tui as tui
         target = {"surface_id": "s", "workspace_id": "w"}
-        for runtime, expected in (({"viewport_checked_at": 100}, "检测延迟"),
+        for runtime, expected in (({"viewport_checked_at": 100}, "监控中"),
                                   ({"viewport_checked_at": 110, "delivery_status": "unknown"}, "投递待验")):
             with mock.patch.object(tui.time, "time", return_value=110):
                 fields = tui.continuation_fields(target, runtime)

@@ -139,6 +139,19 @@ For the exact UUID, inspect `continuation_health.targets`:
   It survives restart. Working or a live queue confirms progress; a new current
   error can permit another attempt. An unchanged error with a prompt echo is
   insufficient evidence. Do not erase this record to force another send.
+- For an unchanged failure after a send timeout, the watcher checks the original
+  process transcript and two fresh, empty-composer observations at least one
+  second apart, after the failed I/O has ended. Only a stable failed task with
+  no later input can reopen a retry. A queue, draft, changed process, missing
+  evidence or running task blocks this path. A retryable attempt must also pass
+  the original-task guard; merely changing a status label cannot release it.
+- The terminal can paint an error before its native task ends. The watcher
+  verifies the latest failed task before persistence and again before input,
+  and stores its session/turn identity to prevent duplicate submissions.
+  If SessionStart was lost, it can use the current process's single open rollout,
+  matching PID/start time, workspace and surface UUIDs. It does not write a
+  synthetic Hook or choose another session. A visible queue is not proof that a
+  new task has started; acceptance requires a later real `task_started` event.
 - `provider_blocked` / `invalid_encrypted_content` and `token_exhausted` require
   provider/session investigation; automatic retry cannot repair those errors.
 
@@ -146,9 +159,30 @@ An enabled target with no observation is unknown. A viewport older than two
 poll intervals is delayed. Send failures, unconfirmed delivery and provider
 blockers also degrade health. `监控中` is therefore not a substitute for timing
 and delivery evidence. Stale or incomplete Hook inventory remains unknown.
+The Supervisor no longer substitutes a delayed-observation label for enrollment;
+the underlying diagnostic measurements remain available through `ccc status`.
 A readable Claude viewport with missing/unverified Hooks is also unknown;
 Hook configuration failures, exhausted fallback retries and unavailable Claude
 models are blocked. These must not appear as a healthy continuation channel.
+
+For Codex Hook timeouts, inspect the actual command for each event. Native cmux
+SessionStart, UserPromptSubmit, Stop, PreToolUse and PostToolUse notifications use
+`hooks enqueue codex`. PermissionRequest and subagent lifecycle events retain
+their upstream synchronous semantics; do not convert all Hooks to background
+commands or disable user guards. Recognizing the exact timeout diagnostic in a
+viewport prevents a retry from being misclassified as superseded, but does not
+prove that every external Hook is healthy.
+
+## Janitor backlog and quarantine
+
+Quarantine retention defaults to three hours. The independent expiry job runs
+every five minutes, so old quarantine can be removed even when no new candidate
+is selected. `cmux-janitorctl drain --apply` processes the current approved candidate set
+in bounded batches and persists progress; `cmux-janitorctl status --json` reports its result.
+`expire` performs retention-based expiry. Use the explicit immediate-disposal
+option only for a backlog the user has authorized for deletion. Keep active
+sessions and live objects outside the candidate set. Report disposed bytes as
+janitor accounting, not as an independently measured increase in free space.
 
 For acceptance, observe all authorized targets for at least 15 minutes, including
 the affected workspace. Record the actual maximum dispatch lag and detection to

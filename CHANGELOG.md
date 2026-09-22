@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.2.8
+
+- Retry transient cmux read/socket failures without permanently pausing authorized
+  surfaces. Preserve explicit pauses and delivery records.
+- Scan the full visible viewport when terminal grids contain bottom padding.
+  Recognize the exact two-line Codex Hook timeout diagnostic without treating it
+  as new task progress; other Hook errors and user/approval text stay protected.
+- Wait for the original Codex task to end before continuation, and revalidate
+  that task at the input boundary. Persist one submission per failed task.
+  Recover missing Hook identity from the live process's original open transcript,
+  checking PID/start time and both cmux UUIDs without fabricating Hook events.
+- Reconcile timed-out input using two fresh empty-composer observations and an
+  unchanged failed task. Verified absent input can retry instead of remaining
+  blocked forever. Queued CCC prompts retain a durable, single-attempt recovery
+  record; user drafts and ambiguous delivery remain protected.
+- Remove the unwanted delayed-observation label from the Supervisor.
+- Expire janitor quarantine after three hours, run expiry independently, and
+  drain approved backlogs in bounded batches with restartable progress records.
+
 ## 0.2.7
 
 Includes the previously unpublished 0.2.2–0.2.6 working drafts.

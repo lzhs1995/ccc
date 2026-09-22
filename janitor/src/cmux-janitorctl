@@ -378,6 +378,20 @@ def build_status(now: float | None = None) -> dict[str, Any]:
 
     quarantine_raw = janitor_raw.get("quarantine")
     quarantine_raw = quarantine_raw if isinstance(quarantine_raw, dict) else {}
+    expiry = _read_json(JANITOR_DIR / "expiry-state.json") or {}
+    expiry_age = _age(expiry.get("observed_at"), moment)
+    q_age = j_age
+    q_observed = janitor_raw.get("observed_at")
+    if (expiry.get("schema_version") == 1 and expiry_age is not None
+            and (j_age is None or expiry_age <= j_age) and isinstance(expiry.get("quarantine"), dict)):
+        quarantine_raw = expiry["quarantine"]
+        q_age = expiry_age
+        q_observed = expiry.get("observed_at")
+    drain = _read_json(JANITOR_DIR / "drain-state.json") or {}
+    try:
+        keep_hours = _config_positive_int("QUARANTINE_KEEP_HOURS", 3)
+    except FailClosed:
+        keep_hours = None  # Diagnostics must still answer for broken config.
 
     status: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
@@ -430,8 +444,18 @@ def build_status(now: float | None = None) -> dict[str, Any]:
                 if isinstance(quarantine_raw.get("next_expiry_at"), str)
                 else None
             ),
-            "keep_hours": _finite_number(quarantine_raw.get("keep_hours")),
+            "keep_hours": keep_hours,
+            "observed_at": q_observed,
+            "age_sec": q_age,
+            "stale": q_age is None or q_age > 900,
         },
+        "expiry": {"observed_at": expiry.get("observed_at"), "age_sec": expiry_age,
+                   "stale": expiry_age is None or expiry_age > 900,
+                   **{k: _finite_number(expiry.get(k)) for k in
+                      ("expired_batches", "expired_items", "expired_bytes", "skipped_batches")}},
+        "drain": {"phase": drain.get("phase"), "observed_at": drain.get("observed_at"),
+                  **{k: _finite_number(drain.get(k)) for k in
+                     ("total", "processed", "disposed", "expired_items", "expired_bytes")}},
         "guard": {
             "present": bool(guard_raw),
             "invalid": guard_invalid,
@@ -559,6 +583,26 @@ def cmd_run(args: argparse.Namespace) -> int:
             start_new_session=True,
         )
     print(json.dumps({"ok": True, "started": True, "pid": proc.pid}, ensure_ascii=False))
+    return 0
+
+
+def cmd_maintenance(args: argparse.Namespace) -> int:
+    status = build_status()
+    if (status["control"]["paused"] or status["control"]["guard_tripped"]
+            or not status["control"]["mode_matches_baseline"]
+            or status["guard"]["stale"] or status["guard"]["health"] != "healthy"):
+        raise FailClosed("maintenance requires an active janitor and a current healthy guard")
+    command = [sys.executable, "-B", str(JANITOR_DIR / "janitor_maintenance.py"), args.command]
+    if args.command == "expire":
+        return subprocess.run(command, env={**os.environ, "HOME": str(HOME)}).returncode
+    if args.purge_now:
+        command.append("--purge-now")
+    if args.wait:
+        return subprocess.run(command, env={**os.environ, "HOME": str(HOME)}).returncode
+    with (JANITOR_DIR / "drain.log").open("ab") as handle:
+        proc = subprocess.Popen(command, stdout=handle, stderr=handle, stdin=subprocess.DEVNULL,
+                                start_new_session=True, env={**os.environ, "HOME": str(HOME)})
+    print(json.dumps({"ok": True, "started": True, "pid": proc.pid, "complete": False}))
     return 0
 
 
@@ -859,6 +903,14 @@ def build_parser() -> argparse.ArgumentParser:
     run = sub.add_parser("run", help="request an immediate sweep")
     run.add_argument("--manual", action="store_true", required=True)
     run.set_defaults(func=cmd_run)
+
+    expire = sub.add_parser("expire", help="expire sealed batches only, under the shared mutex")
+    expire.set_defaults(func=cmd_maintenance)
+    drain = sub.add_parser("drain", help="process a fixed backlog snapshot in bounded batches")
+    drain.add_argument("--apply", action="store_true", required=True)
+    drain.add_argument("--purge-now", action="store_true", help="immediately delete this verified snapshot only")
+    drain.add_argument("--wait", action="store_true", help="wait for the finite drain to finish")
+    drain.set_defaults(func=cmd_maintenance)
 
     pause = sub.add_parser("pause", help="write the DISABLED sentinel")
     pause.set_defaults(func=cmd_pause)

@@ -70,7 +70,7 @@ STAGING_MIN_AGE_MIN=60
 MAX_ITEMS_PER_RUN=500
 USE_QUARANTINE=1
 QUARANTINE_DIR="$HOME/.cmuxterm-janitor-quarantine"
-QUARANTINE_KEEP_HOURS=48
+QUARANTINE_KEEP_HOURS=3
 LOG_MAX_BYTES=1048576
 # Canonical name, matching config.env. The old METRICS_MAX_LINES was an
 # internal-only name, so a configured METRICS_KEEP_LINES was silently ignored --
@@ -84,6 +84,9 @@ VERBOSE=0
 # `inspect`: DISABLED must stay an absolute kill switch, so nothing may run
 # behind GATE 0 just to refresh a display.
 TRIGGER=scheduled
+DRAIN_MANIFEST=""
+MAINTENANCE="$JANITOR_DIR/janitor_maintenance.py"
+PYTHON=/opt/homebrew/bin/python3
 PREVIEW_MODE=0
 PREVIEW_VERBOSE=0
 PREVIEW_JSON=0
@@ -93,6 +96,7 @@ PREVIEW_SCANNED=false
 while [ $# -gt 0 ]; do
   case "$1" in
     --manual)    TRIGGER=manual; shift ;;
+    --drain-manifest) DRAIN_MANIFEST="${2:?manifest required}"; shift 2 ;;
     --scheduled) TRIGGER=scheduled; shift ;;
     --preview)   PREVIEW_MODE=1; TRIGGER=manual; shift ;;
     --verbose)   PREVIEW_VERBOSE=1; shift ;;
@@ -344,6 +348,9 @@ publish_state() {
     printf '  "observed_at": "%s",\n' "$(iso)"
     printf '  "run_id": "%s",\n' "$RUN_ID"
     printf '  "trigger": "%s",\n' "$TRIGGER"
+    if [ -n "$DRAIN_MANIFEST" ]; then
+      "$PYTHON" -B -c 'import json,sys; print("  \"drain_manifest\": " + json.dumps(sys.argv[1]) + ",")' "$DRAIN_MANIFEST"
+    fi
     printf '  "phase": "%s",\n' "$phase"
     printf '  "mode": "%s",\n' "$MODE"
     printf '  "safety_complete": %s,\n' "$SAFETY_COMPLETE"
@@ -671,6 +678,9 @@ write_batch_meta() {
   printf '{"schema_version": %s, "run_id": "%s", "created_at_epoch": %s, "sealed_at_epoch": %s, "sealed_at": "%s", "item_count": %s}\n' \
     "$BATCH_SCHEMA" "$RUN_ID" "$BATCH_CREATED_EPOCH" "$sealed" \
     "$("$DATE" -u -r "$sealed" '+%Y-%m-%dT%H:%M:%SZ')" "$items" > "$tmp" 2>/dev/null || return 1
+  if [ -n "$DRAIN_MANIFEST" ]; then
+    "$PYTHON" -B -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); d["drain_id"]=json.load(open(sys.argv[2]))["drain_id"]; open(p,"w").write(json.dumps(d)+"\n")' "$tmp" "$DRAIN_MANIFEST" || return 1
+  fi
   "$MV" -f "$tmp" "$dir/$BATCH_META" 2>/dev/null || return 1
   "$TOUCH" "$dir" 2>/dev/null
   return 0
@@ -683,42 +693,23 @@ write_batch_meta() {
 # Only batches with verifiable metadata expire; missing or corrupt metadata
 # fails closed and the batch is left alone.
 expire_quarantine() {
-  C_WOULD_EXP_B=0; C_WOULD_EXP_I=0; C_EXP_B=0; C_EXP_I=0; B_EXPIRED=0; P_EXPIRED=exact
-  [ "$USE_QUARANTINE" = "1" ] || return 0
-  [ -d "$QUARANTINE_DIR" ] || return 0
-  local now cutoff b base sealed items kb
-  now=$("$DATE" +%s)
-  cutoff=$((now - QUARANTINE_KEEP_HOURS*3600))
-  while IFS= read -r b; do
-    [ -n "$b" ] || continue
-    case "$b" in "$QUARANTINE_DIR"/*) ;; *) continue ;; esac
-    base=$("$BASENAME" "$b")
-    case "$base" in .incomplete-*) continue ;; esac
-    if ! sealed=$(batch_sealed_epoch "$b"); then
-      log "SKIP-NO-BATCH-META $base (fail closed)"
-      continue
-    fi
-    [ -n "$sealed" ] || continue
-    [ "$sealed" -le "$cutoff" ] || continue
-    items=$("$FIND" "$b" -mindepth 1 -maxdepth 1 ! -name "$BATCH_META" 2>/dev/null | "$WC" -l | "$TR" -d ' ')
-    kb=$("$DU" -sk "$b" 2>/dev/null | "$AWK" '{print $1}')
-    if [ "$PREVIEW_MODE" = "1" ] || [ "$MODE" != "apply" ]; then
-      C_WOULD_EXP_B=$((C_WOULD_EXP_B+1))
-      C_WOULD_EXP_I=$((C_WOULD_EXP_I+items))
-      is_uint "$kb" && B_EXPIRED=$((B_EXPIRED + kb*1024))
-      log "DRY would-expire batch=$base items=$items"
-      continue
-    fi
-    if "$RM" -rf -- "$b" 2>/dev/null; then
-      C_EXP_B=$((C_EXP_B+1))
-      C_EXP_I=$((C_EXP_I+items))
-      is_uint "$kb" && B_EXPIRED=$((B_EXPIRED + kb*1024))
-      log "EXPIRED batch=$base items=$items sealed_at=$("$DATE" -r "$sealed" '+%F %T')"
-    else
-      log "WARN expire failed: $base"
-    fi
-  done < <("$FIND" "$QUARANTINE_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
-  [ "$PREVIEW_MODE" = "0" ] && [ "$MODE" = "apply" ] && "$RMDIR" "$QUARANTINE_DIR" 2>/dev/null
+  local result
+  local args=(expire --shell)
+  if [ "$PREVIEW_MODE" = "1" ]; then
+    args+=(--preview)
+  else
+    args+=(--parent-run "$RUN_ID")
+  fi
+  if [ -n "$DRAIN_MANIFEST" ] && "$PYTHON" -B -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("purge_now") is True else 1)' "$DRAIN_MANIFEST"; then
+    args+=(--immediate-manifest "$DRAIN_MANIFEST")
+  fi
+  if result=$("$PYTHON" -B "$MAINTENANCE" "${args[@]}"); then
+    IFS="$(printf '\t')" read -r C_WOULD_EXP_B C_WOULD_EXP_I C_EXP_B C_EXP_I B_EXPIRED <<< "$result"
+    P_EXPIRED=exact
+  else
+    P_EXPIRED=unknown
+    log "WARN quarantine expiry refused; see expiry-state.json"
+  fi
   return 0
 }
 
@@ -800,6 +791,13 @@ fi
   done < "$ST_CAND"
 } | "$SORT" -t"$(printf '\t')" -k1,1n -k2,2 > "$RUN_TMP/all_cand.txt"
 
+if [ -n "$DRAIN_MANIFEST" ]; then
+  if ! "$PYTHON" -B "$MAINTENANCE" select "$DRAIN_MANIFEST" < "$RUN_TMP/all_cand.txt" > "$RUN_TMP/scoped.txt"; then
+    log "ABORT invalid drain manifest"; exit 1
+  fi
+  "$MV" "$RUN_TMP/scoped.txt" "$RUN_TMP/all_cand.txt"
+fi
+
 C_ELIGIBLE=$("$WC" -l < "$RUN_TMP/all_cand.txt" | "$TR" -d ' ')
 "$HEAD" -n "$MAX_ITEMS_PER_RUN" "$RUN_TMP/all_cand.txt" > "$SEL"
 C_SELECTED=$("$WC" -l < "$SEL" | "$TR" -d ' ')
@@ -852,7 +850,16 @@ case "${CMUX_JANITOR_TEST_SETTLE_SEC:-}" in
 esac
 "$SLEEP" "$SETTLE_SEC"
 
-held() { [ -n "$("$LSOF" -- "$1" 2>/dev/null)" ]; }
+held() {
+  local output rc
+  if [ -d "$1" ]; then
+    output=$("$LSOF" -nP +D "$1" 2>&1); rc=$?
+  else
+    output=$("$LSOF" -nP -- "$1" 2>&1); rc=$?
+  fi
+  # Only a successful empty query means no handle. Errors are not clearance.
+  [ "$rc" -ne 1 ] || [ -n "$output" ]
+}
 stamp_of() { "$STAT" -f%m "$1" 2>/dev/null || echo x; }
 
 QDEST=""
@@ -903,6 +910,9 @@ dispose() {
 # ---------- GATE 3: mtime static + no open handle + no fresh content ----------
 while IFS= read -r line; do
   [ -n "$line" ] || continue
+  if [ -e "$DISABLED" ] || [ -e "$JANITOR_DIR/GUARD_TRIPPED" ]; then
+    log "STOP pause or guard trip during sweep"; break
+  fi
   was="${line%%$(printf '\t')*}"
   p="${line#*$(printf '\t')}"
   if [ -f "$p" ]; then
@@ -915,6 +925,7 @@ while IFS= read -r line; do
       log "SKIP-MOVING $p"; C_SKIP_MOVING=$((C_SKIP_MOVING+1)); continue
     fi
     if held "$p"; then log "SKIP-HELD $p"; C_SKIP_HELD=$((C_SKIP_HELD+1)); continue; fi
+    if [ "$(stamp_of "$p")" != "$was" ]; then C_SKIP_MOVING=$((C_SKIP_MOVING+1)); continue; fi
     dispose "$p" && C_DISPOSED=$((C_DISPOSED+1))
   elif [ -d "$p" ]; then
     case "$p" in "$STAGING"/*) ;; *) log "SKIP-OUTSIDE $p"; C_SKIP_OUTSIDE=$((C_SKIP_OUTSIDE+1)); continue ;; esac
@@ -927,6 +938,7 @@ while IFS= read -r line; do
       log "SKIP-FRESH-CONTENT $p"; C_SKIP_FRESH=$((C_SKIP_FRESH+1)); continue
     fi
     if held "$p"; then log "SKIP-HELD $p"; C_SKIP_HELD=$((C_SKIP_HELD+1)); continue; fi
+    if [ "$(stamp_of "$p")" != "$was" ]; then C_SKIP_MOVING=$((C_SKIP_MOVING+1)); continue; fi
     dispose "$p" && C_DISPOSED=$((C_DISPOSED+1))
   fi
 done < "$SEL"
@@ -935,7 +947,7 @@ done < "$SEL"
 if [ -n "$QDEST" ] && [ -d "$QDEST" ]; then
   if [ "$C_DISPOSED" -gt 0 ]; then
     if write_batch_meta "$QDEST" "$C_DISPOSED"; then
-      QFINAL="$QUARANTINE_DIR/$("$DATE" '+%Y%m%d-%H%M%S')"
+      QFINAL="$QUARANTINE_DIR/$("$DATE" '+%Y%m%d-%H%M%S')-$$"
       if "$MV" -f "$QDEST" "$QFINAL" 2>/dev/null; then
         log "SEALED batch=$("$BASENAME" "$QFINAL") items=$C_DISPOSED"
       else

@@ -40,6 +40,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from claude_ccc_protocol import EVENT_JOURNAL_PATH, EVENT_SOCKET_PATH
 import ccc_observation as observation_health
+from ccc_codex_queue import QueueRecovery
 from ccc_scheduling import CoalescingWriter, SnapshotCache, SnapshotClient, SurfaceScheduler
 
 
@@ -58,7 +59,7 @@ DEFAULT_LABEL = f"{LABEL_PREFIX}.{APP_NAME}"
 PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_APP_DIR = Path.home() / "Library" / "Application Support" / APP_NAME
 DEFAULT_RUNTIME_ROOT = DEFAULT_APP_DIR / "runtime"
-RUNTIME_FILES = ("cmux_codex_watch.py", "claude_ccc_protocol.py", "claude_ccc_event_hook.py", "ccc_observation.py", "ccc_scheduling.py")
+RUNTIME_FILES = ("cmux_codex_watch.py", "claude_ccc_protocol.py", "claude_ccc_event_hook.py", "ccc_observation.py", "ccc_scheduling.py", "ccc_codex_queue.py")
 DEFAULT_LOG_DIR = Path.home() / "Library" / "Logs" / APP_NAME
 DEFAULT_CONFIG_PATH = DEFAULT_APP_DIR / "config.json"
 DEFAULT_STATE_PATH = DEFAULT_APP_DIR / "state.json"
@@ -326,7 +327,7 @@ CLAUDE_CONTEXT_ABSOLUTE_TIMEOUT_SEC = 900.0
 # through TargetRuntime and suppresses duplicate Hook/fallback deliveries.
 # Human label only.  Acceptance always compares SHA-256 of the loaded source:
 # a revision string is hand-maintained and therefore can lie about what runs.
-FEATURE_REVISION = "0.2.7-continuation-scheduler-gil"
+FEATURE_REVISION = "0.2.8-transport-pause-recovery"
 # How long after our own send a byte-identical UserPromptSubmit can still be
 # our echo.  Must exceed claude_submit_confirm_timeout_sec so that a late
 # echo arriving after the transaction timed out is not read as a human.
@@ -538,6 +539,10 @@ class TargetRuntime:
     delivery_confirmed_at: float = 0.0
     send_attempt_id: str = ""
     send_attempt_evidence: str | None = None
+    codex_observed_turn_key: str = ""
+    codex_sent_turn_key: str = ""
+    codex_absent_probe: str = ""
+    codex_absent_since: float = 0.0
     last_send_error: str = ""
     registration_revalidation: dict[str, Any] = dataclasses.field(default_factory=dict)
     observed_screen_signature: str | None = None
@@ -1179,6 +1184,27 @@ def _codex_status_chrome_rows(grid: Grid, composer_row: int) -> frozenset[int]:
         if match and (match[2] == "terminal") == (int(match[1]) == 1):
             return frozenset(rows)
     return frozenset()
+
+
+def _codex_hook_timeout_rows(grid: Grid, composer_row: int) -> frozenset[int]:
+    """A completed hook timeout is not evidence that model work resumed.
+
+    Match the complete native two-row failure card only. Exit-code failures,
+    decision messages, extra output and quoted examples remain blocking. This
+    exemption cannot start a retry by itself: a current provider error and all
+    composer/queue/working/authorization gates are still required.
+    """
+    rows: set[int] = set()
+    for row in range(max(0, composer_row - 1)):
+        if grid.lines[row].rstrip() != "• Hook failed":
+            continue
+        if not re.fullmatch(r"  └ hook timed out after [0-9]+(?:\.[0-9]+)?s", grid.lines[row + 1].rstrip()):
+            continue
+        if not any(span.row == row and span.column == 0 and span.text.startswith("•")
+                   for span in grid.spans):
+            continue
+        rows.update((row, row + 1))
+    return frozenset(rows)
 
 
 def _is_footer(line: str) -> bool:
@@ -1954,11 +1980,11 @@ def classify_text_prefilter(value: str | Iterable[str]) -> ScreenState:
         return ScreenState("queued_followup", reason="Codex already holds queued follow-up input")
     if _working_present(lines):
         return ScreenState("working", reason="Codex is working")
-    tail_count = max(12, len(lines) // 2)
-    tail = lines[-tail_count:]
-    # Match the adjacent error block, excluding the composer and footer. The
-    # grid pass still decides whether the candidate is current and safe to act on.
-    if _find_last_error(tail) is not None:
+    # This is already a viewport-only read. The native grid can pad the lower
+    # half with empty rows; slicing it by height drops a current error above
+    # those rows. Inspect every visible row here and let the structural pass
+    # decide whether the error is current and the composer is safe.
+    if _find_last_error(lines) is not None:
         return ScreenState("candidate", reason="visible error candidate")
     return ScreenState("idle", reason="no visible error candidate")
 
@@ -2061,7 +2087,9 @@ def classify_grid(grid: Grid) -> ScreenState:
             span.style_id in marker_style_ids for span in content_spans
         )
 
-    chrome_rows = _codex_status_chrome_rows(grid, composer_row) | _spinner_chrome_rows(grid, composer_row)
+    chrome_rows = (_codex_status_chrome_rows(grid, composer_row)
+                   | _spinner_chrome_rows(grid, composer_row)
+                   | _codex_hook_timeout_rows(grid, composer_row))
     error = _find_last_error(
         lines,
         composer_row,
@@ -3562,10 +3590,13 @@ class CmuxClient:
                     return str(value["text"])
             result = self._run(args, timeout=8)
         except CmuxError as exc:
-            if not WatchDaemon._is_transient_observation_error(exc):
+            if ("failed to read terminal text" not in str(exc).lower()
+                    or not WatchDaemon._is_transient_observation_error(exc)):
                 raise
             # A fresh viewport grid can survive the plain-text reader failing.
             # Never use replay history or a previous frame as a substitute.
+            # Socket failures and timeouts wait for the next scheduled poll;
+            # another read here would spend a second full transport deadline.
             try:
                 grid = Grid.from_rpc(self.replay(workspace_id, surface_id), surface_id)
             except (CmuxError, IncompatibleError):
@@ -3654,6 +3685,12 @@ class CmuxClient:
         self._run([
             "send-key", "--workspace", workspace_id, "--surface", surface_id, key,
         ], timeout=8)
+
+    def edit_codex_queued_prompt(self, workspace_id: str, surface_id: str) -> None:
+        """Use Codex's displayed Alt+Up binding; caller verifies queue and draft."""
+        if not workspace_id or not surface_id:
+            raise CmuxError("queued edit requires explicit workspace and surface UUIDs")
+        self._run(["send-key", "--workspace", workspace_id, "--surface", surface_id, "alt+up"], timeout=8)
 
     @staticmethod
     def _reject_unapproved_command(message: str) -> None:
@@ -4409,6 +4446,12 @@ class WatchDaemon:
         self.config_path = config_path
         self.state_path = state_path
         self.config_store = ConfigStore(config_path)
+        native_home = Path.home() if config_path == DEFAULT_CONFIG_PATH else config_path.parent
+        self.codex_queue_recovery = QueueRecovery(
+            config_path.parent / "codex-queue-recovery.json",
+            native_home / ".cmuxterm/codex-hook-sessions.json",
+            native_home / ".codex/sessions", MESSAGE,
+        )
         if hook_settings_manager is not None:
             self.claude_hook_settings = hook_settings_manager
         elif config_path == DEFAULT_CONFIG_PATH:
@@ -4438,6 +4481,7 @@ class WatchDaemon:
         self._process_cache_lock = threading.RLock()
         self._config_reload_lock = threading.RLock()
         self._process_snapshots = SnapshotCache(workers=MAINTENANCE_WORKERS)
+        self.codex_queue_recovery.process_lookup = lambda target: self._candidate_process_label(target, self._observation_client())
         self._viewport_socket = CmuxViewportSocket()
         self._scheduler: SurfaceScheduler | None = None
         self._discovery_future: Any = None
@@ -6002,6 +6046,7 @@ class WatchDaemon:
                 )
                 state = self._apply_claude_runtime_guards(surface_id, runtime, state)
                 state = self._apply_claude_context_guard(surface_id, runtime, state)
+                state = self._recover_stranded_codex_queue(target, runtime, state, client, current)
                 if self._reconcile_codex_delivery(surface_id, runtime, state):
                     return None
                 if self._runtime_is_claude(runtime, state) and not current(fresh=True):
@@ -6062,14 +6107,6 @@ class WatchDaemon:
                     ))
                     runtime.state = "cmux_unavailable"
                 return
-            if isinstance(exc.__cause__, (subprocess.TimeoutExpired, TimeoutError)):
-                with self._surface_lock(surface_id):
-                    # A failed observation is not target removal or send acknowledgement.
-                    self._record_observation(surface_id, runtime, ScreenState(
-                        "cmux_unavailable", reason="cmux observation timed out; still monitoring",
-                    ))
-                    runtime.state = "cmux_unavailable"
-                return
             if not client.ping():
                 with self._surface_lock(surface_id):
                     if not current():
@@ -6099,6 +6136,7 @@ class WatchDaemon:
                         )
                         state = self._apply_claude_runtime_guards(surface_id, runtime, state)
                         state = self._apply_claude_context_guard(surface_id, runtime, state)
+                        state = self._recover_stranded_codex_queue(target, runtime, state, client, current)
                         if self._reconcile_codex_delivery(surface_id, runtime, state):
                             return None
                         if self._runtime_is_claude(runtime, state) and not current(fresh=True):
@@ -6149,13 +6187,6 @@ class WatchDaemon:
                             self._record_observation(surface_id, runtime, ScreenState(
                                 "cmux_unavailable",
                                 reason="cmux viewport unavailable after refresh; still monitoring",
-                            ))
-                            runtime.state = "cmux_unavailable"
-                        return
-                    if isinstance(retry_exc.__cause__, (subprocess.TimeoutExpired, TimeoutError)):
-                        with self._surface_lock(surface_id):
-                            self._record_observation(surface_id, runtime, ScreenState(
-                                "cmux_unavailable", reason="cmux observation timed out after refresh; still monitoring",
                             ))
                             runtime.state = "cmux_unavailable"
                         return
@@ -6227,30 +6258,50 @@ class WatchDaemon:
 
     @staticmethod
     def _is_transient_observation_error(exc: BaseException) -> bool:
-        """Return whether a cmux observation failure is safe to retry.
+        """Retry observation outages without changing authorization or delivery."""
+        return observation_health.transient_observation_error(exc)
 
-        ``read-screen`` can report an internal renderer failure while the
-        surface and its process are still present.  Treating that response as
-        a missing target permanently pauses an otherwise recoverable session.
-        Target identity errors (for example ``surface not found`` or
-        ``not a terminal``) intentionally do not match and remain isolated.
-        """
+    def _recover_stranded_codex_queue(self, target, runtime, state, client, current):
+        if (state.kind != "queued_followup" and not (
+                state.kind == "composer_busy" and self.codex_queue_recovery.has_pending_draft(target["surface_id"])
+        )) or self._runtime_is_claude(runtime, state):
+            return state
 
-        detail = str(exc).lower()
-        if isinstance(exc.__cause__, subprocess.TimeoutExpired):
-            return True
-        if any(marker in detail for marker in (
-            "surface not found",
-            "surface_not_found",
-            "not a terminal",
-            "invalid_params",
-        )):
-            return False
-        return any(marker in detail for marker in (
-            "failed to read terminal text",
-            "command timed out",
-            " timed out",
-        ))
+        def view():
+            grid = Grid.from_rpc(client.replay(target["workspace_id"], target["surface_id"]), target["surface_id"])
+            kind, row = _composer_status(grid)
+            lines = grid.lines[:row] if row is not None else grid.lines
+            headers = [i for i, text in enumerate(lines) if QUEUED_FOLLOWUP_RE.search(text)]
+            tail = lines[headers[-1]:] if headers else []
+            queued = [text.strip()[1:].strip() for text in tail if text.strip().startswith("↳")]
+            draft = ""
+            if row is not None:
+                spans = sorted((s for s in grid.spans if s.row == row and not grid.style(s.style_id).get("faint", False)), key=lambda s: s.column)
+                entered = [s for s in spans if 2 <= s.column < grid.cursor.column]
+                trailing = [s for s in spans if s.column >= grid.cursor.column]
+                if (all(s.column + s.cell_width <= grid.cursor.column for s in entered)
+                        and all(not s.text.strip() or _is_spinner_overlay_span(grid, s) for s in trailing)):
+                    draft = "".join(s.text for s in entered)
+            return {"empty": kind == "empty", "draft": draft, "queued": queued,
+                    "editable": any("edit last queued message" in x and ("⌥" in x or "alt" in x.lower()) for x in tail),
+                    "busy": _menu_present(grid.lines) or _working_present(grid.lines)
+                            or any(re.search(r"^[•●]?\s*Reconnecting\.{3}", x.strip()) for x in grid.lines)}
+
+        def authorized():
+            return (self.config.get("mode") == "armed" and not self.config.get("global_paused")
+                    and str(target["surface_id"]) != str(self.config.get("manager_surface_id") or "")
+                    and current(fresh=True))
+
+        outcome = self.codex_queue_recovery.recover(
+            target, runtime, read_view=view,
+            edit_queued=lambda: client.edit_codex_queued_prompt(target["workspace_id"], target["surface_id"]),
+            enter=lambda: client.send_key(target["workspace_id"], target["surface_id"], "enter"),
+            authorized=authorized,
+        )
+        if outcome:
+            self.logger.warning("surface=%s %s original_queued_prompt=true", target["surface_id"], outcome)
+            return ScreenState(outcome, reason=outcome, message_kind="codex")
+        return state
 
     def _mark_claude_event(
         self,
@@ -7798,6 +7849,7 @@ class WatchDaemon:
         runtime.awaiting = False
         runtime.paused_reason = detail
         target["paused"] = True
+        target.update(paused_reason=detail, pause_origin="automatic_incompatible", paused_at=time.time())
         source = str(target.get("source") or "explicit")
         recovery = f"cmux-codex-continue resume {surface_id}"
         try:
@@ -7822,6 +7874,7 @@ class WatchDaemon:
                     persisted = target_by_id(config, surface_id)
                     persisted["paused"] = True
                     persisted["paused_reason"] = detail
+                    persisted.update(pause_origin="automatic_incompatible", paused_at=time.time())
 
                 self._mutate_config(pause_explicit)
         except RuntimeError as exc:
@@ -8406,11 +8459,13 @@ class WatchDaemon:
         runtime.state = "missing_or_error"
         runtime.paused_reason = reason
         target["paused"] = True
+        target.update(paused_reason=reason, pause_origin="automatic_observation_error", paused_at=time.time())
         if target.get("source") != "workspace_rule":
             def pause_explicit(config: dict[str, Any]) -> None:
                 persisted = target_by_id(config, surface_id)
                 persisted["paused"] = True
                 persisted["paused_reason"] = reason
+                persisted.update(pause_origin="automatic_observation_error", paused_at=time.time())
 
             try:
                 self._mutate_config(pause_explicit)
@@ -8574,6 +8629,33 @@ class WatchDaemon:
                 runtime.delivery_status = "retryable"
                 runtime.last_send_error = ""
                 return False
+            target = self._event_target(surface_id)
+            # An unchanged banner cannot by itself prove that timed-out input
+            # was lost. Two fresh empty-composer observations and an unchanged
+            # original completed turn can: a queued or submitted prompt would
+            # change the viewport or lifecycle. Never reset the send ledger.
+            turn = (self.codex_queue_recovery.current_turn(target)
+                    if target and state.kind == "recoverable_error" else None)
+            key = (f"{turn.get('session_id')}:{turn.get('turn_id')}:{turn.get('at')}"
+                   if turn else "")
+            if (turn and turn.get("kind") == "task_complete" and turn.get("signature")
+                    and isinstance(turn.get("error"), Mapping)
+                    and _match_error_block("■ " + str(turn["error"].get("message") or "")) == state.error_type
+                    and 0 < float(turn.get("at") or 0) < runtime.send_started_at
+                    and runtime.send_completed_at > 0
+                    and time.time() - runtime.send_completed_at >= 2
+                    and (not runtime.codex_sent_turn_key or key == runtime.codex_sent_turn_key)):
+                probe = _short_hash(str((runtime.send_attempt_id, key, turn["signature"], state.content_fingerprint)))
+                if runtime.codex_absent_probe != probe:
+                    runtime.codex_absent_probe, runtime.codex_absent_since = probe, time.time()
+                elif time.time() - runtime.codex_absent_since >= 1:
+                    runtime.delivery_status = "retryable"
+                    runtime.last_send_error = ""
+                    runtime.awaiting = False
+                    self.logger.info("surface=%s timed-out input absent: original turn and empty composer verified", surface_id[:8])
+                    return False
+            else:
+                runtime.codex_absent_probe, runtime.codex_absent_since = "", 0.0
             self._record_observation(surface_id, runtime, state)
             runtime.delivery_status = "unknown"
             runtime.state = "delivery_unknown"
@@ -8694,6 +8776,7 @@ class WatchDaemon:
         circuit_limit = int(self.config.get("circuit_pause_after", 0) or 0)
         if circuit_limit > 0 and runtime.send_count >= circuit_limit:
             target["paused"] = True
+            target.update(pause_origin="automatic_circuit", paused_at=time.time())
             if target.get("source") != "workspace_rule":
                 reason = f"circuit limit reached: {circuit_limit}"
 
@@ -8701,6 +8784,7 @@ class WatchDaemon:
                     persisted = target_by_id(config, surface_id)
                     persisted["paused"] = True
                     persisted["paused_reason"] = reason
+                    persisted.update(pause_origin="automatic_circuit", paused_at=time.time())
 
                 try:
                     self._mutate_config(pause_explicit)
@@ -8739,6 +8823,8 @@ class WatchDaemon:
             return
         if self.config.get("mode") != "armed" or self.config.get("global_paused", False):
             return
+        if not self._codex_turn_ready(target, runtime, state):
+            return
         # Persist the attempt before I/O. A restart during a send must reconcile
         # the viewport rather than blindly treating the attempt as never made.
         runtime.send_started_at = time.time()
@@ -8746,6 +8832,7 @@ class WatchDaemon:
         runtime.send_completed_at = 0.0
         runtime.send_attempt_id = uuid.uuid4().hex
         runtime.send_attempt_evidence = state.content_fingerprint
+        runtime.codex_sent_turn_key = runtime.codex_observed_turn_key
         runtime.delivery_status = "sending"
         runtime.last_send_error = ""
         persisted_at = time.monotonic()
@@ -8762,6 +8849,10 @@ class WatchDaemon:
         # at the actual input boundary, including a pause written during fsync.
         if (self._active_send_target(target, is_current) is None
                 or self.config.get("mode") != "armed" or self.config.get("global_paused", False)):
+            runtime.delivery_status = "cancelled"
+            self.save(wait=False)
+            return
+        if not self._codex_turn_ready(target, runtime, state, reserved=True):
             runtime.delivery_status = "cancelled"
             self.save(wait=False)
             return
@@ -8803,6 +8894,38 @@ class WatchDaemon:
                          surface_id[:8], state.error_type, runtime.send_count, runtime.scheduler_lag_ms,
                          runtime.detection_to_send_ms, runtime.send_duration_ms)
         self.save()
+
+
+    def _codex_turn_ready(self, target, runtime, state, *, reserved=False):
+        if state.message_kind != "codex":
+            return True
+        turn = self.codex_queue_recovery.current_turn(target)
+        if turn is None:
+            if not (reserved and runtime.codex_observed_turn_key):
+                runtime.codex_observed_turn_key = ""
+                return True
+            # Losing a verified binding while the attempt is being persisted
+            # is not a legacy client: the original process may have exited.
+            turn = {"kind": "unknown"}
+        # Codex paints a terminal provider error before its native turn ends.
+        # Submitting in that interval can wedge the next TurnInput permanently.
+        # The terminal event must be current, and still a failure; a successful
+        # later turn makes the visible error historical.
+        error = turn.get("error")
+        if (turn.get("kind") == "task_complete" and isinstance(error, Mapping)
+                and _match_error_block("■ " + str(error.get("message") or "")) == state.error_type):
+            key = f"{turn.get('session_id')}:{turn.get('turn_id')}:{turn.get('at')}"
+            already_sent = key == runtime.codex_sent_turn_key
+            if (reserved and key == runtime.codex_observed_turn_key) or (
+                    not reserved and (not already_sent or runtime.delivery_status in {"failed", "cancelled", "retryable"})):
+                runtime.codex_observed_turn_key = key
+                return True
+        phase = "working" if turn.get("kind") in {"task_started", "user_message"} else "awaiting_transition"
+        self._record_state(str(target["surface_id"]), runtime, ScreenState(
+            phase, message_kind="codex", error_type=state.error_type,
+            reason="waiting for native Codex failed-turn completion before submitting continuation",
+        ))
+        return False
 
 
 def configure_logging() -> None:
@@ -10070,9 +10193,12 @@ def cli(argv: Sequence[str] | None = None) -> int:
             elif args.command == "pause":
                 target["paused"] = True
                 target["paused_reason"] = "manual pause"
+                target.update(pause_origin="user", paused_at=time.time())
             else:
                 target["paused"] = False
                 target.pop("paused_reason", None)
+                target.pop("pause_origin", None)
+                target.pop("paused_at", None)
             return target
 
         _, changed, _ = store.mutate(change_target)

@@ -383,7 +383,7 @@ def watch_kind(candidate: Candidate) -> str:
 
 def watch_label(candidate: Candidate) -> str:
     if candidate.source not in {"untracked", "workspace_excluded", "workspace_non_codex"} and not candidate.paused:
-        health_labels = {"unknown": "待检测", "delayed": "检测延迟", "delivery_unknown": "投递待验",
+        health_labels = {"unknown": "待检测", "delivery_unknown": "投递待验",
                          "send_failed": "发送失败", "unavailable": "读取异常", "blocked": "服务阻塞"}
         if candidate.continuation_status in health_labels:
             return health_labels[candidate.continuation_status]
@@ -3015,6 +3015,8 @@ def _snapshot_from_status(document: Mapping[str, Any]) -> dict[str, Any]:
         "quarantine_bytes": quarantine_bytes,
         "quarantine_precision": quarantine_precision,
         "quarantine_keep_hours": _finite_int(quarantine.get("keep_hours")),
+        "quarantine_age_sec": _finite_number_or_none(quarantine.get("age_sec")),
+        "quarantine_stale": quarantine.get("stale") is True,
         # MAX_ITEMS_PER_RUN, so the confirm box can state the cap a manual sweep
         # will honour rather than implying it clears the whole backlog.
         "per_run_limit": _finite_int(janitor.get("limit")),
@@ -3511,14 +3513,17 @@ def junk_line(snapshot: Mapping[str, Any]) -> str:
         # Three stages of the same funnel, so a backlog that is present but
         # deliberately protected cannot be mistaken for one the janitor is
         # failing to clear.
-        f"cmux垃圾 候选 原始{_count_text(counts.get('raw'))}"
+        f"cmux垃圾 上轮候选 原始{_count_text(counts.get('raw'))}"
         f"/合格{_count_text(counts.get('eligible'))}"
         f"/选中{_count_text(counts.get('selected'))}",
-        f"待清 {_bytes_text(snapshot.get('selected_bytes'), str(snapshot.get('selected_precision')))}",
+        f"上轮选中体积 {_bytes_text(snapshot.get('selected_bytes'), str(snapshot.get('selected_precision')))}",
         f"隔离 {_count_text(snapshot.get('quarantine_count'))}批 "
         f"{_bytes_text(snapshot.get('quarantine_bytes'), str(snapshot.get('quarantine_precision')))}"
         f"(留{keep_text})",
     ]
+
+    if snapshot.get("quarantine_stale"):
+        parts.append(f"隔离统计已过期({_age_text(snapshot.get('quarantine_age_sec'))})")
 
     if snapshot.get("guard_tripped"):
         parts.append(f"清扫器 守卫跳闸 最后测量{_age_text(snapshot.get('janitor_age_sec'))}")
@@ -4206,7 +4211,7 @@ def storage_page_lines(snapshot: Mapping[str, Any], action_message: str = "") ->
         f"  通过年龄/引用   {_count_text(counts.get('eligible'))}",
         f"  本轮选中       {_count_text(counts.get('selected'))}（单轮上限 {limit_text}）",
         f"  受保护跳过     {_count_text(counts.get('protected'))}",
-        f"  待清体积       "
+        f"  上轮选中体积   "
         f"{_bytes_text(snapshot.get('selected_bytes'), str(snapshot.get('selected_precision')))}",
         "",
         "隔离区（已移出实时目录；到期由清扫器自行删除）:",
