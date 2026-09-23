@@ -332,9 +332,13 @@ class BatchWorker:
                     continue
                 try:
                     event = json.loads(line)
-                    payload = event["payload"]
-                    if not isinstance(event, dict) or not isinstance(payload, dict):
+                    if not isinstance(event, dict):
                         raise ValueError("invalid native event")
+                    if event.get("type") not in {"event_msg", "response_item"}:
+                        continue
+                    payload = event.get("payload", {})
+                    if not isinstance(payload, dict):
+                        raise ValueError("invalid native payload")
                 except (ValueError, KeyError, TypeError):
                     proof["blocked"] = "invalid original transcript event"
                     return False
