@@ -19,7 +19,6 @@ import subprocess
 import tempfile
 
 MARKER = "CCC_RETIRED_CODEX_COPY_LOOP"
-LABEL = "com.lzhs.codex-tcc-keep"
 COMMENT = "# Codex TCC keep (Documents/FDA survive brew upgrades)"
 TRIGGER = '( /usr/bin/python3 "$HOME/Library/Application Support/codex-tcc-keep/grant.py" >/dev/null 2>&1 & )'
 MESSAGE = "Codex automatic binary copying is retired; install a verified complete release explicitly."
@@ -110,11 +109,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--backup", type=Path)
+    parser.add_argument("--label", required=True, help="Exact legacy launchd label on this Mac")
     args = parser.parse_args()
     user_home = Path.home()
     planned = changes(user_home)
     domains = (f"gui/{os.getuid()}", "system")
-    jobs = {domain: disabled(domain, LABEL) for domain in domains}
+    jobs = {domain: disabled(domain, args.label) for domain in domains}
     report = {"mode": "apply" if args.apply else "read-only", "legacy_jobs_disabled": jobs,
               "planned_files": [str(p) for p, _ in planned]}
     if args.apply:
