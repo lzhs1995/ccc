@@ -16,6 +16,34 @@ def timeout_payload(error="high_demand", detail="  └ hook timed out after 5s")
 
 
 class HookTimeoutTests(unittest.TestCase):
+    def test_signal_terminated_hooks_do_not_hide_provider_failure(self):
+        for detail in ("  └ hook exited without a status code",
+                       "  └ hook process terminated without an exit code"):
+            for error in ERRORS:
+                with self.subTest(detail=detail, error=error), tempfile.TemporaryDirectory() as directory:
+                    payload = timeout_payload(error, detail)
+                    state = core.classify_grid(core.Grid.from_rpc(payload, "surface-uuid"))
+                    self.assertEqual((state.kind, state.error_type), ("recoverable_error", error))
+                    client = FakeClient(payload, visible_text(payload))
+                    daemon = armed_daemon(directory, client)
+                    self.addCleanup(daemon._process_snapshots.close)
+                    daemon.process_once(client)
+                    daemon.process_once(client)
+                    self.assertEqual(len(client.sent), 1)
+
+    def test_signal_failure_alone_or_with_later_output_never_retries(self):
+        for detail in ("  └ hook exited without a status code",
+                       "  └ hook process terminated without an exit code"):
+            with self.subTest(detail=detail):
+                payload = timeout_payload(detail=detail)
+                payload["render_grid"]["row_spans"] = [s for s in payload["render_grid"]["row_spans"]
+                                                       if s["row"] >= 47]
+                self.assertEqual(core.classify_grid(core.Grid.from_rpc(payload, "surface-uuid")).kind, "idle")
+                payload = timeout_payload(detail=detail)
+                payload["render_grid"]["row_spans"].append(span(49, 0, "• A new answer"))
+                self.assertEqual(core.classify_grid(core.Grid.from_rpc(payload, "surface-uuid")).kind,
+                                 "error_superseded")
+
     def test_timeout_after_each_provider_error_remains_recoverable(self):
         for error in ERRORS:
             with self.subTest(error=error), tempfile.TemporaryDirectory() as directory:
@@ -33,6 +61,8 @@ class HookTimeoutTests(unittest.TestCase):
     def test_exit_code_and_unknown_failure_cards_still_block(self):
         for detail in ("  └ hook exited with code 2", "  └ hook exited with code 3",
                        "  └ permission denied", "  └ hook timed out after 5s; denied",
+                       "  └ hook exited without a status code; approval required",
+                       "  └ hook process terminated without an exit code; denied",
                        "hook timed out after 5s", "", "  └ hook failed"):
             with self.subTest(detail=detail):
                 payload = timeout_payload(detail=detail)

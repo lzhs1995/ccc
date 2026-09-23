@@ -1217,8 +1217,8 @@ def _codex_status_chrome_rows(grid: Grid, composer_row: int) -> frozenset[int]:
     return frozenset()
 
 
-def _codex_hook_timeout_rows(grid: Grid, composer_row: int) -> frozenset[int]:
-    """A completed hook timeout is not evidence that model work resumed.
+def _codex_hook_failure_rows(grid: Grid, composer_row: int) -> frozenset[int]:
+    """A timed-out or signal-terminated hook is not resumed model work.
 
     Match the complete native two-row failure card only. Exit-code failures,
     decision messages, extra output and quoted examples remain blocking. This
@@ -1229,7 +1229,10 @@ def _codex_hook_timeout_rows(grid: Grid, composer_row: int) -> frozenset[int]:
     for row in range(max(0, composer_row - 1)):
         if grid.lines[row].rstrip() != "• Hook failed":
             continue
-        if not re.fullmatch(r"  └ hook timed out after [0-9]+(?:\.[0-9]+)?s", grid.lines[row + 1].rstrip()):
+        if not re.fullmatch(
+                r"  └ hook (?:timed out after [0-9]+(?:\.[0-9]+)?s"
+                r"|exited without a status code|process terminated without an exit code)",
+                grid.lines[row + 1].rstrip()):
             continue
         if not any(span.row == row and span.column == 0 and span.text.startswith("•")
                    for span in grid.spans):
@@ -2119,7 +2122,7 @@ def classify_grid(grid: Grid) -> ScreenState:
         return ScreenState("composer_busy", screen_signature=grid.signature(), reason="composer contains user text")
     chrome_rows = (_codex_status_chrome_rows(grid, composer_row)
                    | _spinner_chrome_rows(grid, composer_row)
-                   | _codex_hook_timeout_rows(grid, composer_row)
+                   | _codex_hook_failure_rows(grid, composer_row)
                    | _codex_startup_notice_rows(grid, composer_row))
     marker_rows = [row for row, line in enumerate(lines[:composer_row])
                    if row not in chrome_rows and _is_error_marker(line)]

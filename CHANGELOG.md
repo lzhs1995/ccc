@@ -2,6 +2,8 @@
 
 ## 0.2.13
 
+- Recognize native Hook termination cards without an exit status, as well as timeouts, when a current provider failure needs continuation. Hook failures alone never trigger input; explicit hook decisions and newer task output still block it.
+- Add a backed-up, opt-in migration for the legacy Codex shell/launchd binary-copy loop, and document matched official CLI/helper upgrades without resetting sessions or TCC permissions.
 - Confirm the original batch task through combined AGENTS/environment context and incremental, partial JSONL records. Persist proof before releasing startup protection; recover legacy holds from every relevant batch.
 - Separate startup holds from operator exclusions and show `整池／启动中`. Repeated workspace authorization is idempotent and preserves manual P, exclusions and per-surface pauses.
 - Share timestamped tree/process inventories across the watcher, panel and batch workers. Coalesce failed scans, limit global process discovery to once per five seconds, and continue local confirmation during RPC failures.
