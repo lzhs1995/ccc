@@ -105,7 +105,21 @@ class _BsdInfo(ctypes.Structure):
                 ("start_usec", ctypes.c_uint64)]
 
 
+class _FdInfo(ctypes.Structure):
+    _fields_ = [("fd", ctypes.c_int32), ("kind", ctypes.c_uint32)]
+
+
+class _VnodeFdInfo(ctypes.Structure):
+    # Darwin sys/proc_info.h: vnode_fdinfowithpath, 1200-byte public ABI.
+    # proc_fileinfo is 24 bytes; vnode_info is 152; MAXPATHLEN is 1024.
+    _fields_ = [("openflags", ctypes.c_uint32), ("status", ctypes.c_uint32),
+                ("offset", ctypes.c_int64), ("kind", ctypes.c_int32),
+                ("guardflags", ctypes.c_uint32), ("vnode", ctypes.c_byte * 152),
+                ("path", ctypes.c_char * 1024)]
+
+
 _proc_pidinfo = None
+_proc_pidfdinfo = None
 _proc_listpids = None
 _procargs_sysctl = None
 _procargs_bytes = 0
@@ -118,6 +132,10 @@ if sys.platform == "darwin":
         _proc_listpids = ctypes.CDLL("/usr/lib/libproc.dylib").proc_listpids
         _proc_listpids.argtypes = [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_int]
         _proc_listpids.restype = ctypes.c_int
+        _proc_pidfdinfo = ctypes.CDLL("/usr/lib/libproc.dylib").proc_pidfdinfo
+        _proc_pidfdinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                   ctypes.c_void_p, ctypes.c_int]
+        _proc_pidfdinfo.restype = ctypes.c_int
     except (OSError, AttributeError):
         pass
     try:
@@ -129,6 +147,61 @@ if sys.platform == "darwin":
         _procargs_bytes = os.sysconf("SC_ARG_MAX")
     except (OSError, AttributeError):
         pass
+
+
+def process_writable_files(pid):
+    """Inspect one process directly, without forking lsof for every CLI poll.
+
+    Incomplete native reads or changing vnode descriptors remain unknown.
+    Callers separately recheck PID generation, placement and original session.
+    lsof is only the portable fallback when the native API is unavailable.
+    """
+    if type(pid) is not int or not 0 < pid < 2**31:
+        raise OSError("invalid process identity")
+    if _proc_pidinfo is None or _proc_pidfdinfo is None:
+        result = subprocess.run(["/usr/sbin/lsof", "-n", "-P", "-a", "-p", str(pid), "-Ffan"],
+                                capture_output=True, text=True, timeout=2)
+        if result.returncode:
+            raise OSError("process file inventory unavailable")
+        return writable_open_files(result.stdout)
+
+    def descriptors():
+        item_size = ctypes.sizeof(_FdInfo)
+        needed = _proc_pidinfo(pid, 1, 0, None, 0)  # PROC_PIDLISTFDS
+        if needed <= 0 or needed % item_size or needed // item_size > 16320:
+            raise OSError("incomplete process descriptor inventory")
+        entries = (_FdInfo * (needed // item_size + 64))()
+        size = ctypes.sizeof(entries)
+        count = _proc_pidinfo(pid, 1, 0, entries, size)
+        if count <= 0 or count >= size or count % item_size:
+            raise OSError("truncated process descriptor inventory")
+        return frozenset(e.fd for e in entries[:count // item_size] if e.kind == 1)
+
+    def vnodes(fds):
+        result = {}
+        for fd in fds:
+            info = _VnodeFdInfo()
+            size = ctypes.sizeof(info)
+            if _proc_pidfdinfo(pid, fd, 2, ctypes.byref(info), size) != size:
+                raise OSError("incomplete vnode descriptor")
+            # Access mode, path, device and inode also detect reuse of an FD
+            # number between the two inventories. Ignore changing timestamps.
+            vnode = bytes(info.vnode)
+            result[fd] = (info.openflags & 3, os.fsdecode(info.path), vnode[:4], vnode[8:16])
+        return result
+
+    before = descriptors()
+    files = vnodes(before)
+    if descriptors() != before or vnodes(before) != files:
+        raise OSError("process vnode descriptors changed")
+    paths = set()
+    for flags, name, _device, _inode in files.values():
+        if flags & 2:  # Kernel FWRITE, not userspace O_WRONLY.
+            path = Path(name)
+            if not path.is_absolute():
+                raise OSError("missing vnode path")
+            paths.add(path.resolve())
+    return paths
 
 
 def codex_process_starts(pids):
@@ -573,11 +646,9 @@ class QueueRecovery:
             if cached and time.monotonic() - cached[0] < 1:
                 path, sid = cached[1:]
             else:
-                result = subprocess.run(["/usr/sbin/lsof", "-n", "-P", "-a", "-p", str(pid), "-Ffan"],
-                                        capture_output=True, text=True, timeout=2)
-                paths = {path for path in writable_open_files(result.stdout)
+                paths = {path for path in process_writable_files(pid)
                          if path.suffix == ".jsonl" and path.is_relative_to(self.sessions_root.resolve())}
-                if result.returncode or len(paths) != 1:
+                if len(paths) != 1:
                     return {"kind": "unknown"}
                 path = paths.pop()
                 with path.open() as handle:
@@ -623,11 +694,7 @@ class QueueRecovery:
             started = process_placement_start(pid, target)
             if started is None or started < created_after - 1:
                 return None
-            result = subprocess.run(["/usr/sbin/lsof", "-n", "-P", "-a", "-p", str(pid), "-Ffan"],
-                                    capture_output=True, text=True, timeout=2)
-            if result.returncode:
-                return None
-            files = writable_open_files(result.stdout)
+            files = process_writable_files(pid)
             root = self.sessions_root.resolve()
             if any(p.suffix == ".jsonl" and p.is_relative_to(root) for p in files):
                 return None
