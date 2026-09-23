@@ -297,6 +297,24 @@ def capture():
                 "candidates": records, "batches": batches}
 
 
+def rank_candidates(sources):
+    """Read candidate mtimes in one process; disposal still rechecks identity."""
+    ranked = []
+    for source in sources:
+        with Path(source).open() as handle:
+            for line in handle:
+                name = line.rstrip("\n")
+                if not name:
+                    continue
+                try:
+                    stamp = int(os.lstat(name).st_mtime)
+                except OSError:
+                    stamp = 0  # The existing disposal gates reject vanished paths.
+                ranked.append((stamp, name))
+    for stamp, name in sorted(ranked, key=lambda item: (item[0], os.fsencode(item[1]))):
+        print(f"{stamp}\t{name}")
+
+
 def select(manifest):
     scope = read_json(Path(manifest))
     records = {r["path"]: r["identity"] for r in scope["candidates"]}
@@ -368,10 +386,15 @@ def main():
     exp.add_argument("--shell", action="store_true")
     sel = sub.add_parser("select")
     sel.add_argument("manifest")
+    rank = sub.add_parser("rank-candidates")
+    rank.add_argument("sources", nargs="+")
     run = sub.add_parser("drain")
     run.add_argument("--purge-now", action="store_true")
     args = parser.parse_args()
     try:
+        if args.command == "rank-candidates":
+            rank_candidates(args.sources)
+            return 0
         if args.command == "select":
             select(args.manifest)
             return 0

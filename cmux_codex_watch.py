@@ -59,7 +59,7 @@ DEFAULT_LABEL = f"{LABEL_PREFIX}.{APP_NAME}"
 PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_APP_DIR = Path.home() / "Library" / "Application Support" / APP_NAME
 DEFAULT_RUNTIME_ROOT = DEFAULT_APP_DIR / "runtime"
-RUNTIME_FILES = ("cmux_codex_watch.py", "claude_ccc_protocol.py", "claude_ccc_event_hook.py", "ccc_observation.py", "ccc_scheduling.py", "ccc_codex_queue.py", "ccc_workspace_batch.py")
+RUNTIME_FILES = ("cmux_codex_watch.py", "claude_ccc_protocol.py", "claude_ccc_event_hook.py", "ccc_observation.py", "ccc_scheduling.py", "ccc_codex_queue.py", "ccc_workspace_batch.py", "ccc_inventory.py")
 DEFAULT_LOG_DIR = Path.home() / "Library" / "Logs" / APP_NAME
 DEFAULT_CONFIG_PATH = DEFAULT_APP_DIR / "config.json"
 DEFAULT_STATE_PATH = DEFAULT_APP_DIR / "state.json"
@@ -328,7 +328,7 @@ CLAUDE_CONTEXT_ABSOLUTE_TIMEOUT_SEC = 900.0
 # through TargetRuntime and suppresses duplicate Hook/fallback deliveries.
 # Human label only.  Acceptance always compares SHA-256 of the loaded source:
 # a revision string is hand-maintained and therefore can lie about what runs.
-FEATURE_REVISION = "0.2.12-native-batch-submit"
+FEATURE_REVISION = "0.2.13-batch-authorization-backpressure"
 # How long after our own send a byte-identical UserPromptSubmit can still be
 # our echo.  Must exceed claude_submit_confirm_timeout_sec so that a late
 # echo arriving after the transaction timed out is not read as a human.
@@ -365,6 +365,12 @@ CLAUDE_ORPHAN_ENTER_MAX = 3
 
 class CmuxError(RuntimeError):
     """An expected cmux command or protocol failure."""
+
+
+class CmuxRequestRejected(CmuxError):
+    """The server explicitly refused this request before dispatch."""
+
+    POLLING_RATE_LIMIT = "Error: rate_limited: Polling rate limited for this connection"
 
 
 class UncertainDeliveryError(CmuxError):
@@ -980,7 +986,9 @@ def _match_error_block(block_text: str) -> str | None:
         return "rate_limit"
     # A narrow native viewport can hard-wrap inside "cause" ("c\nause").
     # The caller verifies contiguous error rows before normalizing whitespace.
-    if HIGH_DEMAND.lower().replace(" ", "") in compact:
+    # Current native/provider releases also spell this banner with U+2019.
+    # Keep the complete message and existing marker/quote guards authoritative.
+    if HIGH_DEMAND.lower().replace(" ", "") in compact.replace("’", "'"):
         return "high_demand"
     if RECONNECT_COMPACT_PREFIX_RE.sub("", compact, count=1).lstrip("■⚠└") == "connectionfailed:errorsendingrequest":
         return "stream"
@@ -1211,8 +1219,8 @@ def _codex_status_chrome_rows(grid: Grid, composer_row: int) -> frozenset[int]:
     return frozenset()
 
 
-def _codex_hook_timeout_rows(grid: Grid, composer_row: int) -> frozenset[int]:
-    """A completed hook timeout is not evidence that model work resumed.
+def _codex_hook_failure_rows(grid: Grid, composer_row: int) -> frozenset[int]:
+    """A timed-out or signal-terminated hook is not resumed model work.
 
     Match the complete native two-row failure card only. Exit-code failures,
     decision messages, extra output and quoted examples remain blocking. This
@@ -1223,7 +1231,10 @@ def _codex_hook_timeout_rows(grid: Grid, composer_row: int) -> frozenset[int]:
     for row in range(max(0, composer_row - 1)):
         if grid.lines[row].rstrip() != "• Hook failed":
             continue
-        if not re.fullmatch(r"  └ hook timed out after [0-9]+(?:\.[0-9]+)?s", grid.lines[row + 1].rstrip()):
+        if not re.fullmatch(
+                r"  └ hook (?:timed out after [0-9]+(?:\.[0-9]+)?s"
+                r"|exited without a status code|process terminated without an exit code)",
+                grid.lines[row + 1].rstrip()):
             continue
         if not any(span.row == row and span.column == 0 and span.text.startswith("•")
                    for span in grid.spans):
@@ -2113,7 +2124,7 @@ def classify_grid(grid: Grid) -> ScreenState:
         return ScreenState("composer_busy", screen_signature=grid.signature(), reason="composer contains user text")
     chrome_rows = (_codex_status_chrome_rows(grid, composer_row)
                    | _spinner_chrome_rows(grid, composer_row)
-                   | _codex_hook_timeout_rows(grid, composer_row)
+                   | _codex_hook_failure_rows(grid, composer_row)
                    | _codex_startup_notice_rows(grid, composer_row))
     marker_rows = [row for row, line in enumerate(lines[:composer_row])
                    if row not in chrome_rows and _is_error_marker(line)]
@@ -3586,8 +3597,13 @@ class CmuxClient:
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise CmuxError(str(exc)) from exc
         if result.returncode != 0:
-            detail = (result.stderr or result.stdout or "").strip()[-500:]
-            raise CmuxError(f"cmux {' '.join(args[:2])} failed: {detail}")
+            detail = (result.stderr or result.stdout or "").strip()
+            message = f"cmux {' '.join(args[:2])} failed: {detail[-500:]}"
+            # Match the complete server rejection, not a fragment of output
+            # or a timeout which may have followed a successful mutation.
+            if detail == CmuxRequestRejected.POLLING_RATE_LIMIT:
+                raise CmuxRequestRejected(message)
+            raise CmuxError(message)
         return result
 
     def ping(self) -> bool:
@@ -4467,6 +4483,17 @@ def workspace_rule_by_id(config: Mapping[str, Any], selector: str) -> dict[str, 
     raise RuntimeError(f"workspace rule not found: {selector}")
 
 
+def batch_start_hold(rule, surface_id):
+    """Startup protection is not an operator exclusion, including old jobs."""
+    hold = rule.get("batch_start_holds", {}).get(surface_id)
+    if isinstance(hold, dict) and hold.get("job_id"):
+        return hold
+    reason = rule.get("excluded_surface_reasons", {}).get(surface_id)
+    if isinstance(reason, str) and re.fullmatch(r"batch:[0-9a-fA-F-]{36}:initial", reason):
+        return {"job_id": reason.split(":")[1], "legacy": True}
+    return None
+
+
 def discover_rule_targets(client: CmuxClient, config: Mapping[str, Any]) -> list[dict[str, Any]]:
     rules = [rule for rule in config.get("workspace_rules", []) if rule.get("enabled", True)]
     if not rules:
@@ -4477,7 +4504,7 @@ def discover_rule_targets(client: CmuxClient, config: Mapping[str, Any]) -> list
         workspace_id = str(rule.get("workspace_id") or "")
         excluded = {str(value) for value in rule.get("excluded_surface_ids", [])}
         for record in discover_codex_surfaces(tree, client.top(workspace_id), workspace_id):
-            if record["surface_id"] in excluded:
+            if record["surface_id"] in excluded and not batch_start_hold(rule, record["surface_id"]):
                 continue
             targets.append({
                 **record,
@@ -4745,6 +4772,8 @@ class WatchDaemon:
         self._process_cache_lock = threading.RLock()
         self._config_reload_lock = threading.RLock()
         self._process_snapshots = SnapshotCache(workers=MAINTENANCE_WORKERS)
+        from ccc_inventory import SharedInventory
+        self._shared_inventory = SharedInventory(config_path.parent, owner=True)
         self.codex_queue_recovery.process_lookup = lambda target: self._candidate_process_label(target, self._observation_client())
         self._viewport_socket = CmuxViewportSocket()
         self._scheduler: SurfaceScheduler | None = None
@@ -5987,7 +6016,7 @@ class WatchDaemon:
     def _observation_client(self):
         base = self.client or CmuxClient(str(self.config.get("cmux_path", DEFAULT_CMUX)),
                                          viewport_socket=self._viewport_socket)
-        return SnapshotClient(base, self._process_snapshots)
+        return SnapshotClient(base, self._process_snapshots, self._shared_inventory if self.client is None else None)
 
     def _start_scheduler(self) -> SurfaceScheduler:
         self._scheduler = SurfaceScheduler(
@@ -6072,6 +6101,9 @@ class WatchDaemon:
             return None
         sid = str(target["surface_id"])
         if sid == str(self.config.get("manager_surface_id") or ""):
+            return None
+        if any(r.get("workspace_id") == current.get("workspace_id") and batch_start_hold(r, sid)
+               for r in self.config.get("workspace_rules", [])):
             return None
         explicit = any(str(t.get("surface_id")) == sid for t in self.config.get("targets", []))
         if not explicit:
@@ -6180,6 +6212,9 @@ class WatchDaemon:
                                                 retry_needed=self._native_retry_needed)
         scheduler.observation_interval = native_wakeup.observation_interval
         native_wakeup.start()
+        from ccc_workspace_batch import BatchReconciler
+        batch_reconciler = BatchReconciler(self.config_path, self._observation_client())
+        batch_reconciler.start()
         last_publish = 0.0
         previous_switch_interval = sys.getswitchinterval()
         try:
@@ -6210,6 +6245,8 @@ class WatchDaemon:
                         self.claude_event_inbox.wait(float(self.config.get("cmux_unavailable_poll_sec", 2)))
                         continue
                 self._reload_config_if_changed()
+                if self.client is None:
+                    self._shared_inventory.heartbeat()
                 self._schedule_diagnostics()
                 with self._targets_lock:
                     targets = effective_targets(self.config, self.dynamic_targets.values())
@@ -6226,6 +6263,7 @@ class WatchDaemon:
             return 0
         finally:
             sys.setswitchinterval(previous_switch_interval)
+            batch_reconciler.close()
             native_wakeup.close()
             scheduler.close()
             if self._diagnostics_pool is not None:
@@ -6502,6 +6540,13 @@ class WatchDaemon:
             if not current():
                 return None
             if defer_send:
+                # Reconnecting paints the same provider error while Codex is
+                # still inside its own retry loop. Reject that native active
+                # turn before it occupies a send slot and refreshes topology.
+                # The send path repeats this check, including after durable
+                # persistence: an observation never grants input permission.
+                if not self._codex_turn_ready(target, runtime, state):
+                    return None
                 self._record_observation(surface_id, runtime, state)
                 runtime.candidate_observed_at = runtime.viewport_checked_at
                 return state
@@ -10426,19 +10471,8 @@ def cli(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(added, ensure_ascii=False, indent=2))
         return 0
     if args.command in {"add-workspace", "track-workspace"}:
-        client = CmuxClient(str(config.get("cmux_path", DEFAULT_CMUX)))
-        tree = client.tree()
-        workspace, surfaces = _discover_workspace(client, tree, args.selector)
-        new_rule = _workspace_rule_from_record(workspace, args.name)
-
-        def add_rule(latest: dict[str, Any]) -> dict[str, Any]:
-            if any(rule.get("workspace_id") == workspace["workspace_id"] for rule in latest["workspace_rules"]):
-                raise RuntimeError(f"workspace already registered: {workspace['workspace_id']}")
-            latest["workspace_rules"].append(new_rule)
-            return new_rule
-
-        _, rule, _ = store.mutate(add_rule)
-        print(json.dumps({"rule": rule, "active_codex_surfaces": surfaces}, ensure_ascii=False, indent=2))
+        from ccc_workspace_batch import authorize_workspace
+        print(json.dumps(authorize_workspace(config_path, args.selector, args.name), ensure_ascii=False, indent=2))
         return 0
     if args.command == "pause-workspace":
         transport = CmuxViewportSocket()

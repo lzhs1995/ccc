@@ -320,14 +320,29 @@ class SnapshotCache:
 class SnapshotClient:
     """Per-worker client; process/topology snapshots are shared across workers."""
 
-    def __init__(self, client, cache: SnapshotCache):
-        self.client, self.cache = client, cache
+    def __init__(self, client, cache: SnapshotCache, shared=None):
+        self.client, self.cache, self.shared = client, cache, shared
 
     def __getattr__(self, name):
         return getattr(self.client, name)
 
     def tree(self):
-        return self.cache.get(("tree",), self.client.tree, ttl=1.0)
+        return self.cache.get(("tree",), lambda: self._inventory("tree", self.client.tree, 1), ttl=1.0)
+
+    def fresh_tree(self):
+        return self.client.tree()
+
+    def _inventory(self, name, loader, ttl):
+        if self.shared is None:
+            return loader()
+        # Import lazily: the scheduling primitives also run without cmux.
+        from ccc_inventory import InventoryUnavailable
+        try:
+            return self.shared.get(name, loader, ttl=ttl,
+                                   wait_timeout=1.0 if name == "tree" else 0)
+        except InventoryUnavailable as exc:
+            from cmux_codex_watch import CmuxError
+            raise CmuxError(str(exc)) from exc
 
     def top(self, workspace_id):
         top = self.cached_top(workspace_id, wait=True)
@@ -350,11 +365,12 @@ class SnapshotClient:
         if callable(getattr(self.client, "top_all", None)):
             # cmux top scans the process table even with a workspace filter.
             # Share one fleet scan; callers still join by exact surface UUID.
-            return self.cache.get(("top",), self.client.top_all, ttl=5.0, wait=wait)
+            return self.cache.get(("top",), lambda: self._inventory("top", self.client.top_all, 5),
+                                  ttl=5.0, wait=wait)
         return self.cache.get(("top", workspace_id), lambda: self.client.top(workspace_id), ttl=5.0, wait=wait)
 
     def top_all(self):
-        return self.cache.get(("top",), self.client.top_all, ttl=5.0)
+        return self.cached_top("", wait=True)
 
     def process_labels(self, workspace_id, classify, *, wait=False):
         top = self.cached_top(workspace_id, wait=wait)

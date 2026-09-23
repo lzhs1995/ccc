@@ -31,6 +31,28 @@ class CodexTurnGateTests(unittest.TestCase):
         self.daemon.process_once(self.client)
         self.assertEqual(len(self.client.sent), 1)
 
+    def test_native_retries_do_not_enter_the_send_queue(self):
+        target = self.daemon.config["targets"][0]
+        for kind in ("task_started", "user_message", "unknown", "turn_aborted"):
+            with self.subTest(kind=kind):
+                self.turn.return_value = {"kind": kind}
+                candidate = self.daemon._scheduled_observe(target, lambda: True)
+                self.assertIsNone(candidate)
+        self.assertEqual(self.client.sent, [])
+        self.turn.return_value = self.finished
+        candidate = self.daemon._scheduled_observe(target, lambda: True)
+        self.assertEqual(candidate.kind, "recoverable_error")
+        self.daemon._scheduled_send(target, candidate, lambda: True)
+        self.assertEqual(len(self.client.sent), 1)
+
+    def test_user_turn_after_observation_still_cancels_scheduled_send(self):
+        target = self.daemon.config["targets"][0]
+        candidate = self.daemon._scheduled_observe(target, lambda: True)
+        self.assertEqual(candidate.kind, "recoverable_error")
+        self.turn.return_value = {"kind": "task_started"}
+        self.daemon._scheduled_send(target, candidate, lambda: True)
+        self.assertEqual(self.client.sent, [])
+
     def test_new_user_turn_between_persistence_and_io_cancels_send(self):
         self.turn.side_effect = [self.finished, {"kind": "task_started"}]
         self.daemon.process_once(self.client)

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -38,6 +40,23 @@ class MaintenanceTests(JanitorTestCase):
         self.assertTrue(before.exists())
         self.assertFalse(due.exists())
         self.assertEqual(result["expired_batches"], 1)
+
+    def test_mixed_candidate_ranking_needs_no_per_file_processes(self):
+        first, second = self.box.jd / 'first.txt', self.box.jd / 'second.txt'
+        newer, older = self.box.cm / 'newer.sb-file', self.box.staging / UUIDS[0]
+        newer.write_text('newer')
+        older.mkdir(parents=True, exist_ok=True)
+        os.utime(newer, (2000, 2000))
+        os.utime(older, (1000, 1000))
+        missing = self.box.cm / 'gone.sb-file'
+        first.write_text(f'{newer}\n{missing}\n')
+        second.write_text(f'{older}\n')
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), patch.object(maintenance.subprocess, 'run',
+                side_effect=AssertionError('per-file subprocess')):
+            maintenance.rank_candidates([first, second])
+        self.assertEqual(output.getvalue().splitlines(),
+                         [f'0\t{missing}', f'1000\t{older}', f'2000\t{newer}'])
 
     def test_exact_expiry_boundary_uses_seal_not_directory_mtime(self):
         batch = self.box.batch("boundary", sealed_ago_h=0)

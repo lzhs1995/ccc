@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.2.13
+
+- Keep active native Codex reconnects out of the send queue before topology preflight, so a provider outage cannot fill every send slot with tasks that are still retrying. Revalidate completion again before actual input.
+- Match both `We're` and `We’re` in the complete high-demand banner, including wrapped text. A typographic apostrophe must not leave an authorized failed task classified as idle.
+- Recognize native Hook termination cards without an exit status, as well as timeouts, when a current provider failure needs continuation. Hook failures alone never trigger input; explicit hook decisions and newer task output still block it.
+- Add a backed-up, opt-in migration for the legacy Codex shell/launchd binary-copy loop, and document matched official CLI/helper upgrades without resetting sessions or TCC permissions.
+- Confirm the original batch task through combined AGENTS/environment context and incremental, partial JSONL records. Persist proof before releasing startup protection; recover legacy holds from every relevant batch.
+- Separate startup holds from operator exclusions and show `整池／启动中`. Repeated workspace authorization is idempotent and preserves manual P, exclusions and per-surface pauses.
+- Share timestamped tree/process inventories across the watcher, panel and batch workers. Coalesce failed scans, limit global process discovery to once per five seconds, and continue local confirmation during RPC failures.
+- Share four startup permits and at most two starts per second. Menus and drafts yield their permit; uncertain RPCs keep their durable record without monopolizing capacity. A waiting pool cannot block all other pools, and capacity checks read only active jobs.
+- Give new batches separate SQLite runtimes, seeded through read-only native metadata backups. Avoid both the busy global log database and a full reindex of old rollouts. Discover new Codex children directly from the bootstrap shell when system.top is unavailable.
+- Confirm the first task without waiting for topology refresh, releasing its startup permit promptly. Read native writer descriptors directly on macOS instead of launching lsof for each poll; incomplete reads, descriptor reuse and process/session changes still reject evidence.
+- Let send preflights join an in-flight cross-process topology refresh with a bounded wait, retaining fresh-snapshot requirements instead of repeatedly caching a transient `tree refresh pending` failure.
+- Read and rank janitor candidate timestamps in one process, retaining oldest-first selection and all disposal checks without spawning a separate `stat` for every candidate.
+- Queue B when macOS PTYs are exhausted instead of creating unusable tabs. Recover proven pre-session database/PTY startup failures in the same surface, preserving native sessions, drafts and operator pauses. Include an optional LaunchDaemon for macOS's supported 999-PTY ceiling.
+- Retry cmux's exact pre-dispatch polling rejection with exponential backoff, including legacy batch slots stranded with stale launch receipts. Preserve uncertain deliveries and recheck original surfaces, native sessions, drafts and pool authorization before each retry.
+
 ## 0.2.12
 
 - Confirm a new native Codex session before its first rollout exists, using the

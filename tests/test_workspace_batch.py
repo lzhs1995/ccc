@@ -52,7 +52,7 @@ class BatchFixture:
         sid, session = str(uuid.uuid4()), str(uuid.uuid4())
         self.calls.append(sid)
         with patch.dict(os.environ, {'CMUX_SURFACE_ID': sid, 'CMUX_WORKSPACE_ID': wid}):
-            batch.register(self.test.config, jid, index)
+            batch.register(self.test.config, jid, index, tokens[tokens.index('--launch-id') + 1])
         path = self.test.root / f'{session}.jsonl'
         path.write_text(json.dumps({'type': 'session_meta', 'payload': {'id': session}}) + '\n')
         self.bindings[session] = {'surfaceId': sid, 'workspaceId': wid, 'transcriptPath': str(path)}
@@ -77,10 +77,10 @@ class BatchFixture:
         self.test.assertEqual((wid, message), (self.test.wid, batch.PROMPT))
         job = core.load_json(self.test.worker.path, {})
         self.test.assertEqual(next(s for s in job['slots'] if s.get('surface_id') == sid)['phase'], 'submitting')
-        self.test.assertIn(sid, self.test.store.load()['workspace_rules'][0]['excluded_surface_ids'])
+        self.test.assertEqual(core.batch_start_hold(self.test.store.load()['workspace_rules'][0], sid)['job_id'], job['id'])
         self.sent.append(sid)
         binding = self.bindings[self.states[sid]['session_id']]
-        stamp = datetime.now(timezone.utc).isoformat()
+        stamp = datetime.fromtimestamp(self.test.worker.clock(), timezone.utc).isoformat()
         with Path(binding['transcriptPath']).open('a') as handle:
             # Codex can write task_started before the user_message event.
             for payload in ({'type': 'task_started', 'turn_id': 'first'},
@@ -98,6 +98,18 @@ class BatchFixture:
 
 class WorkspaceBatchTests(unittest.TestCase):
     def setUp(self):
+        # The fixture's register() runs inside the test runner, not a cmux
+        # shell. Never pin the runner's real parent as a launched batch shell.
+        shell = patch.object(batch, 'batch_shell_identity', return_value=None)
+        shell.start()
+        self.addCleanup(shell.stop)
+        pty = patch.object(batch, 'pty_available', return_value=True)
+        pty.start()
+        self.addCleanup(pty.stop)
+        seed = patch.object(batch, 'prepare_sqlite_home', side_effect=lambda config, jid:
+                            batch.sqlite_home(config, jid, 0).mkdir(parents=True, exist_ok=True))
+        seed.start()
+        self.addCleanup(seed.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
@@ -107,11 +119,16 @@ class WorkspaceBatchTests(unittest.TestCase):
         self.store.mutate(lambda c: c.update(mode='armed', global_paused=False))
         self.client = BatchFixture(self)
         self.job = batch.start(self.config, self.wid, client=self.client, launch=False)
-        self.worker = batch.BatchWorker(self.config, self.job['job_id'], client=self.client, queue=self.client)
+        self.now = time.time()
+        self.worker = batch.BatchWorker(self.config, self.job['job_id'], client=self.client, queue=self.client,
+                                        clock=lambda: self.now, pty_probe=lambda: True)
+        self.addCleanup(self.worker.cache.close)
         self.worker.job['status'] = 'running'
 
     def finish(self):
+        self.worker.clock = lambda: self.now
         for _ in range(110):
+            self.now += 1
             if not self.worker.step():
                 break
         return batch.counts(self.worker.job)
@@ -250,9 +267,15 @@ class WorkspaceBatchTests(unittest.TestCase):
                 {'type': 'input_text', 'text': batch.PROMPT}]}},
         ]
         path.write_text('\n'.join(json.dumps(row) for row in rows) + '\n')
-        self.worker._advance(slot)
+        with patch.object(self.client, 'tree', side_effect=core.CmuxError('tree refresh pending')), \
+                patch.object(self.client, 'send_text') as send, \
+                patch.object(self.client, 'send_key', create=True) as enter:
+            self.worker._advance(slot, confirmation_only=True)
+            send.assert_not_called()
+            enter.assert_not_called()
         self.assertEqual(slot['phase'], 'confirmed')
         self.assertNotIn(sid, self.store.load()['workspace_rules'][0]['excluded_surface_ids'])
+        self.assertNotIn(sid, self.store.load()['workspace_rules'][0].get('batch_start_holds', {}))
 
     def test_separate_enter_requires_exact_recorded_draft_and_is_never_repeated(self):
         self.worker.step()

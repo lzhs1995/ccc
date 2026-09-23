@@ -780,16 +780,10 @@ fi
 # The old script gave .sb-* and staging a 500 cap EACH, so a run could touch
 # 1000 items (production logged candidates=514). One queue, ordered by mtime so
 # neither class starves — plain `sort` was lexicographic by path.
-{
-  while IFS= read -r f; do
-    [ -n "$f" ] || continue
-    printf '%s\t%s\n' "$("$STAT" -f%m "$f" 2>/dev/null || echo 0)" "$f"
-  done < "$SB_CAND"
-  while IFS= read -r d; do
-    [ -n "$d" ] || continue
-    printf '%s\t%s\n' "$("$STAT" -f%m "$d" 2>/dev/null || echo 0)" "$d"
-  done < "$ST_CAND"
-} | "$SORT" -t"$(printf '\t')" -k1,1n -k2,2 > "$RUN_TMP/all_cand.txt"
+if ! "$PYTHON" -B "$MAINTENANCE" rank-candidates "$SB_CAND" "$ST_CAND" > "$RUN_TMP/all_cand.txt"; then
+  log "ABORT candidate timestamp scan failed"
+  exit 1
+fi
 
 if [ -n "$DRAIN_MANIFEST" ]; then
   if ! "$PYTHON" -B "$MAINTENANCE" select "$DRAIN_MANIFEST" < "$RUN_TMP/all_cand.txt" > "$RUN_TMP/scoped.txt"; then

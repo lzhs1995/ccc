@@ -1353,7 +1353,7 @@ class GroupedViewTests(unittest.TestCase):
         self.assertEqual(group_action_error(plain, "workspace"), "")
         self.assertEqual(group_action_error(pool, "untrack_workspace"), "")
         # Inapplicable ones are refused here, so the prompt never lies.
-        self.assertIn("已经是整池授权", group_action_error(pool, "workspace"))
+        self.assertEqual("", group_action_error(pool, "workspace"))
         self.assertIn("没有整池授权", group_action_error(plain, "untrack_workspace"))
         self.assertIn("组头", group_action_error(plain, "add"))
         self.assertEqual(member.kind, "member")
@@ -1459,8 +1459,8 @@ class GroupedViewTests(unittest.TestCase):
             self.assertEqual(calls[0][:2], ["track-workspace", "ws-1"])
             model.mutate_workspace(pool, "untrack_workspace")
             self.assertEqual(calls[1], ["untrack-workspace", "ws-9"])
-            with self.assertRaisesRegex(RuntimeError, "已经是整池授权"):
-                model.mutate_workspace(pool, "workspace")
+            model.mutate_workspace(pool, "workspace")
+            self.assertEqual(calls[-1][:2], ["track-workspace", pool.workspace_id])
             with self.assertRaisesRegex(RuntimeError, "没有整池授权"):
                 model.mutate_workspace(plain, "untrack_workspace")
             with self.assertRaisesRegex(RuntimeError, "组头只支持"):

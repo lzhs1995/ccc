@@ -11,6 +11,9 @@ from ccc_codex_queue import QueueRecovery
 
 class ProcessSessionTests(unittest.TestCase):
     def setUp(self):
+        files = patch('ccc_codex_queue._proc_pidfdinfo', None)
+        files.start()
+        self.addCleanup(files.stop)
         portable = patch('ccc_codex_queue._procargs_sysctl', None)
         portable.start()
         self.addCleanup(portable.stop)
