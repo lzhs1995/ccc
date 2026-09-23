@@ -152,6 +152,30 @@ class CodexProviderRateLimitTests(unittest.TestCase):
 
 
 class CodexStatusChromeTests(unittest.TestCase):
+    def test_status_above_verified_composer_particles_still_allows_recovery(self):
+        for error in (PROVIDER_RATE_LIMIT, "high_demand"):
+            for columns in (40, 58, 77, 126):
+                for count in (1, 2):
+                    with self.subTest(error=error, columns=columns, count=count):
+                        payload = status_payload(error, columns, count, word_wrap=True)
+                        grid = payload["render_grid"]
+                        grid["styles"].append({"id": 4, "foreground_source": "rgb", "bold": False})
+                        grid["row_spans"].append(span(53, 2, "⢀  ⠈   ⠁ ⢀", 4))
+                        state = core.classify_grid(core.Grid.from_rpc(payload, "surface-uuid"))
+                        self.assertEqual(state.kind, "recoverable_error")
+                        self.assertIn(51, state.ignored_chrome_rows)
+                        self.assertIn(53, state.ignored_chrome_rows)
+
+    def test_unverified_particles_or_real_output_cannot_hide_status_blocker(self):
+        for text, style in (("⢀  ⠈   ⠁ ⢀", 0), ("new output", 4), ("› user input", 4)):
+            with self.subTest(text=text, style=style):
+                payload = status_payload(PROVIDER_RATE_LIMIT)
+                grid = payload["render_grid"]
+                grid["styles"].append({"id": 4, "foreground_source": "rgb", "bold": False})
+                grid["row_spans"].append(span(53, 2, text, style))
+                state = core.classify_grid(core.Grid.from_rpc(payload, "surface-uuid"))
+                self.assertEqual(state.kind, "error_superseded")
+
     def test_live_429_background_terminal_is_not_new_output(self):
         state = core.classify_grid(core.Grid.from_rpc(captured_payload(), "surface-uuid"))
         self.assertEqual((state.kind, state.error_type), ("recoverable_error", "rate_limit"))
