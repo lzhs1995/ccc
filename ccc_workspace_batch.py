@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -28,6 +29,7 @@ from ccc_inventory import SharedInventory
 from ccc_scheduling import SnapshotCache, SnapshotClient
 
 COUNT = 50
+WORKER_VERSION = 14
 PROMPT = "show me u power"
 INITIALIZING = {"creating", "create_unknown", "created", "restarting", "restart_unknown",
                 "submitted", "submitting", "uncertain"}
@@ -74,7 +76,7 @@ def counts(job):
             "ready": sum(bool(s.get("session_id")) for s in slots),
             "submitted": sum(s.get("phase") in {"submitted", "confirmed"} for s in slots),
             "started": sum(s.get("phase") == "confirmed" for s in slots),
-            "failed": sum(s.get("phase") in {"blocked", "uncertain", "create_unknown"} for s in slots),
+            "failed": sum(s.get("phase") in {"blocked", "surface_closed", "uncertain", "create_unknown"} for s in slots),
             "total": len(slots)}
 
 
@@ -849,8 +851,13 @@ class BatchWorker:
             self.processes = {}
             self.job["error"] = str(exc)
         self.job["status"] = "running"
+        present = {r["surface_id"] for r in core.workspace_surface_records(tree, self.job["workspace_id"]).values()}
         for slot in self.job["slots"]:
             if slot["phase"] not in INITIALIZING | {"startup_wait", "restart_pending", "pty_wait"} or self.clock() < slot.get("retry_at", 0):
+                continue
+            if (slot.get("surface_id") and slot["surface_id"] not in present
+                    and self.clock() - slot.get("launched_at", slot.get("created_at", self.clock())) >= 5):
+                slot.update(phase="surface_closed", error="原 surface 已关闭或移出本池；不补建替代会话")
                 continue
             try:
                 self._advance(slot)
@@ -870,7 +877,7 @@ class BatchWorker:
         if all(s["phase"] == "confirmed" for s in self.job["slots"]):
             self.job["status"] = "complete"
             self.job.pop("error", None)
-        elif all(s["phase"] in {"confirmed", "blocked"} for s in self.job["slots"]):
+        elif all(s["phase"] in {"confirmed", "blocked", "surface_closed"} for s in self.job["slots"]):
             self.job["status"] = "needs_attention"
         self.save()
         return self.job["status"] not in {"complete", "needs_attention", "cancelled", "workspace_closed"}
@@ -879,7 +886,7 @@ class BatchWorker:
         try:
             with core.FileLock(self.path.parent / "worker.lock", timeout_sec=0):
                 self.job = core.load_json(self.path, {})
-                self.job.update(status="running", worker_pid=os.getpid(), worker_version=13)
+                self.job.update(status="running", worker_pid=os.getpid(), worker_version=WORKER_VERSION)
                 for slot in self.job["slots"]:
                     # v0.2.12 marked slow starts blocked at 25 s. Explicit
                     # operator-task/authorization vetoes remain blocked.
@@ -965,7 +972,11 @@ class BatchReconciler:
                         self.launched[jid] = time.monotonic()
             except (OSError, ValueError, RuntimeError) as exc:
                 # A running worker holds the lock; it owns both job and proof.
-                if "lock" not in str(exc).lower():
+                if "lock" in str(exc).lower() and self.launch:
+                    job = core.load_json(path, {})
+                    if job and allowed(self.store.load(), job):
+                        retire_old_worker(job)
+                else:
                     logging.getLogger(core.APP_NAME).warning("batch=%s reconciliation: %s", jid, exc)
 
     def _run(self):
@@ -975,6 +986,30 @@ class BatchReconciler:
             except (OSError, ValueError, RuntimeError) as exc:
                 logging.getLogger(core.APP_NAME).warning("batch reconciliation: %s", exc)
             self.stop.wait(2)
+
+
+def retire_old_worker(job):
+    """An old panel cannot keep a pre-upgrade helper alive indefinitely.
+
+    Only the exact batch helper is retired. Native Codex processes and
+    independently owned acceptance controllers are never signalled.
+    """
+    pid = job.get("worker_pid")
+    if job.get("worker_version", 0) >= WORKER_VERSION or type(pid) is not int or pid <= 1:
+        return False
+    try:
+        result = subprocess.run(["/bin/ps", "-p", str(pid), "-o", "command="],
+                                capture_output=True, text=True, timeout=1)
+        args = shlex.split(result.stdout.strip())
+        index = next((i for i, arg in enumerate(args) if Path(arg).name == "ccc_workspace_batch.py"), -1)
+        if index < 0 or args[index + 1:index + 2] != ["run"] or "--job" not in args:
+            return False
+        if args[args.index("--job") + 1] != job["id"]:
+            return False
+        os.kill(pid, signal.SIGTERM)
+        return True
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        return False
 
 
 def main():

@@ -6,6 +6,7 @@ from pathlib import Path
 import shlex
 import sqlite3
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 import uuid
@@ -189,6 +190,18 @@ class BatchStartupTests(unittest.TestCase):
             'last_start': self.now - 2, 'last_job': self.job['job_id']})
         self.assertTrue(self.worker._reserve_start(self.worker.job['slots'][0]))
 
+    def test_closed_surface_releases_permit_without_replacement(self):
+        self.worker.step()
+        first = self.worker.job['slots'][0]
+        original = first['surface_id']
+        self.client.calls.clear()  # The user closed this tab, not its workspace.
+        self.now += 6
+        self.worker.step()
+        self.assertEqual(first['phase'], 'surface_closed')
+        self.assertEqual(first['surface_id'], original)
+        self.assertEqual(len(self.client.calls), 1)  # Next original pending slot.
+        self.assertNotEqual(self.client.calls[0], original)
+
 
 class DirectBatchProcessTests(unittest.TestCase):
     def label(self, *, reused=False, truncated=False, foreign=False):
@@ -216,6 +229,18 @@ class DirectBatchProcessTests(unittest.TestCase):
         for case in ('reused', 'truncated', 'foreign'):
             with self.subTest(case=case):
                 self.assertIsNone(self.label(**{case: True}))
+
+    def test_upgrade_retires_only_matching_older_batch_helper(self):
+        job = {'id': str(uuid.uuid4()), 'worker_version': batch.WORKER_VERSION-1, 'worker_pid': 12345}
+        good = '/usr/bin/python3 /release/ccc_workspace_batch.py run --config /config.json --job ' + job['id']
+        for command, expected in [(good, True), ('/Applications/codex', False),
+                                  (good.replace(job['id'], str(uuid.uuid4())), False),
+                                  ('/usr/bin/python3 /acceptance/live_batch.py', False)]:
+            with self.subTest(command=command), \
+                    patch.object(batch.subprocess, 'run', return_value=SimpleNamespace(stdout=command)), \
+                    patch.object(batch.os, 'kill') as kill:
+                self.assertEqual(batch.retire_old_worker(job), expected)
+                self.assertEqual(kill.call_count, int(expected))
 
 
 class NativeMetadataSeedTests(unittest.TestCase):
