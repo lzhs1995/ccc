@@ -1,8 +1,10 @@
 """Cross-process inventory bounds under large/slow/failing fleet discovery."""
 import json
+import fcntl
 import multiprocessing
 from pathlib import Path
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import Mock
@@ -92,3 +94,38 @@ class InventoryTests(unittest.TestCase):
         owner.heartbeat()
         self.assertEqual(reader.get('tree', tree, ttl=1), {'windows': []})
         self.assertEqual(tree.call_count, 2)
+
+    def test_send_reader_joins_running_tree_refresh_without_second_collection(self):
+        owner = SharedInventory(self.root)
+        reader = SharedInventory(self.root)
+        entered, finish = threading.Event(), threading.Event()
+        def collect():
+            entered.set()
+            self.assertTrue(finish.wait(2))
+            return {'windows': [{'id': 'current'}]}
+        thread = threading.Thread(target=lambda: owner.get('tree', collect, ttl=1))
+        thread.start()
+        self.assertTrue(entered.wait(2))
+        release = threading.Timer(.05, finish.set)
+        release.start()
+        duplicate = Mock(side_effect=AssertionError('duplicate collection'))
+        try:
+            self.assertEqual(reader.get('tree', duplicate, ttl=1, wait_timeout=1),
+                             {'windows': [{'id': 'current'}]})
+            duplicate.assert_not_called()
+        finally:
+            finish.set()
+            thread.join(2)
+            release.join(2)
+
+    def test_bounded_tree_wait_never_uses_expired_snapshot(self):
+        inventory = SharedInventory(self.root)
+        inventory._write('tree', {'value': {'old': True}, 'collected_at':time.time()-10})
+        loader = Mock()
+        with (inventory.root / 'tree.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            started = time.monotonic()
+            with self.assertRaisesRegex(InventoryUnavailable, 'tree refresh pending'):
+                inventory.get('tree', loader, ttl=1, wait_timeout=.05)
+            self.assertLess(time.monotonic()-started, .5)
+        loader.assert_not_called()

@@ -8,6 +8,8 @@
 - Share four startup permits and at most two starts per second. Menus and drafts yield their permit; uncertain RPCs keep their durable record without monopolizing capacity. A waiting pool cannot block all other pools, and capacity checks read only active jobs.
 - Give new batches separate SQLite runtimes, seeded through read-only native metadata backups. Avoid both the busy global log database and a full reindex of old rollouts. Discover new Codex children directly from the bootstrap shell when system.top is unavailable.
 - Confirm the first task without waiting for topology refresh, releasing its startup permit promptly. Read native writer descriptors directly on macOS instead of launching lsof for each poll; incomplete reads, descriptor reuse and process/session changes still reject evidence.
+- Let send preflights join an in-flight cross-process topology refresh with a bounded wait, retaining fresh-snapshot requirements instead of repeatedly caching a transient `tree refresh pending` failure.
+- Read and rank janitor candidate timestamps in one process, retaining oldest-first selection and all disposal checks without spawning a separate `stat` for every candidate.
 - Queue B when macOS PTYs are exhausted instead of creating unusable tabs. Recover proven pre-session database/PTY startup failures in the same surface, preserving native sessions, drafts and operator pauses. Include an optional LaunchDaemon for macOS's supported 999-PTY ceiling.
 
 ## 0.2.12

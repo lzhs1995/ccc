@@ -338,7 +338,8 @@ class SnapshotClient:
         # Import lazily: the scheduling primitives also run without cmux.
         from ccc_inventory import InventoryUnavailable
         try:
-            return self.shared.get(name, loader, ttl=ttl)
+            return self.shared.get(name, loader, ttl=ttl,
+                                   wait_timeout=1.0 if name == "tree" else 0)
         except InventoryUnavailable as exc:
             from cmux_codex_watch import CmuxError
             raise CmuxError(str(exc)) from exc

@@ -73,7 +73,7 @@ class SharedInventory:
         age = self.clock() - record.get("collected_at", 0)
         return record.get("value") if 0 <= age <= max_age else None
 
-    def get(self, name, loader, *, ttl):
+    def get(self, name, loader, *, ttl, wait_timeout=0):
         self.heartbeat()
         now = self.clock()
         record = self._read(name)
@@ -88,10 +88,26 @@ class SharedInventory:
             raise InventoryUnavailable(f"{name} refresh pending")
         self.root.mkdir(parents=True, exist_ok=True)
         with (self.root / f"{name}.lock").open("a") as lock:
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                raise InventoryUnavailable(f"{name} refresh pending") from None
+            deadline = time.monotonic() + max(0, wait_timeout)
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    # A send preflight can share another process's in-flight
+                    # tree read. Returning "pending" here used to poison the
+                    # local cache for a full polling period on every collision.
+                    record = self._read(name)
+                    now = self.clock()
+                    if (record.get("value") is not None
+                            and 0 <= now - record.get("collected_at", 0) < ttl):
+                        return record["value"]
+                    if record.get("error") and 0 <= now - record.get("attempt_at", 0) < ttl:
+                        raise InventoryUnavailable(record["error"])
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise InventoryUnavailable(f"{name} refresh pending") from None
+                    time.sleep(min(.02, remaining))
             # Another process may have completed between the read and lock.
             record = self._read(name)
             now = self.clock()
