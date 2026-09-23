@@ -494,12 +494,21 @@ class BatchWorker:
             return
         if slot["phase"] != "created":
             return
+        if not receipt:
+            slot["error"] = "等待新 shell 原始回执"
+            return
+        if not self._protected(self.store.load(), slot):
+            slot.update(phase="blocked", error="此路授权已被修改，未发送 prompt")
+            return
         target = self._target(slot)
+        native = self._native(target, slot)
+        if native and native.get("session_id") and native.get("kind") not in {"unknown", "uninitialized"}:
+            slot.update(phase="blocked", error="此 session 已有任务，未发送批量 prompt")
+            return
         grid = core.Grid.from_rpc(self.client.replay(target["workspace_id"], target["surface_id"]), target["surface_id"])
         if core.classify_grid(grid).kind != "idle" or core._composer_status(grid)[0] != "empty":
             slot["error"] = "等待空输入框；启动确认、草稿或运行中任务不会被覆盖"
             return
-        native = self._native(target, slot)
         if not native or not native.get("session_id") or not native.get("pid"):
             slot["error"] = "等待 Codex 原 session 就绪"
             return

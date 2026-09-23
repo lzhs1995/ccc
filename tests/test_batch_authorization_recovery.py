@@ -231,3 +231,21 @@ class BatchAuthorizationTests(unittest.TestCase):
         daemon = core.WatchDaemon(self.config, self.root / 'state.json', client=self.client)
         self.addCleanup(daemon._process_snapshots.close)
         self.assertIsNone(daemon._active_send_target(record))
+
+    def test_operator_takeover_releases_startup_capacity_even_while_view_is_busy(self):
+        self.worker.step()
+        slot=self.worker.job['slots'][0]
+        self.client.frame_options={'working':True}
+        self.client.states[slot['surface_id']]['kind']='task_started'
+        self.worker._advance(slot)
+        self.assertEqual(slot['phase'],'blocked')
+        self.assertEqual(self.client.sent,[])
+
+    def test_manual_include_is_not_left_waiting_on_a_busy_composer(self):
+        self.worker.step()
+        slot=self.worker.job['slots'][0]
+        self.store.mutate(lambda c:c['workspace_rules'][0]['batch_start_holds'].clear())
+        self.client.frame_options={'composer':'operator draft'}
+        self.worker._advance(slot)
+        self.assertEqual(slot['phase'],'blocked')
+        self.assertEqual(self.client.sent,[])
