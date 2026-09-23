@@ -27,6 +27,21 @@ def covered_prompt_payload(prefix="  "):
 
 
 class CodexReconnectRecoveryTests(unittest.TestCase):
+    def test_typographic_apostrophe_recovers_but_preserves_input_guards(self):
+        error = HIGH_DEMAND_TEXT.replace("'", "’")
+        for options, expected in (({}, 'recoverable_error'), ({'composer': 'busy'}, 'composer_busy'),
+                                  ({'menu': True}, 'menu'), ({'working': True}, 'working')):
+            with self.subTest(options=options), tempfile.TemporaryDirectory() as directory:
+                payload = grid_payload([], error=error, **options)
+                text = '\n'.join(visible_lines(payload))
+                client = FakeClient(payload, text)
+                daemon = armed_daemon(directory, client)
+                self.addCleanup(daemon._process_snapshots.close)
+                self.assertEqual(core.classify_grid(core.Grid.from_rpc(payload, 'surface-uuid')).kind, expected)
+                daemon.process_once(client)
+                daemon.process_once(client)
+                self.assertEqual(len(client.sent), 1 if expected == 'recoverable_error' else 0)
+
     def test_native_rate_limit_prefix_added_to_provider_prefix_is_recoverable(self):
         banner = ('rate limit exceeded: rate limit exceeded: Your requests to gpt-6-astra '
                   'for gpt-6-astra in eastus2 have exceeded rate limit.')
@@ -216,9 +231,10 @@ class CodexReconnectRecoveryTests(unittest.TestCase):
                 self.assertEqual(len(client.sent), 1)
 
     def test_high_demand_hard_wrap_at_every_character_stays_current(self):
-        banner = "■ " + HIGH_DEMAND_TEXT
-        for split in range(3, len(banner)):
-            with self.subTest(split=split):
+        for split, banner in ((split, '■ ' + text) for text in
+                              (HIGH_DEMAND_TEXT, HIGH_DEMAND_TEXT.replace("'", "’"))
+                              for split in range(3, len('■ ' + text))):
+            with self.subTest(split=split, banner=banner):
                 payload = covered_prompt_payload("⡀ ")
                 grid = payload["render_grid"]
                 row = grid["cursor"]["row"]

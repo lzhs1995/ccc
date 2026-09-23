@@ -2,6 +2,7 @@
 
 ## 0.2.13
 
+- Match both `We're` and `We’re` in the complete high-demand banner, including wrapped text. A typographic apostrophe must not leave an authorized failed task classified as idle.
 - Recognize native Hook termination cards without an exit status, as well as timeouts, when a current provider failure needs continuation. Hook failures alone never trigger input; explicit hook decisions and newer task output still block it.
 - Add a backed-up, opt-in migration for the legacy Codex shell/launchd binary-copy loop, and document matched official CLI/helper upgrades without resetting sessions or TCC permissions.
 - Confirm the original batch task through combined AGENTS/environment context and incremental, partial JSONL records. Persist proof before releasing startup protection; recover legacy holds from every relevant batch.

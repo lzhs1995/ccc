@@ -986,7 +986,9 @@ def _match_error_block(block_text: str) -> str | None:
         return "rate_limit"
     # A narrow native viewport can hard-wrap inside "cause" ("c\nause").
     # The caller verifies contiguous error rows before normalizing whitespace.
-    if HIGH_DEMAND.lower().replace(" ", "") in compact:
+    # Current native/provider releases also spell this banner with U+2019.
+    # Keep the complete message and existing marker/quote guards authoritative.
+    if HIGH_DEMAND.lower().replace(" ", "") in compact.replace("’", "'"):
         return "high_demand"
     if RECONNECT_COMPACT_PREFIX_RE.sub("", compact, count=1).lstrip("■⚠└") == "connectionfailed:errorsendingrequest":
         return "stream"
