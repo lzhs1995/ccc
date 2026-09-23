@@ -52,7 +52,7 @@ class BatchFixture:
         sid, session = str(uuid.uuid4()), str(uuid.uuid4())
         self.calls.append(sid)
         with patch.dict(os.environ, {'CMUX_SURFACE_ID': sid, 'CMUX_WORKSPACE_ID': wid}):
-            batch.register(self.test.config, jid, index)
+            batch.register(self.test.config, jid, index, tokens[tokens.index('--launch-id') + 1])
         path = self.test.root / f'{session}.jsonl'
         path.write_text(json.dumps({'type': 'session_meta', 'payload': {'id': session}}) + '\n')
         self.bindings[session] = {'surfaceId': sid, 'workspaceId': wid, 'transcriptPath': str(path)}
@@ -98,6 +98,13 @@ class BatchFixture:
 
 class WorkspaceBatchTests(unittest.TestCase):
     def setUp(self):
+        pty = patch.object(batch, 'pty_available', return_value=True)
+        pty.start()
+        self.addCleanup(pty.stop)
+        seed = patch.object(batch, 'prepare_sqlite_home', side_effect=lambda config, jid:
+                            batch.sqlite_home(config, jid, 0).mkdir(parents=True, exist_ok=True))
+        seed.start()
+        self.addCleanup(seed.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
@@ -108,7 +115,8 @@ class WorkspaceBatchTests(unittest.TestCase):
         self.client = BatchFixture(self)
         self.job = batch.start(self.config, self.wid, client=self.client, launch=False)
         self.now = time.time()
-        self.worker = batch.BatchWorker(self.config, self.job['job_id'], client=self.client, queue=self.client, clock=lambda: self.now)
+        self.worker = batch.BatchWorker(self.config, self.job['job_id'], client=self.client, queue=self.client,
+                                        clock=lambda: self.now, pty_probe=lambda: True)
         self.addCleanup(self.worker.cache.close)
         self.worker.job['status'] = 'running'
 

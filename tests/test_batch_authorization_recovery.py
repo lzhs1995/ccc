@@ -160,7 +160,7 @@ class BatchAuthorizationTests(unittest.TestCase):
         self.client.frame_options = {'composer': 'human draft'}
         self.now += 600
         self.worker.step()
-        self.assertEqual(self.worker.job['slots'][0]['phase'], 'created')
+        self.assertEqual(self.worker.job['slots'][0]['phase'], 'startup_wait')
         self.assertIn(self.worker.job['status'], {'running', 'waiting'})
         self.assertEqual(self.client.sent, [])
 
@@ -195,7 +195,7 @@ class BatchAuthorizationTests(unittest.TestCase):
             self.addCleanup(worker.cache.close)
             workers.append(worker)
         for worker in workers:
-            worker.client.frame_options = {'composer': 'human draft'}
+            worker.client.frame_options = {'working': True}
         starts = []
         previous = 0
         for _ in range(100):

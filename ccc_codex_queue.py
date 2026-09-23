@@ -106,6 +106,7 @@ class _BsdInfo(ctypes.Structure):
 
 
 _proc_pidinfo = None
+_proc_listpids = None
 _procargs_sysctl = None
 _procargs_bytes = 0
 if sys.platform == "darwin":
@@ -114,6 +115,9 @@ if sys.platform == "darwin":
         _proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
                                  ctypes.c_void_p, ctypes.c_int]
         _proc_pidinfo.restype = ctypes.c_int
+        _proc_listpids = ctypes.CDLL("/usr/lib/libproc.dylib").proc_listpids
+        _proc_listpids.argtypes = [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_int]
+        _proc_listpids.restype = ctypes.c_int
     except (OSError, AttributeError):
         pass
     try:
@@ -168,6 +172,60 @@ def process_matches(record):
         return False
     actual = codex_process_starts([pid]).get(pid)
     return actual is not None and abs(actual - started) < 1
+
+
+def batch_shell_identity(pid):
+    """Pin the bootstrap's parent shell without an all-process scan."""
+    if _proc_pidinfo is None or type(pid) is not int or not 0 < pid < 2**31:
+        return None
+    info = _BsdInfo()
+    size = ctypes.sizeof(info)
+    if (_proc_pidinfo(pid, 3, 0, ctypes.byref(info), size) != size or info.pid != pid
+            or info.status == 5 or (info.name or info.comm) not in {b'zsh', b'bash', b'sh', b'fish'}):
+        return None
+    return [info.start_sec, info.start_usec]
+
+
+def batch_child_label(shell_pid, shell_start, target):
+    """Read only one receipt-pinned shell's descendants; fail closed on races.
+
+    This is a discovery hint. QueueRecovery still verifies the native writer,
+    session UUID and process placement immediately before every input.
+    """
+    if (_proc_listpids is None or not shell_start
+            or batch_shell_identity(shell_pid) != shell_start):
+        return None
+    pending, seen, agents = [shell_pid], set(), []
+    other = False
+    while pending and len(seen) < 64:
+        parent = pending.pop()
+        if parent in seen:
+            continue
+        seen.add(parent)
+        children = (ctypes.c_int * 64)()
+        size = ctypes.sizeof(children)
+        count = _proc_listpids(6, parent, children, size)  # PROC_PPID_ONLY
+        if count < 0 or count >= size or count % ctypes.sizeof(ctypes.c_int):
+            return None
+        for pid in children[:count // ctypes.sizeof(ctypes.c_int)]:
+            info = _BsdInfo()
+            if (_proc_pidinfo(pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info)) != ctypes.sizeof(info)
+                    or info.pid != pid or info.ppid != parent or info.status == 5):
+                return None
+            if (info.name or info.comm) == b'codex':
+                if process_placement_start(pid, target) is None:
+                    return None
+                agents.append(pid)
+            else:
+                other |= (info.name or info.comm) not in {b'zsh', b'bash', b'sh', b'fish', b'sleep'}
+                pending.append(pid)
+    if pending or batch_shell_identity(shell_pid) != shell_start:
+        return None
+    if len(agents) == 1:
+        return {'agent_kind': 'codex', 'agent_pids': agents, 'process_snapshot_present': True}
+    if not agents and not other:
+        return {'agent_kind': 'shell', 'agent_pids': [], 'process_snapshot_present': True}
+    return None
 
 
 def _process_placement_args(data):

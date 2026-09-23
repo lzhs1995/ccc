@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -22,15 +23,29 @@ import time
 import uuid
 
 import cmux_codex_watch as core
-from ccc_codex_queue import QueueRecovery, epoch
+from ccc_codex_queue import QueueRecovery, epoch, batch_shell_identity, batch_child_label
 from ccc_inventory import SharedInventory
 from ccc_scheduling import SnapshotCache, SnapshotClient
 
 COUNT = 50
 PROMPT = "show me u power"
-INITIALIZING = {"creating", "create_unknown", "created", "submitted", "submitting", "uncertain"}
+INITIALIZING = {"creating", "create_unknown", "created", "restarting", "restart_unknown",
+                "submitted", "submitting", "uncertain"}
+STARTABLE = {"pending", "restart_pending", "pty_wait"}
+STARTUP_LEASE_SEC = 30
 CONFIRMABLE = {"submitted", "submitting", "uncertain", "confirmed"}
 CONFIRM_READ_BYTES = 1024 * 1024
+
+
+def pty_available():
+    """Reserve no terminal when the host has reached its PTY limit."""
+    try:
+        master, slave = os.openpty()
+    except OSError:
+        return False
+    os.close(slave)
+    os.close(master)
+    return True
 
 
 def _startup_context(message):
@@ -167,12 +182,75 @@ def start(config_path, selector, *, client=None, launch=True):
         return {"job_id": job["id"], "workspace_id": wid, **counts(job)}
 
 
-def register(config_path, job_id, index):
+def sqlite_home(config_path, job_id, index):
+    # Keep CODEX_HOME, transcripts, hooks and credentials in their normal
+    # locations. Only the native SQLite writers of this new CLI are isolated.
+    return job_path(config_path, job_id).parent / "native-db"
+
+
+def prepare_sqlite_home(config_path, job_id):
+    """Seed only small native metadata, never the multi-GB logs/history DBs.
+
+    An empty state DB makes Codex synchronously reindex every old rollout.
+    SQLite backup preserves the real completed backfill and selected rollouts;
+    no native status is fabricated. One batch shares this new runtime.
+    """
+    directory = sqlite_home(config_path, job_id, 0)
+    directory.mkdir(parents=True, exist_ok=True)
+    marker = directory / "seed.json"
+    if marker.exists():
+        return
+    with core.FileLock(directory / "seed.lock", timeout_sec=5):
+        if marker.exists():
+            return
+        codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+        source = Path(os.environ.get("CODEX_SQLITE_HOME") or codex_home)
+        try:
+            import tomllib
+            configured = tomllib.loads((codex_home / "config.toml").read_text()).get("sqlite_home")
+            if configured:
+                source = Path(configured)
+        except (ImportError, OSError, ValueError):
+            pass
+        copied = []
+        for path in sorted(source.glob("*.sqlite")):
+            if not re.fullmatch(r"(?:state|goals|memories|queue)_\d+\.sqlite", path.name):
+                continue
+            target = directory / path.name
+            if target.exists():
+                continue  # Never overwrite a runtime already opened by Codex.
+            temp = directory / ("." + path.name + ".seed")
+            deadline = time.monotonic() + 5
+            def progress(status, remaining, total):
+                if time.monotonic() > deadline:
+                    raise RuntimeError("等待原生数据库元数据快照；尚未创建新 terminal")
+            try:
+                with contextlib.closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=1)) as src:
+                    if path.name.startswith("state_"):
+                        status = src.execute("SELECT status FROM backfill_state WHERE id=1").fetchone()
+                        if not status or status[0] != "complete":
+                            continue
+                    with contextlib.closing(sqlite3.connect(temp)) as dst:
+                        src.backup(dst, pages=256, progress=progress, sleep=.05)
+                temp.chmod(0o600)
+                temp.replace(target)
+                copied.append(path.name)
+            except sqlite3.Error as exc:
+                raise RuntimeError("等待原生数据库元数据快照：" + str(exc)) from exc
+            finally:
+                with contextlib.suppress(FileNotFoundError):
+                    temp.unlink()
+        core.atomic_write_json(marker, {"at": time.time(), "metadata": copied})
+
+
+def register(config_path, job_id, index, launch_id=""):
     """Runs in the newly created shell before Codex starts (without a prompt)."""
     path = job_path(config_path, job_id)
     job = core.load_json(path, {})
     if not 0 <= index < len(job["slots"]):
         raise RuntimeError("invalid batch slot")
+    if (job["slots"][index].get("launch_id") or "") != launch_id:
+        raise RuntimeError("stale batch launch")
     sid, wid = os.environ.get("CMUX_SURFACE_ID", ""), os.environ.get("CMUX_WORKSPACE_ID", "")
     uuid.UUID(sid)
     if wid != job["workspace_id"]:
@@ -194,20 +272,28 @@ def register(config_path, job_id, index):
                 rule.setdefault("batch_start_holds", {})[sid] = {
                     "job_id": job_id, "index": index, "created_at": time.time()}
         with core.FileLock(receipt.with_suffix(".lock"), timeout_sec=5):
+            job = core.load_json(path, {})
+            if (job["slots"][index].get("launch_id") or "") != launch_id:
+                raise RuntimeError("stale batch launch")
             old = core.load_json(receipt, {})
             if old and old.get("surface_id") != sid:
                 raise RuntimeError("batch slot already belongs to another surface")
             store.mutate(protect)
-            core.atomic_write_json(receipt, {"surface_id": sid, "workspace_id": wid})
+            prepare_sqlite_home(config_path, job_id)
+            core.atomic_write_json(receipt, {"surface_id": sid, "workspace_id": wid,
+                                            "launch_id": launch_id, "registered_at": time.time(),
+                                            "shell_pid": os.getppid(),
+                                            "shell_start": batch_shell_identity(os.getppid())})
 
 
 class BatchWorker:
-    def __init__(self, config_path, job_id, *, client=None, queue=None, clock=time.time):
+    def __init__(self, config_path, job_id, *, client=None, queue=None, clock=time.time, pty_probe=None):
         self.config_path = Path(config_path)
         self.path = job_path(config_path, job_id)
         self.store = core.ConfigStore(self.config_path)
         self.job = core.load_json(self.path, {})
         self.cache = SnapshotCache(workers=1)
+        self.inventory = SharedInventory(self.config_path.parent)
         self.client = client or SnapshotClient(_client(self.store.load()), self.cache,
                                                SharedInventory(self.config_path.parent))
         self.queue = queue or QueueRecovery(self.path.parent / "unused-queue-ledger.json",
@@ -215,16 +301,44 @@ class BatchWorker:
         self.processes = {}
         self.queue.process_lookup = self._process_label
         self.clock = clock
+        self.pty_probe = pty_probe or pty_available
         self._top_due = 0.0
         self._saved = None
+        self._shell_hints = {}
 
     def _process_label(self, target):
+        slot = next((s for s in self.job["slots"] if s.get("surface_id") == target["surface_id"]), {})
+        if slot:
+            receipt = core.load_json(self.path.parent / f"surface-{slot['index']}.json", {})
+            if (receipt.get("surface_id") == target["surface_id"]
+                    and receipt.get("workspace_id") == target["workspace_id"]):
+                hint = (receipt.get("shell_pid"), receipt.get("shell_start"))
+                if not hint[1]:
+                    hint = self._shell_hints.get(target["surface_id"], hint)
+                if not hint[1]:
+                    # Legacy receipts did not pin their shell. A recent top
+                    # is only a PID hint; direct generation/child checks are
+                    # the evidence, so another full scan is unnecessary.
+                    record = self.inventory._read("top")
+                    if 0 <= self.clock() - record.get("collected_at", 0) < 120:
+                        surface = next((r for r in core._walk_objects(record.get("value", {}))
+                                        if r.get("kind") == "surface" and r.get("id") == target["surface_id"]), {})
+                        for proc in core._walk_objects(surface.get("processes", [])):
+                            started = batch_shell_identity(proc.get("pid"))
+                            if started and started[0] <= record["collected_at"]:
+                                hint = (proc["pid"], started)
+                                self._shell_hints[target["surface_id"]] = hint
+                                break
+                label = batch_child_label(*hint, target)
+                if label:
+                    return label
+                if hint[1] and sys.platform == "darwin":
+                    return {"agent_kind": "unknown", "summary": "等待原启动进程确认"}
         if self.processes:
             return core.surface_process_label(self.processes, target)
         # A persisted submit pins an original PID/start/session. It is only a
         # lookup hint: QueueRecovery rechecks placement, start and writable
         # rollout, and _confirm checks all three identity fields again.
-        slot = next((s for s in self.job["slots"] if s.get("surface_id") == target["surface_id"]), {})
         if slot.get("submit_at") and slot.get("pid") and slot.get("process_start"):
             return {"agent_kind": "codex", "agent_pids": [slot["pid"]]}
         return {"agent_kind": "unknown", "summary": "process lookup unavailable"}
@@ -251,6 +365,10 @@ class BatchWorker:
         with core.workspace_input_lock(self.config_path, wid, shared=True):
             if not allowed(self.store.load(), self.job):
                 return
+            if not self.pty_probe():
+                self.job.update(status="waiting", error="系统 PTY 名额已满；保留剩余名额，空位释放后自动继续")
+                return
+            prepare_sqlite_home(self.config_path, self.job["id"])
             tree = self.client.tree()
             panes = [(win, p) for win in tree.get("windows", []) for w in win.get("workspaces", [])
                      if w.get("id") == wid for p in w.get("panes", [])
@@ -264,15 +382,96 @@ class BatchWorker:
                 return
             # Persist BEFORE creating; an uncertain reply is reconciled from
             # the bootstrap receipt and must never cause a replacement tab.
-            command = shlex.join([sys.executable, "-B", str(Path(__file__).resolve()), "register",
-                                  "--config", str(self.config_path), "--job", self.job["id"],
-                                  "--index", str(slot["index"])]) + " && codex"
+            command = self._launch_command(slot)
             try:
                 slot["surface_id"] = self.client.new_codex_surface(
                     self.job["window_id"], wid, self.job["pane_id"], command)
                 slot["phase"] = "created"
+                self._protect_created(slot)
             except (core.CmuxError, RuntimeError) as exc:
                 slot.update(phase="create_unknown", error=str(exc))
+            self.save()
+
+    def _launch_command(self, slot):
+        bootstrap = shlex.join([sys.executable, "-B", str(Path(__file__).resolve()), "register",
+                                "--config", str(self.config_path), "--job", self.job["id"],
+                                "--index", str(slot["index"]), "--launch-id", slot["launch_id"]])
+        native = shlex.join(["codex", "-c", "sqlite_home=" + json.dumps(
+            str(sqlite_home(self.config_path, self.job["id"], slot["index"]).resolve()))])
+        return bootstrap + " && " + native
+
+    def _protect_created(self, slot):
+        def protect(config):
+            if not allowed(config, self.job):
+                return
+            rule = core.workspace_rule_by_id(config, self.job["workspace_id"])
+            sid = slot["surface_id"]
+            if sid in rule.get("excluded_surface_ids", []):
+                return
+            rule.setdefault("batch_start_holds", {}).setdefault(sid, {
+                "job_id": self.job["id"], "index": slot["index"], "created_at": self.clock()})
+        self.store.mutate(protect)
+
+    @staticmethod
+    def _pty_failure(grid):
+        return "Your system cannot allocate any more pty devices." in " ".join("\n".join(grid.lines).split())
+
+    @staticmethod
+    def _startup_failure(grid):
+        """A native DB startup error immediately followed by an empty shell.
+
+        A quoted error in a Codex response, a menu or a shell draft is not a
+        launch failure. The process-table check is separate and mandatory.
+        """
+        cursor = grid.cursor
+        if not cursor.visible or not 0 <= cursor.row < len(grid.lines):
+            return False
+        line = grid.lines[cursor.row].ljust(grid.columns)
+        prompt = line[:cursor.column]
+        if (line[cursor.column:].strip() or not re.fullmatch(
+                r"(?:[^\s%$#]+@[^\s%$#]+ [^%$#\r\n]* )?[%$#] ", prompt)):
+            return False
+        before = " ".join("\n".join(grid.lines[:cursor.row]).split())
+        return ("Codex couldn't start because another Codex process is using its local data." in before
+                and "ERROR: failed to initialize sqlite local db" in before
+                and "database is locked" in before.rsplit("ERROR:", 1)[-1])
+
+    def _restart_failed(self, slot, *, no_pty=False):
+        # Only pre-session startup failures owned by this batch may be
+        # relaunched, in the same terminal. Never replace an existing session.
+        with core.workspace_input_lock(self.config_path, self.job["workspace_id"], shared=True):
+            config = self.store.load()
+            if not allowed(config, self.job) or not self._protected(config, slot):
+                return
+            if (slot.get("session_id") or slot.get("native_seen_session_id")
+                    or slot.get("submit_at") or slot.get("restart_attempt_at")):
+                return
+            if any(r.get("surfaceId") == slot["surface_id"] for r in self.queue.records().values()):
+                return
+            target = self._target(slot, fresh=True)
+            if no_pty:
+                if not self.pty_probe():
+                    return
+            else:
+                label = self._process_label(target)
+                if label.get("agent_kind") != "shell" or not label.get("process_snapshot_present"):
+                    return
+            if (self._native(target, slot) or {}).get("session_id"):
+                return
+            grid = core.Grid.from_rpc(self.client.replay(target["workspace_id"], target["surface_id"]), target["surface_id"])
+            if not (self._pty_failure(grid) if no_pty else self._startup_failure(grid)):
+                return
+            prepare_sqlite_home(self.config_path, self.job["id"])
+            if not self._reserve_start(slot, restarting=True):
+                return
+            slot["restart_attempt_at"] = self.clock()
+            self.save()  # An ambiguous restart acknowledgement is not replayed.
+            try:
+                self.client.respawn_surface(target["window_id"], slot["surface_id"], self._launch_command(slot))
+                slot["phase"] = "restart_unknown"
+                slot["error"] = "等待原 surface 的启动回执"
+            except (core.CmuxError, RuntimeError) as exc:
+                slot.update(phase="restart_unknown", error=str(exc))
             self.save()
 
     def _transcript(self, sid, native):
@@ -475,6 +674,10 @@ class BatchWorker:
             slot["surface_id"] = receipt["surface_id"]
             if slot["phase"] in {"creating", "create_unknown"}:
                 slot["phase"] = "created"
+            if slot["phase"] in {"restarting", "restart_unknown"}:
+                if receipt.get("launch_id") != slot.get("launch_id"):
+                    return
+                slot.update(phase="created", launched_at=receipt["registered_at"])
         if slot["phase"] in CONFIRMABLE:
             if self._confirm(slot):
                 slot["phase"] = "confirmed"
@@ -492,21 +695,38 @@ class BatchWorker:
             return
         if confirmation_only:
             return
-        if slot["phase"] != "created":
+        if slot["phase"] not in {"created", "startup_wait", "restart_pending", "pty_wait"}:
             return
         if not receipt:
             slot["error"] = "等待新 shell 原始回执"
+            if self.clock() - slot["created_at"] >= 3 and slot.get("surface_id"):
+                target = self._target(slot)
+                grid = core.Grid.from_rpc(self.client.replay(target["workspace_id"], target["surface_id"]), target["surface_id"])
+                if self._pty_failure(grid):
+                    self._protect_created(slot)
+                    slot.update(phase="pty_wait", error="系统 PTY 名额已满；等待空位后在原 surface 补做")
+                    self._restart_failed(slot, no_pty=True)
             return
         if not self._protected(self.store.load(), slot):
             slot.update(phase="blocked", error="此路授权已被修改，未发送 prompt")
             return
         target = self._target(slot)
         native = self._native(target, slot)
+        if (native or {}).get("session_id"):
+            slot["native_seen_session_id"] = native["session_id"]
         if native and native.get("session_id") and native.get("kind") not in {"unknown", "uninitialized"}:
             slot.update(phase="blocked", error="此 session 已有任务，未发送批量 prompt")
             return
         grid = core.Grid.from_rpc(self.client.replay(target["workspace_id"], target["surface_id"]), target["surface_id"])
         if core.classify_grid(grid).kind != "idle" or core._composer_status(grid)[0] != "empty":
+            if not (native or {}).get("session_id") and self._startup_failure(grid):
+                slot.update(phase="restart_pending", error="Codex 数据库锁导致启动失败，等待在原 surface 补做")
+                self._restart_failed(slot)
+                return
+            if core._menu_present(grid.lines) or core._composer_status(grid)[0] == "composer_busy":
+                slot["phase"] = "startup_wait"
+            elif self._process_label(target).get("agent_kind") == "codex":
+                slot["phase"] = "created"
             slot["error"] = "等待空输入框；启动确认、草稿或运行中任务不会被覆盖"
             return
         if not native or not native.get("session_id") or not native.get("pid"):
@@ -545,32 +765,43 @@ class BatchWorker:
                 slot.update(phase="uncertain", error=str(exc))
             self.save()
 
-    def _reserve_start(self, slot):
+    def _reserve_start(self, slot, *, restarting=False):
         # All batch processes share the same capacity and rate limit. Save the
         # reservation before releasing the lock, without holding it over RPC.
         with core.FileLock(self.config_path.parent / "batch-capacity.lock", timeout_sec=.1):
+            path = self.config_path.parent / "batch-capacity.json"
+            budget = core.load_json(path, {})
+            now = self.clock()
+            if now - budget.get("last_start", 0) < .5:
+                return False
             config = self.store.load()
-            ids = relevant_job_ids(self.config_path, config)
+            ids = sorted({r["active_batch_id"] for r in config["workspace_rules"] if r.get("active_batch_id")})
             active = 0
             pending_jobs = []
             for jid in ids:
                 job = self.job if jid == self.job["id"] else core.load_json(job_path(self.config_path, jid), {})
                 if not job or job.get("status") in {"cancelled", "workspace_closed"} or not allowed(config, job):
                     continue
-                active += sum(s.get("phase") in INITIALIZING for s in job.get("slots", []))
-                if any(s.get("phase") == "pending" for s in job.get("slots", [])):
+                # An ambiguous RPC remains durable, but cannot monopolize a
+                # startup permit forever. It is still reconciled, never replayed.
+                active += sum(s.get("phase") in INITIALIZING and
+                              (s.get("phase") not in {"creating", "create_unknown", "restarting", "restart_unknown"} or
+                               now - s.get("launched_at", s.get("created_at", now)) < STARTUP_LEASE_SEC)
+                              for s in job.get("slots", []))
+                if any(s.get("phase") in STARTABLE for s in job.get("slots", [])):
                     pending_jobs.append(jid)
-            path = self.config_path.parent / "batch-capacity.json"
-            budget = core.load_json(path, {})
-            now = self.clock()
             if active >= 4 or now - budget.get("last_start", 0) < .5:
                 return False
             # A busy first pool cannot consume every available startup slot.
             last = budget.get("last_job", "")
-            next_job = next((jid for jid in pending_jobs if jid > last), pending_jobs[0])
-            if next_job != self.job["id"]:
+            if not pending_jobs:
                 return False
-            slot.update(phase="creating", created_at=now)
+            next_job = next((jid for jid in pending_jobs if jid > last), pending_jobs[0])
+            if next_job != self.job["id"] and now - budget.get("last_start", 0) < 1.5:
+                return False
+            slot.update(phase="restarting" if restarting else "creating", launched_at=now,
+                        launch_id=str(uuid.uuid4()))
+            slot.setdefault("created_at", now)
             self.save()
             core.atomic_write_json(path, {"last_start": now, "last_job": self.job["id"]})
             return True
@@ -619,7 +850,7 @@ class BatchWorker:
             self.job["error"] = str(exc)
         self.job["status"] = "running"
         for slot in self.job["slots"]:
-            if slot["phase"] not in INITIALIZING or self.clock() < slot.get("retry_at", 0):
+            if slot["phase"] not in INITIALIZING | {"startup_wait", "restart_pending", "pty_wait"} or self.clock() < slot.get("retry_at", 0):
                 continue
             try:
                 self._advance(slot)
@@ -627,7 +858,7 @@ class BatchWorker:
                 slot["error"] = str(exc)
             # Recoverable waits have no abandonment deadline. Slow startup,
             # partial logs and timeouts do not create replacement sessions.
-            slot["retry_at"] = self.clock() + 1
+            slot["retry_at"] = self.clock() + (5 if slot["phase"] in {"startup_wait", "pty_wait"} else 1)
             if slot["phase"] == "creating":
                 slot.update(phase="create_unknown", error="等待原创建回执；不会重复创建")
         pending = next((s for s in self.job["slots"] if s["phase"] == "pending"), None)
@@ -752,9 +983,10 @@ def main():
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--job", required=True)
     parser.add_argument("--index", type=int, default=0)
+    parser.add_argument("--launch-id", default="")
     args = parser.parse_args()
     if args.action == "register":
-        register(args.config, args.job, args.index)
+        register(args.config, args.job, args.index, args.launch_id)
     else:
         BatchWorker(args.config, args.job).run()
 

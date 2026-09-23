@@ -5,7 +5,9 @@
 - Confirm the original batch task through combined AGENTS/environment context and incremental, partial JSONL records. Persist proof before releasing startup protection; recover legacy holds from every relevant batch.
 - Separate startup holds from operator exclusions and show `整池／启动中`. Repeated workspace authorization is idempotent and preserves manual P, exclusions and per-surface pauses.
 - Share timestamped tree/process inventories across the watcher, panel and batch workers. Coalesce failed scans, limit global process discovery to once per five seconds, and continue local confirmation during RPC failures.
-- Enforce a global budget of four initializing sessions and at most two starts per second. Durable waiting replaces 25/360-second abandonment; repeated B reuses slots and lost replies never trigger duplicate create/prompt/Enter attempts.
+- Share four startup permits and at most two starts per second. Menus and drafts yield their permit; uncertain RPCs keep their durable record without monopolizing capacity. A waiting pool cannot block all other pools, and capacity checks read only active jobs.
+- Give new batches separate SQLite runtimes, seeded through read-only native metadata backups. Avoid both the busy global log database and a full reindex of old rollouts. Discover new Codex children directly from the bootstrap shell when system.top is unavailable.
+- Queue B when macOS PTYs are exhausted instead of creating unusable tabs. Recover proven pre-session database/PTY startup failures in the same surface, preserving native sessions, drafts and operator pauses. Include an optional LaunchDaemon for macOS's supported 999-PTY ceiling.
 
 ## 0.2.12
 
