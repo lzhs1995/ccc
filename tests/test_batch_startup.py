@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shlex
 import sqlite3
+import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -102,6 +103,97 @@ class BatchStartupTests(unittest.TestCase):
         restart.assert_called_once()
         self.assertEqual(slot['phase'], 'restart_unknown')
         self.assertEqual(self.client.sent, [])
+
+    def test_explicit_create_rejection_retries_only_after_backoff(self):
+        self.worker.job['slots'] = self.worker.job['slots'][:1]
+        slot = self.worker.job['slots'][0]
+        create = self.client.new_codex_surface
+        attempts = []
+        def limited(*args):
+            attempts.append(args)
+            if len(attempts) == 1:
+                raise core.CmuxRequestRejected(core.CmuxRequestRejected.POLLING_RATE_LIMIT)
+            return create(*args)
+        with patch.object(self.client, 'new_codex_surface', side_effect=limited):
+            self.worker.step()
+            self.assertEqual(slot['phase'], 'pending')
+            self.assertNotIn('surface_id', slot)
+            self.now += 1
+            self.worker.step()
+            self.assertEqual(len(attempts), 1)
+            self.now = slot['retry_at']
+            self.worker.step()
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(len(self.client.calls), 1)
+
+    def test_explicit_restart_rejection_preserves_backoff_and_original_surface(self):
+        slot = self.failed()
+        self.worker.job['slots'] = [slot]
+        # step() refreshes its process inventory before a recovery attempt.
+        with patch.object(self.worker, '_refresh_processes'), \
+                patch.object(self.client, 'replay', return_value=failure_frame(slot['surface_id'])), \
+                patch.object(self.client, 'respawn_surface', create=True,
+                    side_effect=[core.CmuxRequestRejected('refused before dispatch'), None]) as restart:
+            self.worker.step()
+            self.assertEqual(slot['phase'], 'restart_pending')
+            self.assertNotIn('restart_attempt_at', slot)
+            self.assertEqual(slot['retry_at'], self.now + 2)
+            self.now += 1
+            self.worker.step()
+            restart.assert_called_once()
+            self.now += 1
+            self.worker.step()
+        self.assertEqual(restart.call_count, 2)
+        self.assertEqual({call.args[1] for call in restart.call_args_list}, {slot['surface_id']})
+        self.assertEqual(self.client.calls, [slot['surface_id']])
+        self.assertEqual(slot['phase'], 'restart_unknown')
+
+    def legacy_rejection(self, slot):
+        slot.update(phase='restart_unknown', launch_id=str(uuid.uuid4()), restart_attempt_at=self.now,
+                    error='cmux respawn-pane --window failed: ' + core.CmuxRequestRejected.POLLING_RATE_LIMIT)
+
+    def test_legacy_rejection_recovers_before_stale_receipt_return(self):
+        slot = self.failed()
+        self.legacy_rejection(slot)
+        with patch.object(self.client, 'replay', return_value=failure_frame(slot['surface_id'])), \
+                patch.object(self.client, 'respawn_surface', create=True) as restart:
+            self.worker._advance(slot)
+            self.assertEqual(slot['phase'], 'restart_pending')
+            restart.assert_not_called()
+            self.now = slot['retry_at']
+            self.worker._advance(slot)
+        restart.assert_called_once()
+        self.assertEqual(restart.call_args.args[1], slot['surface_id'])
+
+    def test_rejected_restart_rechecks_session_draft_and_pool_authorization(self):
+        slot = self.failed()
+        self.legacy_rejection(slot)
+        self.worker._advance(slot)
+        self.now = slot['retry_at']
+        with patch.object(self.client, 'respawn_surface', create=True) as restart:
+            with patch.object(self.client, 'replay', return_value=failure_frame(slot['surface_id'], 'echo keep')):
+                self.worker._advance(slot)
+            with patch.object(self.client, 'replay', return_value=failure_frame(slot['surface_id'])):
+                self.store.mutate(lambda c: c['workspace_rules'][0].update(paused=True))
+                self.worker._advance(slot)
+                self.store.mutate(lambda c: c['workspace_rules'][0].update(paused=False))
+                self.client.bindings['original'] = {'surfaceId': slot['surface_id']}
+                self.worker._advance(slot)
+        restart.assert_not_called()
+
+    def test_rejection_never_overrides_a_matching_launch_receipt(self):
+        slot = self.failed()
+        self.legacy_rejection(slot)
+        receipt = core.load_json(self.worker.path.parent / 'surface-0.json', {})
+        receipt['launch_id'] = slot['launch_id']
+        receipt['registered_at'] = self.now
+        core.atomic_write_json(self.worker.path.parent / 'surface-0.json', receipt)
+        with patch.object(self.client, 'replay', return_value=failure_frame(slot['surface_id'])), \
+                patch.object(self.client, 'respawn_surface', create=True) as restart:
+            self.worker._advance(slot)
+        restart.assert_not_called()
+        self.assertIn('restart_attempt_at', slot)
+        self.assertNotIn('rejected_start_attempts', slot)
 
     def test_existing_session_or_missing_process_inventory_forbids_restart(self):
         slot = self.failed()
@@ -201,6 +293,28 @@ class BatchStartupTests(unittest.TestCase):
         self.assertEqual(first['surface_id'], original)
         self.assertEqual(len(self.client.calls), 1)  # Next original pending slot.
         self.assertNotEqual(self.client.calls[0], original)
+
+
+class CmuxRequestRejectionTests(unittest.TestCase):
+    def test_only_complete_explicit_refusal_is_retryable(self):
+        detail = core.CmuxRequestRejected.POLLING_RATE_LIMIT
+        for output, expected in [(detail, core.CmuxRequestRejected),
+                                 ('prefix\n' + detail, core.CmuxError),
+                                 (detail + '\nrequest response timed out', core.CmuxError),
+                                 ('rate limit exceeded', core.CmuxError)]:
+            with self.subTest(output=output):
+                client = core.CmuxClient(runner=lambda *a, **k:
+                    subprocess.CompletedProcess(a[0], 1, '', output))
+                with self.assertRaises(core.CmuxError) as caught:
+                    client._run(['respawn-pane', '--window', 'window'])
+                self.assertIs(type(caught.exception), expected)
+
+    def test_process_timeout_is_not_an_explicit_refusal(self):
+        def timeout(*args, **kwargs):
+            raise subprocess.TimeoutExpired(args[0], kwargs['timeout'])
+        with self.assertRaises(core.CmuxError) as caught:
+            core.CmuxClient(runner=timeout)._run(['respawn-pane', '--window', 'window'])
+        self.assertIs(type(caught.exception), core.CmuxError)
 
 
 class DirectBatchProcessTests(unittest.TestCase):

@@ -29,7 +29,7 @@ from ccc_inventory import SharedInventory
 from ccc_scheduling import SnapshotCache, SnapshotClient
 
 COUNT = 50
-WORKER_VERSION = 16
+WORKER_VERSION = 17
 PROMPT = "show me u power"
 INITIALIZING = {"creating", "create_unknown", "created", "restarting", "restart_unknown",
                 "submitted", "submitting", "uncertain"}
@@ -363,6 +363,8 @@ class BatchWorker:
         return target
 
     def _create(self, slot):
+        if self.clock() < slot.get("retry_at", 0):
+            return
         wid = self.job["workspace_id"]
         with core.workspace_input_lock(self.config_path, wid, shared=True):
             if not allowed(self.store.load(), self.job):
@@ -390,9 +392,42 @@ class BatchWorker:
                     self.job["window_id"], wid, self.job["pane_id"], command)
                 slot["phase"] = "created"
                 self._protect_created(slot)
+            except core.CmuxRequestRejected as exc:
+                self._defer_rejected_start(slot, str(exc))
             except (core.CmuxError, RuntimeError) as exc:
                 slot.update(phase="create_unknown", error=str(exc))
             self.save()
+
+    def _defer_rejected_start(self, slot, error, *, restarting=False):
+        attempts = slot.get("rejected_start_attempts", 0) + 1
+        slot.update(phase="restart_pending" if restarting else "pending", error=error,
+                    rejected_start_attempts=attempts, rejected_start_at=self.clock(),
+                    retry_at=self.clock() + min(30, 2 ** min(attempts, 5)))
+        # The rejected request did not consume the one allowed restart. Every
+        # retry must still pass _restart_failed's original-session checks.
+        if restarting:
+            slot.pop("restart_attempt_at", None)
+
+    def _recover_rejected_start(self, slot, receipt):
+        """Recover v16's persisted refusal without replaying uncertain I/O."""
+        phase = slot["phase"]
+        if phase not in {"create_unknown", "restart_unknown"}:
+            return False
+        command = "respawn-pane --window" if phase == "restart_unknown" else "--json --id-format"
+        if slot.get("error") != f"cmux {command} failed: {core.CmuxRequestRejected.POLLING_RATE_LIMIT}":
+            return False
+        if (slot.get("session_id") or slot.get("native_seen_session_id") or slot.get("submit_at")
+                or (phase == "create_unknown" and slot.get("surface_id"))):
+            return False
+        if receipt:
+            # A receipt from this launch is stronger than the stored error;
+            # let the ordinary receipt path reconcile it, never replay it.
+            if (receipt.get("workspace_id") != self.job["workspace_id"]
+                    or receipt.get("launch_id") == slot.get("launch_id")
+                    or receipt.get("surface_id") != slot.get("surface_id")):
+                return False
+        self._defer_rejected_start(slot, slot["error"], restarting=phase == "restart_unknown")
+        return True
 
     def _launch_command(self, slot):
         bootstrap = shlex.join([sys.executable, "-B", str(Path(__file__).resolve()), "register",
@@ -441,6 +476,8 @@ class BatchWorker:
     def _restart_failed(self, slot, *, no_pty=False):
         # Only pre-session startup failures owned by this batch may be
         # relaunched, in the same terminal. Never replace an existing session.
+        if self.clock() < slot.get("retry_at", 0):
+            return
         with core.workspace_input_lock(self.config_path, self.job["workspace_id"], shared=True):
             config = self.store.load()
             if not allowed(config, self.job) or not self._protected(config, slot):
@@ -472,6 +509,8 @@ class BatchWorker:
                 self.client.respawn_surface(target["window_id"], slot["surface_id"], self._launch_command(slot))
                 slot["phase"] = "restart_unknown"
                 slot["error"] = "等待原 surface 的启动回执"
+            except core.CmuxRequestRejected as exc:
+                self._defer_rejected_start(slot, str(exc), restarting=True)
             except (core.CmuxError, RuntimeError) as exc:
                 slot.update(phase="restart_unknown", error=str(exc))
             self.save()
@@ -674,6 +713,8 @@ class BatchWorker:
 
     def _advance(self, slot, *, confirmation_only=False):
         receipt = core.load_json(self.path.parent / f"surface-{slot['index']}.json", {})
+        if not confirmation_only and self._recover_rejected_start(slot, receipt):
+            return
         if receipt and receipt.get("workspace_id") == self.job["workspace_id"]:
             if slot.get("surface_id") not in {None, receipt["surface_id"]}:
                 raise RuntimeError("create reply and bootstrap receipt disagree")
@@ -869,10 +910,12 @@ class BatchWorker:
                 slot["error"] = str(exc)
             # Recoverable waits have no abandonment deadline. Slow startup,
             # partial logs and timeouts do not create replacement sessions.
-            slot["retry_at"] = self.clock() + (5 if slot["phase"] in {"startup_wait", "pty_wait"} else 1)
+            slot["retry_at"] = max(slot.get("retry_at", 0),
+                self.clock() + (5 if slot["phase"] in {"startup_wait", "pty_wait"} else 1))
             if slot["phase"] == "creating":
                 slot.update(phase="create_unknown", error="等待原创建回执；不会重复创建")
-        pending = next((s for s in self.job["slots"] if s["phase"] == "pending"), None)
+        pending = next((s for s in self.job["slots"]
+                        if s["phase"] == "pending" and self.clock() >= s.get("retry_at", 0)), None)
         if pending is not None:
             try:
                 self._create(pending)

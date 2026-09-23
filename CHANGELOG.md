@@ -11,6 +11,7 @@
 - Let send preflights join an in-flight cross-process topology refresh with a bounded wait, retaining fresh-snapshot requirements instead of repeatedly caching a transient `tree refresh pending` failure.
 - Read and rank janitor candidate timestamps in one process, retaining oldest-first selection and all disposal checks without spawning a separate `stat` for every candidate.
 - Queue B when macOS PTYs are exhausted instead of creating unusable tabs. Recover proven pre-session database/PTY startup failures in the same surface, preserving native sessions, drafts and operator pauses. Include an optional LaunchDaemon for macOS's supported 999-PTY ceiling.
+- Retry cmux's exact pre-dispatch polling rejection with exponential backoff, including legacy batch slots stranded with stale launch receipts. Preserve uncertain deliveries and recheck original surfaces, native sessions, drafts and pool authorization before each retry.
 
 ## 0.2.12
 

@@ -367,6 +367,12 @@ class CmuxError(RuntimeError):
     """An expected cmux command or protocol failure."""
 
 
+class CmuxRequestRejected(CmuxError):
+    """The server explicitly refused this request before dispatch."""
+
+    POLLING_RATE_LIMIT = "Error: rate_limited: Polling rate limited for this connection"
+
+
 class UncertainDeliveryError(CmuxError):
     """Input may have reached cmux; never retry via another transport."""
 
@@ -3586,8 +3592,13 @@ class CmuxClient:
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise CmuxError(str(exc)) from exc
         if result.returncode != 0:
-            detail = (result.stderr or result.stdout or "").strip()[-500:]
-            raise CmuxError(f"cmux {' '.join(args[:2])} failed: {detail}")
+            detail = (result.stderr or result.stdout or "").strip()
+            message = f"cmux {' '.join(args[:2])} failed: {detail[-500:]}"
+            # Match the complete server rejection, not a fragment of output
+            # or a timeout which may have followed a successful mutation.
+            if detail == CmuxRequestRejected.POLLING_RATE_LIMIT:
+                raise CmuxRequestRejected(message)
+            raise CmuxError(message)
         return result
 
     def ping(self) -> bool:
