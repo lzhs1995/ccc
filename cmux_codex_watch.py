@@ -6540,6 +6540,13 @@ class WatchDaemon:
             if not current():
                 return None
             if defer_send:
+                # Reconnecting paints the same provider error while Codex is
+                # still inside its own retry loop. Reject that native active
+                # turn before it occupies a send slot and refreshes topology.
+                # The send path repeats this check, including after durable
+                # persistence: an observation never grants input permission.
+                if not self._codex_turn_ready(target, runtime, state):
+                    return None
                 self._record_observation(surface_id, runtime, state)
                 runtime.candidate_observed_at = runtime.viewport_checked_at
                 return state

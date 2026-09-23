@@ -2,6 +2,7 @@
 
 ## 0.2.13
 
+- Keep active native Codex reconnects out of the send queue before topology preflight, so a provider outage cannot fill every send slot with tasks that are still retrying. Revalidate completion again before actual input.
 - Match both `We're` and `We’re` in the complete high-demand banner, including wrapped text. A typographic apostrophe must not leave an authorized failed task classified as idle.
 - Recognize native Hook termination cards without an exit status, as well as timeouts, when a current provider failure needs continuation. Hook failures alone never trigger input; explicit hook decisions and newer task output still block it.
 - Add a backed-up, opt-in migration for the legacy Codex shell/launchd binary-copy loop, and document matched official CLI/helper upgrades without resetting sessions or TCC permissions.
