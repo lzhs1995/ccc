@@ -81,7 +81,10 @@ class SharedInventory:
             return record["value"]
         if record.get("error") and 0 <= now - record.get("attempt_at", 0) < ttl:
             raise InventoryUnavailable(record["error"])
-        if not self.owner and self._owner_alive():
+        # Tree reads do not scan the OS process table. Let a batch fill the
+        # one-second topology gap when the watcher's next discovery is due in
+        # five seconds; the same file lock still bounds it to one collection.
+        if name == "top" and not self.owner and self._owner_alive():
             raise InventoryUnavailable(f"{name} refresh pending")
         self.root.mkdir(parents=True, exist_ok=True)
         with (self.root / f"{name}.lock").open("a") as lock:

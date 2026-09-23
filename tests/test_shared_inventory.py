@@ -82,3 +82,13 @@ class InventoryTests(unittest.TestCase):
             child.join(timeout=10)
             self.assertEqual(child.exitcode, 0)
         self.assertEqual((self.root / 'calls').read_text().splitlines(), ['top'])
+
+    def test_reader_can_fill_topology_gap_without_starting_a_process_scan(self):
+        owner = SharedInventory(self.root, owner=True, clock=lambda: self.now)
+        reader = SharedInventory(self.root, clock=lambda: self.now)
+        tree = Mock(return_value={'windows': []})
+        owner.get('tree', tree, ttl=1)
+        self.now += 2
+        owner.heartbeat()
+        self.assertEqual(reader.get('tree', tree, ttl=1), {'windows': []})
+        self.assertEqual(tree.call_count, 2)
