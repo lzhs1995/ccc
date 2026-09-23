@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.13
+
+- Confirm the original batch task through combined AGENTS/environment context and incremental, partial JSONL records. Persist proof before releasing startup protection; recover legacy holds from every relevant batch.
+- Separate startup holds from operator exclusions and show `整池／启动中`. Repeated workspace authorization is idempotent and preserves manual P, exclusions and per-surface pauses.
+- Share timestamped tree/process inventories across the watcher, panel and batch workers. Coalesce failed scans, limit global process discovery to once per five seconds, and continue local confirmation during RPC failures.
+- Enforce a global budget of four initializing sessions and at most two starts per second. Durable waiting replaces 25/360-second abandonment; repeated B reuses slots and lost replies never trigger duplicate create/prompt/Enter attempts.
+
 ## 0.2.12
 
 - Confirm a new native Codex session before its first rollout exists, using the

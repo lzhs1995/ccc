@@ -134,7 +134,7 @@ including the current `response_item` user-message format, before that slot is
 released to the guard. An uncertain Enter is never repeated. Process fallback
 ignores read-only history files that Codex opens while indexing older sessions.
 
-- **监控**：`未登记` / `监控中` / `空转` / `整池空转` / `已暂停` / `整池` / `已排除` / `待检测` / `投递待验` / `发送失败` / `读取异常` / `服务阻塞`。登记仍保留，投递异常直接显示；焦点行显示最近检查的年龄。
+- **监控**：`未登记` / `监控中` / `空转` / `整池空转` / `已暂停` / `整池` / `整池／启动中` / `已排除` / `待检测` / `投递待验` / `发送失败` / `读取异常` / `服务阻塞`。登记仍保留，投递异常直接显示；焦点行显示最近检查的年龄。
 - **程序**：`Codex` / `Claude` / `grok` / `Copilot` / `gh` / `shell` / `其他` / `未知`。程序列只显示身份；空转属于「监控」列。
 - **画面**：`空闲` / `运行中` / `菜单` / `待续跑` / `已排队` / `已过时` / `额度耗尽` / `正在输入` / `看不清` / `非Codex` / `Claude关` / `Hook等待` / `输入保护` / `发送中` / `已完成` / `已续跑` / `Hook待验` / `Hook未验` / `配置待核` / `模型错误` / `身份冲突` / `需人工` / `未初始化` / `等待压缩` / `压缩中` / `读不出` / `提交中` / `未确认` / `投递待验` / `发送失败` / `服务阻塞`。完成、压缩和客户端重试不代表续跑器故障。
 - **Hook**：当前进程代次的 Hook 验证结果；历史身份记录本身不能授予发送权限。
@@ -265,3 +265,13 @@ cmux-codex-continue resume-workspace WORKSPACE_UUID
 Native failure hints keep their priority when the first read or identity lookup
 is temporarily unavailable. Unchanged transcripts are not reread, and retrying
 a hint never authorizes input or clears a delivery record.
+
+### 批量启动与授权恢复
+
+`B 新开50+授权` 先保存50个持久化名额，后台绑定目标 workspace 的主区域 pane。重复按 B 复用未完成批次；完成后再按 B 追加50个。全系统最多4路正在初始化，相邻创建至少间隔0.5秒；已运行会话不受这个数量限制。
+
+启动保护记录在 `batch_start_holds`，面板显示 `整池／启动中`，不计入人工暂停。原 session 日志必须包含提交后的首个 task_started 和精确的 `show me u power` 才解除保护；AGENTS 与 environment_context 合并消息、大消息、未写完的 JSONL 行均支持增量确认。回执丢失或 worker 重启不会重开同一名额、重发 prompt 或 Enter。守卫持续核对历史批次，只清理有原始证据的批次保护，保留人工排除和暂停。
+
+`w` 可重复执行授权和核对，不依赖全量进程查询，也不解除 `P` 的整池暂停。`W` 恢复监控但不重新启动被 P 取消的批量创建；需要继续创建时显式按 B。
+
+守卫、面板与批量 worker 共享带时间戳的清单。正常全局进程扫描间隔至少5秒；失败也合并重试。面板可暂用最近30秒的只读清单，终端输入仍重新验证 UUID、原生进程/session、当前输入框和最新授权。全局查询超时不会阻止已有日志确认和保护解除，启动等待不再因25秒或360秒到期而被永久放弃。

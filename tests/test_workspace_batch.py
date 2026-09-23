@@ -77,10 +77,10 @@ class BatchFixture:
         self.test.assertEqual((wid, message), (self.test.wid, batch.PROMPT))
         job = core.load_json(self.test.worker.path, {})
         self.test.assertEqual(next(s for s in job['slots'] if s.get('surface_id') == sid)['phase'], 'submitting')
-        self.test.assertIn(sid, self.test.store.load()['workspace_rules'][0]['excluded_surface_ids'])
+        self.test.assertEqual(core.batch_start_hold(self.test.store.load()['workspace_rules'][0], sid)['job_id'], job['id'])
         self.sent.append(sid)
         binding = self.bindings[self.states[sid]['session_id']]
-        stamp = datetime.now(timezone.utc).isoformat()
+        stamp = datetime.fromtimestamp(self.test.worker.clock(), timezone.utc).isoformat()
         with Path(binding['transcriptPath']).open('a') as handle:
             # Codex can write task_started before the user_message event.
             for payload in ({'type': 'task_started', 'turn_id': 'first'},
@@ -107,11 +107,15 @@ class WorkspaceBatchTests(unittest.TestCase):
         self.store.mutate(lambda c: c.update(mode='armed', global_paused=False))
         self.client = BatchFixture(self)
         self.job = batch.start(self.config, self.wid, client=self.client, launch=False)
-        self.worker = batch.BatchWorker(self.config, self.job['job_id'], client=self.client, queue=self.client)
+        self.now = time.time()
+        self.worker = batch.BatchWorker(self.config, self.job['job_id'], client=self.client, queue=self.client, clock=lambda: self.now)
+        self.addCleanup(self.worker.cache.close)
         self.worker.job['status'] = 'running'
 
     def finish(self):
+        self.worker.clock = lambda: self.now
         for _ in range(110):
+            self.now += 1
             if not self.worker.step():
                 break
         return batch.counts(self.worker.job)

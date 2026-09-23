@@ -32,6 +32,7 @@ SOURCE_LABELS = {
     "untracked": "未登记",
     "explicit": "单路",
     "workspace_rule": "整池",
+    "workspace_starting": "整池／启动中",
     "workspace_excluded": "已排除",
     "workspace_non_codex": "整池·非Codex",
 }
@@ -48,6 +49,7 @@ WATCH_LABELS = {
     "pool_idling": "整池空转",
     "paused": "已暂停",
     "pool": "整池",
+    "starting": "整池／启动中",
     "excluded": "已排除",
 }
 
@@ -317,7 +319,7 @@ def is_idling(candidate: Candidate) -> bool:
     A target whose surface has vanished is *not* idling — it is paused with a
     diagnostic, which is a different and more specific story.
     """
-    if candidate.source == "untracked":
+    if candidate.source in {"untracked", "workspace_starting"}:
         return False
     if candidate.state == "claude_observed":
         # The adapter is disabled, so this registered target is observation-only.
@@ -369,6 +371,8 @@ def program_label(candidate: Candidate) -> str:
 
 
 def watch_kind(candidate: Candidate) -> str:
+    if candidate.source == "workspace_starting":
+        return "paused" if candidate.paused else "starting"
     if candidate.source == "untracked":
         return "untracked"
     if candidate.source == "workspace_excluded":
@@ -383,6 +387,8 @@ def watch_kind(candidate: Candidate) -> str:
 
 
 def watch_label(candidate: Candidate) -> str:
+    if candidate.source == "workspace_starting":
+        return WATCH_LABELS[watch_kind(candidate)]
     if candidate.source not in {"untracked", "workspace_excluded", "workspace_non_codex"} and not candidate.paused:
         health_labels = {"unknown": "待检测", "delivery_unknown": "投递待验",
                          "send_failed": "发送失败", "unavailable": "读取异常", "blocked": "服务阻塞"}
@@ -1915,8 +1921,8 @@ def session_detail(candidate: Candidate) -> str:
     return "，".join(parts)
 
 
-MONITORED_SOURCES = {"explicit", "workspace_rule", "workspace_excluded", "workspace_non_codex"}
-POOL_SOURCES = {"workspace_rule", "workspace_excluded", "workspace_non_codex"}
+MONITORED_SOURCES = {"explicit", "workspace_rule", "workspace_starting", "workspace_excluded", "workspace_non_codex"}
+POOL_SOURCES = {"workspace_rule", "workspace_starting", "workspace_excluded", "workspace_non_codex"}
 
 
 @dataclass
@@ -2259,7 +2265,7 @@ def confirm_prompt(action: str, candidate: Candidate, *, live_codex: int | None 
     if action == "untrack_workspace":
         return f"确认取消整个 {candidate.workspace_ref} 授权？该池将不再自动续跑"
     if action == "pause":
-        if candidate.source in {"workspace_rule", "workspace_excluded"}:
+        if candidate.source in {"workspace_rule", "workspace_starting", "workspace_excluded"}:
             return f"确认只排除 {location}？不会取消整个 {candidate.workspace_ref}"
         return f"确认暂停 {location}？"
     if action == "remove":
@@ -2309,6 +2315,8 @@ class SupervisorModel:
         self.store = core.ConfigStore(config_path)
         self._control_socket = core.CmuxViewportSocket() if client is None else None
         self.client = client or core.CmuxClient(viewport_socket=self._control_socket)
+        from ccc_inventory import SharedInventory
+        self._inventory = SharedInventory(config_path.parent) if client is None else None
         self._control_ready = client is not None
         # The janitor panel's only data source.  Constructed here so the draw
         # path has nothing to build and nothing to wait for; see JanitorClient.
@@ -2448,8 +2456,20 @@ class SupervisorModel:
             if not self._control_ready:
                 self._control_socket.configure(self.client.capabilities())
                 self._control_ready = True
-            tree = self.client.tree()
-            top = self.client.top_all()
+            if self._inventory is None:
+                tree, top = self.client.tree(), self.client.top_all()
+            else:
+                # Display can use bounded last-good data; it never authorizes
+                # input. Force-refresh does not bypass the global scan budget.
+                from ccc_inventory import InventoryUnavailable
+                try:
+                    tree = self._inventory.get("tree", self.client.tree, ttl=1)
+                    top = self._inventory.get("top", self.client.top_all, ttl=5)
+                except InventoryUnavailable:
+                    tree = self._inventory.peek("tree", max_age=30)
+                    top = self._inventory.peek("top", max_age=30)
+                    if tree is None or top is None:
+                        raise core.CmuxError("等待 cmux 清单恢复；授权操作仍可使用")
             candidates = core.main_surface_records(tree, allow_ref_only=True)
             process_by_id = core.classify_surface_processes(top)
             # One resolution pass per refresh, on a worker thread.  Started
@@ -2503,7 +2523,13 @@ class SupervisorModel:
                     str(value)
                     for value in (rule or {}).get("excluded_surface_ids", [])
                 }
-                if target is not None:
+                hold = core.batch_start_hold(rule or {}, surface_id)
+                reason = (rule or {}).get("excluded_surface_reasons", {}).get(surface_id)
+                operator_excluded = surface_id in excluded and not (isinstance(reason, str) and reason.startswith("batch:"))
+                if hold and not operator_excluded and not (target and (target.get("paused") or not target.get("enabled", True))):
+                    source = "workspace_starting"
+                    target = {"paused": False}
+                elif target is not None:
                     source = "explicit"
                 elif rule is not None and surface_id in excluded:
                     source = "workspace_excluded"
@@ -2655,7 +2681,7 @@ class SupervisorModel:
         # output. Give each action its own bounded CLI process instead.
         result = subprocess.run([sys.executable, "-B", str(Path(core.__file__).resolve()),
                                  "--config", str(self.config_path), *args],
-                                capture_output=True, text=True, timeout=180)
+                                capture_output=True, text=True, timeout=30 if args[0] != "pause-workspace" else 180)
         if result.returncode:
             raise RuntimeError((result.stderr or result.stdout).strip()[-1000:]
                                or f"command failed: {' '.join(args)}")
@@ -2682,12 +2708,12 @@ class SupervisorModel:
         elif action == "batch_workspace":
             self.run_cli(["batch-workspace", candidate.record["workspace_id"]])
         elif action == "pause":
-            if candidate.source in {"workspace_rule", "workspace_excluded"}:
+            if candidate.source in {"workspace_rule", "workspace_starting", "workspace_excluded"}:
                 self.run_cli(["exclude", surface_id])
             else:
                 self.run_cli(["pause", surface_id])
         elif action == "resume":
-            if candidate.source in {"workspace_rule", "workspace_excluded"}:
+            if candidate.source in {"workspace_rule", "workspace_starting", "workspace_excluded"}:
                 self.run_cli(["include", surface_id])
             else:
                 self.run_cli(["resume", surface_id])
@@ -2696,7 +2722,7 @@ class SupervisorModel:
                 raise RuntimeError("只有单路登记能用 x 删除")
             self.run_cli(["remove", surface_id])
         elif action == "untrack_workspace":
-            if (candidate.source not in {"workspace_rule", "workspace_excluded", "workspace_non_codex"}
+            if (candidate.source not in {"workspace_rule", "workspace_starting", "workspace_excluded", "workspace_non_codex"}
                     and not candidate.record.get("workspace_authorized")):
                 raise RuntimeError("只有整池目标才能取消 workspace 授权")
             selector = candidate.record.get("workspace_id") or candidate.record.get("workspace_ref")
@@ -2709,8 +2735,6 @@ class SupervisorModel:
     def mutate_workspace(self, row: ViewRow, action: str) -> None:
         """Pool-level actions taken from a workspace header row."""
         if action == "workspace":
-            if has_pool_rule(row):
-                raise RuntimeError(f"{row.workspace_ref} 已经是整池授权")
             self.run_cli(["track-workspace", row.workspace_id,
                           "--name", row.workspace_title or row.workspace_ref])
         elif action == "untrack_workspace":
@@ -4002,8 +4026,6 @@ def group_action_error(row: ViewRow, action: str) -> str:
     pooled = has_pool_rule(row)
     if action in {"pause_workspace", "resume_workspace"} and not pooled:
         return f"{row.workspace_ref} 尚未整池授权；请先按 w"
-    if action == "workspace" and pooled:
-        return f"{row.workspace_ref} 已经是整池授权。要取消请按 u"
     if action == "untrack_workspace" and not pooled:
         return f"{row.workspace_ref} 没有整池授权，不用取消。要授权请按 w"
     return ""
@@ -4910,7 +4932,7 @@ def _run(stdscr: Any, model: SupervisorModel) -> None:
             else:
                 status = "整池目标不能用 x 删除；按 p 排除这一路，或按 u 取消整个 workspace"
             continue
-        if (action == "untrack_workspace" and candidate.source not in {"workspace_rule", "workspace_excluded", "workspace_non_codex"}
+        if (action == "untrack_workspace" and candidate.source not in {"workspace_rule", "workspace_starting", "workspace_excluded", "workspace_non_codex"}
                 and not candidate.record.get("workspace_authorized")):
             status = "只有整池行才能按 u。单路请用 x，未登记不用取消"
             continue

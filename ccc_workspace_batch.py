@@ -7,20 +7,38 @@ recover a lost create reply; only the original transcript confirms a start.
 from __future__ import annotations
 
 import argparse
+import base64
+import contextlib
 import json
+import logging
 import os
 from pathlib import Path
+import re
 import shlex
 import subprocess
 import sys
+import threading
 import time
 import uuid
 
 import cmux_codex_watch as core
 from ccc_codex_queue import QueueRecovery, epoch
+from ccc_inventory import SharedInventory
+from ccc_scheduling import SnapshotCache, SnapshotClient
 
 COUNT = 50
 PROMPT = "show me u power"
+INITIALIZING = {"creating", "create_unknown", "created", "submitted", "submitting", "uncertain"}
+CONFIRMABLE = {"submitted", "submitting", "uncertain", "confirmed"}
+CONFIRM_READ_BYTES = 1024 * 1024
+
+
+def _startup_context(message):
+    message = message.strip()
+    environment = r"<environment_context>[\s\S]*?</environment_context>"
+    instructions = r"# AGENTS\.md instructions for [^\n]+\n\s*<INSTRUCTIONS>[\s\S]*?</INSTRUCTIONS>"
+    return bool(re.fullmatch(environment, message) or
+                re.fullmatch(instructions + r"(?:\s*" + environment + r")?", message))
 
 
 def job_path(config_path, job_id):
@@ -65,21 +83,56 @@ def _client(config):
     return client
 
 
+def _launch(config_path, job):
+    path = job_path(config_path, job["id"])
+    with (path.parent / "worker.log").open("ab") as log:
+        subprocess.Popen([sys.executable, "-B", str(Path(__file__).resolve()), "run",
+                          "--config", str(config_path), "--job", job["id"]],
+                         stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                         start_new_session=True, close_fds=True)
+
+
+def workspace_record(config_path, selector, config, client=None):
+    """UUID actions persist immediately; topology is checked by the worker."""
+    try:
+        rule = core.workspace_rule_by_id(config, selector)
+        return {**rule, "workspace_id": rule["workspace_id"], "ref": rule.get("ref", ""),
+                "title": rule.get("title_snapshot", rule.get("name", ""))}
+    except RuntimeError:
+        pass
+    if client is None:
+        try:
+            uuid.UUID(selector)
+            return {"workspace_id": selector, "ref": "", "title": ""}
+        except ValueError:
+            pass
+        tree = SharedInventory(Path(config_path).parent).peek("tree", max_age=5)
+        if tree is not None:
+            return core.find_workspace(tree, selector)
+        client = _client(config)
+    return core.find_workspace(client.tree(), selector)
+
+
+def authorize_workspace(config_path, selector, name=None, *, client=None):
+    store = core.ConfigStore(Path(config_path))
+    record = workspace_record(config_path, selector, store.load(), client)
+    def authorize(latest):
+        rule = next((r for r in latest["workspace_rules"] if r.get("workspace_id") == record["workspace_id"]), None)
+        if rule is None:
+            rule = core._workspace_rule_from_record(record, name)
+            latest["workspace_rules"].append(rule)
+        # w is idempotent. Only W can undo P; manual exclusions also survive.
+        rule["batch_reconcile_requested_at"] = time.time()
+        return dict(rule)
+    _, rule, _ = store.mutate(authorize)
+    return {"rule": rule, "reconciliation": "queued"}
+
+
 def start(config_path, selector, *, client=None, launch=True):
     store = core.ConfigStore(Path(config_path))
     config = store.load()
-    client = client or _client(config)
-    tree = client.tree()
-    workspace = core.find_workspace(tree, selector)
+    workspace = workspace_record(config_path, selector, config, client)
     wid = workspace["workspace_id"]
-    # Select a main-area pane in the requested workspace, never the Dock or the
-    # active workspace of the panel. UUIDs stay pinned for the whole batch.
-    panes = [(win, w, p) for win in tree["windows"] for w in win.get("workspaces", [])
-             if w.get("id") == wid for p in w.get("panes", [])
-             if p.get("dock_scope") is None and p.get("id")]
-    if not panes:
-        raise RuntimeError("目标 workspace 没有可用的主区域 pane")
-    win, _, pane = next((item for item in panes if item[2].get("focused")), panes[0])
     with core.FileLock(Path(config_path).parent / f"batch-start-{wid}.lock", timeout_sec=5):
         config = store.load()
         rule = next((r for r in config["workspace_rules"] if r.get("workspace_id") == wid), {})
@@ -92,8 +145,8 @@ def start(config_path, selector, *, client=None, launch=True):
         if previous and previous.get("status") != "complete":
             job = previous  # Repeated clicks and retries reuse the same 50 slots.
         else:
-            job = {"id": str(uuid.uuid4()), "workspace_id": wid, "window_id": win["id"],
-                   "pane_id": pane["id"], "created_at": time.time(), "status": "pending",
+            job = {"id": str(uuid.uuid4()), "workspace_id": wid,
+                   "created_at": time.time(), "status": "pending",
                    "slots": [{"index": i, "phase": "pending"} for i in range(COUNT)]}
             core.atomic_write_json(job_path(config_path, job["id"]), job)
         def authorize(latest):
@@ -110,12 +163,7 @@ def start(config_path, selector, *, client=None, launch=True):
             current.update(active_batch_id=job["id"], last_batch_id=job["id"])
         store.mutate(authorize)
         if launch:
-            path = job_path(config_path, job["id"])
-            with (path.parent / "worker.log").open("ab") as log:
-                subprocess.Popen([sys.executable, "-B", str(Path(__file__).resolve()), "run",
-                                  "--config", str(config_path), "--job", job["id"]],
-                                 stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                                 start_new_session=True, close_fds=True)
+            _launch(config_path, job)
         return {"job_id": job["id"], "workspace_id": wid, **counts(job)}
 
 
@@ -136,19 +184,20 @@ def register(config_path, job_id, index):
             if not allowed(latest, job):
                 raise RuntimeError("batch paused or cancelled before launch")
             rule = core.workspace_rule_by_id(latest, wid)
-            excluded = rule.setdefault("excluded_surface_ids", [])
-            reasons = rule.setdefault("excluded_surface_reasons", {})
-            reason = f"batch:{job_id}:initial"
-            if sid in excluded and reasons.get(sid) != reason:
+            previous = core.batch_start_hold(rule, sid)
+            if sid in rule.get("excluded_surface_ids", []) and not (previous or {}).get("legacy"):
                 raise RuntimeError("new surface was excluded by its operator")
-            if sid not in excluded:
-                excluded.append(sid)
-            reasons[sid] = reason
-        store.mutate(protect)
+            if previous and previous.get("job_id") != job_id:
+                raise RuntimeError("surface already belongs to another batch")
+            # A late/repeated bootstrap cannot put a proven session on hold.
+            if job["slots"][index].get("phase") != "confirmed":
+                rule.setdefault("batch_start_holds", {})[sid] = {
+                    "job_id": job_id, "index": index, "created_at": time.time()}
         with core.FileLock(receipt.with_suffix(".lock"), timeout_sec=5):
             old = core.load_json(receipt, {})
             if old and old.get("surface_id") != sid:
                 raise RuntimeError("batch slot already belongs to another surface")
+            store.mutate(protect)
             core.atomic_write_json(receipt, {"surface_id": sid, "workspace_id": wid})
 
 
@@ -158,19 +207,41 @@ class BatchWorker:
         self.path = job_path(config_path, job_id)
         self.store = core.ConfigStore(self.config_path)
         self.job = core.load_json(self.path, {})
-        self.client = client or _client(self.store.load())
+        self.cache = SnapshotCache(workers=1)
+        self.client = client or SnapshotClient(_client(self.store.load()), self.cache,
+                                               SharedInventory(self.config_path.parent))
         self.queue = queue or QueueRecovery(self.path.parent / "unused-queue-ledger.json",
             Path.home() / ".cmuxterm/codex-hook-sessions.json", Path.home() / ".codex/sessions", PROMPT)
         self.processes = {}
-        self.queue.process_lookup = lambda target: core.surface_process_label(self.processes, target)
+        self.queue.process_lookup = self._process_label
         self.clock = clock
+        self._top_due = 0.0
+        self._saved = None
+
+    def _process_label(self, target):
+        if self.processes:
+            return core.surface_process_label(self.processes, target)
+        # A persisted submit pins an original PID/start/session. It is only a
+        # lookup hint: QueueRecovery rechecks placement, start and writable
+        # rollout, and _confirm checks all three identity fields again.
+        slot = next((s for s in self.job["slots"] if s.get("surface_id") == target["surface_id"]), {})
+        if slot.get("submit_at") and slot.get("pid") and slot.get("process_start"):
+            return {"agent_kind": "codex", "agent_pids": [slot["pid"]]}
+        return {"agent_kind": "unknown", "summary": "process lookup unavailable"}
 
     def save(self):
+        value = {k: v for k, v in self.job.items() if k != "updated_at"}
+        serialized = json.dumps(value, sort_keys=True)
+        if serialized == self._saved:
+            return
         self.job["updated_at"] = self.clock()
         core.atomic_write_json(self.path, self.job)
+        self._saved = serialized
 
-    def _target(self, slot):
-        target = core.find_main_surface(self.client.tree(), slot["surface_id"])
+    def _target(self, slot, *, fresh=False):
+        tree = (self.client.fresh_tree() if fresh and isinstance(self.client, SnapshotClient)
+                else self.client.tree())
+        target = core.find_main_surface(tree, slot["surface_id"])
         if target["workspace_id"] != self.job["workspace_id"]:
             raise RuntimeError("surface moved out of its authorized workspace")
         return target
@@ -180,10 +251,19 @@ class BatchWorker:
         with core.workspace_input_lock(self.config_path, wid, shared=True):
             if not allowed(self.store.load(), self.job):
                 return
+            tree = self.client.tree()
+            panes = [(win, p) for win in tree.get("windows", []) for w in win.get("workspaces", [])
+                     if w.get("id") == wid for p in w.get("panes", [])
+                     if p.get("dock_scope") is None and p.get("id")]
+            if not panes:
+                raise RuntimeError("等待目标 workspace 主区域 pane")
+            win, pane = next((pair for pair in panes if pair[1].get("id") == self.job.get("pane_id")),
+                             next((pair for pair in panes if pair[1].get("focused")), panes[0]))
+            self.job.update(window_id=win["id"], pane_id=pane["id"])
+            if not self._reserve_start(slot):
+                return
             # Persist BEFORE creating; an uncertain reply is reconciled from
             # the bootstrap receipt and must never cause a replacement tab.
-            slot.update(phase="creating", created_at=self.clock())
-            self.save()
             command = shlex.join([sys.executable, "-B", str(Path(__file__).resolve()), "register",
                                   "--config", str(self.config_path), "--job", self.job["id"],
                                   "--index", str(slot["index"])]) + " && codex"
@@ -205,6 +285,11 @@ class BatchWorker:
         return str(self.queue.open_file_sources.get(sid, {}).get("path") or "")
 
     def _confirm(self, slot):
+        """Incrementally prove the original first task, never a later prompt.
+
+        The cursor and partial JSON line survive worker restarts. Context may
+        span several reads; an unchanged file causes no payload reread.
+        """
         if not slot.get("transcript") and slot.get("native_uninitialized"):
             target = self._target(slot)
             native = self.queue.current_turn(target)
@@ -213,49 +298,104 @@ class BatchWorker:
             slot["transcript"] = self._transcript(slot["surface_id"], native)
         path = Path(slot.get("transcript") or "/nonexistent")
         try:
+            stat = path.stat()
+            proof = slot.setdefault("confirmation", {"offset": slot["transcript_offset"], "session_id": slot["session_id"]})
+            identity = [stat.st_dev, stat.st_ino]
+            if proof.get("session_id", slot["session_id"]) != slot["session_id"]:
+                proof["blocked"] = "original session changed"
+            if proof.get("identity", identity) != identity or stat.st_size < proof["offset"]:
+                proof["blocked"] = "original transcript changed or truncated"
+            if proof.get("blocked"):
+                return False
+            if proof.get("confirmed"):
+                return True
+            if proof.get("identity") and stat.st_size == proof["offset"]:
+                return False
             with path.open("rb") as handle:
-                meta = json.loads(handle.readline())
-                if meta.get("payload", {}).get("id") != slot.get("session_id"):
+                if not proof.get("identity"):
+                    meta = json.loads(handle.readline())
+                    if meta.get("type") != "session_meta" or meta.get("payload", {}).get("id") != slot.get("session_id"):
+                        proof["blocked"] = "original session mismatch"
+                        return False
+                    proof["identity"] = identity
+                    proof["session_id"] = slot["session_id"]
+                handle.seek(proof["offset"])
+                data = handle.read(CONFIRM_READ_BYTES)
+                proof["offset"] = handle.tell()
+            data = base64.b64decode(proof.pop("partial", "")) + data
+            lines = data.split(b"\n")
+            tail = lines.pop()
+            if tail:
+                proof["partial"] = base64.b64encode(tail).decode("ascii")
+            for line in lines:
+                if not line.strip():
+                    continue
+                try:
+                    event = json.loads(line)
+                    payload = event["payload"]
+                    if not isinstance(event, dict) or not isinstance(payload, dict):
+                        raise ValueError("invalid native event")
+                except (ValueError, KeyError, TypeError):
+                    proof["blocked"] = "invalid original transcript event"
                     return False
-                handle.seek(slot["transcript_offset"])
-                data = handle.read(1024 * 1024)
-            started, prompt = False, False
-            for line in data.splitlines():
-                event = json.loads(line)
-                if event.get("type") == "event_msg" and event.get("payload", {}).get("type") == "user_message":
-                    if event["payload"].get("message") != PROMPT:
+                kind = payload.get("type") if event.get("type") == "event_msg" else ""
+                if kind == "task_started":
+                    if epoch(event["timestamp"]) < slot["submit_at"] - .001 or proof.get("started"):
+                        proof["blocked"] = "different task before batch prompt"
                         return False
-                    prompt = True
-                if event.get("type") == "response_item" and event.get("payload", {}).get("role") == "user":
-                    content = event["payload"].get("content", [])
-                    message = "\n".join(part.get("text", "") for part in content if part.get("type") == "input_text")
-                    if message == PROMPT:
-                        prompt = True
-                    elif not ((message.startswith("<environment_context>") and message.endswith("</environment_context>"))
-                              or (message.startswith("# AGENTS.md instructions for ") and "<INSTRUCTIONS>" in message
-                                  and message.rstrip().endswith("</INSTRUCTIONS>"))):
+                    proof.update(started=True, task_id=payload.get("turn_id"), task_at=event["timestamp"])
+                if kind in {"task_complete", "task_aborted"} and not proof.get("prompt"):
+                    proof["blocked"] = "task ended before batch prompt"
+                    return False
+                message = None
+                if kind == "user_message":
+                    message = payload.get("message")
+                elif event.get("type") == "response_item" and payload.get("role") == "user":
+                    content = payload.get("content", [])
+                    if not content or any(p.get("type") != "input_text" for p in content):
+                        proof["blocked"] = "operator input before batch prompt"
                         return False
-                if (event.get("type") == "event_msg" and event.get("payload", {}).get("type") == "task_started"
-                        # Native timestamps are milliseconds; the byte offset
-                        # and exact prompt still prove this is a new task.
-                        and epoch(event["timestamp"]) >= slot["submit_at"] - .001):
-                    started = True
-                if started and prompt:
+                    message = "\n".join(p.get("text", "") for p in content)
+                    if _startup_context(message):
+                        continue
+                if message is not None:
+                    if message != PROMPT:
+                        proof["blocked"] = "different user prompt"
+                        return False
+                    proof["prompt"] = True
+                if proof.get("started") and proof.get("prompt"):
+                    proof.update(confirmed=True, confirmed_at=self.clock())
+                    proof.pop("partial", None)
                     return True
-            return started and prompt
-        except (OSError, ValueError, KeyError):
-            pass
+        except (OSError, ValueError, KeyError, TypeError):
+            return False
         return False
 
     def _release(self, slot):
+        if slot.get("phase") != "confirmed" or not slot.get("confirmation", {}).get("confirmed"):
+            return
         def release(config):
-            rule = core.workspace_rule_by_id(config, self.job["workspace_id"])
+            rule = next((r for r in config["workspace_rules"] if r.get("workspace_id") == self.job["workspace_id"]), {})
             reasons = rule.get("excluded_surface_reasons", {})
             sid = slot["surface_id"]
             if reasons.get(sid) == f"batch:{self.job['id']}:initial":
                 reasons.pop(sid)
                 rule["excluded_surface_ids"] = [s for s in rule.get("excluded_surface_ids", []) if s != sid]
+            if rule.get("batch_start_holds", {}).get(sid, {}).get("job_id") == self.job["id"]:
+                rule["batch_start_holds"].pop(sid)
         self.store.mutate(release)
+        slot["hold_released_at"] = self.clock()
+
+    def _protected(self, config, slot):
+        rule = core.workspace_rule_by_id(config, self.job["workspace_id"])
+        sid = slot["surface_id"]
+        hold = core.batch_start_hold(rule, sid)
+        if not hold or hold.get("job_id") != self.job["id"]:
+            return False
+        reason = rule.get("excluded_surface_reasons", {}).get(sid)
+        return (not (sid in rule.get("excluded_surface_ids", []) and reason != f"batch:{self.job['id']}:initial")
+                and not any(t.get("surface_id") == sid and (t.get("paused") or not t.get("enabled", True))
+                            for t in config["targets"]))
 
     def _native(self, target, slot):
         native = self.queue.current_turn(target)
@@ -306,12 +446,9 @@ class BatchWorker:
             config = self.store.load()
             if not allowed(config, self.job):
                 return
-            rule = core.workspace_rule_by_id(config, self.job["workspace_id"])
-            if (rule.get("excluded_surface_reasons", {}).get(slot["surface_id"]) != f"batch:{self.job['id']}:initial"
-                    or any(t.get("surface_id") == slot["surface_id"] and (t.get("paused") or not t.get("enabled", True))
-                           for t in config["targets"])):
+            if not self._protected(config, slot):
                 return
-            target = self._target(slot)
+            target = self._target(slot, fresh=True)
             native = self._native(target, slot)
             if (not native or native.get("kind") not in {"unknown", "uninitialized"}
                     or any(native.get(k) != slot.get(k) for k in ("session_id", "pid", "process_start"))):
@@ -326,7 +463,7 @@ class BatchWorker:
             except (core.CmuxError, RuntimeError) as exc:
                 slot.update(phase="uncertain", error=str(exc))
 
-    def _advance(self, slot):
+    def _advance(self, slot, *, confirmation_only=False):
         receipt = core.load_json(self.path.parent / f"surface-{slot['index']}.json", {})
         if receipt and receipt.get("workspace_id") == self.job["workspace_id"]:
             if slot.get("surface_id") not in {None, receipt["surface_id"]}:
@@ -334,13 +471,22 @@ class BatchWorker:
             slot["surface_id"] = receipt["surface_id"]
             if slot["phase"] in {"creating", "create_unknown"}:
                 slot["phase"] = "created"
-        if slot["phase"] in {"submitted", "uncertain", "submitting"}:
+        if slot["phase"] in CONFIRMABLE:
             if self._confirm(slot):
-                self._release(slot)
                 slot["phase"] = "confirmed"
                 slot.pop("error", None)
-            else:
+                # Proof and phase are durable before changing authorization.
+                # A crash on either side is repaired without replaying input.
+                self.save()
+                rule = next((r for r in self.store.load()["workspace_rules"]
+                             if r.get("workspace_id") == self.job["workspace_id"]), {})
+                if core.batch_start_hold(rule, slot["surface_id"]):
+                    self._release(slot)
+                    self.save()
+            elif not confirmation_only:
                 self._finish_submission(slot)
+            return
+        if confirmation_only:
             return
         if slot["phase"] != "created":
             return
@@ -363,14 +509,10 @@ class BatchWorker:
             config = self.store.load()
             if not allowed(config, self.job):
                 return
-            rule = core.workspace_rule_by_id(config, self.job["workspace_id"])
-            reason = rule.get("excluded_surface_reasons", {}).get(slot["surface_id"])
-            if reason != f"batch:{self.job['id']}:initial" or any(
-                    t.get("surface_id") == slot["surface_id"] and (t.get("paused") or not t.get("enabled", True))
-                    for t in config["targets"]):
+            if not self._protected(config, slot):
                 slot.update(phase="blocked", error="此路授权已被修改，未发送 prompt")
                 return
-            target = self._target(slot)
+            target = self._target(slot, fresh=True)
             grid = core.Grid.from_rpc(self.client.replay(target["workspace_id"], target["surface_id"]), target["surface_id"])
             if (core.classify_grid(grid).kind != "idle" or core._composer_status(grid)[0] != "empty"
                     or self._native(target, slot) != native):
@@ -390,58 +532,197 @@ class BatchWorker:
                 slot.update(phase="uncertain", error=str(exc))
             self.save()
 
+    def _reserve_start(self, slot):
+        # All batch processes share the same capacity and rate limit. Save the
+        # reservation before releasing the lock, without holding it over RPC.
+        with core.FileLock(self.config_path.parent / "batch-capacity.lock", timeout_sec=.1):
+            config = self.store.load()
+            ids = relevant_job_ids(self.config_path, config)
+            active = 0
+            for jid in ids:
+                job = self.job if jid == self.job["id"] else core.load_json(job_path(self.config_path, jid), {})
+                if job.get("status") in {"cancelled", "workspace_closed"} or not allowed(config, job):
+                    continue
+                active += sum(s.get("phase") in INITIALIZING for s in job.get("slots", []))
+            path = self.config_path.parent / "batch-capacity.json"
+            budget = core.load_json(path, {})
+            now = self.clock()
+            if active >= 4 or now - budget.get("last_start", 0) < .5:
+                return False
+            slot.update(phase="creating", created_at=now)
+            self.save()
+            core.atomic_write_json(path, {"last_start": now})
+            return True
+
+    def _refresh_processes(self):
+        if isinstance(self.client, SnapshotClient):
+            labels = self.client.process_labels(self.job["workspace_id"], core.classify_surface_processes, wait=False)
+            self.processes = labels or {}
+        elif self.clock() >= self._top_due:
+            self._top_due = self.clock() + 5
+            self.processes = core.classify_surface_processes(self.client.top_all())
+
     def step(self):
+        # Disk evidence is independent of cmux's process-table RPC and of B/P.
+        # Releasing a proven hold does not override P or any manual exclusion.
+        rule = next((r for r in self.store.load()["workspace_rules"]
+                     if r.get("workspace_id") == self.job["workspace_id"]), {})
+        for slot in self.job["slots"]:
+            if slot.get("phase") == "confirmed" and not core.batch_start_hold(rule, slot.get("surface_id")):
+                continue
+            if slot.get("phase") in CONFIRMABLE:
+                try:
+                    self._advance(slot, confirmation_only=True)
+                except (OSError, ValueError, core.CmuxError, RuntimeError) as exc:
+                    slot["error"] = str(exc)
         if not allowed(self.store.load(), self.job):
             self.job["status"] = "cancelled"
             self.save()
             return False
         try:
-            self.processes = core.classify_surface_processes(self.client.top_all())
-        except core.CmuxError as exc:
-            self.job["error"] = str(exc)
+            tree = self.client.tree()
+            workspaces = [w.get("id") for win in tree.get("windows", []) for w in win.get("workspaces", [])]
+            if self.job["workspace_id"] not in workspaces:
+                # Only a successful, fresh inventory proves a closed pool.
+                self.job["status"] = "workspace_closed"
+                self.save()
+                return False
+        except (core.CmuxError, RuntimeError) as exc:
+            self.job.update(status="waiting", error=str(exc))
             self.save()
             return True
+        try:
+            self._refresh_processes()
+        except (core.CmuxError, RuntimeError) as exc:
+            self.processes = {}
+            self.job["error"] = str(exc)
+        self.job["status"] = "running"
         for slot in self.job["slots"]:
-            if slot["phase"] in {"pending", "confirmed", "blocked"}:
+            if slot["phase"] not in INITIALIZING or self.clock() < slot.get("retry_at", 0):
                 continue
             try:
                 self._advance(slot)
             except (OSError, ValueError, core.CmuxError, RuntimeError) as exc:
                 slot["error"] = str(exc)
-            if slot["phase"] == "created" and self.clock() - slot["created_at"] > 25:
-                slot["phase"] = "blocked"
-            elif slot["phase"] == "creating" and self.clock() - slot["created_at"] > 25:
-                slot.update(phase="create_unknown", error="创建结果未确认；不会重复创建")
-        active = sum(s["phase"] in {"creating", "create_unknown", "created", "submitted", "submitting", "uncertain"}
-                     and self.clock() - s.get("created_at", 0) < 25 for s in self.job["slots"])
-        if active < 4:
-            pending = next((s for s in self.job["slots"] if s["phase"] == "pending"), None)
-            if pending is not None:
+            # Recoverable waits have no abandonment deadline. Slow startup,
+            # partial logs and timeouts do not create replacement sessions.
+            slot["retry_at"] = self.clock() + 1
+            if slot["phase"] == "creating":
+                slot.update(phase="create_unknown", error="等待原创建回执；不会重复创建")
+        pending = next((s for s in self.job["slots"] if s["phase"] == "pending"), None)
+        if pending is not None:
+            try:
                 self._create(pending)
+            except (OSError, ValueError, core.CmuxError, RuntimeError) as exc:
+                self.job.update(status="waiting", error=str(exc))
         if all(s["phase"] == "confirmed" for s in self.job["slots"]):
             self.job["status"] = "complete"
-        elif not any(s["phase"] in {"pending", "creating", "created"} or (
-                s["phase"] in {"submitted", "submitting", "uncertain", "create_unknown"}
-                and self.clock() - s.get("created_at", 0) < 25) for s in self.job["slots"]):
-            self.job["status"] = "partial"
+            self.job.pop("error", None)
+        elif all(s["phase"] in {"confirmed", "blocked"} for s in self.job["slots"]):
+            self.job["status"] = "needs_attention"
         self.save()
-        return self.job["status"] not in {"complete", "partial", "cancelled"}
+        return self.job["status"] not in {"complete", "needs_attention", "cancelled", "workspace_closed"}
 
     def run(self):
-        with core.FileLock(self.path.parent / "worker.lock", timeout_sec=0):
-            self.job = core.load_json(self.path, {})
-            self.job.update(status="running", worker_pid=os.getpid())
-            for slot in self.job["slots"]:
-                if slot["phase"] == "blocked" and not slot.get("submit_at"):
-                    slot.setdefault("launched_at", slot["created_at"])
-                    slot.update(phase="created", created_at=self.clock())
-            self.save()
-            deadline = self.clock() + 360
-            while self.clock() < deadline and self.step():
-                time.sleep(.2)
-            if self.job["status"] == "running":
-                self.job["status"] = "partial"
+        try:
+            with core.FileLock(self.path.parent / "worker.lock", timeout_sec=0):
+                self.job = core.load_json(self.path, {})
+                self.job.update(status="running", worker_pid=os.getpid(), worker_version=13)
+                for slot in self.job["slots"]:
+                    # v0.2.12 marked slow starts blocked at 25 s. Explicit
+                    # operator-task/authorization vetoes remain blocked.
+                    if (slot["phase"] == "blocked" and not slot.get("submit_at")
+                            and slot.get("error") not in {"此 session 已有任务，未发送批量 prompt", "此路授权已被修改，未发送 prompt"}):
+                        slot["phase"] = "created"
                 self.save()
+                while self.step():
+                    time.sleep(.5)
+        finally:
+            self.cache.close()
+
+
+def relevant_job_ids(config_path, config):
+    ids = set()
+    for rule in config.get("workspace_rules", []):
+        ids.update(rule.get(key) for key in ("active_batch_id", "last_batch_id") if rule.get(key))
+        ids.update(h["job_id"] for h in rule.get("batch_start_holds", {}).values() if isinstance(h, dict) and h.get("job_id"))
+        for sid in rule.get("excluded_surface_ids", []):
+            hold = core.batch_start_hold(rule, sid)
+            if hold:
+                ids.add(hold["job_id"])
+    # Include every historical/partial batch in authorized pools, not only
+    # last_batch_id. This also catches late registrations from an old worker.
+    workspaces = {r.get("workspace_id") for r in config.get("workspace_rules", [])}
+    for path in (Path(config_path).parent / "workspace-batches").glob("*/job.json"):
+        job = core.load_json(path, {})
+        if job.get("workspace_id") in workspaces and job.get("status") not in {"complete", "workspace_closed"}:
+            ids.add(path.parent.name)
+    return sorted(ids)
+
+
+class BatchReconciler:
+    """Repair durable holds and revive orphaned jobs without blocking watch I/O."""
+    def __init__(self, config_path, client, *, launch=True):
+        self.path, self.client, self.launch = Path(config_path), client, launch
+        self.store = core.ConfigStore(self.path)
+        self.stop = threading.Event()
+        self.workers, self.launched = {}, {}
+        self.thread = threading.Thread(target=self._run, name="ccc-batch-reconcile", daemon=True)
+
+    def start(self):
+        self.thread.start()
+
+    def close(self):
+        self.stop.set()
+        self.thread.join(timeout=3)
+        for worker in self.workers.values():
+            worker.cache.close()
+
+    def cycle(self):
+        config = self.store.load()
+        ids = relevant_job_ids(self.path, config)
+        for jid in ids:
+            if self.stop.is_set():
+                break
+            path = job_path(self.path, jid)
+            try:
+                with core.FileLock(path.parent / "worker.lock", timeout_sec=0):
+                    job = core.load_json(path, {})
+                    if not job:
+                        continue
+                    worker = self.workers.get(jid)
+                    if worker is None:
+                        worker = self.workers[jid] = BatchWorker(self.path, jid, client=self.client)
+                    worker.job = job
+                    rule = next((r for r in config["workspace_rules"] if r.get("workspace_id") == job["workspace_id"]), {})
+                    for slot in job.get("slots", []):
+                        if slot.get("phase") == "confirmed" and not core.batch_start_hold(rule, slot.get("surface_id")):
+                            continue
+                        if slot.get("phase") in CONFIRMABLE:
+                            try:
+                                worker._advance(slot, confirmation_only=True)
+                            except (OSError, ValueError, RuntimeError) as exc:
+                                slot["error"] = str(exc)
+                    if job.get("slots") and all(s["phase"] == "confirmed" for s in job["slots"]):
+                        job["status"] = "complete"
+                    worker.save()
+                    if (self.launch and allowed(self.store.load(), job)
+                            and job.get("status") not in {"complete", "needs_attention", "workspace_closed"}
+                            and time.monotonic() - self.launched.get(jid, 0) >= 10):
+                        _launch(self.path, job)
+                        self.launched[jid] = time.monotonic()
+            except (OSError, ValueError, RuntimeError) as exc:
+                # A running worker holds the lock; it owns both job and proof.
+                if "lock" not in str(exc).lower():
+                    logging.getLogger(core.APP_NAME).warning("batch=%s reconciliation: %s", jid, exc)
+
+    def _run(self):
+        while not self.stop.is_set():
+            try:
+                self.cycle()
+            except (OSError, ValueError, RuntimeError) as exc:
+                logging.getLogger(core.APP_NAME).warning("batch reconciliation: %s", exc)
+            self.stop.wait(2)
 
 
 def main():
