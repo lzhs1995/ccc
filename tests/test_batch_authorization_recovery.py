@@ -207,6 +207,7 @@ class BatchAuthorizationTests(unittest.TestCase):
             self.assertLessEqual(total, 4)
             self.now += .1
         self.assertEqual(previous, 4)
+        self.assertTrue(all(w.client.calls for w in workers), 'each concurrent pool must get a startup slot')
         self.assertTrue(all(b - a >= .5 - 1e-6 for a, b in zip(starts, starts[1:])))
         self.assertTrue(all(s['phase'] != 'blocked' for w in workers for s in w.job['slots']))
 

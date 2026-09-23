@@ -543,19 +543,27 @@ class BatchWorker:
             config = self.store.load()
             ids = relevant_job_ids(self.config_path, config)
             active = 0
+            pending_jobs = []
             for jid in ids:
                 job = self.job if jid == self.job["id"] else core.load_json(job_path(self.config_path, jid), {})
-                if job.get("status") in {"cancelled", "workspace_closed"} or not allowed(config, job):
+                if not job or job.get("status") in {"cancelled", "workspace_closed"} or not allowed(config, job):
                     continue
                 active += sum(s.get("phase") in INITIALIZING for s in job.get("slots", []))
+                if any(s.get("phase") == "pending" for s in job.get("slots", [])):
+                    pending_jobs.append(jid)
             path = self.config_path.parent / "batch-capacity.json"
             budget = core.load_json(path, {})
             now = self.clock()
             if active >= 4 or now - budget.get("last_start", 0) < .5:
                 return False
+            # A busy first pool cannot consume every available startup slot.
+            last = budget.get("last_job", "")
+            next_job = next((jid for jid in pending_jobs if jid > last), pending_jobs[0])
+            if next_job != self.job["id"]:
+                return False
             slot.update(phase="creating", created_at=now)
             self.save()
-            core.atomic_write_json(path, {"last_start": now})
+            core.atomic_write_json(path, {"last_start": now, "last_job": self.job["id"]})
             return True
 
     def _refresh_processes(self):
