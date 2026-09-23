@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.14
+
+- Recognize the dim background-terminal status bar when verified RGB composer particles occupy its usual blank separator. Keep the same position, complete text, dim-style and wrapping checks; real output and unverified particles still block recovery. This fixes completed rate-limit/high-demand turns incorrectly marked as superseded on animated Codex surfaces.
+
 ## 0.2.13
 
 - Keep active native Codex reconnects out of the send queue before topology preflight, so a provider outage cannot fill every send slot with tasks that are still retrying. Revalidate completion again before actual input.

@@ -1191,8 +1191,10 @@ def _codex_status_chrome_rows(grid: Grid, composer_row: int) -> frozenset[int]:
     to four wrapped rows, but require complete grammar, dim spans, indentation
     and wrap geometry.  Unknown or transcript-like rows are never exempted.
     """
+    overlay_rows = _spinner_chrome_rows(grid, composer_row)
     end = composer_row - 1
-    while end >= max(0, composer_row - 3) and not grid.lines[end].strip():
+    while end >= max(0, composer_row - 3) and (
+            not grid.lines[end].strip() or end in overlay_rows):
         end -= 1
     if end < max(0, composer_row - 3):
         return frozenset()
