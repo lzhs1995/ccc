@@ -98,6 +98,11 @@ class BatchFixture:
 
 class WorkspaceBatchTests(unittest.TestCase):
     def setUp(self):
+        # The fixture's register() runs inside the test runner, not a cmux
+        # shell. Never pin the runner's real parent as a launched batch shell.
+        shell = patch.object(batch, 'batch_shell_identity', return_value=None)
+        shell.start()
+        self.addCleanup(shell.stop)
         pty = patch.object(batch, 'pty_available', return_value=True)
         pty.start()
         self.addCleanup(pty.stop)
@@ -262,9 +267,15 @@ class WorkspaceBatchTests(unittest.TestCase):
                 {'type': 'input_text', 'text': batch.PROMPT}]}},
         ]
         path.write_text('\n'.join(json.dumps(row) for row in rows) + '\n')
-        self.worker._advance(slot)
+        with patch.object(self.client, 'tree', side_effect=core.CmuxError('tree refresh pending')), \
+                patch.object(self.client, 'send_text') as send, \
+                patch.object(self.client, 'send_key', create=True) as enter:
+            self.worker._advance(slot, confirmation_only=True)
+            send.assert_not_called()
+            enter.assert_not_called()
         self.assertEqual(slot['phase'], 'confirmed')
         self.assertNotIn(sid, self.store.load()['workspace_rules'][0]['excluded_surface_ids'])
+        self.assertNotIn(sid, self.store.load()['workspace_rules'][0].get('batch_start_holds', {}))
 
     def test_separate_enter_requires_exact_recorded_draft_and_is_never_repeated(self):
         self.worker.step()

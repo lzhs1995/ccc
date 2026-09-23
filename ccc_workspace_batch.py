@@ -29,7 +29,7 @@ from ccc_inventory import SharedInventory
 from ccc_scheduling import SnapshotCache, SnapshotClient
 
 COUNT = 50
-WORKER_VERSION = 14
+WORKER_VERSION = 15
 PROMPT = "show me u power"
 INITIALIZING = {"creating", "create_unknown", "created", "restarting", "restart_unknown",
                 "submitted", "submitting", "uncertain"}
@@ -492,7 +492,11 @@ class BatchWorker:
         span several reads; an unchanged file causes no payload reread.
         """
         if not slot.get("transcript") and slot.get("native_uninitialized"):
-            target = self._target(slot)
+            # Finding the first rollout is read-only and already pinned to
+            # the submitted PID/start/session. A topology refresh must not
+            # delay proof or keep its startup permit occupied. QueueRecovery
+            # checks the live native binding; input still requires fresh tree.
+            target = {"surface_id": slot["surface_id"], "workspace_id": self.job["workspace_id"]}
             native = self.queue.current_turn(target)
             if not native or any(native.get(key) != slot.get(key) for key in ("session_id", "pid", "process_start")):
                 return False
