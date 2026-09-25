@@ -2249,9 +2249,9 @@ def confirm_prompt(action: str, candidate: Candidate, *, live_codex: int | None 
     if action == "pause_workspace":
         return f"确认整池暂停 {candidate.workspace_ref}？立即停发续跑，并 Interrupt 该池全部 Codex；保留 session"
     if action == "resume_workspace":
-        return f"确认恢复 {candidate.workspace_ref} 的整池监控？保留单路暂停和排除设置"
+        return f"确认恢复 {candidate.workspace_ref} 的整池监控？B 池重新布防原会话，不补开已取消名额；保留单路暂停和排除设置"
     if action == "batch_workspace":
-        return f"确认在 {candidate.workspace_ref} 新开50个Codex并整池授权？每路发送 show me u power；未完成批次会继续补做"
+        return f"确认在 {candidate.workspace_ref} 新开50个Codex并整池授权？每路发送 show me u power；任一路收到模型响应即在1秒内 Interrupt 本池全部 Codex，取消剩余名额"
     if action == "workspace":
         title = str(candidate.record.get("workspace_title") or "").strip()
         pool = f"{candidate.workspace_ref}{f'「{title}」' if title else ''}"
@@ -2290,13 +2290,39 @@ def workspace_confirm_prompt(row: ViewRow, action: str, *, live_codex: int | Non
     if action == "pause_workspace":
         return f"确认整池暂停 {pool}？停发续跑并 Interrupt 全部 Codex，保留原 session"
     if action == "resume_workspace":
-        return f"确认恢复 {pool} 整池监控？保留单路暂停和排除设置"
+        return f"确认恢复 {pool} 整池监控？B 池重新布防原会话，不补开已取消名额；保留单路暂停和排除设置"
     if action == "batch_workspace":
-        return f"确认在 {pool} 新开50个Codex并整池授权？每路发送 show me u power；未完成批次会继续补做"
+        return f"确认在 {pool} 新开50个Codex并整池授权？每路发送 show me u power；任一路收到模型响应即在1秒内 Interrupt 本池全部 Codex，取消剩余名额"
     if action == "untrack_workspace":
         return f"确认取消整个 {pool} 授权？该池将不再自动续跑"
     count = row.counts.get("all", 0) if live_codex is None else live_codex
     return f"确认授权整个 {pool}？这一池现在有 {count} 路，之后新开的 Codex 也会自动续跑"
+
+
+def batch_guard_label(protection: Mapping[str, Any]) -> str:
+    phase = protection.get("phase")
+    trip = protection.get("trip") or {}
+    rows = [r for r in protection.get("surfaces", {}).values() if r.get("in_scope", True)]
+    rows += [r for r in protection.get("unmanaged", {}).values() if r.get("in_scope", True)]
+    if protection.get("stop_targets") and phase in {"stopping", "stopped", "failed"}:
+        rows = [r for r in protection["stop_targets"] if r.get("in_scope", True)]
+    sent = sum(bool(r.get("interrupt_requested")) for r in rows)
+    confirmed = sum(bool(r.get("stop_proof")) and not r.get("active") and not r.get("pending_turn")
+                    and (r.get("backend_exited") or r.get("stop_proof") == "original_process_exited") for r in rows)
+    prefix = "接入已确认" if trip.get("connected") else "接入未确认"
+    if phase == "watching":
+        return "B 保护已布防：首个模型响应即整池 Interrupt"
+    if phase in {"arming", "recovering"}:
+        return "B 正在接管原会话；请求入口关闭"
+    if phase == "stopping":
+        return f"{prefix} | Interrupt 已请求 {sent}/{len(rows)} | 停止已确认 {confirmed}/{len(rows)}"
+    if phase == "stopped":
+        forced = sum(r.get("signal") in {"SIGTERM", "SIGKILL"} for r in rows)
+        timing = f" | {trip['elapsed_ms']:.1f}ms" if isinstance(trip.get("elapsed_ms"), (int, float)) else ""
+        return f"{prefix} | 整池停止已确认 {confirmed}/{len(rows)}{timing}" + (f" | 强制终止 {forced}" if forced else "")
+    if phase in {"failed", "fault"}:
+        return f"{prefix} | 保护异常：停止未全部确认；请求入口关闭"
+    return "B 实时保护尚未就绪"
 
 
 def mode_label(config: Mapping[str, Any]) -> str:
@@ -2681,7 +2707,8 @@ class SupervisorModel:
         # output. Give each action its own bounded CLI process instead.
         result = subprocess.run([sys.executable, "-B", str(Path(core.__file__).resolve()),
                                  "--config", str(self.config_path), *args],
-                                capture_output=True, text=True, timeout=30 if args[0] != "pause-workspace" else 180)
+                                capture_output=True, text=True, timeout=180 if args[0] in {
+                                    "pause-workspace", "resume-workspace", "batch-workspace"} else 30)
         if result.returncode:
             raise RuntimeError((result.stderr or result.stdout).strip()[-1000:]
                                or f"command failed: {' '.join(args)}")
@@ -4279,6 +4306,8 @@ def _draw(
     elif focus and (batch := getattr(model, "batch_jobs", {}).get(focus.workspace_id)):
         progress = (f"批量50 {batch['status']} | 创建 {batch['created']}/50 | 就绪 {batch['ready']} | "
                     f"已提交 {batch['submitted']} | 已启动 {batch['started']} | 未完成 {50 - batch['started']} | 异常 {batch['failed']}")
+        if batch.get("protection"):
+            progress = batch_guard_label(batch["protection"])
         _safe_addnstr(stdscr, at["message"], 0, progress, clip, attr("dim"))
     _safe_addnstr(stdscr, at["keys_rule"], 0, rule("-", clip), clip, attr("rule"))
     _safe_addnstr(stdscr, at["keys1"], 0, GLOBAL_KEYS_1, clip, attr("dim"))
