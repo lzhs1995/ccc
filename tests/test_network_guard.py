@@ -265,10 +265,27 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(self.director.sync(1001)[0], "observe")
         self.assertEqual(self.controller.calls, [])
 
+    def test_startup_provider_refuses_download_until_first_reconciliation(self):
+        publisher = ProviderServer(0, 'fixture')
+        self.addCleanup(publisher.close)
+        url = f'http://127.0.0.1:{publisher.server.server_port}/fixture/proxies'
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            opener.open(url, timeout=2)
+        self.assertEqual(error.exception.code, 503)
+        error.exception.close()
+        publisher.set([self.routes[0]])
+        with opener.open(url, timeout=2) as response:
+            self.assertEqual(json.load(response)['proxies'][0]['name'], self.routes[0].name)
+        publisher.set([])
+        with opener.open(url, timeout=2) as response:
+            self.assertEqual(json.load(response)['proxies'], [{'name': 'AR/Offline', 'type': 'reject'}])
+
     def test_general_catalog_is_separate_from_api_admission(self):
         publisher = ProviderServer(0, "fixture")
         self.addCleanup(publisher.close)
         publisher.set_catalog(self.routes, self.config["commercial_pools"])
+        publisher.set([])  # A reconciled empty admission list, not startup.
         base = f"http://127.0.0.1:{publisher.server.server_port}/fixture/"
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         with opener.open(base + "proxies", timeout=2) as response:

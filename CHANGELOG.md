@@ -5,6 +5,7 @@
 - Add an optional independent AnyRouter network guard with isolated Mihomo probes, real Responses/SSE admission, persistent quarantine recovery and shared probe budgets. Keep a healthy commercial pool, rotate on confirmed route failure and reserve ordered Tokyo residential chains for fallback.
 - Preserve consumed probe-budget reservations across wall-clock rollback, including guard restarts, instead of admitting an extra billable probe.
 - Honor configured probe spacing longer than one minute across restarts while keeping the per-minute budget independent.
+- Retain Clash's cached routes while a restarted publisher awaits its first selector reconciliation, instead of briefly publishing an offline-only catalog.
 - Publish only admitted routes through a loopback provider, retain active definitions until selection commits, and pin complete-chain dependencies. Normal failover does not reload Clash or close connections. Add a same-binary stream-preservation acceptance tool for initial profile migration.
 - Show network health in the Supervisor and expose `ccc network status`, `probe` and `install`. Only verified AnyRouter failed turns wait for a confirmed network outage; original B STOP, scope, heartbeat, pause and native-turn gates remain independent.
 

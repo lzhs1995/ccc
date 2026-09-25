@@ -79,6 +79,9 @@ Observation mode never refreshes or selects a production provider. It can run
 while preparing and validating the Clash profile. A loopback HTTP provider
 serves admitted proxy definitions at `/<token>/proxies`; a reject entry is
 always present, including when the candidate list is empty.
+During startup, the provider returns 503 until the first selector reconciliation
+prepares its catalog. A concurrent Clash refresh retains its cached routes;
+it cannot mistake the startup interval for a confirmed empty pool.
 
 Clash Verge's privileged service keeps a separate runtime directory. Its local
 file providers can therefore lag behind subscription files in the user's app

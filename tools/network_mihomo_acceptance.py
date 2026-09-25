@@ -168,6 +168,22 @@ def run(binary):
         timings["stream_started"] = time.monotonic() - started
         originals = {c["id"] for c in controller.get("/connections")["connections"]}
         assert originals
+        # A restarted observer has not yet read the live selection. Its
+        # initial 503 must preserve the cached provider and active streams.
+        publisher.close()
+        publisher = ProviderServer(provider_port, "fixture")
+        refresh_failed = False
+        try:
+            controller.refresh("Verified")
+        except RuntimeError:
+            refresh_failed = True
+        assert refresh_failed, "unreconciled provider must refuse a refresh"
+        assert controller.get("/proxies/Transit-Auto-Select")["now"] == first.name
+        assert first.name in controller.get("/proxies/Transit-Auto-Select")["all"]
+        assert originals.issubset({c["id"] for c in controller.get("/connections")["connections"] or []})
+        once()
+        publisher.set([first, second, chain])
+        timings["publisher_startup_cache_retained"] = time.monotonic() - started
         # An automatic provider refresh must retain the same current name.
         controller.refresh("Verified")
         assert controller.get("/proxies/Transit-Auto-Select")["now"] == first.name
@@ -233,6 +249,7 @@ def run(binary):
         assert core.poll() is None
         return {"version": version, "pid": core.pid, "frames_preserved": len(frames),
                 "provider_refresh_preserved_selection": True, "provider_prune_preserved_connection": True,
+                "publisher_startup_503_preserved_cache_and_stream": True,
                 "hot_reload_preserved_connection_ids": sorted(originals),
                 "hot_reload_uses_new_provider_names": True,
                 "missing_legacy_selection_keeps_same_physical_path": True,

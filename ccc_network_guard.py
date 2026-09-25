@@ -394,11 +394,13 @@ class Engine:
 
 class ProviderServer:
     def __init__(self, port, token, offline_proxy="AR/Offline"):
-        self.payload = b''
+        # A restart must not briefly replace the cached live provider with
+        # Offline before Director has read the actual selection. Failed HTTP
+        # refreshes preserve Mihomo's current definitions until reconciliation.
+        self.payload = None
         self.lock = threading.Lock()
         self.offline_proxy = offline_proxy
         self.catalog = {}
-        self.set([])
         owner = self
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
@@ -406,6 +408,9 @@ class ProviderServer:
                     payload = (owner.payload if self.path == f"/{token}/proxies" else
                                owner.catalog.get(self.path.removeprefix(f"/{token}/transit/"))
                                if self.path.startswith(f"/{token}/transit/") else None)
+                if payload is None and self.path == f"/{token}/proxies":
+                    self.send_error(503, "provider reconciliation pending")
+                    return
                 if payload is None:
                     self.send_error(404)
                     return
