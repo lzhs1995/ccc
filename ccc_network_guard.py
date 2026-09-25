@@ -172,12 +172,13 @@ class Health:
     status: int = 0
 
 
-def recent_deep_starts(starts, now):
+def recent_deep_starts(starts, now, minimum_interval=60):
     # Clock correction does not refund an already consumed request. Keep
     # future reservations until their window expires on the corrected clock,
     # and use the latest timestamp for the minimum spacing after a restart.
+    window = max(60, minimum_interval)
     return sorted(x for x in starts if type(x) in (int, float)
-                  and math.isfinite(x) and x >= 0 and now - x < 60)
+                  and math.isfinite(x) and x >= 0 and now - x < window)
 
 
 class Engine:
@@ -221,7 +222,8 @@ class Engine:
                     continue
             self.current = saved.get("current", "") if saved.get("current") in self.routes else ""
             self.active_pool = saved.get("active_pool", self.active_pool)
-            self.deep_starts = recent_deep_starts(saved.get("deep_starts", []), now)
+            self.deep_starts = recent_deep_starts(saved.get("deep_starts", []), now,
+                                                  self.policy["deep_min_interval_sec"])
             self.seed_consumed = bool(saved.get("seed_consumed"))
 
     def update_inventory(self, routes):
@@ -358,8 +360,8 @@ class Engine:
         return sorted((rid for rid in self.routes if rid not in in_flight and order(rid)[1] <= now), key=order)
 
     def deep_due(self, now, in_flight):
-        self.deep_starts = recent_deep_starts(self.deep_starts, now)
-        if (len(self.deep_starts) >= self.policy["deep_per_minute"]
+        self.deep_starts = recent_deep_starts(self.deep_starts, now, self.policy["deep_min_interval_sec"])
+        if (sum(now - stamp < 60 for stamp in self.deep_starts) >= self.policy["deep_per_minute"]
                 or self.deep_starts and now - self.deep_starts[-1] < self.policy["deep_min_interval_sec"]):
             return None
         hot = set(self.standbys(now))
@@ -549,7 +551,8 @@ class Guard:
                 "error": self.error or self.shadow_error, "routes": rows,
                 "ready": sum(r["ready"] for r in rows), "qualified": sum(r["qualified"] for r in rows),
                 "quarantined": sum(r["quarantined"] for r in rows),
-                "probe_in_flight": len(self.jobs), "deep_in_last_minute": len(e.deep_starts),
+                "probe_in_flight": len(self.jobs),
+                "deep_in_last_minute": sum(now - stamp < 60 for stamp in e.deep_starts),
                 "hint_count": self.hint_count, "hint_socket": str(private_socket_dir(self.config) / "hint.sock"),
                 "shadow_pid": self.core.process.pid if self.core and self.core.process else None}
 

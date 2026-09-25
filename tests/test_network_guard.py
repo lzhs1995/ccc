@@ -143,6 +143,22 @@ class EngineTests(unittest.TestCase):
                 engine.record(self.ids[2], ProbeResult("accessible"), 1062)
                 self.assertEqual(engine.deep_due(1062, set()), self.ids[2])
 
+    def test_probe_minimum_interval_over_one_minute_survives_restart(self):
+        for restart in (False, True):
+            with self.subTest(restart=restart):
+                config = copy.deepcopy(self.config)
+                config['policy']['deep_min_interval_sec'] = 90
+                engine = Engine(config, self.routes, now=1000)
+                engine.reserve_deep(self.ids[0], 1000)
+                if restart:
+                    engine = Engine(config, self.routes, engine.saved(), now=1061)
+                engine.record(self.ids[2], ProbeResult('accessible'), 1061)
+                self.assertIsNone(engine.deep_due(1061, set()))
+                engine.record(self.ids[2], ProbeResult('accessible'), 1089)
+                self.assertIsNone(engine.deep_due(1089, set()))
+                engine.record(self.ids[2], ProbeResult('accessible'), 1090)
+                self.assertEqual(engine.deep_due(1090, set()), self.ids[2])
+
     def test_stale_or_future_qualification_cannot_admit_a_standby(self):
         self.all_good()
         for h in self.e.health.values():
