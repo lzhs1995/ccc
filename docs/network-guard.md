@@ -117,6 +117,15 @@ that the first admitted provider entry preserves the currently verified path
 when the old selector entry is removed. Do not restart Clash, rebuild TUN,
 delete connections or test production by breaking a route.
 
+Compare against `GET /configs`, not just the app YAML. In v1.19.31, parsing
+`ipv6: true` supplies `tun.inet6-address: [fdfe:dcba:9876::1/126]` when omitted.
+A running core can have global IPv6 enabled while its existing TUN has no IPv6
+address. Reloading that raw configuration rebuilds the TUN listener even if
+the core PID stays unchanged. Pin the live address list explicitly (including
+an empty list), validate the effective candidate, and refuse any inbound
+difference before staging or reloading. A stable PID and surviving connection
+IDs alone do not establish that TUN or every stream was preserved.
+
 Run `tools/network_mihomo_acceptance.py --binary /absolute/path/to/mihomo`
 against the same binary first. It creates a separate core with local mock
 upstreams and verifies refresh, pruning, dependency chains and preservation of
