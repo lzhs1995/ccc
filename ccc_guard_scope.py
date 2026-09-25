@@ -147,11 +147,20 @@ def records(tree):
                     try:
                         sid = str(uuid.UUID(surface["id"])).upper()
                         wid = str(uuid.UUID(workspace["id"])).upper()
+                        dock_scope = surface.get("dock_scope", pane.get("dock_scope"))
+                        if dock_scope == "global":
+                            # cmux renders the window's global Dock under the
+                            # selected workspace. Selection is not ownership:
+                            # keep an explicit foreign membership so an owned
+                            # endpoint moved into the Dock is excluded too.
+                            wid = str(uuid.UUID(window["id"])).upper()
                         if sid in result and result[sid]["workspace_id"] != wid:
                             raise RuntimeError("ambiguous current workspace membership")
                         result[sid] = {"surface_id": sid, "workspace_id": wid,
                             "window_id": window["id"], "pane_id": pane["id"],
                             "type": surface.get("type"), "ref": surface.get("ref", "")}
+                        if dock_scope:
+                            result[sid]["dock_scope"] = dock_scope
                     except (KeyError, ValueError, TypeError) as exc:
                         raise RuntimeError("incomplete cmux surface identity") from exc
     return result

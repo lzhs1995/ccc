@@ -184,6 +184,32 @@ class GuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([m["id"] for m in e.writes], [91, 92])
         self.assertEqual(self.pool.phase, "watching")
 
+    async def test_global_dock_is_not_owned_by_the_workspace_displaying_it(self):
+        from ccc_guard_scope import records
+        dock, live = self.endpoint(), self.endpoint()
+        window = str(uuid.uuid4()).upper()
+        pane = str(uuid.uuid4()).upper()
+        tree = {"windows": [{"id": window, "workspaces": [{"id": self.wid, "panes": [
+            {"id": pane, "dock_scope": "global", "surfaces": [{"id": dock.sid, "type": "terminal"}]},
+            {"id": pane, "surfaces": [{"id": live.sid, "type": "terminal"}]}]}]}]}
+        locations = records(tree)
+        self.assertEqual(locations[dock.sid]["workspace_id"], window)
+        self.assertEqual(locations[live.sid]["workspace_id"], self.wid)
+        self.locations.update({sid: row["workspace_id"] for sid, row in locations.items()})
+        dock.native_message(delta())
+        await asyncio.sleep(.02)
+        self.assertEqual(self.pool.phase, "watching")
+        live.native_message(delta())
+        await self.settled()
+        self.assertTrue(dock.active)
+        self.assertEqual(dock.writes, [])
+        self.assertFalse(dock.in_scope)
+        # Some cmux tree views repeat the same global Dock beneath another
+        # workspace. That is still one window-owned surface, not ambiguity.
+        tree["windows"][0]["workspaces"].append({"id": self.other, "panes": [
+            {"id": pane, "surfaces": [{"id": dock.sid, "type": "terminal", "dock_scope": "global"}]}]})
+        self.assertEqual(records(tree)[dock.sid]["workspace_id"], window)
+
     async def test_title_or_fake_origin_is_not_authorization(self):
         wid = str(uuid.uuid4()).upper()
         core.ConfigStore(self.path).mutate(lambda c: c["workspace_rules"].append({

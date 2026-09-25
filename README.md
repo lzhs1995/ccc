@@ -272,6 +272,8 @@ a hint never authorizes input or clears a delivery record.
 
 B 的实时保护只接受配置中 `batch_guard.origin_job_id` 与真实 `workspace-batches/JOB_UUID/job.json` 一致的工作区。每次输入、成功判定和信号发送均核对当前 cmux workspace/surface 完整 UUID；强制信号还核对本机 PID 的微秒级创建时间与进程归属。工作区名称、临时 `surface:N` 编号、相同目录均不能扩大停止范围。人工排除的会话仍属于本池的成本停止范围，但原排除设置会保留。
 
+全局 Dock 属于窗口，即使界面把它显示在当前 workspace 下，也不进入该 workspace 的 B 停止范围。移入全局 Dock 的 surface 同样按新的归属排除。
+
 **接入成功**：当前活跃原生 thread/turn 的非空模型文本、推理、计划增量，或可证明由模型发起的工具事件。登录、授权、`task_started`、HTTP 200、`Working`、工具输出、用户引用与旧 transcript 都不算成功。旧会话恢复返回的历史不会触发保护。
 
 **停止已确认**：所有目标的原生任务已结束，且请求后端已经退出。`turn/interrupt` 的 RPC 回执仅表示请求已送达。首个模型事件立即锁住入口，并并行发送原生 Interrupt；350ms 时向仍未停止的精确进程发 SIGTERM，650ms 时发 SIGKILL，1000ms 前核验结果。超时、成员关系不明或进程身份变化均显示保护异常，不能显示“全部已停”。取消后关闭后端标准输入，阻止内部 goal、队列和自动重试继续发请求；surface 和原会话日志保留。
