@@ -30,6 +30,7 @@
     "deep_timeout_sec": 45
   },
   "publish": {"port": 17891, "token": "replace_with_a_fresh_random_urlsafe_token"},
+  "publish_transit": true,
   "policy": {
     "current_interval_sec": 2,
     "standby_interval_sec": 5,

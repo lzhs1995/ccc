@@ -91,6 +91,8 @@ def load_config(path):
             or not isinstance(value, (int, float)) or not .1 <= value <= 10 for pool, value in by_pool.items())):
         raise ValueError("light_timeout_by_pool needs known pool names and deadlines between .1 and 10 seconds")
     publishing = config.get("publish") or {}
+    if type(config.get("publish_transit", False)) is not bool:
+        raise ValueError("publish_transit must be a boolean")
     token = publishing.get("token", "")
     port = publishing.get("port", 0)
     if (not isinstance(token, str) or len(token) < 24 or any(c not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_" for c in token)
@@ -385,15 +387,18 @@ class ProviderServer:
         self.payload = b''
         self.lock = threading.Lock()
         self.offline_proxy = offline_proxy
+        self.catalog = {}
         self.set([])
         owner = self
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
-                if self.path != f"/{token}/proxies":
+                with owner.lock:
+                    payload = (owner.payload if self.path == f"/{token}/proxies" else
+                               owner.catalog.get(self.path.removeprefix(f"/{token}/transit/"))
+                               if self.path.startswith(f"/{token}/transit/") else None)
+                if payload is None:
                     self.send_error(404)
                     return
-                with owner.lock:
-                    payload = owner.payload
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Cache-Control", "no-store")
@@ -430,6 +435,21 @@ class ProviderServer:
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=1)
+
+    def set_catalog(self, routes, pools):
+        # Service-mode Verge copies local file providers into a private runtime.
+        # Optional loopback catalogs keep GENERAL transit subscriptions current
+        # without asking the privileged service to copy files or restart. These
+        # endpoints are never used by the service-admitted AnyRouter selector.
+        catalogs = {}
+        for pool in pools:
+            proxies = [{**r.proxies[-1], "name": r.label} for r in routes
+                       if r.pool == pool and len(r.proxies) == 1]
+            if not proxies:
+                proxies = [{"name": "Transit-Unavailable", "type": "reject"}]
+            catalogs[urllib.parse.quote(pool, safe="")] = (json.dumps({"proxies": proxies}, ensure_ascii=False) + "\n").encode()
+        with self.lock:
+            self.catalog = catalogs
 
 
 class Director:
@@ -589,6 +609,8 @@ class Guard:
         if self.config.get("seed_file") and not self.engine.seed_consumed:
             self.engine.seed(read_json(self.config["seed_file"], {}), time.time())
         publisher = ProviderServer(self.config["publish"]["port"], self.config["publish"]["token"], self.config["offline_proxy"])
+        if self.config.get("publish_transit"):
+            publisher.set_catalog(routes, self.config["commercial_pools"])
         control = Controller(self.config["controller_socket"], self.config.get("controller_secret", ""), timeout=2)
         self.director = Director(self.config, self.engine, control, publisher)
         hint_socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
@@ -627,6 +649,8 @@ class Guard:
                             self.retired.append(self.core)
                         self.core = next_core
                         self.engine.update_inventory(routes)
+                        if self.config.get("publish_transit"):
+                            publisher.set_catalog(routes, self.config["commercial_pools"])
                         self.shadow_error = ""
                         retry_delay = 5
                     except Exception as exc:
@@ -668,6 +692,8 @@ class Guard:
                             wanted.add(self.engine.current)
                         if wanted != set(self.engine.routes):
                             pending_core = setup.submit(self.new_shadow, latest)
+                        elif self.config.get("publish_transit"):
+                            publisher.set_catalog(latest, self.config["commercial_pools"])
                     except Exception as exc:
                         self.shadow_error = f"subscription refresh failed; retaining verified routes: {type(exc).__name__}"
                     next_inventory = now + self.engine.policy["inventory_interval_sec"]

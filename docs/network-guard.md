@@ -76,6 +76,15 @@ while preparing and validating the Clash profile. A loopback HTTP provider
 serves admitted proxy definitions at `/<token>/proxies`; a reject entry is
 always present, including when the candidate list is empty.
 
+Clash Verge's privileged service keeps a separate runtime directory. Its local
+file providers can therefore lag behind subscription files in the user's app
+directory. With `publish_transit: true`, separate `/<token>/transit/<pool>`
+endpoints publish the complete commercial catalog for general transit groups.
+Use HTTP providers with their own cache paths for those groups. They can run
+ordinary transport health checks; they are never included in the dedicated
+AnyRouter selector. This also makes subscription updates independent of service
+restarts and privileged filesystem writes.
+
 ## Clash integration and preservation of streams
 
 The dedicated selector should use only the guard provider, filtered with

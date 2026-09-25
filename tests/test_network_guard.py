@@ -6,11 +6,12 @@ import sys
 import tempfile
 import time
 import unittest
+import urllib.request
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ccc_mihomo import ProbeResult, route
-from ccc_network_guard import Director, Engine, Guard, singleton, contract_digest
+from ccc_network_guard import Director, Engine, Guard, ProviderServer, singleton, contract_digest
 
 
 def fixtures():
@@ -231,6 +232,20 @@ class PublicationTests(unittest.TestCase):
         self.config["mode"] = "observe"
         self.assertEqual(self.director.sync(1001)[0], "observe")
         self.assertEqual(self.controller.calls, [])
+
+    def test_general_catalog_is_separate_from_api_admission(self):
+        publisher = ProviderServer(0, "fixture")
+        self.addCleanup(publisher.close)
+        publisher.set_catalog(self.routes, self.config["commercial_pools"])
+        base = f"http://127.0.0.1:{publisher.server.server_port}/fixture/"
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(base + "proxies", timeout=2) as response:
+            self.assertEqual(json.load(response)["proxies"], [{"name": "AR/Offline", "type": "reject"}])
+        with opener.open(base + "transit/NTHU", timeout=2) as response:
+            self.assertEqual([p["name"] for p in json.load(response)["proxies"]], ["N1", "N2"])
+        publisher.set([self.routes[0]])
+        with opener.open(base + "proxies", timeout=2) as response:
+            self.assertEqual([p["name"] for p in json.load(response)["proxies"]], [self.routes[0].name, "AR/Offline"])
 
     def test_refresh_failure_does_not_attempt_a_selection(self):
         self.e.record(self.routes[0].id, ProbeResult("blocked"), 1001)
