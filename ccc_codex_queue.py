@@ -69,7 +69,8 @@ def task_snapshot(path, session_id):
         at = epoch(latest.get("timestamp"))
     except (TypeError, ValueError):
         return None
-    return {"kind": latest["payload"]["type"], "at": at,
+    return {**({"model_provider": first["payload"]["model_provider"]} if first["payload"].get("model_provider") else {}),
+            "kind": latest["payload"]["type"], "at": at,
             "turn_id": latest["payload"].get("turn_id"), "error": latest["payload"].get("error"),
             "signature": [after.st_ino, after.st_size, after.st_mtime_ns]}
 

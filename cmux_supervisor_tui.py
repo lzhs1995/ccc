@@ -100,6 +100,7 @@ STATE_LABELS = {
     "delivery_unknown": "投递待验",
     "send_failed": "发送失败",
     "provider_blocked": "服务阻塞",
+    "network_wait": "等待网络",
     "incompatible": "看不清",
     "missing": "已消失",
     "missing_or_error": "无画面",
@@ -2361,6 +2362,8 @@ class SupervisorModel:
         self.runtime: dict[str, Any] = {}
         self.hook_config: dict[str, Any] = {}
         self.batch_jobs: dict[str, Any] = {}
+        self.network = core.network_health.NetworkClient()
+        self.network_state: dict[str, Any] = {}
         self.candidates: list[Candidate] = []
         self.error = ""
         self.last_top_refresh = 0.0
@@ -2447,7 +2450,7 @@ class SupervisorModel:
                     snapshot.online, snapshot.error = False, str(exc)
                 values = {name: getattr(snapshot, name) for name in (
                     "config", "runtime", "hook_config", "candidates", "error",
-                    "online", "last_top_refresh", "_control_ready", "batch_jobs")}
+                    "online", "last_top_refresh", "_control_ready", "batch_jobs", "network_state")}
                 with self._refresh_lock:
                     if not self._refresh_closed:
                         self._refresh_result = (generation, values)
@@ -2463,6 +2466,7 @@ class SupervisorModel:
 
     def refresh(self, *, force: bool = False) -> None:
         self.config = self.store.load()
+        self.network_state = self.network.snapshot(self.config.get("network_guard", {}))
         from ccc_workspace_batch import snapshots
         self.batch_jobs = snapshots(self.config_path, self.config)
         self.runtime = core.load_json(self.config_path.parent / "state.json", {})
@@ -4220,7 +4224,10 @@ def _draw(
         clip,
         stack_attr,
     )
-    _safe_addnstr(stdscr, at["top_rule"], 0, rule("=", clip), clip, attr("rule"))
+    network = getattr(model, "network_state", {})
+    network_line = core.network_health.summary(network) if model.config.get("network_guard", {}).get("enabled") else ""
+    _safe_addnstr(stdscr, at["top_rule"], 0, network_line or rule("=", clip), clip,
+                  attr("error") if network.get("phase") == "network_wait" else attr("dim") if network_line else attr("rule"))
     # One frame, one decision: the same show_collab drives the header and every
     # member row, so the 协作 column cannot appear on one and not the other.
     # The column only exists while a fresh collaboration marker is live -- when

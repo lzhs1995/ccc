@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.17
+
+- Add an optional independent AnyRouter network guard with isolated Mihomo probes, real Responses/SSE admission, persistent quarantine recovery and shared probe budgets. Keep a healthy commercial pool, rotate on confirmed route failure and reserve ordered Tokyo residential chains for fallback.
+- Publish only admitted routes through a loopback provider, retain active definitions until selection commits, and pin complete-chain dependencies. Normal failover does not reload Clash or close connections. Add a same-binary stream-preservation acceptance tool for initial profile migration.
+- Show network health in the Supervisor and expose `ccc network status`, `probe` and `install`. Only verified AnyRouter failed turns wait for a confirmed network outage; original B STOP, scope, heartbeat, pause and native-turn gates remain independent.
+
 ## 0.2.15
 
 - Interrupt every Codex in a genuine B batch workspace on its first fresh native model response. Fence new/queued requests immediately, verify native backend exit, and escalate exact processes at 350/650 ms against a one-second deadline. Current workspace UUIDs and microsecond process identities exclude other workspaces and moved surfaces.
