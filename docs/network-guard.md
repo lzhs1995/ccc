@@ -60,6 +60,35 @@ order, so an older SSE cannot clear an intervening failure. The loop refreshes
 its clock after local result/configuration work before reserving another
 complete API check.
 
+An independent native interface monitor fences in-flight evidence when the
+configured physical interface loses its IPv4 address or its address changes.
+Loopback, unspecified and DHCP self-assigned link-local addresses are not
+usable physical connectivity. Both successful and failed probes crossing a
+detected interface generation change are discarded; existing qualifications,
+quarantine history and consumed reservations are retained. While the interface
+is unavailable, no new probes, provider changes or selector changes are made.
+The actual selection is still read, so an already selected Offline retains
+`network_wait`; a local observer problem cannot replace it with an unrelated
+subscription warning. A link can have an address while its remote path is
+broken, so remote CONNECT, TLS and response failures still retain their normal
+classification. Only failures in local setup or connecting to the loopback
+probe listener are classified as observer errors.
+
+Recovery probing prefers candidates with recent validator evidence in an
+unavailable pool, but admission still requires cooldown, three light successes
+and a new complete SSE. The current route has first probe priority; all other
+candidates compete by their actual due time so slow standby checks cannot
+starve overdue inventory. The network LaunchAgent uses launchd's Interactive
+resource class to support these foreground routing deadlines. This reduces
+background throttling; it does not establish throttling as the cause of every
+network failure.
+
+Each route's status retains its light/deep probe stage and diagnostic detail.
+`events.ndjson` records bounded probe metadata, reservations, interface
+transitions and selection observations, with one rotated `events.1.ndjson`
+file at 2 MiB. Discarded results retain their generation and reason. Neither
+file contains API credentials, response bodies or subscription definitions.
+
 ## Configuration and activation
 
 Copy `network.example.json` into a private directory outside Documents, fill

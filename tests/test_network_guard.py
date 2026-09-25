@@ -14,7 +14,7 @@ import urllib.request
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from ccc_mihomo import ProbeResult, route
+from ccc_mihomo import PhysicalLink, ProbeResult, route
 import ccc_network_guard as network
 from ccc_network_guard import Director, Engine, Guard, ProviderServer, singleton, contract_digest
 
@@ -295,6 +295,11 @@ class GuardLoopTests(unittest.TestCase):
         self.patch("ProviderServer", return_value=self.publisher)
         self.patch("Controller", return_value=self.controller)
         self.patch("ResponsesProbe", return_value=self.probe)
+        self.link_reader = mock.Mock(return_value=("192.0.2.10",))
+        self.link = PhysicalLink("fixture0", self.link_reader)
+        self.link.sample()
+        self.link.start = mock.Mock(side_effect=self.link.sample)
+        self.patch("PhysicalLink", return_value=self.link)
         shadow_patch = mock.patch.object(Guard, "new_shadow", return_value=(self.core, list(self.routes)))
         self.shadow = shadow_patch.start()
         self.addCleanup(shadow_patch.stop)
@@ -459,7 +464,7 @@ class GuardLoopTests(unittest.TestCase):
                                               (False, 1001, 1002, "timeout")):
             job = concurrent.futures.Future()
             job.set_result((ProbeResult(kind, deep=deep), completed))
-            self.guard.jobs[job] = (item.id, deep, self.core, began, contract_digest(self.config))
+            self.guard.jobs[job] = (item.id, deep, self.core, began, contract_digest(self.config), self.link.current())
         self.stepped_loop([1006])
         health = self.guard.engine.health[item.id]
         self.assertTrue(health.quarantined, "an old SSE erased an intervening failure")
@@ -524,6 +529,136 @@ class GuardLoopTests(unittest.TestCase):
         self.assertEqual(set(self.guard.engine.routes), {r.id for r in self.routes})
         self.assertEqual(self.guard.inventory_error, "")
 
+    def save_engine(self, engine):
+        network.atomic_json(self.root / "health.json", {**engine.saved(),
+                            "contract": contract_digest(self.config),
+                            "routes": [r.record() for r in self.routes]})
+
+    def test_cross_generation_sse_cannot_admit_or_refund_its_reservation(self):
+        item = self.routes[0]
+        engine = Engine(self.config, self.routes, now=1000)
+        engine.current = item.id
+        engine.record(item.id, ProbeResult("blocked"), 936)
+        for stamp in (997, 998, 999):
+            engine.record(item.id, ProbeResult("accessible"), stamp)
+        engine.reserve_deep(item.id, 1000)
+        self.save_engine(engine)
+        old_generation = self.link.current()
+        job = concurrent.futures.Future()
+        job.set_result((ProbeResult("healthy", deep=True, stage="response_body"), 1001))
+        self.guard.jobs[job] = (item.id, True, self.core, 1000, contract_digest(self.config), old_generation)
+        self.link_reader.return_value = ()
+        self.link.sample()
+        self.link_reader.return_value = ("192.0.2.10",)
+        self.link.sample()
+        self.stepped_loop([1002])
+        health = self.guard.engine.health[item.id]
+        self.assertTrue(health.quarantined)
+        self.assertFalse(health.qualified)
+        self.assertEqual(health.deep_ok_at, 0)
+        self.assertEqual(health.deep_attempt_at, 1000)
+        self.assertEqual(self.guard.engine.deep_starts, [1000])
+        self.assertEqual(self.guard.discarded_probes, 1)
+        event = self.guard.last_probe_event
+        self.assertFalse(event["accepted"])
+        self.assertEqual(event["stage"], "response_body")
+        self.assertEqual(event["discard_reason"], "physical_interface_generation_changed")
+
+    def test_cross_generation_failures_cannot_isolate_previously_verified_routes(self):
+        item = self.routes[0]
+        engine = Engine(self.config, self.routes, now=1000)
+        engine.current = item.id
+        engine.record(item.id, ProbeResult("accessible"), 998)
+        engine.record(item.id, ProbeResult("healthy", deep=True), 999)
+        engine.reserve_deep(item.id, 1000)
+        self.save_engine(engine)
+        old_generation = self.link.current()
+        for deep, kind in ((True, "timeout"), (False, "blocked")):
+            job = concurrent.futures.Future()
+            job.set_result((ProbeResult(kind, deep=deep, stage="response_headers"), 1001))
+            self.guard.jobs[job] = (item.id, deep, self.core, 1000, contract_digest(self.config), old_generation)
+        self.link_reader.return_value = ("192.0.2.11",)
+        self.link.sample()
+        self.stepped_loop([1002])
+        health = self.guard.engine.health[item.id]
+        self.assertTrue(health.qualified)
+        self.assertFalse(health.quarantined)
+        self.assertEqual(health.failures, 0)
+        self.assertEqual(health.deep_ok_at, 999)
+        self.assertEqual(self.guard.discarded_probes, 2)
+        self.assertEqual(self.guard.engine.deep_starts, [1000])
+
+    def test_unavailable_interface_preserves_current_provider_and_all_prior_evidence(self):
+        engine = Engine(self.config, self.routes, now=1000)
+        engine.current = self.routes[0].id
+        for item in self.routes:
+            engine.record(item.id, ProbeResult("blocked"), 999)
+        engine.reserve_deep(self.routes[0].id, 1000)
+        self.save_engine(engine)
+        prior_health = copy.deepcopy(engine.saved()["health"])
+        self.link_reader.return_value = ()
+        self.link.sample()
+        self.stepped_loop([1001, 1002, 1003])
+        self.assertEqual(self.controller.calls, [])
+        self.assertEqual(self.publisher.routes, [])
+        self.probe.run.assert_not_called()
+        self.assertEqual(self.guard.director.actual_name, self.routes[0].name)
+        self.assertEqual(self.guard.phase, "observer_fault")
+        self.assertEqual(self.guard.engine.saved()["health"], prior_health)
+        self.assertEqual(self.guard.engine.deep_starts, [1000])
+        self.assertFalse(self.snapshots[-1]["physical_link"]["available"])
+
+    def test_unavailable_interface_does_not_hide_an_already_selected_offline(self):
+        self.controller.now = "Offline"
+        self.link_reader.return_value = ()
+        self.link.sample()
+        self.stepped_loop([1000, 1001])
+        self.assertEqual(self.guard.phase, "network_wait")
+        self.assertEqual(self.controller.calls, [])
+        self.probe.run.assert_not_called()
+
+    def test_link_loss_between_persistent_reservation_and_dispatch_keeps_budget_spent(self):
+        engine = Engine(self.config, self.routes, now=1000)
+        engine.current = self.routes[0].id
+        engine.record(self.routes[0].id, ProbeResult("accessible"), 999)
+        self.save_engine(engine)
+        save = self.guard.save
+
+        def saved_then_down():
+            save()
+            if self.guard.engine.deep_starts:
+                self.link_reader.return_value = ()
+                self.link.sample()
+
+        self.guard.save = saved_then_down
+        self.stepped_loop([1000, 1001])
+        self.probe.run.assert_not_called()
+        self.assertEqual(self.guard.engine.deep_starts, [1000])
+        self.assertEqual(self.guard.engine.health[self.routes[0].id].deep_attempt_at, 1000)
+        saved = json.loads((self.root / "health.json").read_text())
+        self.assertEqual(saved["deep_starts"], [1000])
+        self.assertGreaterEqual(self.guard.discarded_probes, 1)
+
+    def test_probe_stages_and_bounded_journal_preserve_failure_diagnostics(self):
+        item = self.routes[0]
+        engine = Engine(self.config, self.routes, now=1000)
+        engine.record(item.id, ProbeResult("timeout", detail="probe deadline exceeded", stage="tls"), 1000)
+        self.assertEqual(engine.health[item.id].light_stage, "tls")
+        self.assertEqual(engine.health[item.id].light_detail, "probe deadline exceeded")
+        (self.root / "events.ndjson").write_text("x" * (2 * 1024 * 1024))
+        self.guard.journal({"event": "fixture", "stage": "tls"})
+        self.assertEqual((self.root / "events.1.ndjson").stat().st_size, 2 * 1024 * 1024)
+        self.assertEqual(json.loads((self.root / "events.ndjson").read_text()), {"event": "fixture", "stage": "tls"})
+
+    def test_network_launchagent_uses_interactive_resource_class_only(self):
+        with mock.patch.object(Path, "home", return_value=self.root), \
+             mock.patch.object(network.subprocess, "run"), \
+             mock.patch("cmux_codex_watch._bootstrap_runtime_service"):
+            installed = network.install(self.root / "network.json", source=self.root / "ccc_network_guard.py")
+        payload = network.plistlib.loads(Path(installed["plist"]).read_bytes())
+        self.assertEqual(payload["ProcessType"], "Interactive")
+        self.assertEqual(payload["ProgramArguments"][-2:], ["--config", str((self.root / "network.json").resolve())])
+
 
 class PublicationTests(unittest.TestCase):
     def setUp(self):
@@ -535,6 +670,35 @@ class PublicationTests(unittest.TestCase):
         self.controller = FakeController([r.name for r in self.routes] + ["Offline"], self.routes[0].name)
         self.publisher = Publisher()
         self.director = Director(self.config, self.e, self.controller, self.publisher)
+
+    def test_link_changes_during_controller_read_hold_all_publication(self):
+        reader = mock.Mock(return_value=("192.0.2.10",))
+        link = PhysicalLink("fixture0", reader)
+        link.sample()
+        get = self.controller.get
+        def down(path):
+            reader.return_value = ()
+            link.sample()
+            return get(path)
+        self.controller.get = down
+        self.assertEqual(self.director.sync(1001, link=link)[0], "observer_fault")
+        self.assertEqual(self.controller.calls, [])
+        self.assertEqual(self.publisher.routes, [])
+
+    def test_link_loss_during_refresh_cannot_commit_a_route_switch(self):
+        self.e.record(self.routes[0].id, ProbeResult("blocked"), 1001)
+        reader = mock.Mock(return_value=("192.0.2.10",))
+        link = PhysicalLink("fixture0", reader)
+        link.sample()
+        refresh = self.controller.refresh
+        def down(provider):
+            refresh(provider)
+            reader.return_value = ()
+            link.sample()
+        self.controller.refresh = down
+        self.assertEqual(self.director.sync(1002, link=link)[0], "observer_fault")
+        self.assertEqual(self.controller.now, self.routes[0].name)
+        self.assertEqual(self.controller.calls, [("refresh", "verified")])
 
     def test_observe_mode_never_changes_the_live_selector_or_provider(self):
         self.config["mode"] = "observe"
