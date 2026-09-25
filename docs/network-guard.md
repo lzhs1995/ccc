@@ -183,6 +183,15 @@ Retain original profiles and a recorded selection for a separately validated
 rollback. A rollback also needs fresh provider names; a raw same-name reload
 has the same connection-closing behavior.
 
+For AnyTLS exits, also run `tools/network_anytls_acceptance.py --binary
+/absolute/path/to/mihomo --expected-sha256 <production-binary-digest>`. It
+creates local AnyTLS peers and two HTTPS streams using default session reuse.
+Changed provider payloads, publisher startup 503, pruning and an Offline-only
+provider must retain both old connections. Forced fixture garbage collection
+after pruning verifies adapter lifetime; each stream must receive newly
+generated post-change frames and an explicit end marker. This tool never
+reloads even its fixture core and cannot target the production controller.
+
 After profile acceptance, set `mode` to `manage`. Normal operation only publishes
 the provider, refreshes it, selects a verified route and reads the choice back.
 It never reloads Clash or closes existing connections. A route switch affects
