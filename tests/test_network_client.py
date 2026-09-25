@@ -61,16 +61,34 @@ class NetworkClientTests(unittest.TestCase):
         self.assertEqual(error_host(fake), "anyrouter.test.evil.invalid")
         self.assertFalse(self.client.verdict(self.options, self.target, fake)["blocked"])
 
-    def process_config(self, extra_args=(), *, config_mtime=99, birth_change=False):
+    def process_config(self, extra_args=(), *, config_mtime=99, birth_change=False,
+                       named_profiles=None, profile_mtime=99, extra_config="",
+                       replace_during_read=False):
         codex_dir = self.root / "codex"
         codex_dir.mkdir(exist_ok=True)
         path = codex_dir / "config.toml"
-        path.write_text('model_provider="custom"\n[model_providers.custom]\nbase_url="https://anyrouter.test/v1"\n')
+        path.write_text(extra_config + 'model_provider="custom"\n[model_providers.custom]\nbase_url="https://anyrouter.test/v1"\n')
         os.utime(path, (config_mtime, config_mtime))
+        for name, content in (named_profiles or {}).items():
+            profile_path = codex_dir / (name + ".config.toml")
+            profile_path.write_text(content)
+            os.utime(profile_path, (profile_mtime, profile_mtime))
         argv = ["codex", *extra_args]
         env = {"CODEX_HOME": str(codex_dir), "CMUX_SURFACE_ID": "surface-a", "CMUX_WORKSPACE_ID": "workspace-a"}
-        with mock.patch("ccc_guard_scope.birth", side_effect=[[100, 1], [101, 2]] if birth_change else None,
-                        return_value=[100, 1]), mock.patch("ccc_guard_scope.arguments", return_value=(argv, env)):
+        checks = 0
+
+        def process_birth(*args, **kwargs):
+            nonlocal checks
+            checks += 1
+            if checks == 2 and replace_during_read:
+                replacement = path.with_suffix(".replacement")
+                replacement.write_text(path.read_text().replace("anyrouter.test", "other.test"))
+                os.utime(replacement, (config_mtime, config_mtime))
+                os.replace(replacement, path)
+            return [101, 2] if checks == 2 and birth_change else [100, 1]
+
+        with mock.patch("ccc_guard_scope.birth", side_effect=process_birth), \
+                mock.patch("ccc_guard_scope.arguments", return_value=(argv, env)):
             return configured_host({**self.turn, "error": None, "model_provider": "custom"}, self.target)
 
     @unittest.skipUnless(sys.version_info >= (3, 11), "Python 3.10 binds through native error URLs")
@@ -79,6 +97,38 @@ class NetworkClientTests(unittest.TestCase):
         self.assertEqual(self.process_config(("-c", 'model_providers.custom.base_url="https://other.test/v1"')), "other.test")
         self.assertEqual(self.process_config(config_mtime=102), "")
         self.assertEqual(self.process_config(birth_change=True), "")
+
+    @unittest.skipUnless(sys.version_info >= (3, 11), "Python 3.10 binds through native error URLs")
+    def test_current_native_named_profile_files_override_base_provider(self):
+        profiles = {"other": '[model_providers.custom]\nbase_url="https://other.test/v1"\n'}
+        for args in (("-p", "other"), ("--profile=other",), ("-pother",)):
+            with self.subTest(args=args):
+                self.assertEqual(self.process_config(args, named_profiles=profiles), "other.test")
+        self.assertEqual(self.process_config(("-p", "other"), named_profiles=profiles,
+                                             profile_mtime=100.5), "")
+
+    @unittest.skipUnless(sys.version_info >= (3, 11), "Python 3.10 binds through native error URLs")
+    def test_inline_remote_endpoint_cannot_use_local_provider_configuration(self):
+        self.assertEqual(self.process_config(("--remote=ws://127.0.0.1:9999",)), "")
+
+    @unittest.skipUnless(sys.version_info >= (3, 11), "Python 3.10 binds through native error URLs")
+    def test_config_changed_within_startup_second_is_not_original_configuration(self):
+        self.assertEqual(self.process_config(config_mtime=100.5), "")
+
+    @unittest.skipUnless(sys.version_info >= (3, 11), "Python 3.10 binds through native error URLs")
+    def test_prompt_after_option_terminator_is_not_a_provider_override(self):
+        self.assertEqual(self.process_config(("--", '-cmodel_providers.custom.base_url="https://other.test/v1"')), "anyrouter.test")
+
+    @unittest.skipUnless(sys.version_info >= (3, 11), "Python 3.10 binds through native error URLs")
+    def test_replaced_configuration_cannot_bind_the_previous_service(self):
+        self.assertEqual(self.process_config(replace_during_read=True), "")
+
+    @unittest.skipUnless(sys.version_info >= (3, 11), "Python 3.10 binds through native error URLs")
+    def test_legacy_and_named_profiles_are_not_conflated(self):
+        profiles = {"other": '[model_providers.custom]\nbase_url="https://other.test/v1"\n'}
+        self.assertEqual(self.process_config(named_profiles=profiles, extra_config='profile="other"\n'), "")
+        self.assertEqual(self.process_config(("-pother",), named_profiles=profiles,
+                                             extra_config='profiles={other={model_provider="custom"}}\n'), "")
 
 
 class NetworkContinuationTests(unittest.TestCase):

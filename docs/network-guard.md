@@ -56,6 +56,11 @@ URL-safe publisher token, and keep `mode` as `observe` initially. The optional
 adapter uses macOS Ruby/Psych to read YAML safely; JSON needs no parser package.
 Python 3.10 supports the guard and native-error URL binding. Python 3.11 or later
 also resolves a verified process's unchanged TOML startup configuration.
+It reads named profile V2 files (`<name>.config.toml`) and CLI overrides only
+before the `--` prompt separator. Remote clients, ambiguous legacy profiles,
+configuration changes after the exact process birth time, and files replaced
+during inspection remain unbound. An unbound turn continues through the
+existing CCC gates; the network guard cannot pause it by guessing a provider.
 
 Add this optional block to the existing CCC configuration without replacing
 its targets, authorization, pauses, state or ledgers:

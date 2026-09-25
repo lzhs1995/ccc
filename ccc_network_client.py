@@ -55,7 +55,7 @@ def configured_host(turn, target):
     """Resolve only a verified native process's unchanged startup config.
 
     Names such as `custom` are not service bindings. Respect its CODEX_HOME,
-    profile and -c overrides, and refuse a config edited after process start.
+    named profile and -c overrides, and refuse a config edited after process start.
     The native failed-turn URL, when present, is stronger evidence.
     """
     try:
@@ -68,22 +68,45 @@ def configured_host(turn, target):
     if before is None or before[0] != int(turn.get("process_start") or 0):
         return ""
     argv, env = arguments(pid)
+    options = argv[1:argv.index("--")] if "--" in argv else argv[1:]
     if (str(env.get("CMUX_SURFACE_ID", "")).upper() != str(target["surface_id"]).upper()
             or str(env.get("CMUX_WORKSPACE_ID", "")).upper() != str(target["workspace_id"]).upper()
-            or "--remote" in argv or "--oss" in argv):
+            or any(arg in {"--remote", "--oss"} or arg.startswith(("--remote=", "--oss="))
+                   for arg in options)):
         return ""
     codex_dir = Path(env.get("CODEX_HOME") or Path(env.get("HOME") or Path.home()) / ".codex")
-    path = codex_dir / "config.toml"
-    if not path.is_absolute() or path.stat().st_mtime > before[0] + 1:
+    if not codex_dir.is_absolute():
         return ""
-    raw = path.read_bytes()
-    if len(raw) > 1024 * 1024:
+    snapshots = []
+    born_ns = before[0] * 1_000_000_000 + before[1] * 1000
+
+    def identity(st):
+        return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns
+
+    def layer(path):
+        try:
+            with path.open("rb") as handle:
+                initial = os.fstat(handle.fileno())
+                if initial.st_mtime_ns > born_ns:
+                    return None
+                raw = handle.read(1024 * 1024 + 1)
+                if (len(raw) > 1024 * 1024 or identity(os.fstat(handle.fileno())) != identity(initial)
+                        or identity(path.stat()) != identity(initial)):
+                    return None
+            snapshots.append((path, identity(initial)))
+            return tomllib.loads(raw.decode())
+        except OSError:
+            return None
+
+    config = layer(codex_dir / "config.toml")
+    if config is None:
         return ""
-    config = tomllib.loads(raw.decode())
     overrides, profile = {}, ""
     index = 1
     while index < len(argv):
         arg = argv[index]
+        if arg == "--":
+            break
         if arg in {"-c", "--config", "-p", "--profile"}:
             if index + 1 >= len(argv):
                 return ""
@@ -96,23 +119,35 @@ def configured_host(turn, target):
             _merge(overrides, tomllib.loads(arg.split("=", 1)[1]))
         elif arg.startswith("--profile="):
             profile = arg.split("=", 1)[1]
+        elif arg.startswith("-p") and len(arg) > 2:
+            profile = arg[2:]
         elif arg.startswith("-c") and len(arg) > 2:
             _merge(overrides, tomllib.loads(arg[2:]))
         index += 1
-    selected_profile = profile or config.get("profile", "")
-    if selected_profile:
-        profiles = config.get("profiles", {})
-        if selected_profile not in profiles:
+    # A legacy profile selector/table cannot establish which profile scheme
+    # this running CLI used. Do not guess a service binding from either one.
+    if config.get("profile") or config.get("profiles"):
+        return ""
+    if profile:
+        # Native profile V2 layers a separate user configuration file. An old
+        # [profiles] table cannot prove what the running CLI actually loaded.
+        if Path(profile).name != profile:
             return ""
-        _merge(config, copy.deepcopy(profiles[selected_profile]))
+        profile_config = layer(codex_dir / (profile + ".config.toml"))
+        if profile_config is None:
+            return ""
+        _merge(config, copy.deepcopy(profile_config))
     _merge(config, overrides)
+    if config.get("profile") or config.get("profiles"):
+        return ""
     provider = turn.get("model_provider") or config.get("model_provider") or "openai"
     configured_provider = config.get("model_provider") or "openai"
     if provider != configured_provider:
         return ""
     entry = config.get("model_providers", {}).get(provider, {})
     url = entry.get("base_url") or (env.get("OPENAI_BASE_URL") if provider == "openai" else "")
-    if not url or birth(pid, codex=True) != before:
+    if (not url or birth(pid, codex=True) != before
+            or any(identity(path.stat()) != stamp for path, stamp in snapshots)):
         return ""
     return urllib.parse.urlsplit(url).hostname or ""
 
