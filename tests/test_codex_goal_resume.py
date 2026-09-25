@@ -111,6 +111,24 @@ class GoalResumeDeliveryTests(unittest.TestCase):
                 self.daemon.process_once(self.client)
                 self.assertEqual(self.client.sent, [])
 
+    def test_unverified_goal_never_falls_back_to_a_matching_native_failed_turn(self):
+        self.daemon.codex_queue_recovery.current_turn = lambda _: {
+            **self.proof, "kind": "task_complete"}
+        with patch.object(goal, "blocked_goal", return_value=None):
+            self.daemon.process_once(self.client)
+        self.assertEqual(self.client.sent, [])
+
+    def test_already_resumed_goal_cannot_receive_plain_continuation(self):
+        self.daemon.codex_queue_recovery.current_turn = lambda _: {
+            **self.proof, "kind": "task_complete"}
+        with patch.object(goal, "blocked_goal", return_value=self.proof):
+            self.daemon.process_once(self.client)
+            runtime = self.daemon.runtime["surface-uuid"]
+            runtime.awaiting = False
+            runtime.last_send_at = 0
+            self.daemon.process_once(self.client)
+        self.assertEqual([row[-1] for row in self.client.sent], ["/goal resume"])
+
 
 if __name__ == "__main__":
     unittest.main()

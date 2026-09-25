@@ -88,6 +88,17 @@ def write_json(path, value):
     core().atomic_write_json(Path(path), value)
 
 
+def valid_job(job, job_id, workspace_id):
+    """Require the same complete slot structure for new and migrated B rules."""
+    if not isinstance(job, dict) or job.get("id") != job_id:
+        return False
+    slots = job.get("slots")
+    return (uid(job.get("workspace_id")) == uid(workspace_id)
+            and isinstance(slots, list) and bool(slots)
+            and all(isinstance(slot, dict) and type(slot.get("index")) is int
+                    and slot["index"] == index for index, slot in enumerate(slots)))
+
+
 def provenance(config_path, workspace_id, config=None):
     """Only an actual B job can confer circuit-breaker scope."""
     config = config if config is not None else core().ConfigStore(Path(config_path)).load()
@@ -103,7 +114,7 @@ def provenance(config_path, workspace_id, config=None):
     try:
         uuid.UUID(jid)
         job = read_json(Path(config_path).parent / "workspace-batches" / jid / "job.json")
-        if uid(job.get("workspace_id")) != wid or job.get("id") != jid or not job.get("slots"):
+        if not valid_job(job, jid, wid):
             return None
     except (OSError, ValueError, TypeError):
         return None
@@ -246,9 +257,12 @@ def arm(config_path, workspace_id, *, resume=False):
 
 
 def _arm(config_path, workspace_id, *, resume=False):
-    from ccc_guard_migration import adopt_workspace, PreflightPreservationError
+    from ccc_guard_migration import adopt_workspace
+    # Adoption owns its preflight-versus-post-capture failure policy. Nothing
+    # it raises may enter this caller's generic stop fallback before it returns
+    # a successfully preserved workspace.
+    adoption = adopt_workspace(config_path, workspace_id)
     try:
-        adoption = adopt_workspace(config_path, workspace_id)
         ensure_service(config_path)
         if adoption.get("adopted"):
             state = request(config_path, "status", workspace_id=uid(workspace_id))
@@ -256,10 +270,6 @@ def _arm(config_path, workspace_id, *, resume=False):
                 raise RuntimeError("protection changed during original-session adoption")
         return request(config_path, "arm", timeout=90, workspace_id=uid(workspace_id),
                        resume=bool(resume or adoption.get("adopted")))
-    except PreflightPreservationError:
-        # Setup is fenced by adoption. Do not destroy an original process
-        # whose still-open file can be the only copy of its session history.
-        raise
     except Exception:
         # Failed adoption/observation must never leave the old B sessions
         # consuming upstream while the new batch cannot be protected.
@@ -290,6 +300,7 @@ class Workspace:
         self.stop_task = None
         self.pause_task = None
         self.last_saved = None
+        self.pending_evidence = set()
 
     def save(self):
         value = {"version": VERSION, "workspace_id": self.wid, "epoch": self.epoch,
@@ -303,9 +314,12 @@ class Workspace:
             write_json(self.directory / "state.json", value)
             self.last_saved = serialized
 
-    def open_gate(self):
+    def ready(self):
         return (self.phase == "watching" and not self.coverage_error
                 and self.service.healthy() and not blocked(self.service.config_path, self.wid))
+
+    def open_gate(self):
+        return not self.pending_evidence and self.ready()
 
     def targets(self):
         return [*self.endpoints.values(), *self.unmanaged.values()]
@@ -770,10 +784,13 @@ class Endpoint:
             self.turn_error = None
             self.stop_proof = self.confirmed_at = None
             self.service.schedule_save(self)
-            if self.in_scope and not self.pool.open_gate():
+            if self.in_scope and not self.pool.ready():
                 self.fault("late_internal_turn")
         evidence = model_evidence(message, self.session_id, self.turn_id) if self.active else None
         if evidence and self.in_scope and self.pool.phase == "watching" and (self.evidence_task is None or self.evidence_task.done()):
+            # Fence new frontend input synchronously. Membership still has to
+            # prove success before any workspace interruption is authorized.
+            self.pool.pending_evidence.add(self)
             self.evidence_task = asyncio.create_task(self.verify_evidence(evidence, time.monotonic()))
         if (method == "turn/completed" and params.get("threadId") == self.session_id
                 and params.get("turn", {}).get("id") == self.turn_id):
@@ -795,11 +812,16 @@ class Endpoint:
         try:
             if await self.service.member(self.pool.wid, self.sid, fresh=True):
                 self.pool.trigger("first_model_response", self, evidence, detected=detected)
-            elif self.service.inventory is None or time.monotonic() - self.service.inventory_at >= .2:
+            elif (self.service.inventory is not None and time.monotonic() - self.service.inventory_at < .2
+                  and self.service.inventory.get(self.sid) != self.pool.wid):
+                self.in_scope = False
+            else:
                 self.pool.trigger("membership_unavailable", self, detected=detected)
         except Exception as exc:
             self.error = str(exc)
             self.pool.trigger("evidence_validation_failure", self, detected=detected)
+        finally:
+            self.pool.pending_evidence.discard(self)
 
     def park(self):
         # EOF after native cancellation shuts down this backend's internal

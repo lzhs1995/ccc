@@ -143,6 +143,20 @@ class WorkspaceBatchTests(unittest.TestCase):
         self.assertEqual(self.worker.job['status'], 'complete')
         self.assertEqual(self.store.load()['workspace_rules'][0]['excluded_surface_ids'], [])
 
+    def test_b_cannot_rearm_a_stop_without_a_verified_one_second_deadline(self):
+        for within_deadline in (False, None):
+            with self.subTest(within_deadline=within_deadline):
+                self.store.mutate(lambda c: c['workspace_rules'][0].update(
+                    paused=True, pause_origin='batch_first_response'))
+                state = {'phase': 'stopped', 'trip': {'connected': True,
+                                                   'within_deadline': within_deadline}}
+                with patch('ccc_batch_guard.snapshot', return_value=state), \
+                     patch('ccc_batch_guard.arm') as arm, patch.object(batch, '_launch') as launch:
+                    with self.assertRaisesRegex(RuntimeError, '本池已暂停'):
+                        batch.start(self.config, self.wid, client=self.client)
+                    arm.assert_not_called()
+                    launch.assert_not_called()
+
     def test_lost_create_and_send_replies_are_reconciled_without_duplicates(self):
         self.client.lose_create = self.client.lose_send = True
         result = self.finish()
