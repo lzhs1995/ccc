@@ -1,16 +1,21 @@
 import copy
+import concurrent.futures
 import json
 from pathlib import Path
 import socket
+import subprocess
 import sys
 import tempfile
+import threading
 import time
+import types
 import unittest
 import urllib.request
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ccc_mihomo import ProbeResult, route
+import ccc_network_guard as network
 from ccc_network_guard import Director, Engine, Guard, ProviderServer, singleton, contract_digest
 
 
@@ -247,6 +252,277 @@ class FakeController:
     def select(self, group, name):
         self.calls.append(("select", group, name))
         self.now = name
+
+
+class ImmediateExecutor:
+    """Deterministic completed jobs for clock and stale-result regressions."""
+    def __init__(self, **kwargs):
+        pass
+
+    def submit(self, function, *args):
+        result = concurrent.futures.Future()
+        try:
+            result.set_result(function(*args))
+        except Exception as exc:
+            result.set_exception(exc)
+        return result
+
+    def shutdown(self, **kwargs):
+        pass
+
+
+class GuardLoopTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="ccc-loop-", dir="/tmp")
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.config, self.routes = fixtures()
+        self.config.update(state_dir=str(self.root), controller_socket="/fixture/controller.sock",
+                           binary="/fixture/mihomo", interface="en0", probe={},
+                           sources=[{"pool": "NTHU", "path": "/fixture/original.json"}],
+                           publish={"port": 0, "token": "fixture"},
+                           policy={**network.DEFAULTS, "inventory_interval_sec": 1})
+        self.publisher = Publisher()
+        self.publisher.close = mock.Mock()
+        self.publisher.set_catalog = mock.Mock()
+        self.controller = FakeController([r.name for r in self.routes] + ["Offline"], self.routes[0].name)
+        self.core = types.SimpleNamespace(process=mock.Mock(pid=4242), ports={}, close=mock.Mock())
+        self.core.process.poll.return_value = None
+        self.probe = mock.Mock()
+        self.probe.run.side_effect = lambda item, deep: ProbeResult("healthy" if deep else "accessible", deep=deep)
+        self.config_reader = self.patch("load_config", return_value=self.config)
+        self.inventory = self.patch("inventory", side_effect=lambda config: list(self.routes))
+        self.patch("ProviderServer", return_value=self.publisher)
+        self.patch("Controller", return_value=self.controller)
+        self.patch("ResponsesProbe", return_value=self.probe)
+        shadow_patch = mock.patch.object(Guard, "new_shadow", return_value=(self.core, list(self.routes)))
+        self.shadow = shadow_patch.start()
+        self.addCleanup(shadow_patch.stop)
+        self.guard = Guard(self.root / "network.json")
+        self.snapshots = []
+        write = network.atomic_json
+
+        def capture(path, value):
+            write(path, value)
+            if Path(path).name == "status.json" and value.get("phase") != "stopped":
+                self.snapshots.append(value)
+
+        self.patch("atomic_json", side_effect=capture)
+
+    def patch(self, name, **options):
+        patch = mock.patch("ccc_network_guard." + name, **options)
+        value = patch.start()
+        self.addCleanup(patch.stop)
+        return value
+
+    def stepped_loop(self, ticks, *, setup=None):
+        clock = [ticks[0]]
+        self.patch("time", new=types.SimpleNamespace(time=lambda: clock[0]))
+        self.patch("concurrent.futures.ThreadPoolExecutor", new=ImmediateExecutor)
+        pending = iter(ticks)
+
+        def tick(timeout):
+            value = next(pending, None)
+            if value is None:
+                return True
+            clock[0] = value
+            return False
+
+        self.guard.stop = types.SimpleNamespace(wait=tick)
+        if setup:
+            setup(clock)
+        self.guard._run(self.root)
+        return clock
+
+    def test_slow_inventory_cannot_block_results_routing_or_heartbeat(self):
+        self.config["policy"]["inventory_interval_sec"] = .01
+        entered, release, advanced = threading.Event(), threading.Event(), threading.Event()
+        reads = 0
+
+        def inventory(config):
+            nonlocal reads
+            reads += 1
+            if reads > 1:
+                entered.set()
+                if not release.wait(10):
+                    raise TimeoutError("fixture did not release subscription")
+            return list(self.routes)
+
+        self.inventory.side_effect = inventory
+        original_get = self.controller.get
+
+        def get(path):
+            if entered.is_set():
+                advanced.set()
+            return original_get(path)
+
+        self.controller.get = get
+        errors = []
+
+        def run():
+            try:
+                self.guard._run(self.root)
+            except Exception as exc:
+                errors.append(exc)
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(3), "periodic subscription read did not begin")
+            before = len(self.snapshots)
+            self.assertTrue(advanced.wait(3), "routing stopped behind subscription parsing")
+            deadline = time.monotonic() + 3
+            while len(self.snapshots) <= before and time.monotonic() < deadline:
+                time.sleep(.02)
+            self.assertGreater(len(self.snapshots), before, "heartbeat stopped behind subscription parsing")
+            self.assertTrue(any(h.deep_ok_at for h in self.guard.engine.health.values()),
+                            "completed probes were not collected during subscription parsing")
+        finally:
+            release.set()
+            self.guard.stop.set()
+            worker.join(4)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+
+    def test_delayed_collection_keeps_worker_completion_time(self):
+        self.stepped_loop([1000, 1100])
+        health = self.guard.engine.health[self.routes[0].id]
+        self.assertEqual(health.light_ok_at, 1000)
+        self.assertEqual(self.guard.engine.deep_starts, [],
+                         "an old light result must not authorize a new paid probe")
+
+    def test_deep_reservation_uses_time_after_local_config_work(self):
+        dispatched = []
+
+        def setup(clock):
+            engine = Engine(self.config, self.routes, now=1000)
+            engine.record(self.routes[0].id, ProbeResult("accessible"), 999)
+            network.atomic_json(self.root / "health.json", {**engine.saved(),
+                                "contract": contract_digest(self.config),
+                                "routes": [r.record() for r in self.routes]})
+
+            def config_read(path):
+                clock[0] = 1007
+                return self.config
+
+            def probe(item, deep):
+                if deep:
+                    dispatched.append(clock[0])
+                return ProbeResult("healthy" if deep else "accessible", deep=deep)
+
+            self.config_reader.side_effect = config_read
+            self.probe.run.side_effect = probe
+
+        self.stepped_loop([1000], setup=setup)
+        self.assertEqual(dispatched, [1007])
+        self.assertEqual(self.guard.engine.deep_starts, dispatched)
+
+    def test_deep_reservation_uses_time_after_result_collection(self):
+        dispatched = []
+
+        def setup(clock):
+            record = Engine.record
+
+            def delayed_record(engine, *args, **kwargs):
+                clock[0] = 1007
+                return record(engine, *args, **kwargs)
+
+            patch = mock.patch.object(Engine, "record", new=delayed_record)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+            def probe(item, deep):
+                if deep:
+                    dispatched.append(clock[0])
+                return ProbeResult("healthy" if deep else "accessible", deep=deep)
+
+            self.probe.run.side_effect = probe
+
+        self.stepped_loop([1000, 1001], setup=setup)
+        self.assertEqual(dispatched, [1007])
+        self.assertEqual(self.guard.engine.deep_starts, dispatched)
+
+    def test_completed_light_failure_precedes_old_deep_success(self):
+        item = self.routes[0]
+        engine = Engine(self.config, self.routes, now=1006)
+        engine.current = item.id
+        engine.record(item.id, ProbeResult("blocked"), 936)
+        for stamp in (997, 998, 999):
+            engine.record(item.id, ProbeResult("accessible"), stamp)
+        engine.reserve_deep(item.id, 1000)
+        network.atomic_json(self.root / "health.json", {**engine.saved(),
+                            "contract": contract_digest(self.config),
+                            "routes": [r.record() for r in self.routes]})
+        # The deep request entered the queue first, but its success completed
+        # after a newer light failure. Both are collected in the same tick.
+        for deep, began, completed, kind in ((True, 1000, 1005, "healthy"),
+                                              (False, 1001, 1002, "timeout")):
+            job = concurrent.futures.Future()
+            job.set_result((ProbeResult(kind, deep=deep), completed))
+            self.guard.jobs[job] = (item.id, deep, self.core, began, contract_digest(self.config))
+        self.stepped_loop([1006])
+        health = self.guard.engine.health[item.id]
+        self.assertTrue(health.quarantined, "an old SSE erased an intervening failure")
+        self.assertFalse(health.qualified)
+        self.assertEqual(health.deep_ok_at, 0)
+        self.assertEqual(health.failure_at, 1002)
+        self.assertEqual(self.guard.engine.deep_starts, [1000])
+
+    def test_unchanged_inventory_recovers_without_hiding_a_known_outage(self):
+        engine = Engine(self.config, self.routes, now=1000)
+        for item in self.routes:
+            engine.record(item.id, ProbeResult("blocked"), 999)
+        network.atomic_json(self.root / "health.json", {**engine.saved(),
+                            "contract": contract_digest(self.config),
+                            "routes": [r.record() for r in self.routes]})
+        self.inventory.side_effect = [list(self.routes), subprocess.TimeoutExpired("fixture", 5),
+                                      list(self.routes), list(self.routes)]
+        self.probe.run.side_effect = lambda item, deep: ProbeResult("observer_error", deep=deep)
+        self.stepped_loop([1000, 1002, 1004, 1006, 1008])
+        failures = [s for s in self.snapshots if "subscription refresh failed" in s.get("error", "")]
+        self.assertTrue(failures)
+        self.assertTrue(all(s["phase"] == "network_wait" for s in failures))
+        self.assertEqual(self.guard.inventory_error, "")
+        self.assertEqual(self.guard.shadow_error, "")
+        self.assertEqual(self.guard.phase, "network_wait")
+
+    def test_inventory_completion_from_old_config_cannot_replace_live_routes(self):
+        updated = copy.deepcopy(self.config)
+        updated["sources"][0]["path"] = "/fixture/updated.json"
+        self.config_reader.side_effect = [self.config, self.config, updated]
+        extra = route("NTHU", {"name": "old-config-only", "type": "http", "server": "127.0.0.1", "port": 9009})
+        self.inventory.side_effect = [list(self.routes), [*self.routes, extra], list(self.routes)]
+        self.stepped_loop([1000, 1002, 1004])
+        self.assertEqual(set(self.guard.engine.routes), {r.id for r in self.routes})
+        self.assertEqual(self.shadow.call_count, 1)
+
+    def test_subscription_recovery_does_not_clear_a_probe_core_error(self):
+        reads = 0
+
+        def inventory(config):
+            nonlocal reads
+            reads += 1
+            if reads == 2:
+                raise subprocess.TimeoutExpired("fixture", 5)
+            if reads == 3:
+                self.guard.shadow_error = "isolated probe core unavailable: fixture"
+            return list(self.routes)
+
+        self.inventory.side_effect = inventory
+        self.stepped_loop([1000, 1002, 1004, 1006, 1008])
+        self.assertFalse(self.snapshots[-1].get("inventory_error"))
+        self.assertEqual(self.guard.shadow_error, "isolated probe core unavailable: fixture")
+        self.assertEqual(self.guard.phase, "observer_fault")
+
+    def test_startup_parser_timeout_can_use_matching_saved_inventory(self):
+        engine = Engine(self.config, self.routes, now=1000)
+        network.atomic_json(self.root / "health.json", {**engine.saved(),
+                            "contract": contract_digest(self.config),
+                            "routes": [r.record() for r in self.routes]})
+        self.inventory.side_effect = [subprocess.TimeoutExpired("fixture", 5), list(self.routes)]
+        self.stepped_loop([1000, 1002, 1004])
+        self.assertEqual(set(self.guard.engine.routes), {r.id for r in self.routes})
+        self.assertEqual(self.guard.inventory_error, "")
 
 
 class PublicationTests(unittest.TestCase):

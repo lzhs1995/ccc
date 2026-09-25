@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import contextlib
+import copy
 import dataclasses
 import fcntl
 import hashlib
@@ -536,6 +537,7 @@ class Guard:
         self.jobs = {}
         self.retired = []
         self.shadow_error = ""
+        self.inventory_error = ""
         self.error = ""
         self.phase = "starting"
         self.hint_count = 0
@@ -553,7 +555,8 @@ class Guard:
                 "service_host": self.config["service_host"], "phase": self.phase,
                 "current_id": e.current, "current": self.director.actual_name,
                 "active_pool": e.active_pool, "last_switch": e.last_switch,
-                "error": self.error or self.shadow_error, "routes": rows,
+                "error": self.error or self.shadow_error or self.inventory_error,
+                "inventory_error": self.inventory_error, "routes": rows,
                 "ready": sum(r["ready"] for r in rows), "qualified": sum(r["qualified"] for r in rows),
                 "quarantined": sum(r["quarantined"] for r in rows),
                 "probe_in_flight": len(self.jobs),
@@ -569,6 +572,16 @@ class Guard:
         except Exception:
             core.close()
             raise
+
+    @staticmethod
+    def run_probe(probe, item, deep):
+        # Completion belongs to the worker, not a later controller/config tick.
+        # Delayed collection must not make an old response appear fresh.
+        try:
+            result = probe.run(item, deep)
+        except Exception:
+            result = ProbeResult("observer_error", detail="probe worker failed", deep=deep)
+        return result, time.time()
 
     def consume_hints(self, sock, now):
         for _ in range(128):
@@ -599,7 +612,7 @@ class Guard:
             saved["contract"] = self.contract
         try:
             routes = inventory(self.config)
-        except (OSError, ValueError, KeyError, RuntimeError):
+        except (OSError, ValueError, KeyError, RuntimeError, subprocess.TimeoutExpired):
             # A transient subscription write cannot strand a restarted guard.
             # Only exact saved definitions under the same API contract qualify.
             if saved.get("contract") != self.contract:
@@ -608,7 +621,7 @@ class Guard:
             if not routes:
                 raise
             validate_dependencies(self.config, routes)
-            self.shadow_error = "subscription unavailable; retaining the last saved inventory"
+            self.inventory_error = "subscription unavailable; retaining the last saved inventory"
         if saved.get("contract") == self.contract:
             for old in saved.get("routes", []):
                 if old.get("id") == saved.get("current") and not any(r.id == old["id"] for r in routes):
@@ -636,8 +649,11 @@ class Guard:
         hint_socket.bind(str(hint_path))
         hint_socket.setblocking(False)
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.engine.policy["concurrency"], thread_name_prefix="network-probe")
-        setup = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="network-inventory")
+        setup = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="network-shadow")
+        inventory_worker = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="network-inventory")
         pending_core = setup.submit(self.new_shadow, routes)
+        pending_inventory = None
+        inventory_config = None
         next_core_retry, retry_delay = 0, 5
         next_inventory, next_config, next_sync, next_save, next_snapshot = 0, 0, 0, 0, 0
         try:
@@ -645,15 +661,22 @@ class Guard:
             while not self.stop.wait(.1):
                 now = time.time()
                 self.consume_hints(hint_socket, now)
+                completed = []
                 for job, (rid, deep, owner, began, contract) in list(self.jobs.items()):
                     if job.done():
                         del self.jobs[job]
                         try:
-                            result = job.result()
+                            result, completed_at = job.result()
                         except Exception:
                             result = ProbeResult("observer_error", detail="probe worker failed", deep=deep)
+                            completed_at = now
                         if contract == self.contract and owner.process.poll() is None:
-                            self.engine.record(rid, result, now, started_at=began)
+                            completed.append((completed_at, rid, result, began))
+                # Submission order is not completion order. An older SSE must
+                # see any intervening failure before it can clear quarantine.
+                for completed_at, rid, result, began in sorted(
+                        completed, key=lambda item: (item[0], item[2].kind not in LOCAL_FAILURES)):
+                    self.engine.record(rid, result, completed_at, started_at=began)
                 for old in list(self.retired):
                     if not any(owner is old for _, _, owner, _, _ in self.jobs.values()):
                         old.close()
@@ -699,20 +722,31 @@ class Guard:
                     self.shadow_error = "isolated probe core exited; restarting only its replacement"
                     if pending_core is None and now >= next_core_retry:
                         pending_core = setup.submit(self.new_shadow, list(self.engine.routes.values()))
-                if pending_core is None and now >= next_inventory:
+                if pending_inventory is not None and pending_inventory.done() and pending_core is None:
                     try:
-                        latest = inventory(self.config)
-                        wanted = {r.id for r in latest}
-                        if self.engine.current in self.engine.routes and self.engine.current not in wanted:
-                            latest.append(self.engine.routes[self.engine.current])
-                            wanted.add(self.engine.current)
-                        if wanted != set(self.engine.routes):
-                            pending_core = setup.submit(self.new_shadow, latest)
-                        elif self.config.get("publish_transit"):
-                            publisher.set_catalog(latest, self.config["commercial_pools"])
+                        latest = pending_inventory.result()
+                        if inventory_config == self.config:
+                            wanted = {r.id for r in latest}
+                            if self.engine.current in self.engine.routes and self.engine.current not in wanted:
+                                latest.append(self.engine.routes[self.engine.current])
+                                wanted.add(self.engine.current)
+                            if wanted != set(self.engine.routes):
+                                pending_core = setup.submit(self.new_shadow, latest)
+                            elif self.config.get("publish_transit"):
+                                publisher.set_catalog(latest, self.config["commercial_pools"])
+                            self.inventory_error = ""
                     except Exception as exc:
-                        self.shadow_error = f"subscription refresh failed; retaining verified routes: {type(exc).__name__}"
-                    next_inventory = now + self.engine.policy["inventory_interval_sec"]
+                        if inventory_config == self.config:
+                            self.inventory_error = f"subscription refresh failed; retaining verified routes: {type(exc).__name__}"
+                    pending_inventory = None
+                    next_inventory = (time.time() + self.engine.policy["inventory_interval_sec"]
+                                      if inventory_config == self.config else 0)
+                if pending_core is None and pending_inventory is None and now >= next_inventory:
+                    inventory_config = copy.deepcopy(self.config)
+                    pending_inventory = inventory_worker.submit(inventory, inventory_config)
+                # Local configuration/publication work may have taken time.
+                # Do not reserve a billable request using the tick's old clock.
+                now = time.time()
                 if self.core and self.core.process.poll() is None:
                     occupied = {rid for rid, deep, _, _, _ in self.jobs.values() if not deep}
                     probe = ResponsesProbe(self.config["probe"], self.core.ports)
@@ -721,13 +755,13 @@ class Guard:
                         if rid:
                             self.engine.reserve_deep(rid, now)
                             self.save()  # Reserve before a billable request can run.
-                            job = executor.submit(probe.run, self.engine.routes[rid], True)
+                            job = executor.submit(self.run_probe, probe, self.engine.routes[rid], True)
                             self.jobs[job] = (rid, True, self.core, now, self.contract)
                     for rid in self.engine.light_due(now, occupied):
                         if len(self.jobs) >= self.engine.policy["concurrency"]:
                             break
                         self.engine.health[rid].light_attempt_at = now
-                        job = executor.submit(probe.run, self.engine.routes[rid], False)
+                        job = executor.submit(self.run_probe, probe, self.engine.routes[rid], False)
                         self.jobs[job] = (rid, False, self.core, now, self.contract)
                 if now >= next_sync:
                     try:
@@ -757,6 +791,7 @@ class Guard:
                     pending_core.result(timeout=30)[0].close()
             executor.shutdown(wait=True, cancel_futures=True)
             setup.shutdown(wait=True, cancel_futures=True)
+            inventory_worker.shutdown(wait=True, cancel_futures=True)
             publisher.close()
             with contextlib.suppress(FileNotFoundError):
                 hint_path.unlink()

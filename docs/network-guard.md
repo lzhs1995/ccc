@@ -48,6 +48,18 @@ for initial admission and quarantine recovery.
 while preserving 5 seconds for commercial paths. Deadline changes retain valid
 API admission and isolation history.
 
+Periodic subscription reads run in a separate worker, so slow YAML parsing
+does not suspend probe collection, selector reconciliation or heartbeats.
+Results from an obsolete configuration are discarded. Subscription errors
+remain visible as `inventory_error`; a successful read clears that error even
+when the route list is unchanged, without clearing an independent probe-core
+failure or masking an already confirmed `network_wait`.
+Probe evidence is dated when its worker finishes, so delayed result collection
+cannot make an old response fresh again. Completed results are applied in that
+order, so an older SSE cannot clear an intervening failure. The loop refreshes
+its clock after local result/configuration work before reserving another
+complete API check.
+
 ## Configuration and activation
 
 Copy `network.example.json` into a private directory outside Documents, fill
