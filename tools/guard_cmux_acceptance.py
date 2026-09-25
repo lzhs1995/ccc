@@ -237,7 +237,11 @@ def run(output, count, legacy, *, early=0, lifecycle=False, fault=None, moved=Fa
                 servers[0].disconnected.clear()
                 servers[0].ready.clear()
                 servers[0].first_response = None
-                sid = next(s for s in session_ids if s != original["surface_id"])
+                # Early stopping can leave an unsubmitted startup draft on a
+                # different surface. W must preserve it, so that composer is
+                # deliberately not empty. Exercise the proven successful turn;
+                # fault fixtures have submitted all their prompts before stop.
+                sid = stopped["trip"].get("surface_id") or next(s for s in session_ids if s != original["surface_id"])
                 submit(scope.records(client.tree())[sid], "Explicit local test turn after W")
                 until(lambda: guard.snapshot(config_path, wid).get("phase") == "stopped", label="W fresh-response interruption")
                 assert len(servers[0].requests) == after + 1
