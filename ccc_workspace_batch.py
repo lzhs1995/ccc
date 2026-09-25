@@ -29,7 +29,7 @@ from ccc_inventory import SharedInventory
 from ccc_scheduling import SnapshotCache, SnapshotClient
 
 COUNT = 50
-WORKER_VERSION = 17
+WORKER_VERSION = 18
 PROMPT = "show me u power"
 INITIALIZING = {"creating", "create_unknown", "created", "restarting", "restart_unknown",
                 "submitted", "submitting", "uncertain"}
@@ -64,10 +64,12 @@ def job_path(config_path, job_id):
 
 
 def allowed(config, job):
+    from ccc_batch_guard import blocked
     rule = next((r for r in config["workspace_rules"] if r.get("workspace_id") == job["workspace_id"]), {})
     return (config.get("mode") == "armed" and not config.get("global_paused")
             and rule.get("enabled", True) and not rule.get("paused")
-            and rule.get("active_batch_id") == job["id"])
+            and rule.get("active_batch_id") == job["id"]
+            and not blocked(job.get("config_path", core.DEFAULT_CONFIG_PATH), job["workspace_id"]))
 
 
 def counts(job):
@@ -88,6 +90,9 @@ def snapshots(config_path, config):
             try:
                 job = core.load_json(job_path(config_path, jid), {})
                 result[rule["workspace_id"]] = {"id": jid, "status": job.get("status"), **counts(job)}
+                if rule.get("batch_guard"):
+                    from ccc_batch_guard import snapshot
+                    result[rule["workspace_id"]]["protection"] = snapshot(config_path, rule["workspace_id"])
             except (OSError, ValueError, KeyError, RuntimeError):
                 continue
     return result
@@ -155,20 +160,32 @@ def start(config_path, selector, *, client=None, launch=True):
         rule = next((r for r in config["workspace_rules"] if r.get("workspace_id") == wid), {})
         if config.get("mode") != "armed" or config.get("global_paused"):
             raise RuntimeError("全局当前未开启续跑；请先按 A 开启，再创建本池")
-        if rule.get("paused") or not rule.get("enabled", True):
+        resume_success = False
+        if launch and rule.get("pause_origin") == "batch_first_response":
+            from ccc_batch_guard import snapshot
+            state = snapshot(config_path, wid)
+            resume_success = state.get("phase") == "stopped" and (state.get("trip") or {}).get("connected") is True
+        if (rule.get("paused") and not resume_success) or not rule.get("enabled", True):
             raise RuntimeError("本池已暂停；请先按 W 恢复，再创建或补做")
         cancel_epoch = rule.get("batch_cancelled_at")
         previous = core.load_json(job_path(config_path, rule["last_batch_id"]), {}) if rule.get("last_batch_id") else {}
-        if previous and previous.get("status") != "complete":
+        if (previous and previous.get("status") not in {"complete", "stopped_success"}
+                and previous.get("created_at", 0) > rule.get("batch_success_at", 0)):
             job = previous  # Repeated clicks and retries reuse the same 50 slots.
         else:
             job = {"id": str(uuid.uuid4()), "workspace_id": wid,
                    "created_at": time.time(), "status": "pending",
                    "slots": [{"index": i, "phase": "pending"} for i in range(COUNT)]}
             core.atomic_write_json(job_path(config_path, job["id"]), job)
+        job["config_path"] = str(Path(config_path).resolve())
+        if launch:
+            job["guard_version"] = 1
+        core.atomic_write_json(job_path(config_path, job["id"]), job)
         def authorize(latest):
             current = next((r for r in latest["workspace_rules"] if r.get("workspace_id") == wid), None)
-            if latest.get("mode") != "armed" or latest.get("global_paused") or (current and current.get("paused")):
+            if (latest.get("mode") != "armed" or latest.get("global_paused")
+                    or (current and current.get("paused") and not
+                        (resume_success and current.get("pause_origin") == "batch_first_response"))):
                 raise RuntimeError("授权状态已改变，批量创建已取消")
             if (current or {}).get("batch_cancelled_at") != cancel_epoch:
                 raise RuntimeError("本池刚被暂停，旧的创建请求已取消")
@@ -178,8 +195,15 @@ def start(config_path, selector, *, client=None, launch=True):
             if not current.get("enabled", True):
                 raise RuntimeError("本池已禁用")
             current.update(active_batch_id=job["id"], last_batch_id=job["id"])
+            if resume_success:
+                current.update(paused=False)
+                current.pop("paused_at", None)
+            if launch:
+                current.setdefault("batch_guard", {"version": 1, "origin_job_id": job["id"]})
         store.mutate(authorize)
         if launch:
+            from ccc_batch_guard import arm
+            arm(config_path, wid, resume=resume_success)
             _launch(config_path, job)
         return {"job_id": job["id"], "workspace_id": wid, **counts(job)}
 
@@ -309,6 +333,10 @@ class BatchWorker:
         self._shell_hints = {}
 
     def _process_label(self, target):
+        from ccc_batch_guard import binding
+        guarded = binding(self.config_path, target)
+        if guarded:
+            return {"agent_kind": "codex", "agent_pids": [guarded["pid"]], "summary": "guarded native backend"}
         slot = next((s for s in self.job["slots"] if s.get("surface_id") == target["surface_id"]), {})
         if slot:
             receipt = core.load_json(self.path.parent / f"surface-{slot['index']}.json", {})
@@ -435,6 +463,9 @@ class BatchWorker:
                                 "--index", str(slot["index"]), "--launch-id", slot["launch_id"]])
         native = shlex.join(["codex", "-c", "sqlite_home=" + json.dumps(
             str(sqlite_home(self.config_path, self.job["id"], slot["index"]).resolve()))])
+        if self.job.get("guard_version") == 1:
+            native = shlex.join([sys.executable, "-B", str(Path(__file__).with_name("ccc_batch_guard.py")),
+                "launch", "--config", str(self.config_path), "--job", self.job["id"], "--index", str(slot["index"])])
         return bootstrap + " && " + native
 
     def _protect_created(self, slot):
@@ -516,6 +547,10 @@ class BatchWorker:
             self.save()
 
     def _transcript(self, sid, native):
+        from ccc_batch_guard import binding
+        guarded = binding(self.config_path, {"surface_id": sid, "workspace_id": self.job["workspace_id"]})
+        if guarded and guarded.get("session_id") == native.get("session_id") and guarded.get("transcript"):
+            return guarded["transcript"]
         try:
             binding = self.queue.records().get(native["session_id"], {})
         except (OSError, ValueError):
@@ -646,6 +681,10 @@ class BatchWorker:
                             for t in config["targets"]))
 
     def _native(self, target, slot):
+        from ccc_batch_guard import binding
+        guarded = binding(self.config_path, target)
+        if guarded and guarded.get("session_id"):
+            return {k: guarded.get(k) for k in ("kind", "session_id", "pid", "process_start")}
         native = self.queue.current_turn(target)
         if (not native or not native.get("session_id")) and hasattr(self.queue, "initial_session"):
             native = self.queue.initial_session(target, slot.get("launched_at", slot["created_at"]))
@@ -801,8 +840,17 @@ class BatchWorker:
             uninitialized = native.get("kind") == "uninitialized"
             if not path and not uninitialized:
                 return
+            try:
+                offset = Path(path).stat().st_size if path else 0
+            except FileNotFoundError:
+                # Native thread/start returns the future rollout path before
+                # its first turn creates the file. Only a proven fresh native
+                # session may start with offset zero.
+                if not uninitialized:
+                    raise
+                offset = 0
             slot.update(phase="submitting", submit_at=self.clock(), transcript=path,
-                        transcript_offset=Path(path).stat().st_size if path else 0, pid=native["pid"],
+                        transcript_offset=offset, pid=native["pid"],
                         process_start=native.get("process_start"), native_uninitialized=uninitialized)
             self.save()
             try:
@@ -875,7 +923,9 @@ class BatchWorker:
                 except (OSError, ValueError, core.CmuxError, RuntimeError) as exc:
                     slot["error"] = str(exc)
         if not allowed(self.store.load(), self.job):
-            self.job["status"] = "cancelled"
+            from ccc_batch_guard import snapshot
+            guard = snapshot(self.config_path, self.job["workspace_id"])
+            self.job["status"] = "stopped_success" if (guard.get("trip") or {}).get("connected") else "cancelled"
             self.save()
             return False
         try:

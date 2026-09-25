@@ -277,6 +277,21 @@ class WorkspaceBatchTests(unittest.TestCase):
         self.assertNotIn(sid, self.store.load()['workspace_rules'][0]['excluded_surface_ids'])
         self.assertNotIn(sid, self.store.load()['workspace_rules'][0].get('batch_start_holds', {}))
 
+    def test_uninitialized_native_can_declare_future_rollout_path(self):
+        self.worker.step()
+        slot = self.worker.job['slots'][0]
+        native = {**self.client.states[slot['surface_id']], 'kind': 'uninitialized'}
+        path = Path(self.client.bindings[native['session_id']]['transcriptPath'])
+        path.unlink()
+        with patch.object(self.worker, '_native', return_value=native), \
+                patch.object(self.worker, '_transcript', return_value=str(path)), \
+                patch.object(self.client, 'send_text') as send:
+            self.worker._advance(slot)
+        self.assertEqual(slot['phase'], 'submitted')
+        self.assertEqual(slot['transcript_offset'], 0)
+        self.assertEqual(slot['transcript'], str(path))
+        send.assert_called_once()
+
     def test_separate_enter_requires_exact_recorded_draft_and_is_never_repeated(self):
         self.worker.step()
         slot = self.worker.job['slots'][0]

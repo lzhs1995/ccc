@@ -59,7 +59,7 @@ DEFAULT_LABEL = f"{LABEL_PREFIX}.{APP_NAME}"
 PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_APP_DIR = Path.home() / "Library" / "Application Support" / APP_NAME
 DEFAULT_RUNTIME_ROOT = DEFAULT_APP_DIR / "runtime"
-RUNTIME_FILES = ("cmux_codex_watch.py", "claude_ccc_protocol.py", "claude_ccc_event_hook.py", "ccc_observation.py", "ccc_scheduling.py", "ccc_codex_queue.py", "ccc_workspace_batch.py", "ccc_inventory.py")
+RUNTIME_FILES = ("cmux_codex_watch.py", "claude_ccc_protocol.py", "claude_ccc_event_hook.py", "ccc_observation.py", "ccc_scheduling.py", "ccc_codex_queue.py", "ccc_codex_goal.py", "ccc_workspace_batch.py", "ccc_inventory.py", "ccc_batch_guard.py", "ccc_guard_transport.py", "ccc_guard_watchdog.py", "ccc_guard_scope.py", "ccc_guard_migration.py", "ccc_codex_launcher.py")
 DEFAULT_LOG_DIR = Path.home() / "Library" / "Logs" / APP_NAME
 DEFAULT_CONFIG_PATH = DEFAULT_APP_DIR / "config.json"
 DEFAULT_STATE_PATH = DEFAULT_APP_DIR / "state.json"
@@ -328,7 +328,7 @@ CLAUDE_CONTEXT_ABSOLUTE_TIMEOUT_SEC = 900.0
 # through TargetRuntime and suppresses duplicate Hook/fallback deliveries.
 # Human label only.  Acceptance always compares SHA-256 of the loaded source:
 # a revision string is hand-maintained and therefore can lie about what runs.
-FEATURE_REVISION = "0.2.13-batch-authorization-backpressure"
+FEATURE_REVISION = "0.2.15-batch-first-response-interrupt"
 # How long after our own send a byte-identical UserPromptSubmit can still be
 # our echo.  Must exceed claude_submit_confirm_timeout_sec so that a late
 # echo arriving after the transaction timed out is not read as a human.
@@ -505,6 +505,7 @@ class ScreenState:
     ignored_chrome_rows: tuple[int, ...] = ()
     # Reconnect stalls have a 60-second repeat floor even as their timers change.
     allow_repeat: bool = True
+    native_goal_stalled: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -552,6 +553,7 @@ class TargetRuntime:
     send_attempt_evidence: str | None = None
     codex_observed_turn_key: str = ""
     codex_sent_turn_key: str = ""
+    codex_goal_resume: bool = False
     codex_absent_probe: str = ""
     codex_absent_since: float = 0.0
     last_send_error: str = ""
@@ -2271,6 +2273,8 @@ def classify_grid(grid: Grid) -> ScreenState:
             error.error_type in PROVIDER_REPEAT_ERROR_TYPES
             or not _is_reconnect_marker(error.block)
         ),
+        native_goal_stalled=any("Goal stalled (/goal resume)" in line
+                                for line in lines[composer_row + 1:composer_row + 4]),
     )
 
 
@@ -3775,13 +3779,13 @@ class CmuxClient:
             raise CmuxError("send_surface requires explicit surface UUID")
         self._run(["send", "--surface", surface_id, f"{text}\n"], timeout=8)
 
-    def respawn_surface(self, window_id: str, surface_id: str, command: str) -> None:
+    def respawn_surface(self, window_id: str, surface_id: str, command: str, *, workspace_id: str | None = None) -> None:
         if not window_id or not surface_id:
             raise CmuxError("respawn_surface requires explicit window and surface UUIDs")
-        self._run([
-            "respawn-pane", "--window", window_id, "--surface", surface_id,
-            "--command", command,
-        ], timeout=8)
+        args = ["respawn-pane", "--window", window_id, "--surface", surface_id]
+        if workspace_id:
+            args += ["--workspace", workspace_id]
+        self._run([*args, "--command", command], timeout=8)
 
     def read_screen(self, workspace_id: str, surface_id: str) -> str:
         args = ["read-screen", "--workspace", workspace_id, "--surface", surface_id]
@@ -3886,6 +3890,31 @@ class CmuxClient:
             raise CmuxError("send_text requires explicit workspace and surface UUIDs")
         self._reject_unapproved_command(message)
         self._run(["send", "--workspace", workspace_id, "--surface", surface_id, message], timeout=8)
+
+    def resume_codex_goal(self, workspace_id: str, surface_id: str) -> None:
+        """Fixed native operation; caller proves this exact goal is stalled."""
+        if not workspace_id or not surface_id:
+            raise CmuxError("goal resume requires explicit workspace and surface UUIDs")
+        if self._control_rpc("surface.send_text", {
+            "workspace_id": workspace_id, "surface_id": surface_id, "text": "/goal resume",
+        }) is None:
+            self._run(["send", "--workspace", workspace_id, "--surface", surface_id, "/goal resume"], timeout=8)
+        # Slash commands are bracket-pasted as draft text by native Codex.
+        # A newline in that paste is not Enter. Confirm our exact draft before
+        # one explicit submission; never resend an uncertain paste or Enter.
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            grid = Grid.from_rpc(self.replay(workspace_id, surface_id), surface_id)
+            status, row = _composer_status(grid)
+            if status == "composer_busy" and row is not None and grid.lines[row].strip() in {
+                    "› /goal resume", "> /goal resume"}:
+                if self._control_rpc("surface.send_key", {
+                    "workspace_id": workspace_id, "surface_id": surface_id, "key": "enter",
+                }) is None:
+                    self.send_key(workspace_id, surface_id, "enter")
+                return
+            time.sleep(.025)
+        raise CmuxError("native goal resume draft was not confirmed; Enter withheld")
 
     def send_key(self, workspace_id: str, surface_id: str, key: str) -> None:
         """Send a named key to an explicitly addressed surface, never focused UI."""
@@ -4607,6 +4636,29 @@ def workspace_input_lock(config_path, workspace_id, *, shared=False):
 
 def pause_workspace(store, workspace_id, client):
     """Persist the gate first; drain in-flight input, then interrupt live pool Codex."""
+    from ccc_batch_guard import provenance, pause as guard_pause
+    existing = workspace_rule_by_id(store.load(), workspace_id)
+    if provenance(store.path, existing["workspace_id"]):
+        status = guard_pause(store.path, existing["workspace_id"])
+        rows = {(row.get("surface_id"), row.get("pid")): row for row in status.get("stop_targets", [])}
+        for source in (status.get("surfaces", {}), status.get("unmanaged", {})):
+            for key, row in source.items():
+                sid = row.get("surface_id", key)
+                rows[(sid, row.get("pid"))] = {**row, "surface_id": sid}
+        scoped = [row for row in rows.values() if row.get("in_scope", True)]
+        failed = [{"surface_id": row.get("surface_id"), "pid": row.get("pid"),
+                   "error": row.get("error") or "停止未确认"}
+                  for row in scoped if not row.get("stop_proof") or row.get("active")
+                  or row.get("pending_turn") or row.get("backend_exited") is False]
+        trip = status.get("trip") or {}
+        if (status.get("phase") != "stopped" or status.get("coverage_error")
+                or trip.get("persistence_error") or trip.get("pause_persistence_error")):
+            failed.append({"workspace_id": existing["workspace_id"],
+                "error": status.get("coverage_error") or trip.get("persistence_error")
+                    or trip.get("pause_persistence_error") or "工作区停止未确认"})
+        return {"workspace_id": existing["workspace_id"], "paused": True,
+                "interrupt_requested": sorted({row["surface_id"] for row in scoped if row.get("interrupt_requested")}),
+                "failed": failed, "protection": status}
     def pause(config):
         rule = workspace_rule_by_id(config, workspace_id)
         rule.update(paused=True, paused_at=time.time())
@@ -4745,6 +4797,7 @@ class WatchDaemon:
             native_home / ".cmuxterm/codex-hook-sessions.json",
             native_home / ".codex/sessions", MESSAGE,
         )
+        self.codex_queue_recovery.guard_config_path = config_path
         if hook_settings_manager is not None:
             self.claude_hook_settings = hook_settings_manager
         elif config_path == DEFAULT_CONFIG_PATH:
@@ -5546,6 +5599,10 @@ class WatchDaemon:
         workspace_id = str(target.get("workspace_id") or "")
         if not workspace_id:
             return {"agent_kind": "unknown", "summary": "workspace unavailable"}
+        from ccc_batch_guard import binding
+        guarded = binding(self.config_path, target)
+        if guarded:
+            return {"agent_kind": "codex", "agent_pids": [guarded["pid"]], "summary": "guarded native backend"}
         try:
             if isinstance(client, SnapshotClient):
                 # Adapter routing is advisory. A cold/slow process lookup must
@@ -6094,6 +6151,9 @@ class WatchDaemon:
 
     def _active_send_target(self, target, is_current=None):
         if self.stop_requested or (is_current is not None and not is_current()):
+            return None
+        from ccc_batch_guard import blocked
+        if blocked(self.config_path, target.get("workspace_id")):
             return None
         self._reload_config_if_changed()
         current = self._event_target(str(target["surface_id"]))
@@ -9210,10 +9270,17 @@ class WatchDaemon:
                     runtime.delivery_status = "cancelled"
                     self.save(wait=False)
                     return
+                if runtime.codex_goal_resume and not self._codex_turn_ready(target, runtime, state, reserved=True):
+                    runtime.delivery_status = "cancelled"
+                    self.save(wait=False)
+                    return
                 runtime.send_io_started_at = time.time()
                 runtime.detection_to_send_ms = round(max(0, runtime.send_io_started_at -
                     (runtime.candidate_observed_at or runtime.observed_at)) * 1000, 3)
-                client.send(str(target["workspace_id"]), surface_id, self._outgoing_message(state))
+                if runtime.codex_goal_resume:
+                    client.resume_codex_goal(str(target["workspace_id"]), surface_id)
+                else:
+                    client.send(str(target["workspace_id"]), surface_id, self._outgoing_message(state))
         except (CmuxError, RuntimeError) as exc:
             runtime.send_completed_at = time.time()
             runtime.send_duration_ms = round((time.monotonic() - send_started) * 1000, 3)
@@ -9250,7 +9317,24 @@ class WatchDaemon:
 
     def _codex_turn_ready(self, target, runtime, state, *, reserved=False):
         if state.message_kind != "codex":
+            runtime.codex_goal_resume = False
             return True
+        if state.native_goal_stalled:
+            from ccc_codex_goal import blocked_goal
+            label = self.codex_queue_recovery.process_lookup(target) if self.codex_queue_recovery.process_lookup else {}
+            pids = label.get("agent_pids", [])
+            goal = blocked_goal(target, pids[0]) if label.get("agent_kind") == "codex" and len(pids) == 1 else None
+            if goal and _match_error_block("■ " + goal["error"]["message"]) == state.error_type:
+                key = f"goal:{goal['session_id']}:{goal['goal_id']}:{goal['turn_id']}:{goal['at']}"
+                if ((reserved and runtime.codex_goal_resume and runtime.codex_observed_turn_key == key)
+                        or (not reserved and (runtime.codex_sent_turn_key != key
+                            or runtime.delivery_status in {"failed", "cancelled", "retryable"}))):
+                    runtime.codex_goal_resume = True
+                    runtime.codex_observed_turn_key = key
+                    return True
+            if reserved and runtime.codex_goal_resume:
+                return False
+        runtime.codex_goal_resume = False
         turn = self.codex_queue_recovery.current_turn(target)
         if turn is None:
             if not (reserved and runtime.codex_observed_turn_key):
@@ -10493,6 +10577,13 @@ def cli(argv: Sequence[str] | None = None) -> int:
             rule.pop("paused_at", None)
             return rule["workspace_id"]
         _, wid, _ = store.mutate(resume_pool)
+        from ccc_batch_guard import provenance, arm
+        if provenance(config_path, wid):
+            try:
+                arm(config_path, wid, resume=True)
+            except Exception:
+                store.mutate(lambda c: workspace_rule_by_id(c, wid).update(paused=True))
+                raise
         print(json.dumps({"workspace_id": wid, "paused": False}))
         return 0
     if args.command in {"remove-workspace", "untrack-workspace"}:
