@@ -48,6 +48,47 @@ for initial admission and quarantine recovery.
 while preserving 5 seconds for commercial paths. Deadline changes retain valid
 API admission and isolation history.
 
+Periodic subscription reads run in a separate worker, so slow YAML parsing
+does not suspend probe collection, selector reconciliation or heartbeats.
+Results from an obsolete configuration are discarded. Subscription errors
+remain visible as `inventory_error`; a successful read clears that error even
+when the route list is unchanged, without clearing an independent probe-core
+failure or masking an already confirmed `network_wait`.
+Probe evidence is dated when its worker finishes, so delayed result collection
+cannot make an old response fresh again. Completed results are applied in that
+order, so an older SSE cannot clear an intervening failure. The loop refreshes
+its clock after local result/configuration work before reserving another
+complete API check.
+
+An independent native interface monitor fences in-flight evidence when the
+configured physical interface loses its IPv4 address or its address changes.
+Loopback, unspecified and DHCP self-assigned link-local addresses are not
+usable physical connectivity. Both successful and failed probes crossing a
+detected interface generation change are discarded; existing qualifications,
+quarantine history and consumed reservations are retained. While the interface
+is unavailable, no new probes, provider changes or selector changes are made.
+The actual selection is still read, so an already selected Offline retains
+`network_wait`; a local observer problem cannot replace it with an unrelated
+subscription warning. A link can have an address while its remote path is
+broken, so remote CONNECT, TLS and response failures still retain their normal
+classification. Only failures in local setup or connecting to the loopback
+probe listener are classified as observer errors.
+
+Recovery probing prefers candidates with recent validator evidence in an
+unavailable pool, but admission still requires cooldown, three light successes
+and a new complete SSE. The current route has first probe priority; all other
+candidates compete by their actual due time so slow standby checks cannot
+starve overdue inventory. The network LaunchAgent uses launchd's Interactive
+resource class to support these foreground routing deadlines. This reduces
+background throttling; it does not establish throttling as the cause of every
+network failure.
+
+Each route's status retains its light/deep probe stage and diagnostic detail.
+`events.ndjson` records bounded probe metadata, reservations, interface
+transitions and selection observations, with one rotated `events.1.ndjson`
+file at 2 MiB. Discarded results retain their generation and reason. Neither
+file contains API credentials, response bodies or subscription definitions.
+
 ## Configuration and activation
 
 Copy `network.example.json` into a private directory outside Documents, fill
@@ -141,6 +182,15 @@ stream frames during migration. It cannot use the production controller.
 Retain original profiles and a recorded selection for a separately validated
 rollback. A rollback also needs fresh provider names; a raw same-name reload
 has the same connection-closing behavior.
+
+For AnyTLS exits, also run `tools/network_anytls_acceptance.py --binary
+/absolute/path/to/mihomo --expected-sha256 <production-binary-digest>`. It
+creates local AnyTLS peers and two HTTPS streams using default session reuse.
+Changed provider payloads, publisher startup 503, pruning and an Offline-only
+provider must retain both old connections. Forced fixture garbage collection
+after pruning verifies adapter lifetime; each stream must receive newly
+generated post-change frames and an explicit end marker. This tool never
+reloads even its fixture core and cannot target the production controller.
 
 After profile acceptance, set `mode` to `manage`. Normal operation only publishes
 the provider, refreshes it, selects a verified route and reads the choice back.

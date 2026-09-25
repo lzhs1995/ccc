@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import contextlib
+import copy
 import dataclasses
 import fcntl
 import hashlib
@@ -27,7 +28,7 @@ import urllib.parse
 import uuid
 from pathlib import Path
 
-from ccc_mihomo import Controller, ProbeResult, ResponsesProbe, Route, ShadowCore, atomic_json, inventory, validate_dependencies
+from ccc_mihomo import Controller, PhysicalLink, ProbeResult, ResponsesProbe, Route, ShadowCore, atomic_json, inventory, validate_dependencies
 
 
 DEFAULTS = {
@@ -164,9 +165,13 @@ class Health:
     light_attempt_at: float = 0
     light_ok_at: float = 0
     light_kind: str = "unknown"
+    light_stage: str = ""
+    light_detail: str = ""
     deep_at: float = 0
     deep_ok_at: float = 0
     deep_kind: str = "unknown"
+    deep_stage: str = ""
+    deep_detail: str = ""
     deep_attempt_at: float = 0
     elapsed_ms: float = 0
     status: int = 0
@@ -250,8 +255,10 @@ class Engine:
         h.elapsed_ms, h.status = result.elapsed_ms, result.status
         if result.deep:
             h.deep_at, h.deep_kind = now, result.kind
+            h.deep_stage, h.deep_detail = result.stage, result.detail
         else:
             h.light_at, h.light_kind = now, result.kind
+            h.light_stage, h.light_detail = result.stage, result.detail
         if result.kind == "accessible" and not result.deep:
             h.light_ok_at = now
             h.light_failures = 0
@@ -312,8 +319,13 @@ class Engine:
         pools += [r.pool for r in self.routes.values() if r.pool not in pools]
         for pool in dict.fromkeys(pools):
             ids = [rid for rid, r in self.routes.items() if r.pool == pool and rid != self.current]
-            ids = sorted(ids, key=lambda rid: (not self.ready(rid, now), not self.qualified(rid, now),
-                                               self.routes[rid].priority))
+            def recovery_order(rid):
+                h = self.health[rid]
+                accessible = (h.light_kind == "accessible" and not h.light_failures
+                              and 0 <= now - h.light_ok_at <= self.policy["light_fresh_sec"])
+                return (not self.ready(rid, now), not self.qualified(rid, now),
+                        not accessible, self.routes[rid].priority)
+            ids = sorted(ids, key=recovery_order)
             chosen.extend(ids[:2 if pool not in self.config["commercial_pools"] else 1])
         return list(dict.fromkeys(chosen))
 
@@ -356,7 +368,9 @@ class Engine:
             due = (h.light_attempt_at or h.light_at) + interval
             if rid == self.current and self.hint_at > h.light_at:
                 due = 0
-            return (0 if rid == self.current else 1 if rid in hot else 2, due)
+            # The current path always gets first service. All other paths
+            # compete by due time, so slow hot probes cannot starve inventory.
+            return (0 if rid == self.current else 1, due)
         return sorted((rid for rid in self.routes if rid not in in_flight and order(rid)[1] <= now), key=order)
 
     def deep_due(self, now, in_flight):
@@ -475,8 +489,9 @@ class Director:
         self.pending_refresh = False
         self.actual_name = ""
 
-    def sync(self, now):
+    def sync(self, now, *, link=None):
         e, c = self.engine, self.config
+        generation = link.current() if link is not None else None
         group = self.controller.get("/proxies/" + urllib.parse.quote(c["group"], safe=""))
         actual = group.get("now", "")
         ids = {r.name: rid for rid, r in e.routes.items()}
@@ -487,6 +502,17 @@ class Director:
         elif actual == c["offline_proxy"]:
             e.current = ""
         self.actual_name = actual
+
+        def observer_unavailable():
+            return link is not None and not link.accepts(generation)
+
+        def held():
+            return ("network_wait" if actual == c["offline_proxy"] else "observer_fault", e.current)
+
+        # Link loss is not a node verdict. Keep the currently selected path and
+        # the last published provider, including across a network-guard restart.
+        if observer_unavailable():
+            return held()
         target, phase = e.decision(now)
         if not target and actual == c["offline_proxy"]:
             phase = "network_wait"
@@ -495,6 +521,8 @@ class Director:
         if known in e.routes:
             approved.add(known)
         ordered = sorted(e.ranked(approved), key=lambda rid: rid != e.current)
+        if observer_unavailable():
+            return held()
         if self.publisher.set([e.routes[rid] for rid in ordered]):
             self.pending_refresh = True
         if c["mode"] != "manage":
@@ -502,11 +530,15 @@ class Director:
         if actual not in ids and actual not in c.get("bootstrap_aliases", {}) and actual != c["offline_proxy"]:
             return "unmanaged_selection", target
         if self.pending_refresh:
+            if observer_unavailable():
+                return held()
             self.controller.refresh(c["provider"])
             self.published, self.pending_refresh = approved, False
             group = self.controller.get("/proxies/" + urllib.parse.quote(c["group"], safe=""))
         desired = e.routes[target].name if target else c["offline_proxy"] if phase == "network_wait" else actual
         if desired != actual:
+            if observer_unavailable():
+                return held()
             if desired not in group.get("all", []):
                 raise RuntimeError("verified route is not present in the live selector")
             self.controller.select(c["group"], desired)
@@ -536,9 +568,27 @@ class Guard:
         self.jobs = {}
         self.retired = []
         self.shadow_error = ""
+        self.inventory_error = ""
         self.error = ""
         self.phase = "starting"
         self.hint_count = 0
+        self.link = PhysicalLink(self.config["interface"])
+        self.last_probe_event = None
+        self.discarded_probes = 0
+        self.journal_error = ""
+
+    def journal(self, event):
+        # Fixed, bounded metadata only: never credentials, response bodies or
+        # subscription definitions. Logging failure cannot halt routing.
+        path = self.root / "events.ndjson"
+        try:
+            if path.exists() and path.stat().st_size >= 2 * 1024 * 1024:
+                os.replace(path, self.root / "events.1.ndjson")
+            with path.open("a") as handle:
+                handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+            self.journal_error = ""
+        except OSError as exc:
+            self.journal_error = "event journal unavailable: " + type(exc).__name__
 
     def save(self):
         atomic_json(self.root / "health.json", {**self.engine.saved(), "contract": self.contract,
@@ -546,6 +596,7 @@ class Guard:
 
     def snapshot(self, now):
         e = self.engine
+        physical = self.link.status()
         rows = [{"id": rid, "name": r.name, "label": r.label, "pool": r.pool,
                  **dataclasses.asdict(e.health[rid]), "qualified": e.qualified(rid, now),
                  "ready": e.ready(rid, now)} for rid, r in e.routes.items()]
@@ -553,7 +604,10 @@ class Guard:
                 "service_host": self.config["service_host"], "phase": self.phase,
                 "current_id": e.current, "current": self.director.actual_name,
                 "active_pool": e.active_pool, "last_switch": e.last_switch,
-                "error": self.error or self.shadow_error, "routes": rows,
+                "error": self.error or self.shadow_error or physical["detail"] or self.inventory_error or self.journal_error,
+                "inventory_error": self.inventory_error, "routes": rows,
+                "physical_link": physical, "last_probe_event": self.last_probe_event,
+                "discarded_probes": self.discarded_probes, "journal_error": self.journal_error,
                 "ready": sum(r["ready"] for r in rows), "qualified": sum(r["qualified"] for r in rows),
                 "quarantined": sum(r["quarantined"] for r in rows),
                 "probe_in_flight": len(self.jobs),
@@ -569,6 +623,20 @@ class Guard:
         except Exception:
             core.close()
             raise
+
+    @staticmethod
+    def run_probe(probe, item, deep, link, generation):
+        # Completion belongs to the worker, not a later controller/config tick.
+        # Delayed collection must not make an old response appear fresh.
+        try:
+            if link.accepts(generation):
+                result = probe.run(item, deep)
+            else:
+                result = ProbeResult("observer_error", detail="physical interface changed before probe dispatch",
+                                     deep=deep, stage="setup")
+        except Exception:
+            result = ProbeResult("observer_error", detail="probe worker failed", deep=deep)
+        return result, time.time()
 
     def consume_hints(self, sock, now):
         for _ in range(128):
@@ -599,7 +667,7 @@ class Guard:
             saved["contract"] = self.contract
         try:
             routes = inventory(self.config)
-        except (OSError, ValueError, KeyError, RuntimeError):
+        except (OSError, ValueError, KeyError, RuntimeError, subprocess.TimeoutExpired):
             # A transient subscription write cannot strand a restarted guard.
             # Only exact saved definitions under the same API contract qualify.
             if saved.get("contract") != self.contract:
@@ -608,7 +676,7 @@ class Guard:
             if not routes:
                 raise
             validate_dependencies(self.config, routes)
-            self.shadow_error = "subscription unavailable; retaining the last saved inventory"
+            self.inventory_error = "subscription unavailable; retaining the last saved inventory"
         if saved.get("contract") == self.contract:
             for old in saved.get("routes", []):
                 if old.get("id") == saved.get("current") and not any(r.id == old["id"] for r in routes):
@@ -636,26 +704,49 @@ class Guard:
         hint_socket.bind(str(hint_path))
         hint_socket.setblocking(False)
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.engine.policy["concurrency"], thread_name_prefix="network-probe")
-        setup = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="network-inventory")
+        setup = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="network-shadow")
+        inventory_worker = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="network-inventory")
+        self.link.start()
         pending_core = setup.submit(self.new_shadow, routes)
+        pending_inventory = None
+        inventory_config = None
         next_core_retry, retry_delay = 0, 5
         next_inventory, next_config, next_sync, next_save, next_snapshot = 0, 0, 0, 0, 0
         try:
             self.save()
             while not self.stop.wait(.1):
                 now = time.time()
+                for change in self.link.changes():
+                    self.journal({"event": "physical_link", **change})
                 self.consume_hints(hint_socket, now)
-                for job, (rid, deep, owner, began, contract) in list(self.jobs.items()):
+                completed = []
+                for job, (rid, deep, owner, began, contract, generation) in list(self.jobs.items()):
                     if job.done():
                         del self.jobs[job]
                         try:
-                            result = job.result()
+                            result, completed_at = job.result()
                         except Exception:
                             result = ProbeResult("observer_error", detail="probe worker failed", deep=deep)
-                        if contract == self.contract and owner.process.poll() is None:
-                            self.engine.record(rid, result, now, started_at=began)
+                            completed_at = now
+                        completed.append((completed_at, rid, result, began, owner, contract, generation))
+                # Submission order is not completion order. An older SSE must
+                # see any intervening failure before it can clear quarantine.
+                for completed_at, rid, result, began, owner, contract, generation in sorted(
+                        completed, key=lambda item: (item[0], item[2].kind not in LOCAL_FAILURES)):
+                    reason = ("obsolete_contract" if contract != self.contract else
+                              "probe_core_stopped" if owner.process.poll() is not None else
+                              "physical_interface_generation_changed" if not self.link.accepts(generation) else "")
+                    event = {"event": "probe", "at": completed_at, "collected_at": time.time(),
+                             "route_id": rid, "started_at": began, "generation": generation,
+                             "accepted": not reason, "discard_reason": reason, **dataclasses.asdict(result)}
+                    if reason:
+                        self.discarded_probes += 1
+                    else:
+                        self.engine.record(rid, result, completed_at, started_at=began)
+                    self.journal(event)
+                    self.last_probe_event = event
                 for old in list(self.retired):
-                    if not any(owner is old for _, _, owner, _, _ in self.jobs.values()):
+                    if not any(owner is old for _, _, owner, _, _, _ in self.jobs.values()):
                         old.close()
                         self.retired.remove(old)
                 if pending_core and pending_core.done():
@@ -699,41 +790,59 @@ class Guard:
                     self.shadow_error = "isolated probe core exited; restarting only its replacement"
                     if pending_core is None and now >= next_core_retry:
                         pending_core = setup.submit(self.new_shadow, list(self.engine.routes.values()))
-                if pending_core is None and now >= next_inventory:
+                if pending_inventory is not None and pending_inventory.done() and pending_core is None:
                     try:
-                        latest = inventory(self.config)
-                        wanted = {r.id for r in latest}
-                        if self.engine.current in self.engine.routes and self.engine.current not in wanted:
-                            latest.append(self.engine.routes[self.engine.current])
-                            wanted.add(self.engine.current)
-                        if wanted != set(self.engine.routes):
-                            pending_core = setup.submit(self.new_shadow, latest)
-                        elif self.config.get("publish_transit"):
-                            publisher.set_catalog(latest, self.config["commercial_pools"])
+                        latest = pending_inventory.result()
+                        if inventory_config == self.config:
+                            wanted = {r.id for r in latest}
+                            if self.engine.current in self.engine.routes and self.engine.current not in wanted:
+                                latest.append(self.engine.routes[self.engine.current])
+                                wanted.add(self.engine.current)
+                            if wanted != set(self.engine.routes):
+                                pending_core = setup.submit(self.new_shadow, latest)
+                            elif self.config.get("publish_transit"):
+                                publisher.set_catalog(latest, self.config["commercial_pools"])
+                            self.inventory_error = ""
                     except Exception as exc:
-                        self.shadow_error = f"subscription refresh failed; retaining verified routes: {type(exc).__name__}"
-                    next_inventory = now + self.engine.policy["inventory_interval_sec"]
-                if self.core and self.core.process.poll() is None:
-                    occupied = {rid for rid, deep, _, _, _ in self.jobs.values() if not deep}
+                        if inventory_config == self.config:
+                            self.inventory_error = f"subscription refresh failed; retaining verified routes: {type(exc).__name__}"
+                    pending_inventory = None
+                    next_inventory = (time.time() + self.engine.policy["inventory_interval_sec"]
+                                      if inventory_config == self.config else 0)
+                if pending_core is None and pending_inventory is None and now >= next_inventory:
+                    inventory_config = copy.deepcopy(self.config)
+                    pending_inventory = inventory_worker.submit(inventory, inventory_config)
+                # Local configuration/publication work may have taken time.
+                # Do not reserve a billable request using the tick's old clock.
+                now = time.time()
+                generation = self.link.current()
+                if generation is not None and self.core and self.core.process.poll() is None:
+                    occupied = {rid for rid, deep, _, _, _, _ in self.jobs.values() if not deep}
                     probe = ResponsesProbe(self.config["probe"], self.core.ports)
-                    if len(self.jobs) < self.engine.policy["concurrency"] and not any(deep for _, deep, _, _, _ in self.jobs.values()):
+                    if len(self.jobs) < self.engine.policy["concurrency"] and not any(deep for _, deep, _, _, _, _ in self.jobs.values()):
                         rid = self.engine.deep_due(now, occupied)
                         if rid:
                             self.engine.reserve_deep(rid, now)
                             self.save()  # Reserve before a billable request can run.
-                            job = executor.submit(probe.run, self.engine.routes[rid], True)
-                            self.jobs[job] = (rid, True, self.core, now, self.contract)
+                            self.journal({"event": "deep_reserved", "at": now, "route_id": rid,
+                                          "generation": generation})
+                            job = executor.submit(self.run_probe, probe, self.engine.routes[rid], True, self.link, generation)
+                            self.jobs[job] = (rid, True, self.core, now, self.contract, generation)
                     for rid in self.engine.light_due(now, occupied):
                         if len(self.jobs) >= self.engine.policy["concurrency"]:
                             break
                         self.engine.health[rid].light_attempt_at = now
-                        job = executor.submit(probe.run, self.engine.routes[rid], False)
-                        self.jobs[job] = (rid, False, self.core, now, self.contract)
+                        job = executor.submit(self.run_probe, probe, self.engine.routes[rid], False, self.link, generation)
+                        self.jobs[job] = (rid, False, self.core, now, self.contract, generation)
                 if now >= next_sync:
                     try:
                         self.save()  # Proof and full route definition precede publication.
-                        self.phase, _ = self.director.sync(now)
-                        if self.shadow_error:
+                        previous_selection = self.director.actual_name
+                        self.phase, _ = self.director.sync(now, link=self.link)
+                        if self.director.actual_name != previous_selection:
+                            self.journal({"event": "selection", "at": time.time(), "phase": self.phase,
+                                          "previous": previous_selection, "current": self.director.actual_name})
+                        if self.shadow_error and self.phase != "network_wait":
                             self.phase = "observer_fault"
                     except Exception as exc:
                         self.phase = "observer_fault"
@@ -746,6 +855,7 @@ class Guard:
                     atomic_json(self.root / "status.json", self.snapshot(time.time()))
                     next_snapshot = now + 1
         finally:
+            self.link.close()
             hint_socket.close()
             atomic_json(self.root / "status.json", {"version": 1, "at": time.time(), "phase": "stopped", "mode": self.config["mode"]})
             if self.core:
@@ -757,6 +867,7 @@ class Guard:
                     pending_core.result(timeout=30)[0].close()
             executor.shutdown(wait=True, cancel_futures=True)
             setup.shutdown(wait=True, cancel_futures=True)
+            inventory_worker.shutdown(wait=True, cancel_futures=True)
             publisher.close()
             with contextlib.suppress(FileNotFoundError):
                 hint_path.unlink()
@@ -773,7 +884,7 @@ def install(config_path, *, source=None):
     root = Path(config["state_dir"])
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     payload = {"Label": label, "ProgramArguments": [sys.executable, "-B", str(source), "--config", str(config_path)],
-        "RunAtLoad": True, "KeepAlive": True, "ThrottleInterval": 5, "ProcessType": "Background",
+        "RunAtLoad": True, "KeepAlive": True, "ThrottleInterval": 5, "ProcessType": "Interactive",
         "WorkingDirectory": str(source.parent),
         "EnvironmentVariables": {"PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin", "PYTHONDONTWRITEBYTECODE": "1"},
         "StandardOutPath": str(root / "service.out.log"), "StandardErrorPath": str(root / "service.err.log")}

@@ -6,9 +6,12 @@ This module never reloads or stops the production core.
 """
 from __future__ import annotations
 
+from collections import deque
 import dataclasses
+import ctypes
 import hashlib
 import http.client
+import ipaddress
 import json
 import os
 import re
@@ -312,6 +315,130 @@ class ProbeResult:
     elapsed_ms: float = 0
     detail: str = ""
     deep: bool = False
+    stage: str = ""
+
+
+class _IfAddrs(ctypes.Structure):
+    pass
+
+
+_IfAddrs._fields_ = [
+    ("next", ctypes.POINTER(_IfAddrs)), ("name", ctypes.c_char_p),
+    ("flags", ctypes.c_uint), ("address", ctypes.c_void_p),
+    ("netmask", ctypes.c_void_p), ("destination", ctypes.c_void_p),
+    ("data", ctypes.c_void_p),
+]
+
+
+def physical_ipv4(interface):
+    """Read the kernel's interface snapshot without DNS, probes or subprocesses.
+
+    The shadow core explicitly uses IPv4 on one physical interface. A missing
+    address or link-down event is an observer outage, not evidence about every
+    remote exit. getifaddrs has compatible layouts on Darwin and Linux; only
+    the sockaddr family encoding differs.
+    """
+    if sys.platform not in {"darwin", "linux"}:
+        raise OSError("native interface inspection is unavailable")
+    library = ctypes.CDLL(None, use_errno=True)
+    library.getifaddrs.argtypes = [ctypes.POINTER(ctypes.POINTER(_IfAddrs))]
+    library.getifaddrs.restype = ctypes.c_int
+    library.freeifaddrs.argtypes = [ctypes.POINTER(_IfAddrs)]
+    library.freeifaddrs.restype = None
+    head = ctypes.POINTER(_IfAddrs)()
+    if library.getifaddrs(ctypes.byref(head)):
+        raise OSError(ctypes.get_errno(), "native interface inspection failed")
+    addresses = set()
+    try:
+        cursor = head
+        while cursor:
+            entry = cursor.contents
+            if (entry.name == interface.encode() and entry.address
+                    and entry.flags & 1 and entry.flags & 0x40 and not entry.flags & 8):
+                raw = ctypes.string_at(entry.address, 8)
+                family = raw[1] if sys.platform == "darwin" else int.from_bytes(raw[:2], sys.byteorder)
+                if family == socket.AF_INET:
+                    address = socket.inet_ntop(socket.AF_INET, raw[4:8])
+                    parsed = ipaddress.IPv4Address(address)
+                    if not (parsed.is_unspecified or parsed.is_loopback or parsed.is_link_local):
+                        addresses.add(address)
+            cursor = entry.next
+    finally:
+        library.freeifaddrs(head)
+    return tuple(sorted(addresses))
+
+
+class PhysicalLink:
+    """Generation fence for evidence collected across local link changes."""
+    def __init__(self, interface, reader=None):
+        self.interface = interface
+        self.reader = reader or physical_ipv4
+        self.generation = 0
+        self.signature = None
+        self.available = False
+        self.detail = "physical interface has not been inspected"
+        self.lock = threading.Lock()
+        self.stop = threading.Event()
+        self.thread = None
+        self.changed_at = 0
+        self.transitions = deque(maxlen=64)
+
+    def sample(self):
+        with self.lock:
+            return self._sample()
+
+    def _sample(self):
+        try:
+            addresses = tuple(sorted(self.reader(self.interface)))
+            signature = ("up" if addresses else "down", addresses)
+            self.available = bool(addresses)
+            self.detail = "" if addresses else "physical interface has no active IPv4 address"
+        except (OSError, ValueError, AttributeError) as exc:
+            signature = ("unknown", type(exc).__name__)
+            self.available = False
+            self.detail = "physical interface inspection failed: " + type(exc).__name__
+        if signature != self.signature:
+            self.signature = signature
+            self.generation += 1
+            self.changed_at = time.time()
+            self.transitions.append({"at": self.changed_at, "generation": self.generation,
+                                     "interface": self.interface, "available": self.available,
+                                     "detail": self.detail})
+        return self.generation if self.available else None
+
+    def accepts(self, generation):
+        with self.lock:
+            return self.available and generation is not None and generation == self.generation
+
+    def current(self):
+        # Read the independent monitor's snapshot without doing interface I/O
+        # on the guard's management loop.
+        with self.lock:
+            return self.generation if self.available else None
+
+    def status(self):
+        with self.lock:
+            return {"interface": self.interface, "available": self.available,
+                    "generation": self.generation, "changed_at": self.changed_at, "detail": self.detail}
+
+    def changes(self):
+        with self.lock:
+            events = list(self.transitions)
+            self.transitions.clear()
+            return events
+
+    def start(self, interval=.2):
+        self.sample()
+        def watch():
+            while not self.stop.wait(interval):
+                self.sample()
+        self.thread = threading.Thread(target=watch, name="network-link", daemon=True)
+        self.thread.start()
+
+    def close(self):
+        self.stop.set()
+        if self.thread:
+            self.thread.join(timeout=1)
 
 
 def sse_events(text):
@@ -398,10 +525,21 @@ def classify(status, content_type, body, *, deep=False):
 class _DeadlineConnection(http.client.HTTPConnection):
     """Hard wall clock limit, including CONNECT, TLS and slow-drip bodies."""
     transport = None
+    stage = "setup"
 
     def connect(self):
+        self.stage = "observer_connect"
         super().connect()
         self.transport = self.sock
+        self.stage = "request"
+
+    def _tunnel(self):
+        # Expose the socket before CONNECT can block so the total deadline can
+        # interrupt it. Failure to open localhost is distinct from a remote
+        # CONNECT/TLS failure and cannot quarantine a subscription node.
+        self.transport = self.sock
+        self.stage = "tunnel"
+        super()._tunnel()
 
     def expire(self):
         self.expired.set()
@@ -422,6 +560,7 @@ class _DeadlineConnection(http.client.HTTPConnection):
 class _DeadlineTLSConnection(_DeadlineConnection):
     def connect(self):
         super().connect()
+        self.stage = "tls"
         self.sock.settimeout(self.remaining())
         # Assign before handshake so the deadline can interrupt it too.
         self.sock = self.context.wrap_socket(self.sock, server_hostname=self._tunnel_host,
@@ -429,6 +568,7 @@ class _DeadlineTLSConnection(_DeadlineConnection):
         self.transport = self.sock
         self.sock.do_handshake()
         self.sock.settimeout(self.remaining())
+        self.stage = "request"
 
 
 class ResponsesProbe:
@@ -497,7 +637,9 @@ class ResponsesProbe:
         try:
             connection.remaining()
             connection.request("POST", path, body, headers)
+            connection.stage = "response_headers"
             response = connection.getresponse()
+            connection.stage = "response_body"
             content_type = response.getheader("Content-Type", "")
             if deep and response.status == 200 and "text/event-stream" in content_type.lower():
                 chunks, size, event_parts = [], 0, []
@@ -526,9 +668,12 @@ class ResponsesProbe:
                 raise TimeoutError("probe deadline")
             result = classify(response.status, content_type, raw, deep=deep)
         except (TimeoutError, socket.timeout):
-            result = ProbeResult("timeout", detail="probe deadline exceeded", deep=deep)
+            local = connection.stage in {"setup", "observer_connect"}
+            result = ProbeResult("observer_error" if local else "timeout",
+                                 detail="local probe setup deadline exceeded" if local else "probe deadline exceeded", deep=deep)
         except (OSError, ssl.SSLError, http.client.HTTPException, zlib.error) as exc:
-            result = ProbeResult("timeout" if connection.expired.is_set() else "transport",
+            local = connection.stage in {"setup", "observer_connect"}
+            result = ProbeResult("observer_error" if local else "timeout" if connection.expired.is_set() else "transport",
                                  detail=type(exc).__name__, deep=deep)
         finally:
             timer.cancel()
@@ -536,6 +681,7 @@ class ResponsesProbe:
                 response.close()
             connection.close()
         result.elapsed_ms = round((time.monotonic() - started) * 1000, 3)
+        result.stage = connection.stage
         return result
 
 
