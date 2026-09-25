@@ -149,7 +149,7 @@ if sys.platform == "darwin":
         pass
 
 
-def process_writable_files(pid):
+def process_writable_files(pid, *, identities=False):
     """Inspect one process directly, without forking lsof for every CLI poll.
 
     Incomplete native reads or changing vnode descriptors remain unknown.
@@ -159,6 +159,8 @@ def process_writable_files(pid):
     if type(pid) is not int or not 0 < pid < 2**31:
         raise OSError("invalid process identity")
     if _proc_pidinfo is None or _proc_pidfdinfo is None:
+        if identities:
+            raise OSError("native file identities unavailable")
         result = subprocess.run(["/usr/sbin/lsof", "-n", "-P", "-a", "-p", str(pid), "-Ffan"],
                                 capture_output=True, text=True, timeout=2)
         if result.returncode:
@@ -194,13 +196,18 @@ def process_writable_files(pid):
     files = vnodes(before)
     if descriptors() != before or vnodes(before) != files:
         raise OSError("process vnode descriptors changed")
-    paths = set()
+    paths = {} if identities else set()
     for flags, name, _device, _inode in files.values():
         if flags & 2:  # Kernel FWRITE, not userspace O_WRONLY.
             path = Path(name)
             if not path.is_absolute():
                 raise OSError("missing vnode path")
-            paths.add(path.resolve())
+            path = path.resolve()
+            if identities:
+                paths[path] = {"device": int.from_bytes(_device, sys.byteorder),
+                               "inode": int.from_bytes(_inode, sys.byteorder)}
+            else:
+                paths.add(path)
     return paths
 
 
@@ -328,6 +335,8 @@ def _process_placement_args(data):
         position = end + 1
     placement = {}
     for value in data[position:].split(b"\0"):
+        if not value:
+            break
         name, separator, content = value.partition(b"=")
         if separator and name in {b"CMUX_SURFACE_ID", b"CMUX_WORKSPACE_ID"}:
             if name.decode() in placement:
@@ -491,6 +500,7 @@ class QueueRecovery:
         self.next_probe = {}
         self.binding_cache = (0.0, {})
         self.process_lookup = None
+        self.guard_config_path = None
         self.open_file_cache = {}
         self.open_file_sources = {}
         self.wakeup_process_cache = (0.0, frozenset(), {})
@@ -572,6 +582,15 @@ class QueueRecovery:
         a current PID/start binding exists, missing/changing lifecycle evidence
         must not turn a displayed error into permission to submit early.
         """
+        if self.guard_config_path is not None:
+            from ccc_batch_guard import binding
+            guarded = binding(self.guard_config_path, target)
+            if guarded and guarded.get("session_id"):
+                return {"session_id": guarded["session_id"], "pid": guarded["pid"],
+                        "process_start": guarded["process_start"], "kind": guarded["kind"],
+                        "turn_id": guarded.get("turn_id"), "at": guarded.get("at", 0),
+                        "error": guarded.get("turn_error"),
+                        "signature": [guarded.get("start_id"), guarded.get("turn_id"), guarded.get("at")]}
         try:
             records = self.records()
         except FileNotFoundError:
