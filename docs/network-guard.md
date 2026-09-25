@@ -154,3 +154,8 @@ identities, CODEX_HOME, profile and overrides must match. Unknown bindings,
 other providers and a missing/stale observer never acquire a network pause.
 Recovery still passes CCC's original failed-turn, identity, pause, B STOP and
 delivery-deduplication checks.
+
+Error-URL binding also requires the original local process and cmux ownership;
+remote clients cannot inherit this machine's outage. Only native request-URL
+markers for a Responses endpoint establish that binding. Help links and other
+URLs in an error body are not service evidence.

@@ -9,6 +9,7 @@
 - Publish only admitted routes through a loopback provider, retain active definitions until selection commits, and pin complete-chain dependencies. Normal failover does not reload Clash or close connections. Add a same-binary stream-preservation acceptance tool for initial profile migration.
 - Show network health in the Supervisor and expose `ccc network status`, `probe` and `install`. Only verified AnyRouter failed turns wait for a confirmed network outage; original B STOP, scope, heartbeat, pause and native-turn gates remain independent.
 - Resolve native named profile files and attached CLI options when binding failed turns to AnyRouter. Exclude remote clients, legacy profile ambiguity, prompt text after `--`, and configuration changes or replacements during inspection so other providers cannot inherit an unrelated network pause.
+- Require local process ownership for native error-URL binding as well. Distinguish the actual Responses request endpoint from help links in an upstream error body.
 
 ## 0.2.16
 

@@ -23,6 +23,11 @@ class NetworkClientTests(unittest.TestCase):
         self.target = {"surface_id": "surface-a", "workspace_id": "workspace-a"}
         self.turn = {"kind": "task_complete", "session_id": "original", "pid": 42, "process_start": 100,
                      "error": {"message": "error sending request for url (https://anyrouter.test/v1/responses)"}}
+        for name, value in (("birth", [100, 1]), ("arguments", (["codex"],
+                {"CMUX_SURFACE_ID": "surface-a", "CMUX_WORKSPACE_ID": "workspace-a"}))):
+            patch = mock.patch("ccc_guard_scope." + name, return_value=value)
+            patch.start()
+            self.addCleanup(patch.stop)
         self.status()
 
     def status(self, phase="network_wait", at=None, mode="manage"):
@@ -60,6 +65,34 @@ class NetworkClientTests(unittest.TestCase):
         fake = {"error": {"message": "url (https://anyrouter.test.evil.invalid/v1/responses)"}}
         self.assertEqual(error_host(fake), "anyrouter.test.evil.invalid")
         self.assertFalse(self.client.verdict(self.options, self.target, fake)["blocked"])
+
+    def test_reference_links_do_not_bind_a_native_request_host(self):
+        messages = ("See https://anyrouter.test/v1/responses for help",
+                    "Documentation url: https://anyrouter.test/help")
+        for message in messages:
+            with self.subTest(message=message):
+                turn = {**self.turn, "error": {"message": message}}
+                self.assertEqual(error_host(turn), "")
+                with mock.patch("ccc_network_client.configured_host", return_value="api.openai.com"):
+                    self.assertFalse(self.client.verdict(self.options, self.target, turn)["blocked"])
+
+    def test_native_request_endpoint_is_distinct_from_response_body_links(self):
+        turn = {**self.turn, "error": {"message": "unexpected status 503 Service Unavailable: "
+                "see https://support.test/help, url: https://anyrouter.test/v1/responses, request id: fixture"}}
+        self.assertEqual(error_host(turn), "anyrouter.test")
+        with mock.patch("ccc_network_client.configured_host", return_value=""):
+            self.assertTrue(self.client.verdict(self.options, self.target, turn)["blocked"])
+
+    def test_native_error_url_cannot_bypass_local_process_ownership(self):
+        env = {"CMUX_SURFACE_ID": "surface-a", "CMUX_WORKSPACE_ID": "workspace-a"}
+        for argv, context in ((["codex", "--remote=ws://localhost:9999"], env),
+                              (["codex", "--remote", "ws://localhost:9999"], env),
+                              (["codex"], {**env, "CMUX_WORKSPACE_ID": "workspace-b"})):
+            with self.subTest(argv=argv, context=context), \
+                    mock.patch("ccc_guard_scope.arguments", return_value=(argv, context)):
+                self.assertFalse(self.client.verdict(self.options, self.target, self.turn)["blocked"])
+        with mock.patch("ccc_guard_scope.birth", side_effect=[[100, 1], [100, 2]]):
+            self.assertFalse(self.client.verdict(self.options, self.target, self.turn)["blocked"])
 
     def process_config(self, extra_args=(), *, config_mtime=99, birth_change=False,
                        named_profiles=None, profile_mtime=99, extra_config="",

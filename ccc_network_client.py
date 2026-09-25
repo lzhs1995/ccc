@@ -38,7 +38,12 @@ def bounded_json(path):
 def error_host(turn):
     error = turn.get("error") or {}
     message = str(error.get("message") or "") if isinstance(error, dict) else ""
-    hosts = {urllib.parse.urlsplit(url).hostname for url in re.findall(r'https?://[^\s)\]"\'>]+', message)}
+    # Native transport errors identify the request with `url: ...` or
+    # `for url (...)`. A link inside the provider's response body is not proof
+    # of where this process sent its request.
+    urls = re.findall(r'\burl\s*(?:\(\s*|:\s*)(https?://[^\s)\]"\'>,]+)', message, re.IGNORECASE)
+    parsed = [urllib.parse.urlsplit(url.rstrip(".;")) for url in urls]
+    hosts = {url.hostname for url in parsed if url.path.rstrip("/").endswith("/responses")}
     hosts.discard(None)
     return hosts.pop() if len(hosts) == 1 else ""
 
@@ -49,6 +54,23 @@ def _merge(base, change):
             _merge(base[key], value)
     base.update({k: v for k, v in change.items() if not (isinstance(v, dict) and isinstance(base.get(k), dict))})
     return base
+
+
+def _local_process_context(turn, target):
+    """Snapshot local ownership; each caller rechecks birth after using it."""
+    from ccc_guard_scope import arguments, birth
+    pid = turn.get("pid")
+    before = birth(pid, codex=True)
+    if before is None or before[0] != int(turn.get("process_start") or 0):
+        return None
+    argv, env = arguments(pid)
+    options = argv[1:argv.index("--")] if "--" in argv else argv[1:]
+    if (str(env.get("CMUX_SURFACE_ID", "")).upper() != str(target["surface_id"]).upper()
+            or str(env.get("CMUX_WORKSPACE_ID", "")).upper() != str(target["workspace_id"]).upper()
+            or any(arg in {"--remote", "--oss"} or arg.startswith(("--remote=", "--oss="))
+                   for arg in options)):
+        return None
+    return before, argv, env
 
 
 def configured_host(turn, target):
@@ -62,18 +84,12 @@ def configured_host(turn, target):
         import tomllib
     except ImportError:
         return ""  # Python 3.10 still binds using the native failure URL.
-    from ccc_guard_scope import arguments, birth
-    pid = turn.get("pid")
-    before = birth(pid, codex=True)
-    if before is None or before[0] != int(turn.get("process_start") or 0):
+    from ccc_guard_scope import birth
+    context = _local_process_context(turn, target)
+    if context is None:
         return ""
-    argv, env = arguments(pid)
-    options = argv[1:argv.index("--")] if "--" in argv else argv[1:]
-    if (str(env.get("CMUX_SURFACE_ID", "")).upper() != str(target["surface_id"]).upper()
-            or str(env.get("CMUX_WORKSPACE_ID", "")).upper() != str(target["workspace_id"]).upper()
-            or any(arg in {"--remote", "--oss"} or arg.startswith(("--remote=", "--oss="))
-                   for arg in options)):
-        return ""
+    before, argv, env = context
+    pid = turn["pid"]
     codex_dir = Path(env.get("CODEX_HOME") or Path(env.get("HOME") or Path.home()) / ".codex")
     if not codex_dir.is_absolute():
         return ""
@@ -209,7 +225,14 @@ class NetworkClient:
         if not expected:
             return {"blocked": False, "phase": snapshot["phase"], "service_host": ""}
         try:
-            host = error_host(turn) or configured_host(turn, target)
+            host = error_host(turn)
+            if host:
+                from ccc_guard_scope import birth
+                context = _local_process_context(turn, target)
+                if context is None or birth(turn.get("pid"), codex=True) != context[0]:
+                    host = ""
+            else:
+                host = configured_host(turn, target)
         except (OSError, ValueError, TypeError, RuntimeError):
             host = ""
         if host != expected:
