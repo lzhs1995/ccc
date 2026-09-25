@@ -164,7 +164,9 @@ def start(config_path, selector, *, client=None, launch=True):
         if launch and rule.get("pause_origin") == "batch_first_response":
             from ccc_batch_guard import snapshot
             state = snapshot(config_path, wid)
-            resume_success = state.get("phase") == "stopped" and (state.get("trip") or {}).get("connected") is True
+            trip = state.get("trip") or {}
+            resume_success = (state.get("phase") == "stopped" and trip.get("connected") is True
+                              and trip.get("within_deadline") is True)
         if (rule.get("paused") and not resume_success) or not rule.get("enabled", True):
             raise RuntimeError("本池已暂停；请先按 W 恢复，再创建或补做")
         cancel_epoch = rule.get("batch_cancelled_at")

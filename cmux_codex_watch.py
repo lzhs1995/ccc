@@ -328,7 +328,7 @@ CLAUDE_CONTEXT_ABSOLUTE_TIMEOUT_SEC = 900.0
 # through TargetRuntime and suppresses duplicate Hook/fallback deliveries.
 # Human label only.  Acceptance always compares SHA-256 of the loaded source:
 # a revision string is hand-maintained and therefore can lie about what runs.
-FEATURE_REVISION = "0.2.15-batch-first-response-interrupt"
+FEATURE_REVISION = "0.2.16-batch-first-response-interrupt"
 # How long after our own send a byte-identical UserPromptSubmit can still be
 # our echo.  Must exceed claude_submit_confirm_timeout_sec so that a late
 # echo arriving after the transaction timed out is not read as a human.
@@ -9332,8 +9332,12 @@ class WatchDaemon:
                     runtime.codex_goal_resume = True
                     runtime.codex_observed_turn_key = key
                     return True
-            if reserved and runtime.codex_goal_resume:
-                return False
+            runtime.codex_goal_resume = False
+            self._record_state(str(target["surface_id"]), runtime, ScreenState(
+                "awaiting_transition", message_kind="codex", error_type=state.error_type,
+                reason="waiting for verified original Codex stalled-goal evidence before native resume",
+            ))
+            return False
         runtime.codex_goal_resume = False
         turn = self.codex_queue_recovery.current_turn(target)
         if turn is None:

@@ -37,9 +37,7 @@ def establish_provenance(config_path, workspace_id=None):
             try:
                 uuid.UUID(jid)
                 job = guard.read_json(Path(config_path).parent / "workspace-batches" / jid / "job.json")
-                if (job.get("id") != jid or guard.uid(job.get("workspace_id")) != guard.uid(rule["workspace_id"])
-                        or not isinstance(job.get("slots"), list) or not job["slots"]
-                        or [s.get("index") for s in job["slots"]] != list(range(len(job["slots"])))):
+                if not guard.valid_job(job, jid, rule["workspace_id"]):
                     continue
             except (OSError, ValueError, TypeError, AttributeError):
                 continue
@@ -188,26 +186,43 @@ def cmux_client(config_path):
 
 def adopt_workspace(config_path, workspace_id, *, client=None):
     """Serialize adoption and guarantee a closed gate on every failure path."""
-    wid = guard.uid(workspace_id)
-    if not guard.provenance(config_path, wid):
-        raise RuntimeError("workspace does not have a genuine B batch record")
-    guard.private_directory(guard.guard_root(config_path))
-    guard.private_directory(guard.pool_dir(config_path, wid))
-    with guard.core().FileLock(guard.pool_dir(config_path, wid) / "migration.lock", timeout_sec=180):
+    with contextlib.ExitStack() as locks:
+        preflight = {"complete": False}
+        authorized = False
         try:
-            return _adopt_workspace(config_path, wid, client=client)
-        except PreflightPreservationError as exc:
-            # In particular, killing an unlinked-rollout writer would destroy
-            # the only surviving history. Refuse B setup before any stop or
-            # replacement, while fencing the batch and automatic continuation.
-            guard.write_json(guard.pool_dir(config_path, wid) / "STOP.json", {
-                "reason": "session_preservation_failed", "connected": False,
-                "error": str(exc), "at": time.time()})
-            guard.core().ConfigStore(Path(config_path)).mutate(lambda config:
-                guard.core().workspace_rule_by_id(config, wid).update(
-                    paused=True, pause_origin="guard_migration", batch_cancelled_at=time.time()))
-            raise
-        except Exception:
+            wid = guard.uid(workspace_id)
+            if not guard.provenance(config_path, wid):
+                raise PreflightPreservationError("workspace does not have a genuine B batch record")
+            authorized = True
+            guard.private_directory(guard.guard_root(config_path))
+            guard.private_directory(guard.pool_dir(config_path, wid))
+            locks.enter_context(guard.core().FileLock(
+                guard.pool_dir(config_path, wid) / "migration.lock", timeout_sec=180))
+            return _adopt_workspace(config_path, wid, client=client, preflight=preflight)
+        except Exception as exc:
+            if not preflight["complete"] or isinstance(exc, PreflightPreservationError):
+                # Discovery, identity and persistence failures all precede the
+                # permission to stop. Even a failed fence write must retain
+                # this exception type so the caller cannot stop uncaptured
+                # original processes as a generic setup-failure fallback.
+                detail = str(exc)
+                if not authorized:
+                    # No B scope was established; even a pause marker would
+                    # interfere with an ordinary workspace.
+                    raise PreflightPreservationError(detail) from exc
+                try:
+                    guard.write_json(guard.pool_dir(config_path, wid) / "STOP.json", {
+                        "reason": "session_preservation_failed", "connected": False,
+                        "error": detail, "at": time.time()})
+                except Exception as fence_error:
+                    detail += "; stop marker failed: " + str(fence_error)
+                try:
+                    guard.core().ConfigStore(Path(config_path)).mutate(lambda config:
+                        guard.core().workspace_rule_by_id(config, wid).update(
+                            paused=True, pause_origin="guard_migration", batch_cancelled_at=time.time()))
+                except Exception as fence_error:
+                    detail += "; authorization fence failed: " + str(fence_error)
+                raise PreflightPreservationError(detail) from exc
             guard.write_json(guard.pool_dir(config_path, wid) / "STOP.json", {
                 "reason": "protection_setup_failed", "connected": False, "at": time.time()})
             with contextlib.suppress(Exception):
@@ -215,7 +230,7 @@ def adopt_workspace(config_path, workspace_id, *, client=None):
             raise
 
 
-def _adopt_workspace(config_path, workspace_id, *, client=None):
+def _adopt_workspace(config_path, workspace_id, *, client=None, preflight=None):
     """Gate, capture, stop, then resume each original session without a prompt."""
     wid = guard.uid(workspace_id)
     if not guard.provenance(config_path, wid):
@@ -240,6 +255,8 @@ def _adopt_workspace(config_path, workspace_id, *, client=None):
             continue
         candidates.append(row)
     if not candidates:
+        if preflight is not None:
+            preflight["complete"] = True
         guard.ensure_service(config_path)
         return {"workspace_id": wid, "adopted": 0}
     groups = {}
@@ -289,6 +306,8 @@ def _adopt_workspace(config_path, workspace_id, *, client=None):
             # No process has been replaced; drafts and identities remain intact.
             guard.write_json(directory / "result.json", {"phase": "blocked", "failures": failures})
             raise PreflightPreservationError("B migration preflight could not preserve every original session: " + str(failures))
+        if preflight is not None:
+            preflight["complete"] = True
         guard.ensure_service(config_path)
         guard.request(config_path, "prepare", timeout=3, workspace_id=wid)
         for value, path in plan:

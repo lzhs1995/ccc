@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.16
+
+- Fence new B workspace input synchronously when a native model event arrives, before awaiting membership verification. Only confirmed current membership authorizes success and interruption; moved surfaces release the provisional fence without stopping the old workspace.
+- Require structurally valid, contiguous B job slots for both original and migrated protection rules. Reject malformed records instead of treating their presence as authorization.
+- Preserve every original session on any migration failure before history preflight completes, including discovery and fence-persistence errors. Keep post-preflight setup failures on the existing scoped stop path.
+- Require verified stopping within one second before B can rearm a successful pool. Late or incomplete proof keeps the pool paused until an explicit W recovery.
+- Keep stalled goals on the verified native goal-resume path. Missing or already-consumed goal evidence cannot fall through to an ordinary continuation prompt.
+
 ## 0.2.15
 
 - Interrupt every Codex in a genuine B batch workspace on its first fresh native model response. Fence new/queued requests immediately, verify native backend exit, and escalate exact processes at 350/650 ms against a one-second deadline. Current workspace UUIDs and microsecond process identities exclude other workspaces and moved surfaces.

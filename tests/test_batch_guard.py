@@ -172,6 +172,75 @@ class GuardTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(.02)
         self.assertEqual(self.pool.phase, "watching")
 
+    async def test_first_model_event_fences_input_before_membership_await(self):
+        source, peer = self.endpoint(), self.endpoint()
+        source.native_message(delta())
+        try:
+            peer.front_message({"id": 22, "method": "turn/start", "params": {"threadId": "session"}})
+            self.assertEqual(peer.writes, [])
+            self.assertFalse(self.pool.open_gate())
+        finally:
+            await source.evidence_task
+        await self.settled()
+        self.assertTrue(self.pool.trip["connected"])
+
+    async def test_moved_evidence_releases_input_fence_without_stopping_pool(self):
+        moved = self.endpoint()
+        self.locations[moved.sid] = self.other
+        moved.native_message(delta())
+        try:
+            self.assertFalse(self.pool.open_gate())
+        finally:
+            await moved.evidence_task
+        self.assertTrue(self.pool.open_gate())
+        self.assertIsNone(self.pool.trip)
+        self.assertEqual(moved.writes, [])
+
+    async def test_moved_evidence_cannot_release_another_pending_success(self):
+        moved, live = self.endpoint(), self.endpoint()
+        self.locations[moved.sid] = self.other
+        gates = {e.sid: asyncio.Event() for e in (moved, live)}
+        original = self.service.membership
+        async def membership(wid, sid):
+            await gates[sid].wait()
+            return await original(wid, sid)
+        self.service.membership = membership
+        moved.native_message(delta())
+        live.native_message(delta())
+        try:
+            gates[moved.sid].set()
+            await moved.evidence_task
+            self.assertFalse(self.pool.open_gate())
+            self.assertIsNone(self.pool.trip)
+        finally:
+            gates[live.sid].set()
+            await live.evidence_task
+        await self.settled()
+        self.assertTrue(self.pool.trip["connected"])
+        self.assertEqual(moved.writes, [])
+
+    async def test_already_inflight_turn_does_not_replace_pending_success_with_fault(self):
+        source, peer = self.endpoint(), self.endpoint()
+        ready = asyncio.Event()
+        original = self.service.membership
+        async def membership(wid, sid):
+            if sid == source.sid:
+                await ready.wait()
+            return await original(wid, sid)
+        self.service.membership = membership
+        source.native_message(delta())
+        peer.active, peer.awaiting_turn = False, True
+        peer.native_message({"method": "turn/started", "params": {
+            "threadId": "session", "turn": {"id": "turn"}}})
+        try:
+            await asyncio.sleep(0)
+            self.assertIsNone(self.pool.trip)
+        finally:
+            ready.set()
+            await source.evidence_task
+        await self.settled()
+        self.assertEqual(self.pool.trip["reason"], "first_model_response")
+
     async def test_moved_surface_keeps_normal_title_and_session_requests(self):
         e = self.endpoint()
         e.expected_session = "session"
@@ -217,6 +286,17 @@ class GuardTests(unittest.IsolatedAsyncioTestCase):
             "batch_guard": {"version": 1, "origin_job_id": str(uuid.uuid4())}}))
         with self.assertRaisesRegex(RuntimeError, "provenance"):
             await self.service.dispatch({"command": "arm", "workspace_id": wid})
+
+    async def test_malformed_batch_slots_cannot_confer_provenance(self):
+        rule = core.ConfigStore(self.path).load()["workspace_rules"][0]
+        jid = rule["batch_guard"]["origin_job_id"]
+        path = self.path.parent / "workspace-batches" / jid / "job.json"
+        job = guard.read_json(path)
+        for slots in ([{}], [None], [{"index": 1}], [{"index": True}],
+                      [{"index": 0}, {"index": 0}], {"index": 0}, "slots"):
+            with self.subTest(slots=slots):
+                guard.write_json(path, {**job, "slots": slots})
+                self.assertIsNone(guard.provenance(self.path, self.wid))
 
     async def test_monitor_fault_stops_pool_but_is_not_connection_success(self):
         self.endpoint()
@@ -362,18 +442,108 @@ class LauncherMigrationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "ambiguous"):
             parse_arguments(data + b"CMUX_SURFACE_ID=foreign\0")
 
-    def test_migration_preflight_failure_closes_gate_and_invokes_scoped_stop(self):
+    def test_migration_preflight_failure_closes_gate_without_stopping_originals(self):
         import ccc_guard_migration as migration
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "config.json"
             wid = str(uuid.uuid4()).upper()
+            config = core.default_config()
+            config["workspace_rules"] = [{"workspace_id": wid, "enabled": True}]
+            core.atomic_write_json(path, config)
             with patch.object(guard, "provenance", return_value={"enabled": True}), \
                  patch.object(migration, "_adopt_workspace", side_effect=RuntimeError("draft unavailable")), \
                  patch.object(guard, "pause") as stop:
-                with self.assertRaisesRegex(RuntimeError, "draft unavailable"):
+                with self.assertRaisesRegex(migration.PreflightPreservationError, "draft unavailable"):
                     migration.adopt_workspace(path, wid)
                 self.assertTrue(guard.blocked(path, wid))
+                stop.assert_not_called()
+
+    def test_initial_provenance_directory_and_lock_failures_cannot_send_stop(self):
+        import ccc_guard_migration as migration
+        for component in ("provenance", "directory", "lock"):
+            with self.subTest(component=component), tempfile.TemporaryDirectory() as temp:
+                path = Path(temp) / "config.json"
+                wid = str(uuid.uuid4()).upper()
+                config = core.default_config()
+                config["workspace_rules"] = [{"workspace_id": wid, "enabled": True}]
+                core.atomic_write_json(path, config)
+                original = path.read_bytes()
+                owner, name = ((guard, "private_directory") if component == "directory"
+                               else (core.FileLock, "__enter__"))
+                with patch.object(guard, "provenance", return_value=component != "provenance"), \
+                     patch.object(owner, name, side_effect=RuntimeError("initial setup unavailable")), \
+                     patch.object(guard, "request") as request, patch.object(guard, "pause") as stop:
+                    with self.assertRaises(migration.PreflightPreservationError):
+                        guard._arm(path, wid)
+                    request.assert_not_called()
+                    stop.assert_not_called()
+                if component == "provenance":
+                    self.assertEqual(path.read_bytes(), original)
+                    self.assertFalse(guard.blocked(path, wid))
+
+    def test_discovery_failures_never_start_guard_or_stop_uncaptured_sessions(self):
+        import ccc_guard_migration as migration
+        for component in ("tree", "scan"):
+            with self.subTest(component=component), tempfile.TemporaryDirectory() as temp:
+                path = Path(temp) / "config.json"
+                wid = str(uuid.uuid4()).upper()
+                config = core.default_config()
+                config["workspace_rules"] = [{"workspace_id": wid, "enabled": True}]
+                core.atomic_write_json(path, config)
+                client = SimpleNamespace(tree=lambda: {})
+                owner = client if component == "tree" else migration.scope
+                with patch.object(guard, "provenance", return_value={"enabled": True}), \
+                     patch.object(migration, "cmux_client", return_value=client), \
+                     patch.object(owner, component, side_effect=RuntimeError("discovery unavailable")), \
+                     patch.object(guard, "request", side_effect=ConnectionRefusedError), \
+                     patch.object(guard, "ensure_service") as start, patch.object(guard, "pause") as stop:
+                    with self.assertRaisesRegex(migration.PreflightPreservationError, "discovery unavailable"):
+                        guard._arm(path, wid)
+                    self.assertTrue(guard.blocked(path, wid))
+                    start.assert_not_called()
+                    stop.assert_not_called()
+
+    def test_failed_fence_write_keeps_preservation_failure_out_of_stop_fallback(self):
+        import ccc_guard_migration as migration
+        for component in ("marker", "config"):
+            with self.subTest(component=component), tempfile.TemporaryDirectory() as temp:
+                path = Path(temp) / "config.json"
+                wid = str(uuid.uuid4()).upper()
+                config = core.default_config()
+                config["workspace_rules"] = [{"workspace_id": wid, "enabled": True}]
+                core.atomic_write_json(path, config)
+                owner, name = (guard, "write_json") if component == "marker" else (core.ConfigStore, "mutate")
+                with patch.object(guard, "provenance", return_value={"enabled": True}), \
+                     patch.object(migration, "_adopt_workspace", side_effect=migration.PreflightPreservationError("unlinked history")), \
+                     patch.object(owner, name, side_effect=OSError("read-only fence")), \
+                     patch.object(guard, "pause") as stop:
+                    with self.assertRaisesRegex(migration.PreflightPreservationError, "read-only fence"):
+                        guard._arm(path, wid)
+                    stop.assert_not_called()
+
+    def test_setup_failure_after_complete_capture_still_uses_scoped_stop(self):
+        import ccc_guard_migration as migration
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "config.json"
+            wid, sid = (str(uuid.uuid4()).upper() for _ in range(2))
+            config = core.default_config()
+            config["workspace_rules"] = [{"workspace_id": wid, "enabled": True}]
+            core.atomic_write_json(path, config)
+            record = {"pid": 1234, "birth": [1, 2], "surface_id": sid}
+            client = SimpleNamespace(tree=lambda: {})
+            with patch.object(guard, "provenance", return_value={"enabled": True}), \
+                 patch.object(migration.scope, "records", return_value={sid: {"workspace_id": wid, "surface_id": sid}}), \
+                 patch.object(migration.scope, "scan", return_value=[record]), \
+                 patch.object(migration, "capture", return_value={"resume_session": "original"}), \
+                 patch.object(guard, "request", side_effect=ConnectionRefusedError), \
+                 patch.object(guard, "ensure_service", side_effect=RuntimeError("guard offline")), \
+                 patch.object(guard, "pause") as stop:
+                with self.assertRaisesRegex(RuntimeError, "guard offline"):
+                    migration.adopt_workspace(path, wid, client=client)
                 stop.assert_called_once_with(path, wid, reason="protection_setup_failed")
+                records = list(guard.pool_dir(path, wid).glob("migrations/*/" + sid + ".json"))
+                self.assertEqual(len(records), 1)
+                self.assertEqual(guard.read_json(records[0])["resume_session"], "original")
 
     def test_unrecoverable_history_preflight_fences_b_without_killing_original(self):
         import ccc_guard_migration as migration
