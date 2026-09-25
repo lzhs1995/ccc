@@ -458,6 +458,29 @@ class LauncherMigrationTests(unittest.TestCase):
                 self.assertTrue(guard.blocked(path, wid))
                 stop.assert_not_called()
 
+    def test_initial_provenance_directory_and_lock_failures_cannot_send_stop(self):
+        import ccc_guard_migration as migration
+        for component in ("provenance", "directory", "lock"):
+            with self.subTest(component=component), tempfile.TemporaryDirectory() as temp:
+                path = Path(temp) / "config.json"
+                wid = str(uuid.uuid4()).upper()
+                config = core.default_config()
+                config["workspace_rules"] = [{"workspace_id": wid, "enabled": True}]
+                core.atomic_write_json(path, config)
+                original = path.read_bytes()
+                owner, name = ((guard, "private_directory") if component == "directory"
+                               else (core.FileLock, "__enter__"))
+                with patch.object(guard, "provenance", return_value=component != "provenance"), \
+                     patch.object(owner, name, side_effect=RuntimeError("initial setup unavailable")), \
+                     patch.object(guard, "request") as request, patch.object(guard, "pause") as stop:
+                    with self.assertRaises(migration.PreflightPreservationError):
+                        guard._arm(path, wid)
+                    request.assert_not_called()
+                    stop.assert_not_called()
+                if component == "provenance":
+                    self.assertEqual(path.read_bytes(), original)
+                    self.assertFalse(guard.blocked(path, wid))
+
     def test_discovery_failures_never_start_guard_or_stop_uncaptured_sessions(self):
         import ccc_guard_migration as migration
         for component in ("tree", "scan"):

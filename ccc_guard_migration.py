@@ -186,14 +186,18 @@ def cmux_client(config_path):
 
 def adopt_workspace(config_path, workspace_id, *, client=None):
     """Serialize adoption and guarantee a closed gate on every failure path."""
-    wid = guard.uid(workspace_id)
-    if not guard.provenance(config_path, wid):
-        raise RuntimeError("workspace does not have a genuine B batch record")
-    guard.private_directory(guard.guard_root(config_path))
-    guard.private_directory(guard.pool_dir(config_path, wid))
-    with guard.core().FileLock(guard.pool_dir(config_path, wid) / "migration.lock", timeout_sec=180):
+    with contextlib.ExitStack() as locks:
         preflight = {"complete": False}
+        authorized = False
         try:
+            wid = guard.uid(workspace_id)
+            if not guard.provenance(config_path, wid):
+                raise PreflightPreservationError("workspace does not have a genuine B batch record")
+            authorized = True
+            guard.private_directory(guard.guard_root(config_path))
+            guard.private_directory(guard.pool_dir(config_path, wid))
+            locks.enter_context(guard.core().FileLock(
+                guard.pool_dir(config_path, wid) / "migration.lock", timeout_sec=180))
             return _adopt_workspace(config_path, wid, client=client, preflight=preflight)
         except Exception as exc:
             if not preflight["complete"] or isinstance(exc, PreflightPreservationError):
@@ -202,6 +206,10 @@ def adopt_workspace(config_path, workspace_id, *, client=None):
                 # this exception type so the caller cannot stop uncaptured
                 # original processes as a generic setup-failure fallback.
                 detail = str(exc)
+                if not authorized:
+                    # No B scope was established; even a pause marker would
+                    # interfere with an ordinary workspace.
+                    raise PreflightPreservationError(detail) from exc
                 try:
                     guard.write_json(guard.pool_dir(config_path, wid) / "STOP.json", {
                         "reason": "session_preservation_failed", "connected": False,

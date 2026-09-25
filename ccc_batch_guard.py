@@ -257,9 +257,12 @@ def arm(config_path, workspace_id, *, resume=False):
 
 
 def _arm(config_path, workspace_id, *, resume=False):
-    from ccc_guard_migration import adopt_workspace, PreflightPreservationError
+    from ccc_guard_migration import adopt_workspace
+    # Adoption owns its preflight-versus-post-capture failure policy. Nothing
+    # it raises may enter this caller's generic stop fallback before it returns
+    # a successfully preserved workspace.
+    adoption = adopt_workspace(config_path, workspace_id)
     try:
-        adoption = adopt_workspace(config_path, workspace_id)
         ensure_service(config_path)
         if adoption.get("adopted"):
             state = request(config_path, "status", workspace_id=uid(workspace_id))
@@ -267,10 +270,6 @@ def _arm(config_path, workspace_id, *, resume=False):
                 raise RuntimeError("protection changed during original-session adoption")
         return request(config_path, "arm", timeout=90, workspace_id=uid(workspace_id),
                        resume=bool(resume or adoption.get("adopted")))
-    except PreflightPreservationError:
-        # Setup is fenced by adoption. Do not destroy an original process
-        # whose still-open file can be the only copy of its session history.
-        raise
     except Exception:
         # Failed adoption/observation must never leave the old B sessions
         # consuming upstream while the new batch cannot be protected.
