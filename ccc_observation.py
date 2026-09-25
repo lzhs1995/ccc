@@ -207,7 +207,7 @@ def continuation_row(target, runtime, *, now, poll_interval=1.0):
         status, reason = "send_failed", "cmux_rejected_send"
     elif phase in {"cmux_unavailable", "send_guard_unavailable", "incompatible", "claude_viewport_blind"}:
         status, reason = "unavailable", phase
-    elif phase in {"provider_blocked", "token_exhausted"}:
+    elif phase in {"provider_blocked", "token_exhausted", "network_wait"}:
         status, reason = "blocked", str(runtime.get("observed_error_type") or runtime.get("error_type") or phase)
     elif phase in {"claude_hook_missing", "claude_hook_unverified", "claude_hook_legacy"}:
         status, reason = "unknown", phase

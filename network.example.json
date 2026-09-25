@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "mode": "observe",
+  "state_dir": "/Users/you/Library/Application Support/cmux-codex-continue/network",
+  "binary": "/Applications/Clash Verge.app/Contents/MacOS/verge-mihomo",
+  "controller_socket": "/var/run/clash-verge-service/users/501/verge-mihomo.sock",
+  "interface": "en0",
+  "service_host": "anyrouter.top",
+  "group": "Transit-Auto-Select",
+  "provider": "CCC-AnyRouter-Verified-v217",
+  "offline_proxy": "AR/Offline",
+  "commercial_pools": ["NTHU", "Yeye"],
+  "sources": [
+    {"pool": "NTHU", "path": "/absolute/path/to/nthu-subscription.yaml"},
+    {"pool": "Yeye", "path": "/absolute/path/to/yeye-subscription.yaml"}
+  ],
+  "fallback": {
+    "path": "/absolute/path/to/chain-profile.yaml",
+    "pool": "Tokyo",
+    "transit": "VPS-Tokyo-Fallback",
+    "exits": ["kookeey-US-3", "kookeey-US2"]
+  },
+  "probe": {
+    "url": "https://anyrouter.top/v1/responses",
+    "model": "gpt-6-astra",
+    "auth_file": "/Users/you/.codex/auth.json",
+    "auth_key": "OPENAI_API_KEY",
+    "timeout_sec": 5,
+    "light_timeout_by_pool": {"Tokyo": 8},
+    "deep_timeout_sec": 45
+  },
+  "publish": {"port": 17891, "token": "replace_with_a_fresh_random_urlsafe_token"},
+  "publish_transit": true,
+  "policy": {
+    "current_interval_sec": 2,
+    "standby_interval_sec": 5,
+    "other_interval_sec": 60,
+    "concurrency": 4,
+    "deep_min_interval_sec": 30,
+    "deep_per_minute": 2
+  }
+}

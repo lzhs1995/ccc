@@ -40,6 +40,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from claude_ccc_protocol import EVENT_JOURNAL_PATH, EVENT_SOCKET_PATH
 import ccc_observation as observation_health
+import ccc_network_client as network_health
 from ccc_codex_queue import NativeCompletionWatcher, QueueRecovery
 from ccc_scheduling import CoalescingWriter, SnapshotCache, SnapshotClient, SurfaceScheduler
 
@@ -59,7 +60,7 @@ DEFAULT_LABEL = f"{LABEL_PREFIX}.{APP_NAME}"
 PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_APP_DIR = Path.home() / "Library" / "Application Support" / APP_NAME
 DEFAULT_RUNTIME_ROOT = DEFAULT_APP_DIR / "runtime"
-RUNTIME_FILES = ("cmux_codex_watch.py", "claude_ccc_protocol.py", "claude_ccc_event_hook.py", "ccc_observation.py", "ccc_scheduling.py", "ccc_codex_queue.py", "ccc_codex_goal.py", "ccc_workspace_batch.py", "ccc_inventory.py", "ccc_batch_guard.py", "ccc_guard_transport.py", "ccc_guard_watchdog.py", "ccc_guard_scope.py", "ccc_guard_migration.py", "ccc_codex_launcher.py")
+RUNTIME_FILES = ("cmux_codex_watch.py", "claude_ccc_protocol.py", "claude_ccc_event_hook.py", "ccc_observation.py", "ccc_scheduling.py", "ccc_codex_queue.py", "ccc_codex_goal.py", "ccc_workspace_batch.py", "ccc_inventory.py", "ccc_batch_guard.py", "ccc_guard_transport.py", "ccc_guard_watchdog.py", "ccc_guard_scope.py", "ccc_guard_migration.py", "ccc_codex_launcher.py", "ccc_network_client.py", "ccc_network_guard.py", "ccc_mihomo.py")
 DEFAULT_LOG_DIR = Path.home() / "Library" / "Logs" / APP_NAME
 DEFAULT_CONFIG_PATH = DEFAULT_APP_DIR / "config.json"
 DEFAULT_STATE_PATH = DEFAULT_APP_DIR / "state.json"
@@ -328,7 +329,7 @@ CLAUDE_CONTEXT_ABSOLUTE_TIMEOUT_SEC = 900.0
 # through TargetRuntime and suppresses duplicate Hook/fallback deliveries.
 # Human label only.  Acceptance always compares SHA-256 of the loaded source:
 # a revision string is hand-maintained and therefore can lie about what runs.
-FEATURE_REVISION = "0.2.16-batch-first-response-interrupt"
+FEATURE_REVISION = "0.2.17-service-aware-network-guard"
 # How long after our own send a byte-identical UserPromptSubmit can still be
 # our echo.  Must exceed claude_submit_confirm_timeout_sec so that a late
 # echo arriving after the transaction timed out is not read as a human.
@@ -557,6 +558,9 @@ class TargetRuntime:
     codex_absent_probe: str = ""
     codex_absent_since: float = 0.0
     last_send_error: str = ""
+    network_service_host: str = ""
+    network_phase: str = ""
+    network_checked_at: float = 0.0
     registration_revalidation: dict[str, Any] = dataclasses.field(default_factory=dict)
     observed_screen_signature: str | None = None
     observed_evidence_row: int | None = None
@@ -2281,6 +2285,7 @@ def classify_grid(grid: Grid) -> ScreenState:
 def default_config() -> dict[str, Any]:
     return {
         "schema_version": 2,
+        "network_guard": {"enabled": False},
         "mode": "dry-run",
         "global_paused": False,
         "message": MESSAGE,
@@ -2777,6 +2782,7 @@ def validate_config(value: Any) -> dict[str, Any]:
         raise RuntimeError(f"unsupported config schema_version: {schema_version}")
     merged = default_config()
     merged.update(value)
+    network_health.validate_options(merged["network_guard"])
     # Schema-v2 readers accept old files, but these knobs no longer influence
     # Claude.  ConfigStore.mutate writes the validated result back without
     # them, providing an atomic migration under config.lock.
@@ -4798,6 +4804,7 @@ class WatchDaemon:
             native_home / ".codex/sessions", MESSAGE,
         )
         self.codex_queue_recovery.guard_config_path = config_path
+        self.network = network_health.NetworkClient()
         if hook_settings_manager is not None:
             self.claude_hook_settings = hook_settings_manager
         elif config_path == DEFAULT_CONFIG_PATH:
@@ -6688,7 +6695,9 @@ class WatchDaemon:
         def authorized():
             return (self.config.get("mode") == "armed" and not self.config.get("global_paused")
                     and str(target["surface_id"]) != str(self.config.get("manager_surface_id") or "")
-                    and current(fresh=True))
+                    and current(fresh=True)
+                    and (not self.config.get("network_guard", {}).get("enabled")
+                         or self._network_turn_ready(target, runtime, self.codex_queue_recovery.current_turn(target))))
 
         def guarded_key(send):
             with workspace_input_lock(self.config_path, target["workspace_id"], shared=True):
@@ -9315,6 +9324,20 @@ class WatchDaemon:
         self.save()
 
 
+    def _network_turn_ready(self, target, runtime, turn):
+        if not self.config.get("network_guard", {}).get("enabled"):
+            return True
+        verdict = self.network.verdict(self.config.get("network_guard", {}), target, turn)
+        runtime.network_service_host = verdict["service_host"]
+        runtime.network_phase = verdict["phase"]
+        runtime.network_checked_at = time.time()
+        if verdict["blocked"]:
+            runtime.state = "network_wait"
+            # Observation and delivery evidence remain intact. Recovery must
+            # pass every original identity, pause, turn and deduplication gate.
+            return False
+        return True
+
     def _codex_turn_ready(self, target, runtime, state, *, reserved=False):
         if state.message_kind != "codex":
             runtime.codex_goal_resume = False
@@ -9329,6 +9352,8 @@ class WatchDaemon:
                 if ((reserved and runtime.codex_goal_resume and runtime.codex_observed_turn_key == key)
                         or (not reserved and (runtime.codex_sent_turn_key != key
                             or runtime.delivery_status in {"failed", "cancelled", "retryable"}))):
+                    if not self._network_turn_ready(target, runtime, {**goal, "pid": pids[0]}):
+                        return False
                     runtime.codex_goal_resume = True
                     runtime.codex_observed_turn_key = key
                     return True
@@ -9347,6 +9372,8 @@ class WatchDaemon:
             # Losing a verified binding while the attempt is being persisted
             # is not a legacy client: the original process may have exited.
             turn = {"kind": "unknown"}
+        if not self._network_turn_ready(target, runtime, turn):
+            return False
         # Codex paints a terminal provider error before its native turn ends.
         # Submitting in that interval can wedge the next TurnInput permanently.
         # The terminal event must be current, and still a failure; a successful
@@ -10296,6 +10323,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     sub = parser.add_subparsers(dest="command", required=False)
     sub.add_parser("watch")
+    network = sub.add_parser("network", help="shared AnyRouter network guard")
+    network.add_argument("action", nargs="?", default="status", choices=("status", "probe", "install"))
+    network.add_argument("--route", default="", help="route id or exact label for an asynchronous recheck")
     add = sub.add_parser("add")
     add.add_argument("selector")
     add.add_argument("--name", default="")
@@ -10481,6 +10511,9 @@ def cli(argv: Sequence[str] | None = None) -> int:
         return 0
     store = ConfigStore(config_path)
     config = store.load()
+    if args.command == "network":
+        print(json.dumps(network_health.command(config.get("network_guard", {}), args.action, args.route), ensure_ascii=False, indent=2))
+        return 0
     if args.command in {"hook-doctor", "hook-repair"}:
         manager = ClaudeHookSettingsManager()
         report = manager.ensure(

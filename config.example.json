@@ -19,5 +19,8 @@
   "workspace_discovery_interval_sec": 5,
   "cmux_path": "/opt/homebrew/bin/cmux",
   "targets": [],
-  "workspace_rules": []
+  "workspace_rules": [],
+  "network_guard": {
+    "enabled": false
+  }
 }
