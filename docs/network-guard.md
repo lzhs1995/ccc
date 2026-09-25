@@ -34,7 +34,9 @@ Defaults are 2 seconds for the current path, 5 seconds for hot standbys and
 5-second light deadline. Complete SSE checks are serialized, start at least
 30 seconds apart, and use at most two requests per minute across all sessions.
 These small real API requests can consume quota. Reservations survive restarts;
-status and manual hints cannot reset the budget. The default complete-check
+status and manual hints cannot reset the budget. Reservations dated ahead of a
+corrected system clock remain spent; clock rollback cannot refund a probe.
+The default complete-check
 periods are 120 seconds for the active path, 300 seconds for hot standbys and
 one hour for other admitted candidates. A real API response remains necessary
 for initial admission and quarantine recovery.

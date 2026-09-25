@@ -172,6 +172,14 @@ class Health:
     status: int = 0
 
 
+def recent_deep_starts(starts, now):
+    # Clock correction does not refund an already consumed request. Keep
+    # future reservations until their window expires on the corrected clock,
+    # and use the latest timestamp for the minimum spacing after a restart.
+    return sorted(x for x in starts if type(x) in (int, float)
+                  and math.isfinite(x) and x >= 0 and now - x < 60)
+
+
 class Engine:
     """Pure route policy. Probe results never constitute terminal-send grants."""
     def __init__(self, config, routes, saved=None, now=None):
@@ -213,7 +221,7 @@ class Engine:
                     continue
             self.current = saved.get("current", "") if saved.get("current") in self.routes else ""
             self.active_pool = saved.get("active_pool", self.active_pool)
-            self.deep_starts = [x for x in saved.get("deep_starts", []) if isinstance(x, (int, float)) and 0 <= now - x < 60]
+            self.deep_starts = recent_deep_starts(saved.get("deep_starts", []), now)
             self.seed_consumed = bool(saved.get("seed_consumed"))
 
     def update_inventory(self, routes):
@@ -350,7 +358,7 @@ class Engine:
         return sorted((rid for rid in self.routes if rid not in in_flight and order(rid)[1] <= now), key=order)
 
     def deep_due(self, now, in_flight):
-        self.deep_starts = [x for x in self.deep_starts if 0 <= now - x < 60]
+        self.deep_starts = recent_deep_starts(self.deep_starts, now)
         if (len(self.deep_starts) >= self.policy["deep_per_minute"]
                 or self.deep_starts and now - self.deep_starts[-1] < self.policy["deep_min_interval_sec"]):
             return None

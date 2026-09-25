@@ -127,6 +127,22 @@ class EngineTests(unittest.TestCase):
         restored.record(self.ids[2], ProbeResult("accessible"), 1062)
         self.assertIsNotNone(restored.deep_due(1062, set()))
 
+    def test_clock_rollback_cannot_erase_consumed_probe_budget(self):
+        for restart in (False, True):
+            with self.subTest(restart=restart):
+                engine = Engine(self.config, self.routes, now=995)
+                engine.reserve_deep(self.ids[0], 1000)
+                engine.reserve_deep(self.ids[1], 1031)
+                if restart:
+                    engine = Engine(self.config, self.routes, engine.saved(), now=995)
+                engine.record(self.ids[2], ProbeResult("accessible"), 995)
+                self.assertIsNone(engine.deep_due(995, set()))
+                self.assertEqual(engine.deep_starts, [1000, 1031])
+                engine.record(self.ids[2], ProbeResult("accessible"), 1040)
+                self.assertIsNone(engine.deep_due(1040, set()))
+                engine.record(self.ids[2], ProbeResult("accessible"), 1062)
+                self.assertEqual(engine.deep_due(1062, set()), self.ids[2])
+
     def test_stale_or_future_qualification_cannot_admit_a_standby(self):
         self.all_good()
         for h in self.e.health.values():
