@@ -103,6 +103,24 @@ class GuardObservationTests(JanitorTestCase):
         self.assertEqual(self.box.run_guard("--status").returncode, 3)
         self.assertEqual(sorted(p.name for p in self.box.jd.iterdir()), before)
 
+    def test_baseline_stat_values_match_actual_files_and_existing_numeric_baselines(self):
+        self.assertEqual(self.box.run_guard().returncode, 0)
+        path = self.box.jd / "guard.baseline"
+        values = dict(line.split("=", 1) for line in path.read_text().splitlines()
+                      if "=" in line and not line.startswith("#"))
+        self.assertEqual(values["BASE_LOCK_SIZE"], str(self.box.lock.stat().st_size))
+        self.assertEqual(values["BASE_LOCK_MTIME"], str(int(self.box.lock.stat().st_mtime)))
+        self.assertEqual(self.box.run_guard("--rearm").returncode, 0)
+
+    def test_malformed_stat_output_holds_measurement_without_inventing_a_change(self):
+        self.box.run_guard()
+        baseline = (self.box.jd / "guard.baseline").read_bytes()
+        self.fake_tool("STAT", 'case "$1" in -f%z) printf z; exit 0;; esac\nexec /usr/bin/stat "$@"')
+        self.assertEqual(self.box.run_guard().returncode, 3)
+        self.assertEqual((self.box.jd / "guard.baseline").read_bytes(), baseline)
+        self.assertFalse((self.box.jd / "GUARD_TRIPPED").exists())
+        self.assertTrue((self.box.jd / "GUARD_UNAVAILABLE").exists())
+
     def test_failed_baseline_replacement_preserves_prior_baseline_and_trip(self):
         self.box.run_guard()
         self.box.set_config(USE_QUARANTINE=0)
