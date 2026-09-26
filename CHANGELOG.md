@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.20
+
+- Keep fleet target merging linear in targets and workspace rules, and move it outside shared target locks. Native completion monitoring and authorization no longer wait for a full fleet merge.
+- Discover exact local Codex surface/workspace identities independently of slow GUI process snapshots. Expired, ambiguous, remote and noninteractive hints cannot enroll a target; native writer, original session, failed turn and input checks still gate every continuation.
+- Pin canonical transcript paths for native monitoring instead of repeatedly resolving unchanged paths. Publish coverage per surface during a scan with a bounded measured freshness allowance, so a busy fleet does not repeatedly fall back to full viewport polling.
+- Confirm missing B surfaces with a new topology request before declaring them closed. Reconcile falsely closed original slots only with matching launch receipts and current workspace membership; submitted work stays on its original confirmation path.
+- Allow an explicit B after a definitively finished batch with closed/excluded slots. Keep live or uncertain old slots, pending submissions and creation receipts instead of duplicating the batch.
+- Make both B confirmation paths report the current automatic-pause policy. Automatic pause remains off; the optional connectivity rule still requires three consecutive complete real responses from one original session.
+- Add a fleet acceptance tool with 843 isolated surfaces, real native transcript parsing, durable send records and concurrent configuration changes, plus original-process loopback acceptance without production API requests.
+
 ## 0.2.19
 
 - Separate the user-owned AnyRouter selector from the guard's automatic selector. Prepare complete static manual routes, ordered Tokyo dependencies and a preserved emergency default. An empty automatic provider or stopped detector cannot delete or override manual choices.

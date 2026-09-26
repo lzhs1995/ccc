@@ -33,6 +33,23 @@ class DiscoveryFairnessTests(unittest.TestCase):
         finally:
             scheduler.close()
 
+    def test_fleet_pause_merge_scans_rules_once_and_preserves_explicit_precedence(self):
+        class Rules(list):
+            scans = 0
+            def __iter__(self):
+                self.scans += 1
+                return super().__iter__()
+        rules = Rules([{'workspace_id': f'w-{i}', 'paused': i == 4} for i in range(318)])
+        targets = [{'surface_id': str(i), 'workspace_id': f'w-{i % 318}',
+                    'ref': f'surface:{i}', 'enabled': True} for i in range(843)]
+        explicit = {**targets[0], 'enabled': False}
+        merged = core.effective_targets({'targets': [explicit], 'workspace_rules': rules}, targets)
+        self.assertEqual(rules.scans, 1)
+        self.assertEqual(len(merged), 843)
+        self.assertFalse(merged[0]['enabled'])
+        self.assertEqual({r['surface_id'] for r in merged if r.get('paused')}, {'4', '322', '640'})
+        self.assertFalse(any(t.get('paused') for t in targets))
+
     def test_unrelated_registration_during_read_keeps_the_observation(self):
         with tempfile.TemporaryDirectory() as directory:
             daemon, client = self.daemon(directory)

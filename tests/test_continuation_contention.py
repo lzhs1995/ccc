@@ -33,6 +33,25 @@ class ContentionTests(unittest.TestCase):
                     self.assertTrue(done.wait(1), "unchanged config waited behind a reload lock")
                 future.result(2)
 
+    def test_native_source_merge_cannot_hold_target_authorization_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            daemon, _ = self.make_daemon(directory)
+            entered, release = threading.Event(), threading.Event()
+            original = core.effective_targets
+            def merge(*args):
+                entered.set()
+                release.wait(3)
+                return original(*args)
+            with mock.patch.object(core, 'effective_targets', side_effect=merge), ThreadPoolExecutor(2) as pool:
+                sources = pool.submit(daemon._native_wakeup_sources)
+                try:
+                    self.assertTrue(entered.wait(1))
+                    target = pool.submit(daemon._event_target, 'surface-uuid').result(1)
+                    self.assertEqual(target['surface_id'], 'surface-uuid')
+                finally:
+                    release.set()
+                sources.result(2)
+
     def test_changed_config_still_waits_for_reload_and_applies_pause(self):
         with tempfile.TemporaryDirectory() as directory:
             daemon, _ = self.make_daemon(directory)

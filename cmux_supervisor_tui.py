@@ -2245,14 +2245,20 @@ def selected_action_hint(candidate: Candidate | None) -> str:
     return ""
 
 
+def batch_pause_policy() -> str:
+    from ccc_batch_guard import AUTOMATIC_POOL_STOP, CONNECTION_CUT_ENABLED
+    return ("同一 session 连续完成3轮回复后 Interrupt 本池"
+            if AUTOMATIC_POOL_STOP and CONNECTION_CUT_ENABLED else "自动暂停已关闭")
+
+
 def confirm_prompt(action: str, candidate: Candidate, *, live_codex: int | None = None) -> str:
     location = f"{candidate.workspace_ref}/{candidate.ref}"
     if action == "pause_workspace":
         return f"确认整池暂停 {candidate.workspace_ref}？立即停发续跑，并 Interrupt 该池全部 Codex；保留 session"
     if action == "resume_workspace":
-        return f"确认恢复 {candidate.workspace_ref} 的整池监控？B 池重新布防原会话，不补开已取消名额；保留单路暂停和排除设置"
+        return f"确认恢复 {candidate.workspace_ref} 的整池监控？保留原会话，不补开已取消名额；保留单路暂停和排除设置"
     if action == "batch_workspace":
-        return f"确认在 {candidate.workspace_ref} 新开50个Codex并整池授权？每路发送 show me u power；任一路收到模型响应即在1秒内 Interrupt 本池全部 Codex，取消剩余名额"
+        return f"确认在 {candidate.workspace_ref} 新开50个Codex并整池授权？每路发送 show me u power；{batch_pause_policy()}"
     if action == "workspace":
         title = str(candidate.record.get("workspace_title") or "").strip()
         pool = f"{candidate.workspace_ref}{f'「{title}」' if title else ''}"
@@ -2293,10 +2299,7 @@ def workspace_confirm_prompt(row: ViewRow, action: str, *, live_codex: int | Non
     if action == "resume_workspace":
         return f"确认恢复 {pool} 整池监控？保留原会话，不补开已取消名额；保留单路暂停和排除设置"
     if action == "batch_workspace":
-        from ccc_batch_guard import AUTOMATIC_POOL_STOP, CONNECTION_CUT_ENABLED
-        policy = ("同一 session 连续完成3轮回复后 Interrupt 本池"
-                  if AUTOMATIC_POOL_STOP and CONNECTION_CUT_ENABLED else "自动暂停已关闭")
-        return f"确认在 {pool} 新开50个Codex并整池授权？每路发送 show me u power；{policy}"
+        return f"确认在 {pool} 新开50个Codex并整池授权？每路发送 show me u power；{batch_pause_policy()}"
     if action == "untrack_workspace":
         return f"确认取消整个 {pool} 授权？该池将不再自动续跑"
     count = row.counts.get("all", 0) if live_codex is None else live_codex
