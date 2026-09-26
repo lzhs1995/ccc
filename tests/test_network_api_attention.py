@@ -163,6 +163,19 @@ class ApiRetryTests(unittest.TestCase):
         self.assertEqual(restored.snapshot(1064)["completed"], 3)
         self.assertEqual(restored.remaining(1064), 60)
 
+    def test_inconsistent_saved_deadline_cannot_permanently_block_recovery(self):
+        for delay, until in ((0, 1e12), (300, 0)):
+            clock = [0]
+            saved = {"version": 1, "since": 1000, "history": [], "kind": "", "streak": 0,
+                     "paths": [], "last_at": 1000, "delay": delay, "until": until}
+            state = network.ApiProbeState(1000, saved, monotonic=lambda: clock[0])
+            self.assertEqual(state.recovery, "invalid_api_state")
+            self.assertLessEqual(state.remaining(1000), 300)
+            clock[0] = 301
+            self.assertEqual(state.remaining(1301), 0)
+            state.record(self.ids[0], ProbeResult("upstream", 500, deep=True), 1301)
+            self.assertEqual(state.recovery, "")
+
     def test_previously_qualified_current_cannot_starve_other_api_checks(self):
         self.engine.current = self.ids[0]
         self.engine.record(self.ids[0], ProbeResult("accessible"), 1000)

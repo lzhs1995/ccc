@@ -175,6 +175,8 @@ class ApiProbeState:
                  and type(saved.get("streak")) is int and 0 <= saved["streak"] <= 1024
                  and all(stamp(saved.get(k)) for k in ("since", "last_at", "until", "delay"))
                  and saved["delay"] <= self.MAX_DELAY
+                 and ((saved["delay"] == 0 and saved["until"] == 0)
+                      or (saved["delay"] > 0 and saved["until"] > 0))
                  and isinstance(saved.get("paths"), list) and len(saved["paths"]) <= 8
                  and all(isinstance(r, str) and len(r) <= 128 for r in saved["paths"]))
         if not valid:
@@ -210,6 +212,7 @@ class ApiProbeState:
         self.since = min(self.since, now)
         self.history = [r for r in self.history if 0 <= now - r["at"] <= self.WINDOW][-127:]
         self.history.append({"at": now, "kind": result.kind, "status": result.status})
+        self.recovery = ""
         if result.kind not in API_ATTENTION:
             self.kind, self.streak, self.paths = "", 0, []
             self.last_at, self.until, self.delay = now, 0, 0
@@ -858,7 +861,10 @@ class Guard:
         elif api["backoff"]["recovery"] == "invalid_api_state":
             state, reason = "observer_error", "探测退避记录不完整，等待恢复检查"
         elif api["backoff"]["remaining_sec"] > 0:
-            state, reason = "api_backoff", "多条路径连续 API 异常，等待恢复检查"
+            if api["backoff"]["consecutive_failures"] >= 3 and api["backoff"]["distinct_paths"] >= 2:
+                state, reason = "api_backoff", "多条路径连续 API 异常，等待恢复检查"
+            else:
+                state, reason = "checking", "等待保守恢复检查"
         elif ready:
             state, reason = "ready", "已有完整 API 答复验证通过的候选"
         elif last.get("kind") == "observer_error":
