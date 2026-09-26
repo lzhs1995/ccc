@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import copy
 import hashlib
 import http.client
 import http.server
@@ -25,20 +26,22 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ccc_mihomo import Controller, Route, atomic_json
 from ccc_network_guard import ProviderServer
+from tools.network_profile import build_profile, manual_name, MANUAL_GROUP
 
 
-def run(binary, expected_sha256=None):
+def run(binary, expected_sha256=None, *, manual_rescue=False):
     binary = Path(binary).resolve()
     digest = hashlib.sha256(binary.read_bytes()).hexdigest()
     if expected_sha256 and digest != expected_sha256:
         raise ValueError("fixture binary differs from the required production digest")
     root = Path(tempfile.mkdtemp(prefix="ccc-anytls-accept-", dir="/tmp"))
-    core = publisher = upstream = None
+    core = publisher = upstream = fresh_core = None
     clients, readers, errors = [], [], []
     frames, sent, completed, end_received = {}, {}, set(), set()
     finish = threading.Event()
     once_calls = []
     checkpoints = []
+    cold_attempts = []
     log = (root / "core.log").open("wb")
     started = time.monotonic()
 
@@ -214,40 +217,62 @@ def run(binary, expected_sha256=None):
                                 "produced_before_checkpoint": counts,
                                 "frames": {name: len(row) for name, row in frames.items()}})
 
+        automatic, provider = "Transit-Auto-Select", "Verified"
+        if manual_rescue:
+            automatic, provider = "AnyRouter-Auto", "VerifiedResilience"
+            network = {"outer_group": "Transit-Auto-Select", "group": automatic, "provider": provider,
+                       "previous_provider": "Verified", "offline_proxy": "AR/Offline",
+                       "commercial_pools": ["fixture"], "service_host": "anyrouter.test",
+                       "publish": {"port": provider_port, "token": "fixture"}}
+            config = build_profile(config, network, [first, second], default_id=first.id)
+            atomic_json(path, config)
+            # Fixture-only migration uses a fresh provider identity. Existing
+            # AnyTLS streams must survive the group split and forced GC.
+            controller.request("PUT", "/configs?force=false", {"path": str(path)})
+            assert controller.get("/proxies/Transit-Auto-Select")["now"] == MANUAL_GROUP
+            assert controller.get("/proxies/" + MANUAL_GROUP)["now"] == manual_name(first)
+            once()
+            for _ in range(2):
+                controller.request("PUT", "/debug/gc")
+                time.sleep(.1)
+            checkpoint("manual_group_migration_preserves_old_anytls_streams")
+            controller.select(automatic, first.name)
+            controller.select("Transit-Auto-Select", automatic)
+
         publisher.close()
         publisher = ProviderServer(provider_port, "fixture")
         try:
-            controller.refresh("Verified")
+            controller.refresh(provider)
         except RuntimeError:
             pass
         else:
             raise AssertionError("unreconciled publisher did not refuse refresh")
-        assert controller.get("/proxies/Transit-Auto-Select")["now"] == first.name
+        assert controller.get("/proxies/" + automatic)["now"] == first.name
         once()
         checkpoint("publisher_startup_503")
 
         # Change the payload so Mihomo actually reparses and replaces adapters.
         publisher.set([first, second, spare])
-        controller.refresh("Verified")
-        group = controller.get("/proxies/Transit-Auto-Select")
+        controller.refresh(provider)
+        group = controller.get("/proxies/" + automatic)
         assert group["now"] == first.name and spare.name in group["all"]
         checkpoint("changed_provider_refreshed")
-        controller.select("Transit-Auto-Select", second.name)
+        controller.select(automatic, second.name)
         once()
         publisher.set([second])
-        controller.refresh("Verified")
-        group = controller.get("/proxies/Transit-Auto-Select")
+        controller.refresh(provider)
+        group = controller.get("/proxies/" + automatic)
         assert group["now"] == second.name and first.name not in group["all"]
         for _ in range(2):
             controller.request("PUT", "/debug/gc")
             time.sleep(.1)
         checkpoint("old_anytls_pruned_then_two_gc_cycles")
 
-        controller.select("Transit-Auto-Select", "AR/Offline")
+        controller.select(automatic, "AR/Offline")
         publisher.set([])
-        controller.refresh("Verified")
-        group = controller.get("/proxies/Transit-Auto-Select")
-        assert group["now"] == "AR/Offline" and group["all"] == ["AR/Offline"]
+        controller.refresh(provider)
+        group = controller.get("/proxies/" + automatic)
+        assert group["now"] == "AR/Offline" and set(group["all"]) == {"AR/Offline"}
         count_before = len(once_calls)
         denied = False
         try:
@@ -263,6 +288,60 @@ def run(binary, expected_sha256=None):
             controller.request("PUT", "/debug/gc")
             time.sleep(.1)
         checkpoint("offline_rejects_new_calls_but_old_streams_continue")
+        if manual_rescue:
+            controller.select("Transit-Auto-Select", MANUAL_GROUP)
+            once()
+            publisher.close()
+            publisher = None
+            try:
+                controller.refresh(provider)
+            except (OSError, RuntimeError):
+                pass
+            else:
+                raise AssertionError("stopped publisher unexpectedly refreshed")
+            once()
+            for _ in range(2):
+                controller.request("PUT", "/debug/gc")
+                time.sleep(.1)
+            checkpoint("manual_rescue_with_empty_automatic_pool_and_dead_publisher")
+            assert controller.get("/proxies/Transit-Auto-Select")["now"] == MANUAL_GROUP
+
+            # A fresh independent client core has no provider cache and no
+            # publisher at all. The static manual path must still work.
+            fresh_root = root / "fresh"
+            fresh = copy.deepcopy(config)
+            with socket.socket() as reserved:
+                reserved.bind(("127.0.0.1", 0))
+                fresh_port = reserved.getsockname()[1]
+            fresh["external-controller-unix"] = str(fresh_root / "core.sock")
+            fresh["listeners"] = [{**listeners[0], "port": fresh_port}]
+            atomic_json(fresh_root / "config.json", fresh)
+            fresh_core = subprocess.Popen([str(binary), "-d", str(fresh_root), "-f", str(fresh_root / "config.json")],
+                                          stdout=log, stderr=log)
+            fresh_control = Controller(fresh_root / "core.sock")
+            def fresh_ready():
+                try:
+                    return fresh_control.get("/proxies/Transit-Auto-Select").get("now") == MANUAL_GROUP
+                except (OSError, RuntimeError):
+                    return False
+            wait_for(fresh_ready, "cold manual core could not start without publisher or cache")
+            original_port, listener_port = listener_port, fresh_port
+            try:
+                def cold_routable():
+                    # API group visibility precedes completion of provider
+                    # initialization. Readiness means a real request passed.
+                    try:
+                        once()
+                        cold_attempts.append("ok")
+                        return True
+                    except (OSError, http.client.HTTPException) as exc:
+                        cold_attempts.append(type(exc).__name__)
+                        return False
+                wait_for(cold_routable, "cold manual path never became usable without publisher", timeout=10)
+            finally:
+                listener_port = original_port
+            assert set(fresh_control.get("/proxies/" + automatic)["all"]) == {"AR/Offline"}
+            checkpoint("cold_manual_start_without_publisher_or_cache")
         assert controller.get("/configs") == original_configs
         finish.set()
         for reader in readers:
@@ -276,7 +355,11 @@ def run(binary, expected_sha256=None):
         return {"binary_sha256": digest, "version": version, "fixture": str(root), "core_pid": core.pid,
                 "protocol": "anytls", "session_reuse": "default", "https_streams": 2,
                 "frames_preserved": {name: len(row) for name, row in frames.items()},
-                "connection_ids_preserved": sorted(originals), "forced_gc_cycles": 4,
+                "connection_ids_preserved": sorted(originals), "forced_gc_cycles": 8 if manual_rescue else 4,
+                "manual_rescue_without_publisher": manual_rescue,
+                "manual_cold_start_without_publisher_or_cache": manual_rescue,
+                "cold_start_readiness_attempts": cold_attempts,
+                "group_migration_with_fresh_provider_names": manual_rescue,
                 "stream_end_markers_received": sorted(end_received),
                 "publisher_startup_503_preserved_streams": True, "changed_provider_preserved_streams": True,
                 "pruned_adapter_gc_preserved_streams": True, "offline_rejected_new_request": True,
@@ -286,6 +369,13 @@ def run(binary, expected_sha256=None):
         finish.set()
         for client in clients:
             client.close()
+        if fresh_core is not None and fresh_core.poll() is None:
+            fresh_core.terminate()
+            try:
+                fresh_core.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                fresh_core.kill()
+                fresh_core.wait(timeout=2)
         if core is not None and core.poll() is None:
             core.terminate()
             try:
@@ -308,8 +398,9 @@ def main():
     parser.add_argument("--binary", required=True, type=Path)
     parser.add_argument("--expected-sha256")
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--manual-rescue", action="store_true")
     args = parser.parse_args()
-    result = run(args.binary, args.expected_sha256)
+    result = run(args.binary, args.expected_sha256, manual_rescue=args.manual_rescue)
     if args.output:
         atomic_json(args.output, result)
     print(json.dumps(result, sort_keys=True))

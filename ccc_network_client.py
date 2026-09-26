@@ -186,6 +186,8 @@ class NetworkClient:
                     value = bounded_json(Path(config["state_dir"]) / "status.json")
                     if value.get("version") != 1 or value.get("service_host") != config.get("service_host"):
                         raise ValueError("network status identity does not match")
+                    if config.get("group") and any(value.get(k) != config.get(k) for k in ("group", "outer_group")):
+                        raise ValueError("network status belongs to an obsolete selector configuration")
                 except (OSError, ValueError, KeyError, TypeError):
                     value = {"phase": "observer_fault", "at": now}
                 self.cache = now, path, value
@@ -238,7 +240,9 @@ class NetworkClient:
         if host != expected:
             return {"blocked": False, "phase": "unbound", "service_host": host}
         self.hint(snapshot, surface_id=str(target["surface_id"]), now=now)
-        return {"blocked": snapshot.get("mode") == "manage" and snapshot["phase"] == "network_wait",
+        effective = snapshot.get("effective_route")
+        return {"blocked": (snapshot.get("mode") == "manage" and snapshot["phase"] == "network_wait"
+                            and isinstance(effective, dict) and effective.get("managed") is True),
                 "phase": snapshot["phase"], "service_host": host}
 
 
@@ -249,7 +253,11 @@ def summary(snapshot):
     labels = {"healthy": "可用", "fallback": "东京兜底", "network_wait": "等待网络恢复",
               "suspect": "正在复核", "checking": "正在探测", "observe": "观察模式",
               "api_attention": "API 限流或配置异常", "observer_fault": "探测器异常",
+              "manual": "手动路由", "inactive": "当前配置未启用自动路由",
               "observer_stale": "探测器心跳过期", "unmanaged_selection": "策略组待接入", "stopped": "已停止"}
+    if phase in {"manual", "inactive"}:
+        selected = snapshot.get("effective_route", {}).get("selection") or "—"
+        return f"AnyRouter {labels[phase]} · {selected} · 自动候选 {snapshot.get('ready', 0)}/{len(snapshot.get('routes', []))}"
     return f"AnyRouter {labels.get(phase, '启动中')} · {snapshot.get('active_pool', '—')} · 可用 {snapshot.get('ready', 0)}/{len(snapshot.get('routes', []))} · 隔离 {snapshot.get('quarantined', 0)}"
 
 

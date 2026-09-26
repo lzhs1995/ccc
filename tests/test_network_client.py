@@ -32,6 +32,7 @@ class NetworkClientTests(unittest.TestCase):
 
     def status(self, phase="network_wait", at=None, mode="manage"):
         value = {"version": 1, "service_host": "anyrouter.test", "mode": mode,
+                 "effective_route": {"managed": True, "kind": "automatic"},
                  "phase": phase, "at": time.time() if at is None else at}
         (self.root / "status.json").write_text(json.dumps(value))
         self.client.cache = (0, "", {})
@@ -46,6 +47,22 @@ class NetworkClientTests(unittest.TestCase):
         verdict = self.client.verdict(self.options, self.target, other)
         self.assertFalse(verdict["blocked"])
         self.assertEqual(verdict["service_host"], "api.openai.com")
+
+    def test_automatic_pool_outage_requires_effective_route_proof(self):
+        for effective in (None, [], {}, {"managed": False, "kind": "manual"},
+                          {"managed": False, "kind": "inactive"}):
+            with self.subTest(effective=effective):
+                self.status()
+                path = self.root / "status.json"
+                value = json.loads(path.read_text())
+                value["effective_route"] = effective
+                path.write_text(json.dumps(value))
+                self.assertFalse(self.client.verdict(self.options, self.target, self.turn)["blocked"])
+
+    def test_selector_reconfiguration_invalidates_old_outage_status(self):
+        self.path.write_text(json.dumps({"state_dir": str(self.root), "service_host": "anyrouter.test",
+                                        "group": "New-Automatic", "outer_group": "User-Selector"}))
+        self.assertFalse(self.client.verdict(self.options, self.target, self.turn)["blocked"])
 
     def test_unknown_binding_does_not_pause_other_providers(self):
         with mock.patch("ccc_network_client.configured_host", return_value=""):

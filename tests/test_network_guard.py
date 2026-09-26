@@ -1,5 +1,6 @@
 import copy
 import concurrent.futures
+import errno
 import json
 from pathlib import Path
 import socket
@@ -70,6 +71,19 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(self.e.decision(1001), (self.ids[0], "healthy"))
         self.e.current, self.e.active_pool = self.ids[2], "Yeye"
         self.assertEqual(self.e.decision(1001), (self.ids[2], "healthy"))
+
+    def test_credential_metadata_does_not_revoke_routes_but_key_changes_do(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "auth.json"
+            path.write_text(json.dumps({"OPENAI_API_KEY": "fixture-key", "refreshed_at": 1}))
+            config = {"probe": {"auth_file": str(path), "url": "https://example.invalid/v1/responses", "model": "test"}}
+            digest = contract_digest(config)
+            legacy = contract_digest(config, legacy_credential=True)
+            path.write_text(json.dumps({"OPENAI_API_KEY": "fixture-key", "refreshed_at": 2}, indent=2))
+            self.assertEqual(contract_digest(config), digest)
+            self.assertNotEqual(contract_digest(config, legacy_credential=True), legacy)
+            path.write_text(json.dumps({"OPENAI_API_KEY": "changed-key", "refreshed_at": 2}))
+            self.assertNotEqual(contract_digest(config), digest)
 
     def test_single_timeout_rechecks_without_flapping(self):
         self.all_good()
@@ -246,7 +260,11 @@ class FakeController:
     def __init__(self, names, now):
         self.names, self.now, self.calls = names, now, []
     def get(self, path):
-        return {"now": self.now, "all": self.names}
+        if path == "/configs":
+            return {"mode": "rule"}
+        if path == "/rules":
+            return {"rules": [{"type": "Domain", "payload": "anyrouter.test", "proxy": "AnyRouter"}]}
+        return {"type": "Selector", "now": self.now, "all": self.names}
     def refresh(self, provider):
         self.calls.append(("refresh", provider))
     def select(self, group, name):
@@ -625,10 +643,11 @@ class GuardLoopTests(unittest.TestCase):
         save = self.guard.save
 
         def saved_then_down():
-            save()
+            result = save()
             if self.guard.engine.deep_starts:
                 self.link_reader.return_value = ()
                 self.link.sample()
+            return result
 
         self.guard.save = saved_then_down
         self.stepped_loop([1000, 1001])
@@ -658,6 +677,69 @@ class GuardLoopTests(unittest.TestCase):
         payload = network.plistlib.loads(Path(installed["plist"]).read_bytes())
         self.assertEqual(payload["ProcessType"], "Interactive")
         self.assertEqual(payload["ProgramArguments"][-2:], ["--config", str((self.root / "network.json").resolve())])
+
+
+    def test_disk_full_status_keeps_loop_and_cleanup_alive(self):
+        write = network.atomic_json.side_effect
+        attempts = []
+        def full(path, value):
+            if Path(path).name == "status.json":
+                attempts.append(value["phase"])
+                raise OSError(errno.ENOSPC, "fixture disk full")
+            return write(path, value)
+        self.patch("atomic_json", side_effect=full)
+        self.stepped_loop([1000, 1001, 1002])
+        self.assertEqual(len(attempts), 4)  # Three heartbeats and final cleanup.
+        self.assertEqual(attempts[-1], "stopped")
+        self.assertIn("ENOSPC", self.guard.storage_errors["status.json"])
+        self.core.close.assert_called_once()
+        self.publisher.close.assert_called_once()
+
+    def test_failed_health_write_cannot_dispatch_deep_or_publish_empty_pool(self):
+        engine = Engine(self.config, self.routes, now=1000)
+        engine.current = self.routes[0].id
+        engine.record(self.routes[0].id, ProbeResult("accessible"), 999)
+        self.save_engine(engine)
+        self.publisher.routes = [self.routes[0]]
+        write = network.atomic_json.side_effect
+        def full(path, value):
+            if Path(path).name == "health.json":
+                raise OSError(errno.ENOSPC, "fixture disk full")
+            return write(path, value)
+        self.patch("atomic_json", side_effect=full)
+        self.stepped_loop([1000, 1001, 1002])
+        self.assertFalse(any(call.args[1] for call in self.probe.run.call_args_list))
+        self.assertEqual(self.guard.engine.deep_starts, [1000])
+        self.assertEqual(self.controller.calls, [])
+        self.assertEqual(self.publisher.routes, [self.routes[0]])
+        self.assertEqual(self.guard.phase, "observer_fault")
+        self.assertTrue(self.snapshots[-1]["storage_errors"])
+
+    def test_storage_recovery_keeps_reserved_budget_and_requires_durable_dispatch(self):
+        engine = Engine(self.config, self.routes, now=1000)
+        engine.current = self.routes[0].id
+        engine.record(self.routes[0].id, ProbeResult("accessible"), 999)
+        self.save_engine(engine)
+        write = network.atomic_json.side_effect
+        paid = []
+        def setup(clock):
+            def disk(path, value):
+                if Path(path).name == "health.json" and clock[0] < 1002:
+                    raise OSError(errno.ENOSPC, "fixture disk full")
+                return write(path, value)
+            self.patch("atomic_json", side_effect=disk)
+            def probe(item, deep):
+                if deep:
+                    durable = json.loads((self.root / "health.json").read_text())
+                    self.assertIn(clock[0], durable["deep_starts"])
+                    paid.append(clock[0])
+                return ProbeResult("healthy" if deep else "accessible", deep=deep)
+            self.probe.run.side_effect = probe
+        self.stepped_loop([1000, 1001, 1002, 1030, 1031, 1032], setup=setup)
+        self.assertEqual(len(paid), 1)
+        self.assertGreaterEqual(paid[0] - 1000, 30)
+        self.assertEqual(self.guard.engine.deep_starts, [1000, paid[0]])
+        self.assertEqual(self.guard.storage_errors, {})
 
 
 class PublicationTests(unittest.TestCase):
