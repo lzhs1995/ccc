@@ -445,6 +445,11 @@ if [ -e "$DISABLED" ]; then
   log "SKIP disabled-by-user (DISABLED sentinel present) trigger=$TRIGGER"
   exit 0
 fi
+if [ -e "$JANITOR_DIR/GUARD_TRIPPED" ] || [ -e "$JANITOR_DIR/GUARD_UNAVAILABLE" ]; then
+  if [ "$PREVIEW_MODE" = "1" ]; then PREVIEW_REASON=guard_unavailable; print_preview; exit 0; fi
+  log "SKIP guard tripped or measurement unavailable"
+  exit 0
+fi
 
 if [ ! -d "$CM" ]; then
   if [ "$PREVIEW_MODE" = "1" ]; then PREVIEW_REASON=store_missing; print_preview; fi
@@ -904,7 +909,7 @@ dispose() {
 # ---------- GATE 3: mtime static + no open handle + no fresh content ----------
 while IFS= read -r line; do
   [ -n "$line" ] || continue
-  if [ -e "$DISABLED" ] || [ -e "$JANITOR_DIR/GUARD_TRIPPED" ]; then
+  if [ -e "$DISABLED" ] || [ -e "$JANITOR_DIR/GUARD_TRIPPED" ] || [ -e "$JANITOR_DIR/GUARD_UNAVAILABLE" ]; then
     log "STOP pause or guard trip during sweep"; break
   fi
   was="${line%%$(printf '\t')*}"

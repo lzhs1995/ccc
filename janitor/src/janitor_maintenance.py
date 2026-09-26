@@ -82,7 +82,7 @@ def config():
 
 
 def gate():
-    if any((JD / name).exists() for name in ("DISABLED", "GUARD_TRIPPED")):
+    if any((JD / name).exists() for name in ("DISABLED", "GUARD_TRIPPED", "GUARD_UNAVAILABLE")):
         raise Refused("janitor paused or guard tripped")
     for root in (CM, STAGING, Q):
         if root.is_symlink():

@@ -742,6 +742,20 @@ def session_generation(pid: int, started_at: str) -> str:
     return core._short_hash(f"{pid}:{started_at or 'unknown'}")
 
 
+def copy_session_id(candidate: Candidate | None) -> str:
+    """Copy the resolved full ID, never the rendered cell or surface UUID."""
+    if candidate is None:
+        raise RuntimeError("请先选中一条 session，工作区组头没有 session ID")
+    if not candidate.session.ok:
+        raise RuntimeError("当前 session ID 尚未确认，剪贴板未改动")
+    session_id = str(candidate.session.session_id)
+    result = subprocess.run(["/usr/bin/pbcopy"], input=session_id,
+                            capture_output=True, text=True, timeout=2, check=False)
+    if result.returncode != 0:
+        raise RuntimeError("系统剪贴板写入失败，请重试")
+    return session_id
+
+
 def _generation_is_unmeasured(generation: str, pid: int) -> bool:
     """True for the watcher's *unhashed* ``"<pid>:unknown"`` sentinel.
 
@@ -1992,7 +2006,10 @@ def group_identity(members: list[Candidate]) -> tuple[str, str]:
     """
     ref = ""
     title = ""
-    for item in members:
+    # A fresh tree row outranks a historical registration even if the latter
+    # happens to sort first. Workspace UUID remains the grouping key.
+    current_first = sorted(members, key=lambda item: not bool(item.record.get("workspace_title")))
+    for item in current_first:
         candidate_ref = str(item.record.get("workspace_ref") or "")
         if not ref and candidate_ref and candidate_ref != "?":
             ref = candidate_ref
@@ -2644,70 +2661,10 @@ class SupervisorModel:
                     # an unmeasured result rather than an empty string.
                     session=session_by_id.get(surface_id) or SessionResult(),
                 ))
-            live_ids = {row.surface_id for row in rows}
-            for target in self.config.get("targets", []):
-                surface_id = str(target.get("surface_id") or "")
-                if not surface_id or surface_id in live_ids:
-                    continue
-                runtime = self.runtime.get(surface_id, {}) if isinstance(self.runtime, Mapping) else {}
-                observed_error, observed_reason = runtime_observation(runtime)
-                rows.append(Candidate(
-                    record={
-                        "surface_id": surface_id,
-                        "workspace_id": str(target.get("workspace_id") or ""),
-                        # Persisted at registration time; a target registered
-                        # before that existed still shows "?" and cannot be
-                        # recovered, because its pane is already gone.
-                        "workspace_ref": str(target.get("workspace_ref") or "?"),
-                        "pane_ref": str(target.get("pane_ref") or ""),
-                        "ref": str(target.get("ref") or surface_id[:8]),
-                        "title": str(target.get("title_snapshot") or target.get("name") or "(not present)"),
-                    },
-                    source="explicit",
-                    state=str(runtime.get("state") or "missing"),
-                    error_type=observed_error,
-                    send_count=int(runtime.get("send_count") or 0),
-                    paused=bool(target.get("paused")),
-                    selected_hint=surface_id == self.suggested_surface,
-                    status_detail=str(runtime.get("paused_reason") or target.get("paused_reason") or observed_reason),
-                    # The surface is gone, so nothing is running in it.  Claiming
-                    # "Codex" here was a lie the 程序 column then printed.
-                    agent_kind="unknown",
-                    process_summary="目标已消失",
-                    **continuation_fields(target, runtime, float(self.config.get("poll_interval_sec", 1))),
-                    hook_health="offline",
-                    consecutive_resumes=int(runtime.get("claude_consecutive_resumes") or 0),
-                    repeat_warning=bool(runtime.get("claude_repeat_warning")),
-                    hook_live_sends=int(runtime.get("claude_hook_live_send_count") or 0),
-                    hook_sla_misses=int(runtime.get("claude_hook_sla_miss_count") or 0),
-                    context_status=str(runtime.get("claude_context_status") or "unknown"),
-                    context_percent=(
-                        int(runtime["claude_context_percent"])
-                        if isinstance(runtime.get("claude_context_percent"), (int, float))
-                        and not isinstance(runtime.get("claude_context_percent"), bool)
-                        else None
-                    ),
-                    compaction_percent=(
-                        int(runtime["claude_compaction_current_percent"])
-                        if isinstance(runtime.get("claude_compaction_current_percent"), (int, float))
-                        and not isinstance(runtime.get("claude_compaction_current_percent"), bool)
-                        else None
-                    ),
-                    # Exposure durations. A bare "缺失" label hid a pane that had
-                    # been unprotected for 14.5h, and a bare "看不清" hid one blind
-                    # for the whole 5.65h observation. The number is the point.
-                    unprotected_sec=_elapsed_since(runtime.get("claude_hook_unprotected_since")),
-                    unreadable_sec=_elapsed_since(runtime.get("claude_unreadable_since")),
-                    context_age_sec=_elapsed_since(runtime.get("claude_context_sampled_at")),
-                    deferred_reason=(
-                        str(runtime.get("claude_deferred_reason") or "")
-                        if runtime.get("claude_deferred_event") else ""
-                    ),
-                    deferred_sec=(
-                        _elapsed_since(runtime.get("claude_deferred_since"))
-                        if runtime.get("claude_deferred_event") else 0.0
-                    ),
-                ))
+            # This is the current cmux inventory, not a registration history.
+            # Refs are ephemeral: resurrecting config-only rows both invents
+            # paused terminals and can relabel a live UUID with a reused wsN.
+            # Keep stored authorizations/history intact; only live rows render.
             self.candidates = sorted(rows, key=lambda row: (
                 core._ref_number(str(row.record.get("workspace_ref") or "")),
                 core._ref_number(str(row.record.get("pane_ref") or "")),
@@ -3128,6 +3085,9 @@ def _absent_snapshot(reason: str) -> dict[str, Any]:
         "reason": reason,
         "paused": None,
         "guard_tripped": None,
+        "guard_unavailable": None,
+        "guard_reason": "",
+        "guard_violations": [],
         "janitor_mode": "absent",
         "janitor_age_sec": None,
         "guard_age_sec": None,
@@ -3201,6 +3161,11 @@ def _snapshot_from_status(document: Mapping[str, Any]) -> dict[str, Any]:
         "reason": "",
         "paused": control.get("paused") is True,
         "guard_tripped": control.get("guard_tripped") is True,
+        "guard_unavailable": control.get("guard_unavailable") is True,
+        "guard_reason": guard.get("reason") if isinstance(guard.get("reason"), str) else "",
+        "guard_violations": [str(item)[:512] for item in guard.get("violations", [])
+                             if isinstance(item, str)][:16]
+                            if isinstance(guard.get("violations"), list) else [],
         "janitor_mode": mode,
         # Three separate figures with three separate meanings; the panel labels
         # each one rather than presenting a single "reclaimable" total.
@@ -3732,6 +3697,11 @@ def junk_line(snapshot: Mapping[str, Any]) -> str:
 
     if snapshot.get("guard_tripped"):
         parts.append(f"清扫器 守卫跳闸 最后测量{_age_text(snapshot.get('janitor_age_sec'))}")
+        violations = snapshot.get("guard_violations") or []
+        if violations:
+            parts.append(str(violations[0]))
+    elif snapshot.get("guard_unavailable"):
+        parts.append("清扫器 等待守卫重新完成测量")
     elif snapshot.get("paused"):
         # A paused janitor's state file goes stale by design, so the age is
         # reported as information rather than as a fault.
@@ -3779,7 +3749,7 @@ def junk_is_alarming(snapshot: Mapping[str, Any]) -> bool:
     # janitor refuses means every scheduled run ends at validate_config.
     if snapshot.get("phase") == "error" or snapshot.get("error"):
         return True
-    if snapshot.get("guard_tripped"):
+    if snapshot.get("guard_tripped") or snapshot.get("guard_unavailable"):
         return True
     if snapshot.get("guard_health") != "healthy":
         return True
@@ -4081,7 +4051,7 @@ def view_row_attr(row: ViewRow) -> int:
     return row_attr(row.candidate) if row.candidate else 0
 
 
-GLOBAL_KEYS_1 = "↑↓ jk 移动   Tab 折/展   z 全折起   Z 全展开   [ ] 跳 workspace   / 查找   c 清除"
+GLOBAL_KEYS_1 = "↑↓ jk 移动  Tab 折/展  z/Z 全折/展  [ ] 跳 workspace  / 查找  c 清除  y 复制ID（也可点击ID）"
 GLOBAL_KEYS_2 = "P 整池停 W 整池恢复  f 筛选 R 刷新 G 存储 v 三件套 e 配置 A 开启发 S 停发 d 观察 q 退出"
 
 
@@ -4410,6 +4380,8 @@ def storage_page_lines(snapshot: Mapping[str, Any], action_message: str = "") ->
         state = "未加载到 launchd（不会再自动清扫；需 launchctl bootstrap 重新加载）"
     elif snapshot.get("guard_tripped"):
         state = "守卫跳闸（清扫已停；需人工 guard.sh --status 后 --rearm）"
+    elif snapshot.get("guard_unavailable"):
+        state = "守卫测量暂不可用（清扫暂停，完整复查通过后恢复）"
     elif snapshot.get("paused"):
         state = "已暂停（DISABLED 存在）"
     elif snapshot.get("phase") == "error":
@@ -4455,6 +4427,11 @@ def storage_page_lines(snapshot: Mapping[str, Any], action_message: str = "") ->
         "候选与隔离分开统计，从不相加: 前者还在实时目录里，后者已被处理掉。",
         "相加会让清扫器越勤快、数字越大。",
     ]
+    details = snapshot.get("guard_violations") or []
+    if not details and snapshot.get("guard_reason"):
+        details = [snapshot["guard_reason"]]
+    if details:
+        return_lines[4:4] = ["守卫原因: " + str(detail) for detail in details[:16]]
     if action_message:
         return_lines += ["", action_message]
     return return_lines
@@ -4836,7 +4813,15 @@ def _run(stdscr: Any, model: SupervisorModel) -> None:
                         clicked = window_start(index, len(rows), at["visible"]) + my - at["first_row"]
                         if 0 <= clicked < len(rows):
                             cursor_key = rows[clicked].key
-                        continue
+                            candidate = rows[clicked].candidate
+                            columns = row_layout(width - 1, collab_available=bool(model.collab.snapshot()))
+                            if (candidate is not None and columns.session
+                                    and columns.head_cells + 1 <= mx < columns.head_cells + 1 + SESSION_COL_WIDTH):
+                                index, key = clicked, ord("y")
+                            else:
+                                continue
+                        else:
+                            continue
             except curses.error:
                 continue
         status = next_status_after_key(key, status)
@@ -4875,6 +4860,16 @@ def _run(stdscr: Any, model: SupervisorModel) -> None:
         if key in (ord("c"), ord("C")):
             query = ""
             status = "已清除查找"
+            continue
+        if key in (ord("y"), ord("Y")):
+            candidate = rows[index].candidate if rows else None
+            if candidate is None or not candidate.session.ok:
+                status = "请选中已显示完整 session ID 的行；未测量或组头无法复制"
+            else:
+                status = model.start_action(
+                    lambda candidate=candidate: copy_session_id(candidate),
+                    f"已复制 session ID：{candidate.session.session_id}",
+                )
             continue
         if key in (curses.KEY_UP, ord("k")) and rows:
             cursor_key = rows[max(0, index - 1)].key

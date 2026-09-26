@@ -330,7 +330,7 @@ CLAUDE_CONTEXT_ABSOLUTE_TIMEOUT_SEC = 900.0
 # through TargetRuntime and suppresses duplicate Hook/fallback deliveries.
 # Human label only.  Acceptance always compares SHA-256 of the loaded source:
 # a revision string is hand-maintained and therefore can lie about what runs.
-FEATURE_REVISION = "0.2.20-native-coverage-and-serialized-batches"
+FEATURE_REVISION = "0.2.21-current-topology-and-guard-observation"
 # How long after our own send a byte-identical UserPromptSubmit can still be
 # our echo.  Must exceed claude_submit_confirm_timeout_sec so that a late
 # echo arriving after the transaction timed out is not read as a human.
@@ -539,6 +539,7 @@ class TargetRuntime:
     observation_started_at: float = 0.0
     observation_completed_at: float = 0.0
     observation_interval_ms: float = 0.0
+    observation_cadence_sec: float = 1.0
     scheduler_lag_ms: float = 0.0
     read_duration_ms: float = 0.0
     candidate_observed_at: float = 0.0
@@ -5491,7 +5492,18 @@ class WatchDaemon:
             top = {"snapshots": list({id(value): value for value in snapshots if value is not None}.values())}
         else:
             top = client.top_all()
+        inventory_complete = inventory_complete and not any(
+            item.get("enumeration_complete") is False for item in _walk_objects(top))
         labels = classify_surface_processes(top)
+        # A positive independent native identity defeats a delayed GUI scan;
+        # absence from this advisory index never proves a process has exited.
+        targets_by_id = {t["surface_id"]: t for t in targets}
+        for sid, hint in (self._native_process_index.snapshot() or {}).items():
+            pids = hint.get("agent_pids", [])
+            record = records.get(sid) or targets_by_id.get(sid, {})
+            if pids and hint.get("workspace_id") == record.get("workspace_id"):
+                labels[sid] = {**hint, "agent_pid": pids[0], "identity_verified_pids": list(pids),
+                               "process_snapshot_present": True}
         process_owners = {p["pid"]: (p.get("cmux_surface_id"), p.get("cmux_workspace_id"))
                           for p in _walk_objects(top) if p.get("kind") == "process"
                           and type(p.get("pid")) is int and p.get("cmux_surface_id")}
@@ -5564,7 +5576,8 @@ class WatchDaemon:
             sid = str(target["surface_id"])
             rows.append(observation_health.observation_row(
                 target, records.get(sid), labels.get(sid, {}), terminals.get(sid, {}), state.get(sid, {}),
-                owner_alive=owners.get(sid), now=now, stale_after=stale_after))
+                owner_alive=owners.get(sid), now=now, stale_after=stale_after,
+                inventory_complete=metadata.get("inventory_complete", False)))
             rows[-1]["observed_at"] = metadata_at
             if (not metadata_matches or not 0 <= now - metadata_at <= stale_after) and rows[-1]["status"] != "paused":
                 rows[-1].update(status="unknown", reason_code="diagnostic_snapshot_stale")
@@ -5580,7 +5593,8 @@ class WatchDaemon:
                         {k: t[k] for k in ("surface_id", "workspace_id", "enabled", "paused") if k in t}
                         for t in targets],
                     "continuation_health": observation_health.continuation_report(
-                        targets, state, now=now, poll_interval=float(config.get("poll_interval_sec", 1))),
+                        targets, state, now=now, poll_interval=float(config.get("poll_interval_sec", 1)),
+                        observations=rows),
                     "claude_hook_coverage": hooks, "hook_coverage_at": metadata_at,
                     "scheduler": {**self._scheduler.snapshot(), "thread_switch_interval_sec": sys.getswitchinterval()}
                     if self._scheduler else {}}
@@ -6240,6 +6254,9 @@ class WatchDaemon:
         if phase == "observe":
             runtime.scheduler_lag_ms = round(delay * 1000, 3)
             runtime.observation_started_at = time.time()
+            interval = float(self.config.get("poll_interval_sec", 1))
+            cadence = self._scheduler.observation_interval if self._scheduler else None
+            runtime.observation_cadence_sec = cadence(target, interval) if cadence else interval
         else:
             runtime.send_queue_ms = round(delay * 1000, 3)
 
@@ -10054,10 +10071,12 @@ def observation_status(config: Mapping[str, Any], state: Mapping[str, Any], snap
 def continuation_status(config: Mapping[str, Any], state: Mapping[str, Any], snapshot: Mapping[str, Any]) -> dict[str, Any]:
     # Recompute ages at read time so a stopped daemon cannot leave a green
     # health result indefinitely. Only a matching snapshot can add dynamic IDs.
-    dynamic = snapshot.get("monitored_targets", []) if snapshot.get("config_key") == monitoring_config_key(config) else []
+    matches = snapshot.get("config_key") == monitoring_config_key(config)
+    dynamic = snapshot.get("monitored_targets", []) if matches else []
     targets = effective_targets(config, dynamic if isinstance(dynamic, list) else [])
     result = observation_health.continuation_report(
-        targets, state, now=time.time(), poll_interval=float(config.get("poll_interval_sec", 1)))
+        targets, state, now=time.time(), poll_interval=float(config.get("poll_interval_sec", 1)),
+        observations=snapshot.get("rows", []) if matches and isinstance(snapshot.get("rows"), list) else [])
     if not targets and config.get("workspace_rules"):
         result["status"] = "unknown"
     return result

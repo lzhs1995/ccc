@@ -40,6 +40,7 @@ CONFIG_ENV = JANITOR_DIR / "config.env"
 BASELINE = JANITOR_DIR / "guard.baseline"
 DISABLED = JANITOR_DIR / "DISABLED"
 GUARD_TRIPPED = JANITOR_DIR / "GUARD_TRIPPED"
+GUARD_UNAVAILABLE = JANITOR_DIR / "GUARD_UNAVAILABLE"
 JANITOR_STATE = JANITOR_DIR / "janitor-state.json"
 GUARD_STATE = JANITOR_DIR / "guard-state.json"
 METRICS = JANITOR_DIR / "metrics.jsonl"
@@ -375,6 +376,17 @@ def build_status(now: float | None = None) -> dict[str, Any]:
 
     disabled = DISABLED.exists()
     tripped = GUARD_TRIPPED.exists()
+    violations = [v for v in (guard_raw.get("violations") or []) if isinstance(v, str)][:16]
+    if tripped and not violations:
+        # Each later guard check says only "already tripped". Preserve the
+        # original cause for diagnostics instead of reporting zero violations.
+        try:
+            with GUARD_TRIPPED.open(encoding="utf-8") as handle:
+                trip_text = handle.read(16384)
+            violations = [line.strip()[:512] for line in trip_text.splitlines()
+                          if re.match(r"^\s*R\d+\s", line)][:16]
+        except OSError:
+            pass
 
     quarantine_raw = janitor_raw.get("quarantine")
     quarantine_raw = quarantine_raw if isinstance(quarantine_raw, dict) else {}
@@ -400,6 +412,7 @@ def build_status(now: float | None = None) -> dict[str, Any]:
         "control": {
             "paused": disabled,
             "guard_tripped": tripped,
+            "guard_unavailable": GUARD_UNAVAILABLE.exists(),
             "config_mode": config_mode,
             "baseline_mode": base_mode,
             "baseline_schema": base_schema,
@@ -460,11 +473,12 @@ def build_status(now: float | None = None) -> dict[str, Any]:
             "present": bool(guard_raw),
             "invalid": guard_invalid,
             "health": guard_raw.get("health") if isinstance(guard_raw.get("health"), str) else None,
+            "reason": guard_raw.get("reason") if isinstance(guard_raw.get("reason"), str) else None,
             "observed_at": guard_raw.get("observed_at") if isinstance(guard_raw.get("observed_at"), str) else None,
             "age_sec": g_age,
             "stale": (g_age is None or g_age > GUARD_STALE_SEC),
             "baseline_schema": _finite_number(guard_raw.get("baseline_schema")),
-            "violations": [v for v in (guard_raw.get("violations") or []) if isinstance(v, str)][:16],
+            "violations": violations,
         },
     }
     return status
@@ -515,6 +529,8 @@ def cmd_resume(args: argparse.Namespace) -> int:
             "guard is tripped; investigate, then run: guard.sh --status "
             "and guard.sh --rearm"
         )
+    if control["guard_unavailable"] or guard["health"] != "healthy":
+        refusals.append("guard observation is not healthy; wait for a complete check")
     if guard["invalid"]:
         refusals.append("guard state is not valid JSON")
     elif not guard["present"]:
@@ -564,6 +580,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         refusals.append("janitor is paused (DISABLED); resume first")
     if control["guard_tripped"]:
         refusals.append("guard is tripped; investigate before sweeping")
+    if control["guard_unavailable"]:
+        refusals.append("guard measurement unavailable; wait for a complete check")
     if refusals:
         print(json.dumps({"ok": False, "refused": refusals}, ensure_ascii=False, indent=2))
         return 1
@@ -588,7 +606,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 def cmd_maintenance(args: argparse.Namespace) -> int:
     status = build_status()
-    if (status["control"]["paused"] or status["control"]["guard_tripped"]
+    if (status["control"]["paused"] or status["control"]["guard_tripped"] or status["control"]["guard_unavailable"]
             or not status["control"]["mode_matches_baseline"]
             or status["guard"]["stale"] or status["guard"]["health"] != "healthy"):
         raise FailClosed("maintenance requires an active janitor and a current healthy guard")

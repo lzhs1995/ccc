@@ -87,6 +87,12 @@ fails closed when its live store or quarantine setting is not trustworthy.
 `ccp_new.py` is a foreground editor by design, so credentials are never written
 by a background LaunchAgent.
 
+A janitor measurement failure sets `GUARD_UNAVAILABLE` and holds cleanup until
+a complete check succeeds. It does not invent a permanent configuration
+violation or clear an operator pause. Real `GUARD_TRIPPED` incidents retain
+their original cause and still require the existing `guard.sh --rearm` and
+`cmux-janitorctl resume` checks after investigation.
+
 ## Supervisor view contract
 
 The supervisor is a read-only projection of cmux-owned state. Its table keeps
@@ -98,6 +104,11 @@ state vocabulary (`空闲`, `运行中`, `菜单`, `待续跑`, `已排队`, `�
 `额度耗尽`, `正在输入`, `看不清`, `非Codex`, `Claude关`, `Hook等待`, `输入保护`,
 `发送中`, `已完成`, `已续跑`, `Hook待验`, `Hook缺失`, `Hook旧版`, `身份冲突`,
 or `需人工`).
+
+The table shows current surfaces by workspace UUID. Closed registrations stay
+in history without reappearing as paused rows; a reused `workspace:N` does not
+identify the old workspace. Press `y`/`Y` on a session row, or click its session
+cell, to copy the full verified native session ID. `c` still clears search.
 
 `R` 只是重扫，不会登记任何东西。New
 workspaces remain `未登记` until the operator explicitly chooses `a` (one

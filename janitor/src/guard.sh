@@ -45,6 +45,7 @@ BASE="$JD/guard.baseline"
 GLOG="$JD/guard.log"
 TRIPPED="$JD/GUARD_TRIPPED"
 DISABLED="$JD/DISABLED"
+UNAVAILABLE="$JD/GUARD_UNAVAILABLE"
 STATE="$JD/guard-state.json"
 LOG_MAX=262144
 
@@ -113,31 +114,68 @@ q_fingerprint() {
     printf 'absent'
     return 0
   fi
-  local line
+  local line inode mtime
   line=$("$FIND" "$Q" -mindepth 1 -maxdepth 1 -type d 2>/dev/null \
     | "$SORT" \
     | while IFS= read -r d; do
         [ -n "$d" ] || continue
+        inode=$("$STAT" -f%i "$d") || exit 3
+        mtime=$("$STAT" -f%m "$d") || exit 3
         printf '%s|%s|%s\n' \
-          "$("$BASENAME" "$d")" \
-          "$("$STAT" -f%i "$d" 2>/dev/null || echo x)" \
-          "$("$STAT" -f%m "$d" 2>/dev/null || echo x)"
+          "${d##*/}" \
+          "$inode" "$mtime" || exit 3
       done \
-    | "$SHASUM" -a 256 2>/dev/null | { read -r h _; printf '%s' "$h"; })
-  printf '%s' "${line:-error}"
+    | "$SHASUM" -a 256 2>/dev/null | { read -r h _; printf '%s' "$h"; }) || return 3
+  [ -n "$line" ] || return 3
+  printf '%s' "$line"
+}
+
+stat_or_missing() {
+  if [ ! -e "$2" ]; then printf MISSING; return 0; fi
+  "$STAT" "-f$1" "$2"
+}
+
+read_config() {
+  # Read one file using shell builtins. A failed grep/tail/cut fork used to
+  # become an empty value and a permanent R9 violation on a valid config.
+  local line before after modes=0 quarantines=0
+  [ -f "$JD/config.env" ] && [ -r "$JD/config.env" ] || return 3
+  before=$("$STAT" -f '%i:%z:%m' "$JD/config.env") || return 3
+  NOW_MODE=""; NOW_USE_QUARANTINE=""
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    case "$line" in
+      MODE=*) NOW_MODE="${line#MODE=}"; modes=$((modes + 1)) ;;
+      USE_QUARANTINE=*) NOW_USE_QUARANTINE="${line#USE_QUARANTINE=}"; quarantines=$((quarantines + 1)) ;;
+    esac
+  done < "$JD/config.env" || return 3
+  after=$("$STAT" -f '%i:%z:%m' "$JD/config.env") || return 3
+  [ "$before" = "$after" ] || return 3
+  [ "$modes" -le 1 ] || NOW_MODE=duplicate
+  [ "$quarantines" -le 1 ] || NOW_USE_QUARANTINE=duplicate
 }
 
 read_now() {
-  NOW_LOCK_SIZE=$($STAT -f%z "$LOCK" 2>/dev/null || echo MISSING)
-  NOW_LOCK_MTIME=$($STAT -f%m "$LOCK" 2>/dev/null || echo MISSING)
-  NOW_LIVE_SIZE=$($STAT -f%z "$LIVE" 2>/dev/null || echo MISSING)
-  NOW_PUB_COUNT=$($FIND "$PUB" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | $WC -l | $TR -d ' ')
-  NOW_CFG_COUNT=$($LS -A "$CMUX_CFG" 2>/dev/null | $WC -l | $TR -d ' ')
-  NOW_HOOKS_COUNT=$($LS -A "$CMUX_HOOKS" 2>/dev/null | $WC -l | $TR -d ' ')
-  NOW_MODE=$($GREP -E '^MODE=' "$JD/config.env" 2>/dev/null | /usr/bin/tail -1 | /usr/bin/cut -d= -f2)
-  NOW_USE_QUARANTINE=$($GREP -E '^USE_QUARANTINE=' "$JD/config.env" 2>/dev/null | /usr/bin/tail -1 | /usr/bin/cut -d= -f2)
+  local rc count
+  NOW_LOCK_SIZE=$(stat_or_missing z "$LOCK") || return 3
+  NOW_LOCK_MTIME=$(stat_or_missing m "$LOCK") || return 3
+  NOW_LIVE_SIZE=$(stat_or_missing z "$LIVE") || return 3
+  NOW_PUB_COUNT=$($FIND "$PUB" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | $WC -l | $TR -d ' ') || return 3
+  NOW_CFG_COUNT=$($LS -A "$CMUX_CFG" 2>/dev/null | $WC -l | $TR -d ' ') || return 3
+  NOW_HOOKS_COUNT=$($LS -A "$CMUX_HOOKS" 2>/dev/null | $WC -l | $TR -d ' ') || return 3
+  for count in "$NOW_PUB_COUNT" "$NOW_CFG_COUNT" "$NOW_HOOKS_COUNT"; do
+    case "$count" in ''|*[!0-9]*) return 3 ;; esac
+  done
+  read_config || return 3
   NOW_Q_EXISTS=$([ -d "$Q" ] && echo yes || echo no)
-  NOW_Q_FINGERPRINT=$(q_fingerprint)
+  NOW_Q_FINGERPRINT=$(q_fingerprint) || return 3
+  NOW_OUTSIDE_COUNT=0
+  if [ -f "$JD/janitor.log" ]; then
+    NOW_OUTSIDE_COUNT=$($GREP -c 'SKIP-OUTSIDE\|SKIP-PROTECTED-NAME' "$JD/janitor.log" 2>/dev/null)
+    rc=$?
+    [ "$rc" -le 1 ] || return 3
+  fi
+  case "$NOW_OUTSIDE_COUNT" in ''|*[!0-9]*) return 3 ;; esac
 }
 
 write_baseline() {
@@ -147,58 +185,96 @@ write_baseline() {
   # This is a whole-table rewrite, so BASE_MODE is re-taken from the current
   # config every time. That is exactly why plain --rearm refuses a MODE drift:
   # rebaselining a drifted MODE would silently bless it and retire R6.
+  local tmp stamp
+  stamp=$(ts) || return 3
+  tmp=$("$MKTEMP" "$JD/.guard-baseline.XXXXXX") || return 3
   {
-    printf '# cmux-janitor guard baseline — written %s\n' "$(ts)"
-    printf 'BASE_SCHEMA=%s\n'        "$SCHEMA_VERSION"
-    printf 'BASE_LOCK_SIZE=%s\n'     "$NOW_LOCK_SIZE"
-    printf 'BASE_LOCK_MTIME=%s\n'    "$NOW_LOCK_MTIME"
-    printf 'BASE_PUB_COUNT=%s\n'     "$NOW_PUB_COUNT"
-    printf 'BASE_CFG_COUNT=%s\n'     "$NOW_CFG_COUNT"
-    printf 'BASE_HOOKS_COUNT=%s\n'   "$NOW_HOOKS_COUNT"
-    printf 'BASE_MODE=%s\n'          "$NOW_MODE"
-    printf 'BASE_USE_QUARANTINE=%s\n' "$NOW_USE_QUARANTINE"
+    printf '# cmux-janitor guard baseline — written %s\n' "$stamp" &&
+    printf 'BASE_SCHEMA=%s\n'        "$SCHEMA_VERSION" &&
+    printf 'BASE_LOCK_SIZE=%s\n'     "$NOW_LOCK_SIZE" &&
+    printf 'BASE_LOCK_MTIME=%s\n'    "$NOW_LOCK_MTIME" &&
+    printf 'BASE_PUB_COUNT=%s\n'     "$NOW_PUB_COUNT" &&
+    printf 'BASE_CFG_COUNT=%s\n'     "$NOW_CFG_COUNT" &&
+    printf 'BASE_HOOKS_COUNT=%s\n'   "$NOW_HOOKS_COUNT" &&
+    printf 'BASE_MODE=%s\n'          "$NOW_MODE" &&
+    printf 'BASE_USE_QUARANTINE=%s\n' "$NOW_USE_QUARANTINE" &&
     printf 'BASE_Q_FINGERPRINT=%s\n' "$NOW_Q_FINGERPRINT"
-  } > "$BASE"
+  } > "$tmp" || { "$RM" -f "$tmp"; return 3; }
+  "$MV" -f "$tmp" "$BASE" || { "$RM" -f "$tmp"; return 3; }
 }
 
 # ---------- state publication (atomic; consumed only via cmux-janitorctl) ----------
 # Bounded by construction: no paths, no batch names, no unbounded arrays.
 publish_state() {
-  local health="$1" reason="$2" tmp
-  tmp=$("$MKTEMP" "$JD/.guard-state.XXXXXX") || return 0
+  local health="$1" reason="$2" tmp observed baseline_at=unknown
+  local mode_matches=false q_matches=false disabled=false tripped=false
+  observed=$(iso) || return 3
+  if [ -f "$BASE" ] && ! baseline_at=$("$STAT" -f '%Sm' -t '%FT%TZ' "$BASE"); then
+    [ "$health" != healthy ] || return 3
+    baseline_at=unknown
+  fi
+  [ "${NOW_MODE:-x}" = "${BASE_MODE:-y}" ] && mode_matches=true
+  [ "${NOW_Q_FINGERPRINT:-x}" = "${BASE_Q_FINGERPRINT:-y}" ] && q_matches=true
+  [ -e "$DISABLED" ] && disabled=true
+  [ -e "$TRIPPED" ] && tripped=true
+  tmp=$("$MKTEMP" "$JD/.guard-state.XXXXXX") || return 3
   {
-    printf '{\n'
-    printf '  "schema_version": 1,\n'
-    printf '  "observed_at": "%s",\n' "$(iso)"
-    printf '  "health": "%s",\n' "$health"
-    printf '  "baseline_schema": %s,\n' "${BASE_SCHEMA:-0}"
-    printf '  "baseline_written_at": "%s",\n' "$(${STAT} -f '%Sm' -t '%FT%TZ' "$BASE" 2>/dev/null || echo unknown)"
-    printf '  "mode": "%s",\n' "${NOW_MODE:-unknown}"
-    printf '  "baseline_mode": "%s",\n' "${BASE_MODE:-unknown}"
-    printf '  "mode_matches_baseline": %s,\n' \
-      "$([ "${NOW_MODE:-x}" = "${BASE_MODE:-y}" ] && echo true || echo false)"
-    printf '  "disabled": %s,\n' "$([ -e "$DISABLED" ] && echo true || echo false)"
-    printf '  "guard_tripped": %s,\n' "$([ -e "$TRIPPED" ] && echo true || echo false)"
-    printf '  "quarantine_fingerprint_matches": %s,\n' \
-      "$([ "${NOW_Q_FINGERPRINT:-x}" = "${BASE_Q_FINGERPRINT:-y}" ] && echo true || echo false)"
-    printf '  "reason": "%s"\n' "$reason"
+    printf '{\n' &&
+    printf '  "schema_version": 1,\n' &&
+    printf '  "observed_at": "%s",\n' "$observed" &&
+    printf '  "health": "%s",\n' "$health" &&
+    printf '  "baseline_schema": %s,\n' "${BASE_SCHEMA:-0}" &&
+    printf '  "baseline_written_at": "%s",\n' "$baseline_at" &&
+    printf '  "mode": "%s",\n' "${NOW_MODE:-unknown}" &&
+    printf '  "baseline_mode": "%s",\n' "${BASE_MODE:-unknown}" &&
+    printf '  "mode_matches_baseline": %s,\n' "$mode_matches" &&
+    printf '  "disabled": %s,\n' "$disabled" &&
+    printf '  "guard_tripped": %s,\n' "$tripped" &&
+    printf '  "quarantine_fingerprint_matches": %s,\n' "$q_matches" &&
+    printf '  "reason": "%s"\n' "$reason" &&
     printf '}\n'
-  } > "$tmp" 2>/dev/null
-  "$MV" -f "$tmp" "$STATE" 2>/dev/null || "$RM" -f "$tmp" 2>/dev/null
+  } > "$tmp" 2>/dev/null || { "$RM" -f "$tmp"; return 3; }
+  "$MV" -f "$tmp" "$STATE" 2>/dev/null || { "$RM" -f "$tmp"; return 3; }
 }
 
-read_now
+hold_unavailable() {
+  printf 'guard measurement or publication unavailable\n' > "$UNAVAILABLE"
+}
+
+publish_healthy() {
+  publish_state healthy "$1" || { hold_unavailable; return 3; }
+  "$RM" -f "$UNAVAILABLE" || return 3
+}
+
+if ! read_now; then
+  printf 'guard.sh: measurement unavailable; no baseline or violation inferred\n' >&2
+  if [ "$ACTION" != "status" ]; then
+    # Separate from the user's pause and from a proved violation. A complete
+    # successful check may clear only this temporary observation gate.
+    hold_unavailable
+    publish_state observation_error "guard measurement unavailable; retry on next check"
+  fi
+  exit 3
+fi
 
 # ---------- first run: establish baseline ----------
 if [ ! -f "$BASE" ]; then
-  write_baseline
+  if [ "$ACTION" = "status" ]; then
+    printf 'guard.sh: baseline missing; status is read-only\n' >&2
+    exit 3
+  fi
+  case "$NOW_MODE:$NOW_USE_QUARANTINE" in
+    dry:1|apply:1) ;;
+    *) hold_unavailable; printf 'guard.sh: cannot baseline invalid safety configuration\n' >&2; exit 3 ;;
+  esac
+  write_baseline || { hold_unavailable; exit 3; }
   rotate
   glog "BASELINE established schema=$SCHEMA_VERSION lock_mtime=$NOW_LOCK_MTIME pub=$NOW_PUB_COUNT cfg=$NOW_CFG_COUNT hooks=$NOW_HOOKS_COUNT mode=$NOW_MODE"
   BASE_SCHEMA=$SCHEMA_VERSION
   BASE_MODE=$NOW_MODE
   BASE_USE_QUARANTINE=$NOW_USE_QUARANTINE
   BASE_Q_FINGERPRINT=$NOW_Q_FINGERPRINT
-  publish_state healthy "baseline established"
+  publish_healthy "baseline established" || exit 3
   exit 0
 fi
 
@@ -246,6 +322,8 @@ if [ "$ACTION" = "rearm" ]; then
   USE_QUARANTINE is ${NOW_USE_QUARANTINE:-<missing>} in config.env; the only rearm-able value is 1"
 
   # MODE authorization (R2-3).
+  case "$NOW_MODE" in dry|apply) ;; *) REARM_FAIL="$REARM_FAIL
+  MODE is missing or invalid in config.env" ;; esac
   if [ -n "$ACCEPT_MODE" ]; then
     # Deliberate MODE change: only with the janitor already paused, and the
     # declared value must match what config.env actually says right now.
@@ -264,12 +342,13 @@ if [ "$ACTION" = "rearm" ]; then
     exit 1
   fi
 
-  /bin/rm -f "$TRIPPED"
-  write_baseline
+  write_baseline || { hold_unavailable; exit 3; }
   . "$BASE"
   rotate
   glog "REARMED by user schema=$SCHEMA_VERSION lock_mtime=$NOW_LOCK_MTIME pub=$NOW_PUB_COUNT mode=$NOW_MODE accept_mode=${ACCEPT_MODE:-none} qfp=${NOW_Q_FINGERPRINT:0:12}"
-  publish_state healthy "rearmed by user"
+  hold_unavailable || exit 3
+  "$RM" -f "$TRIPPED" || exit 3
+  publish_healthy "rearmed by user" || exit 3
   printf '\n  守卫已重置并重新取基线 (schema=%s)。\n' "$SCHEMA_VERSION"
   printf '  MODE=%s  隔离区指纹=%s\n' "$NOW_MODE" "${NOW_Q_FINGERPRINT:0:12}"
   printf '  注意: janitor 的 DISABLED 哨兵未自动清除。\n'
@@ -357,7 +436,7 @@ fi
   && add "R5 ~/.cmux/hooks 项数减少: $BASE_HOOKS_COUNT -> $NOW_HOOKS_COUNT"
 
 # R6 MODE must not change without the user doing it
-[ -n "$NOW_MODE" ] && [ "$NOW_MODE" != "$BASE_MODE" ] \
+[ "$NOW_MODE" != "$BASE_MODE" ] \
   && add "R6 MODE 未经预期地变了: $BASE_MODE -> $NOW_MODE (合法变更: 先暂停再 guard.sh --rearm --accept-mode $NOW_MODE)"
 
 # R9 safety configuration must not drift: USE_QUARANTINE is the reversibility
@@ -378,7 +457,7 @@ fi
 
 # R8 the janitor must never report an outside-scope or protected-name hit
 if [ -f "$JD/janitor.log" ]; then
-  n=$($GREP -c 'SKIP-OUTSIDE\|SKIP-PROTECTED-NAME' "$JD/janitor.log" 2>/dev/null || echo 0)
+  n=$NOW_OUTSIDE_COUNT
   [ "$n" -gt 0 ] 2>/dev/null && add "R8 janitor 日志出现越界/受保护命中 ($n 次)"
 fi
 
@@ -403,5 +482,5 @@ if [ -n "$VIOLATIONS" ]; then
 fi
 
 # healthy: silent except for the machine-readable state file.
-publish_state healthy ""
+publish_healthy "" || exit 3
 exit 0
