@@ -330,7 +330,7 @@ CLAUDE_CONTEXT_ABSOLUTE_TIMEOUT_SEC = 900.0
 # through TargetRuntime and suppresses duplicate Hook/fallback deliveries.
 # Human label only.  Acceptance always compares SHA-256 of the loaded source:
 # a revision string is hand-maintained and therefore can lie about what runs.
-FEATURE_REVISION = "0.2.21-current-topology-and-guard-observation"
+FEATURE_REVISION = "0.2.22-private-batch-startup"
 # How long after our own send a byte-identical UserPromptSubmit can still be
 # our echo.  Must exceed claude_submit_confirm_timeout_sec so that a late
 # echo arriving after the transaction timed out is not read as a human.
@@ -3923,6 +3923,23 @@ class CmuxClient:
                 return
             time.sleep(.025)
         raise CmuxError("native goal resume draft was not confirmed; Enter withheld")
+
+    def draft_batch_session_name(self, workspace_id: str, surface_id: str, job_id: str, index: int) -> None:
+        """Draft a fixed local name; the B worker separately proves and submits it."""
+        try:
+            if not workspace_id or not surface_id or str(uuid.UUID(job_id)) != job_id:
+                raise ValueError("invalid batch naming identity")
+            uuid.UUID(workspace_id)
+            uuid.UUID(surface_id)
+            if type(index) is not int or not 0 <= index < 50:
+                raise ValueError("invalid batch naming index")
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise CmuxError("batch naming requires exact UUIDs and a valid slot") from exc
+        command = f"/rename B-check-{job_id[:8]}-{index + 1:02d}"
+        if self._control_rpc("surface.send_text", {
+            "workspace_id": workspace_id, "surface_id": surface_id, "text": command,
+        }) is None:
+            self._run(["send", "--workspace", workspace_id, "--surface", surface_id, command], timeout=8)
 
     def send_key(self, workspace_id: str, surface_id: str, key: str) -> None:
         """Send a named key to an explicitly addressed surface, never focused UI."""

@@ -1514,10 +1514,17 @@ def launch(config_path, *, job_id=None, index=None, resume_session=None, config_
         if arg.startswith("mcp_servers.cmux-cua.env.CMUX_CUA_STATE_OWNER_PID="):
             args[n] = 'mcp_servers.cmux-cua.env.CMUX_CUA_STATE_OWNER_PID=' + json.dumps(str(os.getpid()))
     if job_id:
-        from ccc_workspace_batch import job_path, sqlite_home
+        from ccc_workspace_batch import (job_path, sqlite_home, prepare_working_directory,
+                                         workspace_launch_context)
         job = read_json(job_path(config_path, job_id))
         if uid(job.get("workspace_id")) != wid or job["slots"][index].get("surface_id", sid).upper() != sid:
             raise RuntimeError("batch launch identity mismatch")
+        prepare_working_directory(config_path, job, index)
+        directory, context = workspace_launch_context(config_path, job, index)
+        if directory:
+            os.chdir(directory)
+            environment["PWD"] = str(directory)
+            args += context
         args += ["-c", "sqlite_home=" + json.dumps(str(sqlite_home(config_path, job_id, index).resolve()))]
     ensure_service(config_path)
     response = request(config_path, "register", timeout=10, workspace_id=wid, surface_id=sid,
