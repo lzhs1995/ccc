@@ -7,6 +7,7 @@ recover a lost create reply; only the original transcript confirms a start.
 from __future__ import annotations
 
 import argparse
+import ast
 import base64
 import contextlib
 import json
@@ -1120,10 +1121,12 @@ class BatchWorker:
         return self.job["status"] not in {"complete", "needs_attention", "cancelled", "workspace_closed"}
 
     def run(self):
+        from ccc_guard_scope import birth
         try:
             with core.FileLock(self.path.parent / "worker.lock", timeout_sec=0):
                 self.job = core.load_json(self.path, {})
-                self.job.update(status="running", worker_pid=os.getpid(), worker_version=WORKER_VERSION)
+                self.job.update(status="running", worker_pid=os.getpid(),
+                                worker_birth=birth(os.getpid()), worker_version=WORKER_VERSION)
                 for slot in self.job["slots"]:
                     # v0.2.12 marked slow starts blocked at 25 s. Explicit
                     # operator-task/authorization vetoes remain blocked.
@@ -1218,7 +1221,7 @@ class BatchReconciler:
                 if "lock" in str(exc).lower() and self.launch:
                     job = core.load_json(path, {})
                     if job and allowed(self.store.load(), job):
-                        retire_old_worker(job)
+                        retire_old_worker(job, config_path=self.path)
                 else:
                     logging.getLogger(core.APP_NAME).warning("batch=%s reconciliation: %s", jid, exc)
 
@@ -1231,27 +1234,46 @@ class BatchReconciler:
             self.stop.wait(2)
 
 
-def retire_old_worker(job):
+def retire_old_worker(job, *, config_path=None):
     """An old panel cannot keep a pre-upgrade helper alive indefinitely.
 
     Only the exact batch helper is retired. Native Codex processes and
-    independently owned acceptance controllers are never signalled.
+    independently owned acceptance controllers are never signalled. A newly
+    launched helper may hold the lock before it publishes its claim: its
+    actual source version, not the stale job version, vetoes retirement.
     """
     pid = job.get("worker_pid")
     if job.get("worker_version", 0) >= WORKER_VERSION or type(pid) is not int or pid <= 1:
         return False
     try:
-        result = subprocess.run(["/bin/ps", "-p", str(pid), "-o", "command="],
-                                capture_output=True, text=True, timeout=1)
-        args = shlex.split(result.stdout.strip())
-        index = next((i for i, arg in enumerate(args) if Path(arg).name == "ccc_workspace_batch.py"), -1)
-        if index < 0 or args[index + 1:index + 2] != ["run"] or "--job" not in args:
+        from ccc_guard_scope import birth, arguments
+        generation = birth(pid)
+        if generation is None or (job.get("worker_birth") is not None and job["worker_birth"] != generation):
             return False
-        if args[args.index("--job") + 1] != job["id"]:
+        args, _ = arguments(pid)
+        if not args or not re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", Path(args[0]).name, re.IGNORECASE):
+            return False
+        index = 2 if args[1:2] == ["-B"] else 1
+        tail = args[index + 1:]
+        if len(tail) != 5 or tail[0:2] != ["run", "--config"] or tail[3:] != ["--job", job["id"]]:
+            return False
+        expected_config = config_path or job.get("config_path")
+        if not expected_config or Path(tail[2]).resolve() != Path(expected_config).resolve():
+            return False
+        script = Path(args[index])
+        if not script.is_absolute() or script.name != "ccc_workspace_batch.py":
+            return False
+        source = script.read_bytes()
+        versions = [node.value for node in ast.parse(source).body if isinstance(node, ast.Assign)
+                    and any(isinstance(t, ast.Name) and t.id == "WORKER_VERSION" for t in node.targets)]
+        if (len(versions) != 1 or not isinstance(versions[0], ast.Constant)
+                or type(versions[0].value) is not int or not 0 < versions[0].value < WORKER_VERSION):
+            return False
+        if script.read_bytes() != source or arguments(pid)[0] != args or birth(pid) != generation:
             return False
         os.kill(pid, signal.SIGTERM)
         return True
-    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+    except (OSError, ValueError, IndexError, RuntimeError, SyntaxError):
         return False
 
 

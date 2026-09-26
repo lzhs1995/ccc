@@ -363,16 +363,50 @@ class DirectBatchProcessTests(unittest.TestCase):
                 self.assertIsNone(self.label(**{case: True}))
 
     def test_upgrade_retires_only_matching_older_batch_helper(self):
-        job = {'id': str(uuid.uuid4()), 'worker_version': batch.WORKER_VERSION-1, 'worker_pid': 12345}
-        good = '/usr/bin/python3 /release/ccc_workspace_batch.py run --config /config.json --job ' + job['id']
-        for command, expected in [(good, True), ('/Applications/codex', False),
-                                  (good.replace(job['id'], str(uuid.uuid4())), False),
-                                  ('/usr/bin/python3 /acceptance/live_batch.py', False)]:
-            with self.subTest(command=command), \
-                    patch.object(batch.subprocess, 'run', return_value=SimpleNamespace(stdout=command)), \
+        self.assertEqual(self.retirement_attempt(), (True, 1))
+        self.assertEqual(self.retirement_attempt(foreign_job=True), (False, 0))
+
+    def retirement_attempt(self, *, version=None, source=None, worker_birth=None,
+                           generations=None, foreign_job=False, foreign_config=False, native_argv=False):
+        with tempfile.TemporaryDirectory() as temp:
+            script = Path(temp) / 'ccc_workspace_batch.py'
+            version = batch.WORKER_VERSION - 1 if version is None else version
+            script.write_text(source if source is not None else f'WORKER_VERSION = {version}\n')
+            config = Path(temp) / 'config.json'
+            job = {'id': str(uuid.uuid4()), 'worker_version': batch.WORKER_VERSION - 1,
+                   'worker_pid': 12345, 'config_path': str(config)}
+            if worker_birth is not None:
+                job['worker_birth'] = worker_birth
+            argv = ['/Applications/codex' if native_argv else '/usr/bin/python3', '-B', str(script), 'run',
+                    '--config', str(config.with_name('foreign.json') if foreign_config else config),
+                    '--job', str(uuid.uuid4()) if foreign_job else job['id']]
+            with patch.object(batch.subprocess, 'run', return_value=SimpleNamespace(stdout=shlex.join(argv))), \
+                    patch('ccc_guard_scope.arguments', return_value=(argv, {})), \
+                    patch('ccc_guard_scope.birth', side_effect=generations or [[10, 20], [10, 20]]), \
                     patch.object(batch.os, 'kill') as kill:
-                self.assertEqual(batch.retire_old_worker(job), expected)
-                self.assertEqual(kill.call_count, int(expected))
+                result = batch.retire_old_worker(job)
+                return result, kill.call_count
+
+    def test_unclaimed_current_or_newer_helper_is_not_an_old_worker(self):
+        # The new helper has the lock, while the job still names the previous
+        # version/PID. Its actual executable source must veto retirement.
+        for version in (batch.WORKER_VERSION, batch.WORKER_VERSION + 1):
+            with self.subTest(version=version):
+                self.assertEqual(self.retirement_attempt(version=version), (False, 0))
+
+    def test_reused_worker_birth_or_generation_change_vetoes_retirement(self):
+        self.assertEqual(self.retirement_attempt(worker_birth=[9, 9]), (False, 0))
+        self.assertEqual(self.retirement_attempt(generations=[[10, 20], [10, 21]]), (False, 0))
+
+    def test_same_job_in_another_config_or_native_argv_is_never_signalled(self):
+        self.assertEqual(self.retirement_attempt(foreign_config=True), (False, 0))
+        self.assertEqual(self.retirement_attempt(native_argv=True), (False, 0))
+
+    def test_unproved_source_version_cannot_authorize_retirement(self):
+        for source in ('', 'WORKER_VERSION = unavailable\n', 'WORKER_VERSION = True\n',
+                       'WORKER_VERSION = 1\nWORKER_VERSION = 2\n'):
+            with self.subTest(source=source):
+                self.assertEqual(self.retirement_attempt(source=source), (False, 0))
 
 
 class NativeMetadataSeedTests(unittest.TestCase):
