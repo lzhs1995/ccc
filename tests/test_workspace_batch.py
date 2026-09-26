@@ -98,6 +98,9 @@ class BatchFixture:
 
 class WorkspaceBatchTests(unittest.TestCase):
     def setUp(self):
+        native = patch('ccc_batch_guard.native_binary', return_value='/test/native/codex')
+        native.start()
+        self.addCleanup(native.stop)
         # The fixture's register() runs inside the test runner, not a cmux
         # shell. Never pin the runner's real parent as a launched batch shell.
         shell = patch.object(batch, 'batch_shell_identity', return_value=None)

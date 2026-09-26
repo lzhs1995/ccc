@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.18
+
+- Keep automatic workspace pause disabled. B now launches the verified native Codex executable directly, without re-entering an old conditional launcher or adopting existing sessions.
+- Replace first-delta success with three consecutive complete, nonempty successful turns from one exact native session. Exclude reasoning, tools, history and duplicate events; reset on failure or identity change. This optional policy remains off.
+- Preserve session, transcript and submission evidence when a remote-endpoint error is displayed. Recovery may only relaunch a proved pre-session startup failure in its original surface.
+- Restore four shared native initialization permits with bounded leases. A newly created tab does not immediately release its permit and flood the remaining cold starts.
+- Recover high-demand failures despite a stale stalled-goal footer when the current original failed turn is proven. Deduplicate accepted submissions across restart and recheck native state after acquiring the workspace input lock.
+- Recover the original failed turn when a missed Hook and an idle, closed rollout leave only the verified native thread writer lock. Check process birth, surface/workspace, file identities and lifecycle again before using that evidence.
+- Keep observations running through unrelated batch configuration updates, preserve overdue readers' order, share one discovery snapshot and retain known targets when process enumeration is incomplete. Preserve the final input and pause checks.
+- Show that automatic pause is disabled in the B confirmation and status display; historical first-event stops no longer claim connectivity under the new rule.
+- Keep existing relay backends and all pause/history/configuration records during upgrade. No Clash or network-policy change is part of this repair.
+
 ## 0.2.17
 
 - Add an optional independent AnyRouter network guard with isolated Mihomo probes, real Responses/SSE admission, persistent quarantine recovery and shared probe budgets. Keep a healthy commercial pool, rotate on confirmed route failure and reserve ordered Tokyo residential chains for fallback.

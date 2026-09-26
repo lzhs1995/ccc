@@ -503,6 +503,7 @@ class QueueRecovery:
         self.process_lookup = None
         self.guard_config_path = None
         self.open_file_cache = {}
+        self.idle_file_cache = {}
         self.open_file_sources = {}
         self.wakeup_process_cache = (0.0, frozenset(), {})
         try:
@@ -668,6 +669,8 @@ class QueueRecovery:
             else:
                 paths = {path for path in process_writable_files(pid)
                          if path.suffix == ".jsonl" and path.is_relative_to(self.sessions_root.resolve())}
+                if not paths:
+                    return self._idle_process_turn(target, pid, hint_source)
                 if len(paths) != 1:
                     return {"kind": "unknown"}
                 path = paths.pop()
@@ -694,6 +697,85 @@ class QueueRecovery:
             return {"session_id": sid, "pid": pid, "process_start": started,
                     **(snapshot or {"kind": "unknown"})}
         except (OSError, ValueError, subprocess.SubprocessError):
+            return {"kind": "unknown"}
+
+    def _idle_process_turn(self, target, pid, hint_source=None):
+        """Codex closes its rollout while idle but retains the thread writer lock.
+
+        A missed SessionStart Hook must not make that original failed turn
+        permanently unknowable. The live lock's inode and UUID, exact process
+        birth/placement, original file identity and current lifecycle all have
+        to agree. This never creates a Hook, session, or continuation itself.
+        """
+        import ccc_guard_scope as scope
+
+        def linked(path, identity):
+            info = path.stat()
+            return info.st_dev == identity["device"] and info.st_ino == identity["inode"]
+
+        try:
+            process = scope.process(pid)
+            if (not process or process["surface_id"] != str(target["surface_id"])
+                    or process["environment_workspace_id"] != str(target["workspace_id"])
+                    or process.get("remote")):
+                return {"kind": "unknown"}
+            argv, _ = scope.arguments(pid)
+            options = argv[:argv.index("--")] if "--" in argv else argv
+            if any(arg == "--remote" or arg.startswith("--remote=") for arg in options):
+                return {"kind": "unknown"}
+            files = process_writable_files(pid, identities=True)
+            locks = [p for p in files if p.parent.name == "thread-writer-locks" and p.suffix == ".lock"]
+            if len(locks) != 1:
+                return {"kind": "unknown"}
+            lock = locks[0]
+            sid = str(uuid.UUID(lock.stem))
+            root = self.sessions_root.resolve()
+            native_sessions = (lock.parent.parent / "sessions").resolve()
+            if (not native_sessions.is_relative_to(root) or not native_sessions.is_dir()
+                    or not linked(lock, files[lock])):
+                return {"kind": "unknown"}
+            key = (pid, tuple(process["birth"]), sid, files[lock]["device"], files[lock]["inode"])
+            with self.lock:
+                cached = self.idle_file_cache.get(key)
+            if cached:
+                path, file_identity = cached
+                if not linked(path, file_identity):
+                    return {"kind": "unknown"}
+            else:
+                candidates = list(native_sessions.rglob(f"*-{sid}.jsonl"))
+                if len(candidates) != 1:
+                    return {"kind": "unknown"}
+                path = candidates[0].resolve()
+                if not path.is_relative_to(native_sessions):
+                    return {"kind": "unknown"}
+                info = path.stat()
+                file_identity = {"device": info.st_dev, "inode": info.st_ino}
+            if hint_source is not None and (
+                    sid != hint_source.get("session_id")
+                    or path != Path(str(hint_source.get("path") or "")).resolve()):
+                return {"kind": "unknown"}
+            snapshot = task_snapshot(path, sid)
+            born = process["birth"][0] + process["birth"][1] / 1e6
+            if not snapshot or snapshot["at"] < born:
+                return {"kind": "unknown"}
+            current_files = process_writable_files(pid, identities=True)
+            current_locks = {p for p in current_files if p.parent.name == "thread-writer-locks" and p.suffix == ".lock"}
+            current_rollouts = {p for p in current_files if p.suffix == ".jsonl" and p.is_relative_to(root)}
+            if (scope.process(pid) != process or current_locks != {lock}
+                    or current_files.get(lock) != files[lock] or not linked(lock, files[lock])
+                    or not linked(path, file_identity)
+                    or current_rollouts - {path}
+                    or (path in current_files and current_files[path] != file_identity)):
+                return {"kind": "unknown"}
+            with self.lock:
+                self.idle_file_cache[key] = (path, file_identity)
+                self.open_file_sources[str(target["surface_id"])] = {
+                    "surface_id": str(target["surface_id"]), "workspace_id": str(target["workspace_id"]),
+                    "session_id": sid, "path": path, "process_start": process["process_start"], "pid": pid,
+                }
+            return {"session_id": sid, "pid": pid, "process_start": process["process_start"],
+                    "birth": process["birth"], **snapshot}
+        except (OSError, ValueError, RuntimeError, KeyError, TypeError):
             return {"kind": "unknown"}
 
     def initial_session(self, target, created_after):

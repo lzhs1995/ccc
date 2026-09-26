@@ -291,6 +291,14 @@ class CodexReconnectRecoveryTests(unittest.TestCase):
             self.assertEqual(len(client.sent), 1)
             daemon.process_once(client)
             self.assertEqual(len(client.sent), 1)
+            runtime = daemon.runtime["surface-uuid"]
+            runtime.last_send_at -= core.REPEAT_SEND_DELAY_SEC + 1
+            daemon.process_once(client)
+            self.assertEqual(len(client.sent), 1)
+            turn.update(turn_id='new-failed-turn', at=901)
+            daemon.process_once(client)
+            self.assertEqual(len(client.sent), 2)
+            self.assertEqual(client.sent[-1][-1], core.MESSAGE)
 
     def test_covered_prompt_requires_native_placeholder_animation_and_footer(self):
         for missing in ("placeholder", "dim", "animation", "rgb", "footer", "model", "cursor", "home", "prefix"):

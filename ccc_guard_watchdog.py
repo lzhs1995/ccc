@@ -121,7 +121,8 @@ def run(config_path, parent, generation):
         except (OSError, ValueError, TypeError):
             healthy = False
         if not healthy:
-            if owned:
+            # A missed heartbeat must not pause pools or signal Codex.
+            if owned and guard.AUTOMATIC_POOL_STOP:
                 emergency(config_path, owned, last_heartbeat=last_good)
             return
         guard.write_json(root / "watchdog-heartbeat.json", {"pid": os.getpid(), "generation": generation,

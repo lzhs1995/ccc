@@ -329,7 +329,7 @@ CLAUDE_CONTEXT_ABSOLUTE_TIMEOUT_SEC = 900.0
 # through TargetRuntime and suppresses duplicate Hook/fallback deliveries.
 # Human label only.  Acceptance always compares SHA-256 of the loaded source:
 # a revision string is hand-maintained and therefore can lie about what runs.
-FEATURE_REVISION = "0.2.17-service-aware-network-guard"
+FEATURE_REVISION = "0.2.18-native-batch-response-streak"
 # How long after our own send a byte-identical UserPromptSubmit can still be
 # our echo.  Must exceed claude_submit_confirm_timeout_sec so that a late
 # echo arriving after the transaction timed out is not read as a human.
@@ -4531,16 +4531,69 @@ def batch_start_hold(rule, surface_id):
     return None
 
 
+class DiscoverySnapshot:
+    """One topology/process collection per discovery pass, never an input grant."""
+
+    def __init__(self, client):
+        self.client = client
+        self.records = {r["surface_id"]: r for r in main_surface_records(client.tree())}
+        self.workspaces = {}
+        for record in self.records.values():
+            if record.get("type") == "terminal":
+                self.workspaces.setdefault(record["workspace_id"], []).append(record)
+        self.fleet = callable(getattr(client, "top_all", None)) and (
+            not isinstance(client, SnapshotClient) or callable(getattr(client.client, "top_all", None)))
+        self.tops, self.labels = {}, {}
+
+    def _load(self, workspace_id):
+        key = "" if self.fleet else workspace_id
+        if key not in self.tops:
+            top = self.client.top_all() if self.fleet else self.client.top(workspace_id)
+            self.tops[key] = top
+            self.labels[key] = classify_surface_processes(top)
+        return self.tops[key], self.labels[key]
+
+    def codex_surfaces(self, workspace_id):
+        records = self.workspaces.get(workspace_id, [])
+        if not records:
+            return []
+        _, labels = self._load(workspace_id)
+        return sorted((dict(r) for r in records if surface_process_label(labels, r)["agent_kind"] == "codex"),
+                      key=lambda record: _ref_number(record["ref"]))
+
+    def incomplete(self, workspace_id):
+        # Call only for workspaces already collected during this pass. No I/O
+        # occurs while publishing under the configuration lock.
+        top = self.tops.get("" if self.fleet else workspace_id, {})
+        return top.get("sample", {}).get("enumeration_complete") is False
+
+
+def dynamic_target_authorized(config, target):
+    """Reapply current discovery scope after I/O; sending has stronger gates."""
+    sid, wid = str(target["surface_id"]), str(target["workspace_id"])
+    rules = [r for r in config.get("workspace_rules", []) if str(r.get("workspace_id")) == wid]
+    if target.get("source") == "workspace_rule":
+        return str(target.get("source_workspace_id")) == wid and any(
+            r.get("enabled", True)
+            and (sid not in r.get("excluded_surface_ids", []) or batch_start_hold(r, sid)) for r in rules)
+    if target.get("source") == "pane_follow":
+        return not any(sid in r.get("excluded_surface_ids", []) for r in rules) and any(
+            t.get("enabled", True) and not t.get("paused", False)
+            and t.get("workspace_id") == wid and t.get("pane_id") == target.get("pane_id")
+            for t in config.get("targets", []))
+    return False
+
+
 def discover_rule_targets(client: CmuxClient, config: Mapping[str, Any]) -> list[dict[str, Any]]:
     rules = [rule for rule in config.get("workspace_rules", []) if rule.get("enabled", True)]
     if not rules:
         return []
-    tree = client.tree()
+    inventory = client if isinstance(client, DiscoverySnapshot) else DiscoverySnapshot(client)
     targets: list[dict[str, Any]] = []
     for rule in rules:
         workspace_id = str(rule.get("workspace_id") or "")
         excluded = {str(value) for value in rule.get("excluded_surface_ids", [])}
-        for record in discover_codex_surfaces(tree, client.top(workspace_id), workspace_id):
+        for record in inventory.codex_surfaces(workspace_id):
             if record["surface_id"] in excluded and not batch_start_hold(rule, record["surface_id"]):
                 continue
             targets.append({
@@ -4579,12 +4632,12 @@ def discover_pane_follow_targets(client: CmuxClient, config: Mapping[str, Any]) 
             panes_by_workspace.setdefault(workspace_id, set()).add(pane_id)
     if not panes_by_workspace:
         return []
-    tree = client.tree()
+    inventory = client if isinstance(client, DiscoverySnapshot) else DiscoverySnapshot(client)
     discovered: list[dict[str, Any]] = []
     seen: set[str] = set()
     for workspace_id, pane_ids in panes_by_workspace.items():
         try:
-            records = discover_codex_surfaces(tree, client.top(workspace_id), workspace_id)
+            records = inventory.codex_surfaces(workspace_id)
         except CmuxError:
             continue
         for record in records:
@@ -4786,6 +4839,37 @@ def describe_daemon_runtime(
     return result
 
 
+class ObservationPolicy:
+    """Read generations follow the affected target, not B bookkeeping writes.
+
+    This is deliberately not send authorization. Durable mutations and sends
+    retain the full config revision check and their final live preflight.
+    """
+
+    def __init__(self, config):
+        self.common = json.dumps({k: v for k, v in config.items()
+                                  if k not in {"targets", "workspace_rules", "schema_version"}},
+                                 sort_keys=True, separators=(",", ":"))
+        self.targets = {str(t["surface_id"]): json.dumps(t, sort_keys=True, separators=(",", ":"))
+                        for t in config.get("targets", [])}
+        self.rules = {}
+        for rule in config.get("workspace_rules", []):
+            excluded = frozenset(rule.get("excluded_surface_ids", []))
+            held = frozenset(sid for sid in set(rule.get("batch_start_holds", {})) | set(excluded)
+                             if batch_start_hold(rule, sid))
+            self.rules[str(rule.get("workspace_id"))] = (
+                rule.get("enabled", True), rule.get("paused", False), excluded, held)
+        self.panes = frozenset((t.get("workspace_id"), t.get("pane_id")) for t in config.get("targets", [])
+                               if t.get("enabled", True) and not t.get("paused", False))
+
+    def key(self, target):
+        sid, wid = str(target["surface_id"]), str(target["workspace_id"])
+        rule = self.rules.get(wid)
+        own_rule = (rule[0], rule[1], sid in rule[2], sid in rule[3]) if rule else None
+        pane = (wid, target.get("pane_id")) in self.panes if target.get("source") == "pane_follow" else None
+        return self.common, self.targets.get(sid), own_rule, pane
+
+
 class WatchDaemon:
     def __init__(
         self,
@@ -4843,6 +4927,7 @@ class WatchDaemon:
         self._observation_metadata: dict[str, Any] = {}
         self._metadata_lock = threading.Lock()
         self.config = self._load_config_at_startup()
+        self._observation_policy = ObservationPolicy(self.config)
         self.runtime: dict[str, TargetRuntime] = self._load_runtime()
         self._clear_stale_runtime_pause_reasons()
         self.dynamic_targets: dict[str, dict[str, Any]] = {}
@@ -5224,6 +5309,7 @@ class WatchDaemon:
         }
         self._queue_registration_checks(self.config, reloaded)
         self.config = reloaded
+        self._observation_policy = ObservationPolicy(reloaded)
         self._config_mtime_ns = current_mtime
         self._last_workspace_discovery_at = 0.0
         # F2 重置点之三：人工重新 arm 是明确的"再试一次"授权，孤儿 Enter
@@ -5272,6 +5358,7 @@ class WatchDaemon:
                 self._viewport_socket.path = None
             self._queue_registration_checks(self.config, config)
             self.config = config
+            self._observation_policy = ObservationPolicy(config)
             self._config_mtime_ns = mtime_ns
             self._last_workspace_discovery_at = 0.0
             return result
@@ -6144,11 +6231,13 @@ class WatchDaemon:
         previous = runtime.observation_completed_at
         started = time.monotonic()
         generation = self._config_mtime_ns
+        policy_key = self._observation_policy.key(target)
         try:
             return self._process_one_target(
                 target, self._observation_client(), None, "",
                 defer_send=True,
-                is_current=lambda: is_current() and generation == self._config_mtime_ns,
+                is_current=lambda: is_current() and policy_key == self._observation_policy.key(target),
+                authorization_current=lambda: generation == self._config_mtime_ns,
             )
         finally:
             now = time.time()
@@ -6320,7 +6409,7 @@ class WatchDaemon:
                 with self._targets_lock:
                     targets = effective_targets(self.config, self.dynamic_targets.values())
                 scheduler.tick(
-                    targets, generation=self._config_mtime_ns,
+                    targets, generation=self._observation_policy.key,
                     interval=float(self.config.get("poll_interval_sec", 1)),
                 )
                 now = time.monotonic()
@@ -6395,6 +6484,7 @@ class WatchDaemon:
         *,
         defer_send: bool = False,
         is_current: Callable[[], bool] | None = None,
+        authorization_current: Callable[[], bool] | None = None,
     ) -> ScreenState | None:
         def current(*, fresh=False):
             if is_current is None:
@@ -6402,7 +6492,8 @@ class WatchDaemon:
             # Observation bookkeeping only needs the scheduler/config generation.
             # Durable isolation and input paths must still check the disk config.
             if fresh:
-                return self._active_send_target(target, is_current) is not None
+                check = lambda: is_current() and (authorization_current is None or authorization_current())
+                return self._active_send_target(target, check) is not None
             return is_current()
 
         if not current():
@@ -8165,21 +8256,38 @@ class WatchDaemon:
             return
         self._last_workspace_discovery_at = now
         config = copy.deepcopy(self.config)
-        revision = self._config_mtime_ns
         try:
-            discovered = discover_rule_targets(client, config)
-            discovered.extend(discover_pane_follow_targets(client, config))
-        except CmuxError as exc:
+            inventory = DiscoverySnapshot(client)
+            discovered = discover_rule_targets(inventory, config)
+            discovered.extend(discover_pane_follow_targets(inventory, config))
+        except RuntimeError as exc:
             # Keep the last known set, but do not add or rebind anything from a
             # partial/failed discovery cycle.
             self.logger.error("workspace discovery failed; keeping previous targets: %s", exc)
             return
-        if revision != self._config_mtime_ns:
-            self._last_workspace_discovery_at = 0.0
-            return
-        new_targets = {str(target["surface_id"]): target for target in discovered}
-        with self._targets_lock:
+        with self._config_reload_lock, self._targets_lock:
+            current = self.config
+            if config.get("cmux_path") != current.get("cmux_path"):
+                self._last_workspace_discovery_at = 0.0
+                return
+            # A batch can update config several times while collection runs.
+            # Apply current authorization to each result instead of discarding
+            # the entire fleet on an unrelated timestamp change.
+            new_targets = {str(t["surface_id"]): t for t in discovered if dynamic_target_authorized(current, t)}
             old_ids = set(self.dynamic_targets)
+            for sid, old in self.dynamic_targets.items():
+                record = inventory.records.get(sid)
+                if (sid not in new_targets and record and record["workspace_id"] == old["workspace_id"]
+                        and dynamic_target_authorized(current, old) and inventory.incomplete(old["workspace_id"])):
+                    # Missing processes in a partial enumeration do not prove
+                    # exit. Keep observation and original turn de-duplication;
+                    # a fresh native identity still gates every actual send.
+                    new_targets[sid] = {**old, **record}
+            explicit_ids = {str(t.get("surface_id")) for t in current.get("targets", [])}
+            with self._runtime_lock:
+                for sid in old_ids - set(new_targets) - explicit_ids:
+                    self.runtime.pop(sid, None)
+            self.dynamic_targets = new_targets
         new_ids = set(new_targets)
         for surface_id in sorted(new_ids - old_ids):
             target = new_targets[surface_id]
@@ -8189,14 +8297,8 @@ class WatchDaemon:
                 str(target.get("workspace_id", ""))[:8],
                 target.get("ref", ""),
             )
-        explicit_ids = {str(target.get("surface_id")) for target in self.config.get("targets", [])}
         for surface_id in sorted(old_ids - new_ids):
             self.logger.info("surface=%s no longer an active Codex; removed from dynamic targets", surface_id[:8])
-            if surface_id not in explicit_ids:
-                with self._runtime_lock:
-                    self.runtime.pop(surface_id, None)
-        with self._targets_lock:
-            self.dynamic_targets = new_targets
 
     def _refresh_workspace(self, target: dict[str, Any], client: CmuxClient, *, is_current=None) -> bool:
         """Refresh only the same UUID; never rebind a stale numeric ref."""
@@ -8246,6 +8348,7 @@ class WatchDaemon:
                 # Keep this daemon fail-closed even if another config writer
                 # holds the lock for too long.
                 self.config["mode"] = "dry-run"
+                self._observation_policy = ObservationPolicy(self.config)
                 self.logger.error("cannot persist global dry-run: %s", exc)
             self._notify("cmux-codex-continue", "cmux incompatible; switched to dry-run")
         self.logger.error("global incompatible: %s", reason)
@@ -9279,7 +9382,7 @@ class WatchDaemon:
                     runtime.delivery_status = "cancelled"
                     self.save(wait=False)
                     return
-                if runtime.codex_goal_resume and not self._codex_turn_ready(target, runtime, state, reserved=True):
+                if not self._codex_turn_ready(target, runtime, state, reserved=True):
                     runtime.delivery_status = "cancelled"
                     self.save(wait=False)
                     return
@@ -9357,14 +9460,20 @@ class WatchDaemon:
                     runtime.codex_goal_resume = True
                     runtime.codex_observed_turn_key = key
                     return True
+                # This stalled goal is already resumed. Do not also send 任务请继续.
+                runtime.codex_goal_resume = False
+                return False
+            if reserved and runtime.codex_goal_resume:
+                # The proof disappeared while the resume was being persisted.
+                runtime.codex_goal_resume = False
+                return False
+            # The footer is visible but the sqlite proof is missing. That must
+            # not freeze a still-visible high-demand failure; continue below.
             runtime.codex_goal_resume = False
-            self._record_state(str(target["surface_id"]), runtime, ScreenState(
-                "awaiting_transition", message_kind="codex", error_type=state.error_type,
-                reason="waiting for verified original Codex stalled-goal evidence before native resume",
-            ))
-            return False
         runtime.codex_goal_resume = False
         turn = self.codex_queue_recovery.current_turn(target)
+        if turn is None and state.native_goal_stalled:
+            turn = {"kind": "unknown"}
         if turn is None:
             if not (reserved and runtime.codex_observed_turn_key):
                 runtime.codex_observed_turn_key = ""
@@ -9383,8 +9492,12 @@ class WatchDaemon:
                 and _match_error_block("■ " + str(error.get("message") or "")) == state.error_type):
             key = f"{turn.get('session_id')}:{turn.get('turn_id')}:{turn.get('at')}"
             already_sent = key == runtime.codex_sent_turn_key
+            # The renderer can retain an old error after accepting input.
+            # Only a new failed turn or independently proved non-delivery may
+            # authorize another prompt; accepted/unknown are not retry proofs.
+            retryable = runtime.delivery_status in {"failed", "cancelled", "retryable"}
             if (reserved and key == runtime.codex_observed_turn_key) or (
-                    not reserved and (not already_sent or runtime.delivery_status in {"failed", "cancelled", "retryable"})):
+                    not reserved and (not already_sent or retryable)):
                 runtime.codex_observed_turn_key = key
                 return True
         phase = "working" if turn.get("kind") in {"task_started", "user_message"} else "awaiting_transition"

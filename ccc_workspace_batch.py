@@ -29,7 +29,7 @@ from ccc_inventory import SharedInventory
 from ccc_scheduling import SnapshotCache, SnapshotClient
 
 COUNT = 50
-WORKER_VERSION = 18
+WORKER_VERSION = 21
 PROMPT = "show me u power"
 INITIALIZING = {"creating", "create_unknown", "created", "restarting", "restart_unknown",
                 "submitted", "submitting", "uncertain"}
@@ -151,6 +151,8 @@ def authorize_workspace(config_path, selector, name=None, *, client=None):
 
 
 def start(config_path, selector, *, client=None, launch=True):
+    from ccc_batch_guard import AUTOMATIC_POOL_STOP
+    guarded = launch and AUTOMATIC_POOL_STOP
     store = core.ConfigStore(Path(config_path))
     config = store.load()
     workspace = workspace_record(config_path, selector, config, client)
@@ -161,7 +163,7 @@ def start(config_path, selector, *, client=None, launch=True):
         if config.get("mode") != "armed" or config.get("global_paused"):
             raise RuntimeError("全局当前未开启续跑；请先按 A 开启，再创建本池")
         resume_success = False
-        if launch and rule.get("pause_origin") == "batch_first_response":
+        if guarded and rule.get("pause_origin") == "batch_first_response":
             from ccc_batch_guard import snapshot
             state = snapshot(config_path, wid)
             trip = state.get("trip") or {}
@@ -180,8 +182,10 @@ def start(config_path, selector, *, client=None, launch=True):
                    "slots": [{"index": i, "phase": "pending"} for i in range(COUNT)]}
             core.atomic_write_json(job_path(config_path, job["id"]), job)
         job["config_path"] = str(Path(config_path).resolve())
-        if launch:
+        if guarded:
             job["guard_version"] = 1
+        if launch:
+            job["launch_mode"] = "guarded" if guarded else "native"
         core.atomic_write_json(job_path(config_path, job["id"]), job)
         def authorize(latest):
             current = next((r for r in latest["workspace_rules"] if r.get("workspace_id") == wid), None)
@@ -200,12 +204,13 @@ def start(config_path, selector, *, client=None, launch=True):
             if resume_success:
                 current.update(paused=False)
                 current.pop("paused_at", None)
-            if launch:
+            if guarded:
                 current.setdefault("batch_guard", {"version": 1, "origin_job_id": job["id"]})
         store.mutate(authorize)
-        if launch:
+        if guarded:
             from ccc_batch_guard import arm
             arm(config_path, wid, resume=resume_success)
+        if launch:
             _launch(config_path, job)
         return {"job_id": job["id"], "workspace_id": wid, **counts(job)}
 
@@ -463,9 +468,12 @@ class BatchWorker:
         bootstrap = shlex.join([sys.executable, "-B", str(Path(__file__).resolve()), "register",
                                 "--config", str(self.config_path), "--job", self.job["id"],
                                 "--index", str(slot["index"]), "--launch-id", slot["launch_id"]])
-        native = shlex.join(["codex", "-c", "sqlite_home=" + json.dumps(
+        from ccc_batch_guard import AUTOMATIC_POOL_STOP, native_binary
+        native = shlex.join([native_binary(), "-c", "sqlite_home=" + json.dumps(
             str(sqlite_home(self.config_path, self.job["id"], slot["index"]).resolve()))])
-        if self.job.get("guard_version") == 1:
+        # The guard relay is only the auto-pause cut. With that cut off, Codex
+        # starts in this terminal. A dead unix endpoint never receives the prompt.
+        if self.job.get("guard_version") == 1 and AUTOMATIC_POOL_STOP:
             native = shlex.join([sys.executable, "-B", str(Path(__file__).with_name("ccc_batch_guard.py")),
                 "launch", "--config", str(self.config_path), "--job", self.job["id"], "--index", str(slot["index"])])
         return bootstrap + " && " + native
@@ -506,6 +514,25 @@ class BatchWorker:
                 and "ERROR: failed to initialize sqlite local db" in before
                 and "database is locked" in before.rsplit("ERROR:", 1)[-1])
 
+    @staticmethod
+    def _guard_refusal(grid):
+        """The original launch already ran and the guard rejected it.
+
+        The shell is sitting on that traceback. Codex never started, so the
+        same surface can run the original command again.
+        """
+        cursor = grid.cursor
+        if not cursor.visible or not 0 <= cursor.row < len(grid.lines):
+            return False
+        line = grid.lines[cursor.row].ljust(grid.columns)
+        prompt = line[:cursor.column]
+        if (line[cursor.column:].strip() or not re.fullmatch(
+                r"(?:[^\s%$#]+@[^\s%$#]+ [^%$#\r\n]* )?[%$#] ", prompt)):
+            return False
+        before = " ".join("\n".join(grid.lines[:cursor.row]).split())
+        return (("B 工作区已停止" in before and "不会启动额外请求" in before)
+                or "surface is not currently inside its authorized B workspace" in before)
+
     def _restart_failed(self, slot, *, no_pty=False):
         # Only pre-session startup failures owned by this batch may be
         # relaunched, in the same terminal. Never replace an existing session.
@@ -515,8 +542,7 @@ class BatchWorker:
             config = self.store.load()
             if not allowed(config, self.job) or not self._protected(config, slot):
                 return
-            if (slot.get("session_id") or slot.get("native_seen_session_id")
-                    or slot.get("submit_at") or slot.get("restart_attempt_at")):
+            if slot.get("session_id") or slot.get("native_seen_session_id") or slot.get("submit_at"):
                 return
             if any(r.get("surfaceId") == slot["surface_id"] for r in self.queue.records().values()):
                 return
@@ -531,11 +557,18 @@ class BatchWorker:
             if (self._native(target, slot) or {}).get("session_id"):
                 return
             grid = core.Grid.from_rpc(self.client.replay(target["workspace_id"], target["surface_id"]), target["surface_id"])
-            if not (self._pty_failure(grid) if no_pty else self._startup_failure(grid)):
+            guard_refusal = False if no_pty else self._guard_refusal(grid)
+            if slot.get("restart_attempt_at"):
+                return
+            if guard_refusal and slot.get("guard_refusal_attempts", 0) >= 5:
+                return
+            if not ((self._pty_failure(grid) if no_pty else self._startup_failure(grid)) or guard_refusal):
                 return
             prepare_sqlite_home(self.config_path, self.job["id"])
             if not self._reserve_start(slot, restarting=True):
                 return
+            if guard_refusal:
+                slot["guard_refusal_attempts"] = slot.get("guard_refusal_attempts", 0) + 1
             slot["restart_attempt_at"] = self.clock()
             self.save()  # An ambiguous restart acknowledgement is not replayed.
             try:
@@ -807,8 +840,11 @@ class BatchWorker:
             return
         grid = core.Grid.from_rpc(self.client.replay(target["workspace_id"], target["surface_id"]), target["surface_id"])
         if core.classify_grid(grid).kind != "idle" or core._composer_status(grid)[0] != "empty":
-            if not (native or {}).get("session_id") and self._startup_failure(grid):
-                slot.update(phase="restart_pending", error="Codex 数据库锁导致启动失败，等待在原 surface 补做")
+            if not (native or {}).get("session_id") and (self._startup_failure(grid) or self._guard_refusal(grid)):
+                slot.update(phase="restart_pending", error=(
+                    "B 启动被停止标记拒绝，等待在原 surface 重开 Codex"
+                    if self._guard_refusal(grid) else
+                    "Codex 数据库锁导致启动失败，等待在原 surface 补做"))
                 self._restart_failed(slot)
                 return
             if core._menu_present(grid.lines) or core._composer_status(grid)[0] == "composer_busy":
@@ -865,7 +901,7 @@ class BatchWorker:
     def _reserve_start(self, slot, *, restarting=False):
         # All batch processes share the same capacity and rate limit. Save the
         # reservation before releasing the lock, without holding it over RPC.
-        with core.FileLock(self.config_path.parent / "batch-capacity.lock", timeout_sec=.1):
+        with core.FileLock(self.config_path.parent / "batch-capacity.lock", timeout_sec=2):
             path = self.config_path.parent / "batch-capacity.json"
             budget = core.load_json(path, {})
             now = self.clock()
@@ -881,9 +917,11 @@ class BatchWorker:
                     continue
                 # An ambiguous RPC remains durable, but cannot monopolize a
                 # startup permit forever. It is still reconciled, never replayed.
+                # Native initialization still consumes capacity after cmux
+                # creates the tab. Bound its lease so a stalled startup cannot
+                # monopolize every pool, but do not flood 50 cold SQLite writers.
                 active += sum(s.get("phase") in INITIALIZING and
-                              (s.get("phase") not in {"creating", "create_unknown", "restarting", "restart_unknown"} or
-                               now - s.get("launched_at", s.get("created_at", now)) < STARTUP_LEASE_SEC)
+                              now - s.get("launched_at", s.get("created_at", now)) < STARTUP_LEASE_SEC
                               for s in job.get("slots", []))
                 if any(s.get("phase") in STARTABLE for s in job.get("slots", [])):
                     pending_jobs.append(jid)

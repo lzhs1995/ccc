@@ -19,10 +19,37 @@ def delta(thread="session", turn="turn", text="OK", method="item/agentMessage/de
     return {"method": method, "params": {"threadId": thread, "turnId": turn, "itemId": "model-item", "delta": text}}
 
 
+def complete(turn="turn", text="Complete answer", status="completed", **extra):
+    return {"method": "turn/completed", "params": {"threadId": "session", "turn": {
+        "id": turn, "status": status, "error": None,
+        "items": [{"id": turn + "-answer", "type": "agentMessage", "phase": "final_answer", "text": text}],
+        **extra}}}
+
+
+def qualify(endpoint):
+    # Three genuinely complete answers, followed by an already-in-flight next
+    # turn. Cancellation tests must still stop that turn before it can spend.
+    for tid in ("one", "two", "three"):
+        endpoint.native_message({"method": "turn/started", "params": {
+            "threadId": "session", "turn": {"id": tid}}})
+        endpoint.native_message(complete(tid))
+    endpoint.native_message({"method": "turn/started", "params": {
+        "threadId": "session", "turn": {"id": "turn"}}})
+
+
 class EvidenceTests(unittest.TestCase):
+    def setUp(self):
+        self._cut = patch.object(guard, "CONNECTION_CUT_ENABLED", True)
+        self._cut.start()
+        self.addCleanup(self._cut.stop)
+
     def test_only_fresh_typed_model_events_are_positive(self):
         for method in guard.MODEL_DELTAS:
-            self.assertIsNotNone(guard.model_evidence(delta(method=method), "session", "turn"))
+            self.assertIsNone(guard.model_evidence(delta(method=method), "session", "turn"))
+        self.assertIsNotNone(guard.model_evidence(complete(), "session", "turn"))
+        for event in (complete(text="  "), complete(status="failed"), complete(status="interrupted"),
+                      complete(error={"message": "high demand"}), complete(turn="other")):
+            self.assertIsNone(guard.model_evidence(event, "session", "turn"))
         for event in (delta(thread="old"), delta(turn="old"), delta(text=""), delta(text="  "),
                       delta(method="error"), delta(method="item/commandExecution/outputDelta"),
                       {"method": "turn/started", "params": {"threadId": "session", "turnId": "turn"}},
@@ -30,11 +57,11 @@ class EvidenceTests(unittest.TestCase):
                       {"result": {"thread": {"turns": [delta()]}}}):
             self.assertIsNone(guard.model_evidence(event, "session", "turn"), event)
 
-    def test_raw_model_tools_are_positive_but_tool_results_and_user_quotes_are_not(self):
+    def test_raw_tools_results_and_user_quotes_are_not_complete_answers(self):
         p = {"threadId": "session", "turnId": "turn"}
         for kind in ("function_call", "custom_tool_call", "local_shell_call", "web_search_call"):
             event = {"method": "rawResponseItem/completed", "params": {**p, "item": {"type": kind, "id": "model-id"}}}
-            self.assertIsNotNone(guard.model_evidence(event, "session", "turn"))
+            self.assertIsNone(guard.model_evidence(event, "session", "turn"))
         for item in ({"type": "function_call_output", "id": "x", "output": "OK"},
                      {"type": "message", "role": "user", "content": [{"type": "text", "text": "connected"}]},
                      {"type": "message", "role": "assistant", "content": None}):
@@ -46,7 +73,7 @@ class EvidenceTests(unittest.TestCase):
                 "item": {"type": "commandExecution", "id": "x", "command": "echo OK", "source": source}}}
             self.assertIsNone(guard.model_evidence(event, "session", "turn"))
         event["params"]["item"]["source"] = "agent"
-        self.assertIsNotNone(guard.model_evidence(event, "session", "turn"))
+        self.assertIsNone(guard.model_evidence(event, "session", "turn"))
 
 
 class GuardTests(unittest.IsolatedAsyncioTestCase):
@@ -65,6 +92,12 @@ class GuardTests(unittest.IsolatedAsyncioTestCase):
                 {"id": jid, "workspace_id": wid, "slots": [{"index": 0}]})
         core.atomic_write_json(self.path, config)
         self.locations = {}
+        self._cut = patch.object(guard, "CONNECTION_CUT_ENABLED", True)
+        self._cut.start()
+        self.addCleanup(self._cut.stop)
+        self._auto = patch.object(guard, "AUTOMATIC_POOL_STOP", True)
+        self._auto.start()
+        self.addCleanup(self._auto.stop)
         async def membership(wid, sid):
             self.service.inventory = self.locations.copy()
             self.service.inventory_at = time.monotonic()
@@ -114,7 +147,7 @@ class GuardTests(unittest.IsolatedAsyncioTestCase):
         peers = [self.endpoint() for _ in range(60)]
         untouched = self.endpoint(self.service.pools[self.other])
         before = copy.deepcopy(core.ConfigStore(self.path).load()["workspace_rules"][1])
-        peers[17].native_message(delta())
+        qualify(peers[17])
         await self.settled()
         self.assertEqual(self.pool.phase, "stopped")
         self.assertTrue(self.pool.trip["connected"] and self.pool.trip["within_deadline"])
@@ -128,7 +161,7 @@ class GuardTests(unittest.IsolatedAsyncioTestCase):
         stuck = self.endpoint(ack=False, ignore_term=True)
         untouched = self.endpoint(self.service.pools[self.other])
         with patch("ccc_codex_queue.process_placement_start", return_value=1):
-            stuck.native_message(delta())
+            qualify(stuck)
             await self.settled()
         self.assertEqual(stuck.signal_name, "SIGKILL")
         self.assertEqual(stuck.stop_proof, "backend_exited")
@@ -139,7 +172,7 @@ class GuardTests(unittest.IsolatedAsyncioTestCase):
     async def test_pid_reuse_refuses_force_signal_and_reports_failure(self):
         stuck = self.endpoint(ack=False)
         with patch("ccc_codex_queue.process_placement_start", return_value=2):
-            stuck.native_message(delta())
+            qualify(stuck)
             await self.settled()
         self.assertEqual(self.pool.phase, "failed")
         self.assertIsNone(stuck.signal_name)
@@ -148,10 +181,10 @@ class GuardTests(unittest.IsolatedAsyncioTestCase):
     async def test_surface_moved_out_is_neither_a_trigger_nor_a_stop_target(self):
         moved, live = self.endpoint(), self.endpoint()
         self.locations[moved.sid] = self.other
-        moved.native_message(delta())
+        qualify(moved)
         await asyncio.sleep(.02)
         self.assertEqual(self.pool.phase, "watching")
-        live.native_message(delta())
+        qualify(live)
         await self.settled()
         self.assertEqual(moved.writes, [])
         self.assertTrue(moved.active)
@@ -160,7 +193,7 @@ class GuardTests(unittest.IsolatedAsyncioTestCase):
     async def test_latch_rejects_late_turns_and_rearm_ignores_replayed_history(self):
         e = self.endpoint()
         e.front = SimpleNamespace(write=lambda x: None)
-        e.native_message(delta())
+        qualify(e)
         await self.settled()
         before = len(e.writes)
         e.front_message({"id": 22, "method": "turn/start", "params": {"threadId": "session"}})
@@ -172,9 +205,9 @@ class GuardTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(.02)
         self.assertEqual(self.pool.phase, "watching")
 
-    async def test_first_model_event_fences_input_before_membership_await(self):
+    async def test_third_completed_answer_fences_input_before_membership_await(self):
         source, peer = self.endpoint(), self.endpoint()
-        source.native_message(delta())
+        qualify(source)
         try:
             peer.front_message({"id": 22, "method": "turn/start", "params": {"threadId": "session"}})
             self.assertEqual(peer.writes, [])
@@ -187,7 +220,7 @@ class GuardTests(unittest.IsolatedAsyncioTestCase):
     async def test_moved_evidence_releases_input_fence_without_stopping_pool(self):
         moved = self.endpoint()
         self.locations[moved.sid] = self.other
-        moved.native_message(delta())
+        qualify(moved)
         try:
             self.assertFalse(self.pool.open_gate())
         finally:
@@ -205,8 +238,8 @@ class GuardTests(unittest.IsolatedAsyncioTestCase):
             await gates[sid].wait()
             return await original(wid, sid)
         self.service.membership = membership
-        moved.native_message(delta())
-        live.native_message(delta())
+        qualify(moved)
+        qualify(live)
         try:
             gates[moved.sid].set()
             await moved.evidence_task
@@ -228,7 +261,7 @@ class GuardTests(unittest.IsolatedAsyncioTestCase):
                 await ready.wait()
             return await original(wid, sid)
         self.service.membership = membership
-        source.native_message(delta())
+        qualify(source)
         peer.active, peer.awaiting_turn = False, True
         peer.native_message({"method": "turn/started", "params": {
             "threadId": "session", "turn": {"id": "turn"}}})
@@ -239,7 +272,8 @@ class GuardTests(unittest.IsolatedAsyncioTestCase):
             ready.set()
             await source.evidence_task
         await self.settled()
-        self.assertEqual(self.pool.trip["reason"], "first_model_response")
+        self.assertEqual(self.pool.trip["reason"], "three_completed_responses")
+        self.assertEqual(self.pool.trip['evidence']['consecutive_responses'], 3)
 
     async def test_moved_surface_keeps_normal_title_and_session_requests(self):
         e = self.endpoint()
@@ -265,10 +299,10 @@ class GuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(locations[dock.sid]["workspace_id"], window)
         self.assertEqual(locations[live.sid]["workspace_id"], self.wid)
         self.locations.update({sid: row["workspace_id"] for sid, row in locations.items()})
-        dock.native_message(delta())
+        qualify(dock)
         await asyncio.sleep(.02)
         self.assertEqual(self.pool.phase, "watching")
-        live.native_message(delta())
+        qualify(live)
         await self.settled()
         self.assertTrue(dock.active)
         self.assertEqual(dock.writes, [])
@@ -335,7 +369,7 @@ class GuardTests(unittest.IsolatedAsyncioTestCase):
             return True
         with patch("ccc_guard_scope.birth", side_effect=lambda pid, **kw: [1, 2] if pid in live else None), \
              patch("ccc_guard_scope.send", side_effect=send):
-            source.native_message(delta())
+            qualify(source)
             await self.settled()
         self.assertNotIn(41001, live)
         self.assertIn(41002, live)
@@ -376,7 +410,118 @@ class GuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(e.session_id, "session")
 
 
+class ConnectionCutDisabledTests(unittest.IsolatedAsyncioTestCase):
+    async def test_model_response_does_not_pause_or_interrupt(self):
+        self.assertFalse(guard.CONNECTION_CUT_ENABLED)
+        self.assertIsNone(guard.model_evidence(delta(), "session", "turn"))
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "config.json"
+            wid = str(uuid.uuid4()).upper()
+            jid = str(uuid.uuid4())
+            config = core.default_config()
+            config.update(mode="armed", global_paused=False, workspace_rules=[{
+                "workspace_id": wid, "enabled": True,
+                "batch_guard": {"version": 1, "origin_job_id": jid}}])
+            core.atomic_write_json(path, config)
+            core.atomic_write_json(path.parent / "workspace-batches" / jid / "job.json",
+                {"id": jid, "workspace_id": wid, "slots": [{"index": 0}]})
+            locations = {}
+
+            async def membership(pool_wid, sid):
+                return locations.get(sid) == pool_wid
+
+            service = guard.GuardService(path, membership=membership)
+            await service.dispatch({"command": "arm", "workspace_id": wid})
+            pool = service.pools[wid]
+            sid = str(uuid.uuid4()).upper()
+            endpoint = guard.Endpoint(pool, sid, {"cwd": temp})
+            locations[sid] = wid
+            pool.endpoints[sid] = endpoint
+            endpoint.session_id, endpoint.turn_id, endpoint.active = "session", "turn", True
+            endpoint.writes = []
+            endpoint.native = SimpleNamespace(pid=4242, returncode=None, stdin=SimpleNamespace(
+                write=lambda raw: endpoint.writes.append(json.loads(raw)), is_closing=lambda: False),
+                send_signal=lambda sig: None)
+            endpoint.native_message(delta())
+            endpoint.native_message({"method": "rawResponseItem/completed", "params": {
+                "threadId": "session", "turnId": "turn",
+                "item": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "ok"}]}}})
+            await asyncio.sleep(.05)
+            self.assertEqual(pool.phase, "watching")
+            self.assertIsNone(pool.trip)
+            self.assertEqual(endpoint.writes, [])
+            self.assertTrue(endpoint.active)
+            self.assertFalse(guard.blocked(path, wid))
+            self.assertFalse(core.ConfigStore(path).load()["workspace_rules"][0].get("paused"))
+            pool.trigger("coverage_unavailable")
+            pool.trigger("protection_setup_failed")
+            pool.trigger("frontend_protocol_failure")
+            await asyncio.sleep(.05)
+            self.assertEqual(pool.phase, "watching")
+            self.assertFalse(guard.blocked(path, wid))
+            self.assertFalse(core.ConfigStore(path).load()["workspace_rules"][0].get("paused"))
+
+    async def test_automatic_stop_marker_still_lets_b_open_codex(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "config.json"
+            wid = str(uuid.uuid4()).upper()
+            jid = str(uuid.uuid4())
+            config = core.default_config()
+            config.update(mode="armed", global_paused=False, workspace_rules=[{
+                "workspace_id": wid, "enabled": True,
+                "batch_guard": {"version": 1, "origin_job_id": jid}}])
+            core.atomic_write_json(path, config)
+            core.atomic_write_json(path.parent / "workspace-batches" / jid / "job.json",
+                {"id": jid, "workspace_id": wid, "slots": [{"index": 0}]})
+            locations = {}
+
+            async def membership(pool_wid, sid):
+                return locations.get(sid) == pool_wid
+
+            service = guard.GuardService(path, membership=membership)
+            await service.dispatch({"command": "arm", "workspace_id": wid})
+            pool = service.pools[wid]
+            pool.phase = "stopped"
+            pool.coverage_error = "fresh workspace membership unavailable"
+            guard.write_json(pool.directory / "STOP.json", {"reason": "coverage_unavailable"})
+            sid = str(uuid.uuid4()).upper()
+            locations[sid] = wid
+
+            async def started(endpoint):
+                endpoint.native = SimpleNamespace(pid=7, returncode=None)
+            with patch.object(guard.Endpoint, "start", started):
+                result = await service.dispatch({
+                    "command": "register", "workspace_id": wid, "surface_id": sid,
+                    "frontend_pid": 1, "cwd": temp})
+            self.assertEqual(result["pid"], 7)
+            self.assertEqual(pool.phase, "watching")
+            self.assertIsNone(pool.coverage_error)
+
+    async def test_operator_pause_still_refuses_another_codex(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "config.json"
+            wid = str(uuid.uuid4()).upper()
+            jid = str(uuid.uuid4())
+            config = core.default_config()
+            config.update(mode="armed", global_paused=False, workspace_rules=[{
+                "workspace_id": wid, "enabled": True, "paused": True, "pause_origin": "operator_pause",
+                "batch_guard": {"version": 1, "origin_job_id": jid}}])
+            core.atomic_write_json(path, config)
+            core.atomic_write_json(path.parent / "workspace-batches" / jid / "job.json",
+                {"id": jid, "workspace_id": wid, "slots": [{"index": 0}]})
+            service = guard.GuardService(path, membership=lambda *_: True)
+            with self.assertRaisesRegex(RuntimeError, "不会启动额外请求"):
+                await service.dispatch({
+                    "command": "register", "workspace_id": wid,
+                    "surface_id": str(uuid.uuid4()).upper(), "frontend_pid": 1, "cwd": temp})
+
+
 class LauncherMigrationTests(unittest.TestCase):
+    def setUp(self):
+        automatic = patch.object(guard, 'AUTOMATIC_POOL_STOP', True)
+        automatic.start()
+        self.addCleanup(automatic.stop)
+
     def test_new_arm_creates_private_parent_before_the_workspace_lock(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "config.json"
