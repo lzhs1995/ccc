@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.19
+
+- Separate the user-owned AnyRouter selector from the guard's automatic selector. Prepare complete static manual routes, ordered Tokyo dependencies and a preserved emergency default. An empty automatic provider or stopped detector cannot delete or override manual choices.
+- Bind network waiting to the effective Clash route and selector configuration. GLOBAL/manual choices and other active profiles do not inherit an automatic-pool outage; a manual choice during a failed provider refresh remains visible.
+- Keep the publisher and cleanup alive when health/status writes fail, including ENOSPC. Hold routing mutations while observer persistence is unavailable and never dispatch a paid probe without its durable reservation. Preserve consumed budgets and quarantine evidence.
+- Identify the API credential by the actual key used by the probe, so JSON formatting and unrelated auth-file metadata cannot revoke every route's qualification. Real credential changes still require new admission.
+- Extend same-binary AnyTLS acceptance to selector migration, manual rescue with a dead publisher and an Offline-only automatic pool, and cold startup without a publisher cache. Verify two old streams, newly produced frames, connection IDs, explicit stream ends and forced garbage collection.
+- Preserve v0.2.18 B/continuation behavior and keep automatic workspace pause disabled. This update does not change B authorization, native events, scope, heartbeat or STOP logic.
+
 ## 0.2.18
 
 - Keep automatic workspace pause disabled. B now launches the verified native Codex executable directly, without re-entering an old conditional launcher or adopting existing sessions.

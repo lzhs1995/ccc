@@ -26,8 +26,10 @@ or participate in B's success, STOP, scope, or heartbeat protocols.
   Tokyo chains only when no commercial path is ready: VPS → us11, then
   VPS → us178. A recovered commercial pool takes over from Tokyo; recovery of
   another commercial pool does not displace a healthy commercial selection.
-- If every path is isolated, select an explicit reject node and report
-  `network_wait`. Do not insert DIRECT or an unverified node as a substitute.
+- If every path is isolated, only the inner automatic selector may select an
+  explicit reject node. Report `network_wait` only when the service's effective
+  route actually uses that selector. The independent manual catalog remains
+  available, and the guard never changes the user's outer or manual selection.
 
 Defaults are 2 seconds for the current path, 5 seconds for hot standbys and
 60 seconds for other candidates, with at most four concurrent probes and a
@@ -89,6 +91,14 @@ transitions and selection observations, with one rotated `events.1.ndjson`
 file at 2 MiB. Discarded results retain their generation and reason. Neither
 file contains API credentials, response bodies or subscription definitions.
 
+Local observer failures, including an unavailable probe listener or a failed
+health/status write, freeze publication and automatic selection. They are not
+evidence that every egress is blocked. Disk-full status failures cannot tear
+down the publisher or skip cleanup; failed durable reservation writes prevent
+new complete API probes. Admission fingerprints use the actual API key, so
+rewriting unrelated fields or formatting in an auth file does not revoke all
+routes. A real credential change still requires fresh admission.
+
 ## Configuration and activation
 
 Copy `network.example.json` into a private directory outside Documents, fill
@@ -140,8 +150,32 @@ restarts and privileged filesystem writes.
 
 ## Clash integration and preservation of streams
 
-The dedicated selector should use only the guard provider, filtered with
-`^AR/`. The provider uses a local cache, disabled built-in health checks and
+Use three distinct selectors:
+
+- `Transit-Auto-Select` is the user-owned entry point for AnyRouter.
+- `AnyRouter-Manual` contains complete top-level proxy definitions, independent
+  of provider downloads, quarantine, the publisher, and the guard process.
+- `AnyRouter-Auto` is the only selector the guard may change. Its dynamic
+  entries come from the guard provider, filtered with `^AR/`, alongside a
+  static `AR/Offline` reject entry for cold startup.
+
+Set `group` to `AnyRouter-Auto` and `outer_group` to `Transit-Auto-Select` in
+the network configuration. To rescue a connection in Clash Verge, select
+`Transit-Auto-Select` → `AnyRouter-Manual` → the desired complete route. This
+does not mark that node API-healthy or clear its quarantine. Returning to
+`AnyRouter-Auto` is an explicit user choice; the guard cannot take it back.
+
+`tools/network_profile.py --profile /absolute/source.yaml --config
+/absolute/network.json --output /absolute/new-candidate.json --default-pool
+Yeye --default-label 'America B1'` prepares a new candidate only. It preserves
+the named working route as the manual default, includes both commercial pools
+and ordered Tokyo chains, and leaves the outer selector on manual by default
+when there is no saved selection. Existing independent exits can be included
+with `--extra-manual-prefix`. The tool cannot activate a profile, reload a
+controller, or send probes. Saved Clash selections still require inspection
+before migration; a generated default does not override them.
+
+The automatic provider uses a local cache, disabled built-in health checks and
 `proxy: DIRECT` solely for downloading its **loopback** configuration URL.
 `AR/Offline` is the reject sentinel, not a direct internet route. Preserve
 `DOMAIN,anyrouter.top,Transit-Auto-Select`; ordinary sites should use a separate
@@ -166,14 +200,18 @@ that the first admitted provider entry preserves the currently verified path
 when the old selector entry is removed. Do not restart Clash, rebuild TUN,
 delete connections or test production by breaking a route.
 
-Compare against `GET /configs`, not just the app YAML. In v1.19.31, parsing
+Compare both the privileged runtime input and `GET /configs`, not just the app
+YAML. In v1.19.31, parsing
 `ipv6: true` supplies `tun.inet6-address: [fdfe:dcba:9876::1/126]` when omitted.
 A running core can have global IPv6 enabled while its existing TUN has no IPv6
 address. Reloading that raw configuration rebuilds the TUN listener even if
 the core PID stays unchanged. Pin the live address list explicitly (including
 an empty list), validate the effective candidate, and refuse any inbound
-difference before staging or reloading. A stable PID and surviving connection
-IDs alone do not establish that TUN or every stream was preserved.
+difference before staging or reloading. The running API can also expose
+derived values such as an allocated `utun` device and GSO size. Do not copy
+those blindly into the input: Mihomo compares the parsed input to its previous
+input when deciding whether to recreate TUN. A stable PID and surviving
+connection IDs alone do not establish that TUN or every stream was preserved.
 
 Run `tools/network_mihomo_acceptance.py --binary /absolute/path/to/mihomo`
 against the same binary first. It creates a separate core with local mock
@@ -190,7 +228,11 @@ Changed provider payloads, publisher startup 503, pruning and an Offline-only
 provider must retain both old connections. Forced fixture garbage collection
 after pruning verifies adapter lifetime; each stream must receive newly
 generated post-change frames and an explicit end marker. This tool never
-reloads even its fixture core and cannot target the production controller.
+targets the production controller. Add `--manual-rescue` to test a fixture-only
+configuration migration, manual requests after the publisher stops and the
+automatic pool becomes empty, and a separate cold start without provider
+cache. Cold startup may delay accepting requests while provider initialization
+finishes; old-stream preservation does not prove immediate cold readiness.
 
 After profile acceptance, set `mode` to `manage`. Normal operation only publishes
 the provider, refreshes it, selects a verified route and reads the choice back.
@@ -198,7 +240,12 @@ It never reloads Clash or closes existing connections. A route switch affects
 new connections; an already broken remote stream still needs the client's
 normal retry. No network policy can guarantee an upstream API never fails.
 
-Only a reliably bound AnyRouter failed turn waits on `network_wait`. Native
+Only a reliably bound AnyRouter failed turn whose effective route is proven
+automatic waits on `network_wait`. GLOBAL/manual routes and unrelated profiles
+cannot inherit a stopped automatic pool's outage; missing or obsolete route
+proof leaves CCC's normal continuation gates in control. Rule-mode proof
+requires the exact AnyRouter domain rule first, including after profile
+enhancement scripts run. Native
 failure URLs are preferred; otherwise the original process, birth time, cmux
 identities, CODEX_HOME, profile and overrides must match. Unknown bindings,
 other providers and a missing/stale observer never acquire a network pause.
