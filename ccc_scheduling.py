@@ -102,7 +102,8 @@ class SurfaceScheduler:
                     if slot.future:
                         slot.future.cancel()
             for index, (sid, target) in enumerate(active.items()):
-                key = (generation, str(target.get("workspace_id")),
+                target_generation = generation(target) if callable(generation) else generation
+                key = (target_generation, str(target.get("workspace_id")),
                        str(target.get("source")), str(target.get("source_workspace_id")))
                 slot = self._slots.get(sid)
                 cadence = (self.observation_interval(target, self.interval)
@@ -119,7 +120,11 @@ class SurfaceScheduler:
                         slot.cadence_anchor = now + cadence * index / max(1, len(active))
                     if slot.key != key:
                         slot.revision += 1
-                        slot.due = now
+                        # A config update invalidates an old result, not the
+                        # waiting reader's place in line. Resetting every due
+                        # time lets the first worker-sized prefix starve peers
+                        # whenever a batch keeps updating its configuration.
+                        slot.due = min(slot.due, now)
                         slot.cadence_anchor = now + cadence * index / max(1, len(active))
                         slot.candidate = None
                         slot.urgent_at = None
@@ -358,7 +363,8 @@ class SnapshotClient:
                               if str(workspace.get("id") or workspace.get("workspace_id") or "") == workspace_id]
                 if workspaces:
                     windows.append({"id": window.get("id"), "kind": "window", "workspaces": workspaces})
-            return {"windows": windows}
+            return {**{key: top[key] for key in ("sample", "include_processes") if key in top},
+                    "windows": windows}
         return self.cache.get(("workspace_top", workspace_id), scoped, ttl=5.0, source=top)
 
     def cached_top(self, workspace_id, *, wait=False):
