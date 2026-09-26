@@ -121,7 +121,8 @@ class ProbeTransportTests(unittest.TestCase):
     def test_unreadable_credentials_do_not_crash_or_probe(self):
         item, probe = self.probe(1)
         probe.config.update(auth_file="/nonexistent/ccc-test-auth.json", allow_unauthenticated_test=False)
-        self.assertEqual(probe.run(item).kind, "auth")
+        probe = ResponsesProbe(probe.config, probe.ports)
+        self.assertEqual(probe.run(item).kind, "observer_error")
 
 
 class InventoryTests(unittest.TestCase):

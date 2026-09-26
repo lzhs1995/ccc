@@ -369,7 +369,7 @@ class GuardLoopTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.config, self.routes = fixtures()
         self.config.update(state_dir=str(self.root), controller_socket="/fixture/controller.sock",
-                           binary="/fixture/mihomo", interface="en0", probe={},
+                           binary="/fixture/mihomo", interface="en0", probe={"allow_unauthenticated_test": True},
                            sources=[{"pool": "NTHU", "path": "/fixture/original.json"}],
                            publish={"port": 0, "token": "fixture"},
                            policy={**network.DEFAULTS, "inventory_interval_sec": 1})
@@ -610,7 +610,8 @@ class GuardLoopTests(unittest.TestCase):
                 future.set_result(function(*args))
                 # Simulate a changed API contract while the paid job waited.
                 # Discarding its health evidence cannot refund its budget.
-                self.guard.contract = "obsolete-fixture-contract"
+                rid, deep, owner, began, _, generation = self.guard.jobs[future]
+                self.guard.jobs[future] = (rid, deep, owner, began, "obsolete-fixture-contract", generation)
         self.stepped_loop(range(1000, 1166), setup=setup, on_tick=advance)
         self.assertEqual(dispatched[0], 1040)
         self.assertGreaterEqual(self.guard.discarded_probes, 1)

@@ -30,7 +30,8 @@ import uuid
 from pathlib import Path
 
 from ccc_mihomo import (Controller, ControllerError, PhysicalLink, ProbeResult, ResponsesProbe,
-                        Route, ShadowCore, atomic_json, effective_service_route, inventory, probe_key, validate_dependencies)
+                        Route, ShadowCore, atomic_json, effective_service_route, inventory,
+                        probe_credential, probe_key, validate_dependencies)
 
 
 DEFAULTS = {
@@ -119,26 +120,136 @@ def load_config(path):
     return config
 
 
-def contract_digest(config, *, legacy=False, legacy_credential=False):
+def contract_digest(config, *, legacy=False, legacy_credential=False, credential=None, source_digest=None):
     probe = dict(config["probe"])
     if not legacy:
         for key in ("timeout_sec", "deep_timeout_sec", "light_timeout_by_pool"):
             probe.pop(key, None)  # Scheduling/deadline changes do not change API identity.
     if (legacy or legacy_credential) and probe.get("auth_file"):
         try:
-            probe["credential_digest"] = hashlib.sha256(Path(probe["auth_file"]).read_bytes()).hexdigest()
+            probe["credential_digest"] = (source_digest if source_digest is not None else
+                                          hashlib.sha256(Path(probe["auth_file"]).read_bytes()).hexdigest())
         except OSError:
             probe["credential_digest"] = "unreadable"
     if probe.get("auth_env"):
-        probe["credential_digest"] = hashlib.sha256(os.environ.get(probe["auth_env"], "").encode()).hexdigest()
+        key = os.environ.get(probe["auth_env"], "") if credential is None else credential
+        probe["credential_digest"] = hashlib.sha256(key.encode()).hexdigest()
     elif not (legacy or legacy_credential) and probe.get("auth_file"):
         try:
             # Only the credential sent by ResponsesProbe identifies the API
             # contract. Formatting/metadata writes must not revoke all routes.
-            probe["credential_digest"] = hashlib.sha256(probe_key(probe).encode()).hexdigest()
+            key = probe_key(probe) if credential is None else credential
+            probe["credential_digest"] = hashlib.sha256(key.encode()).hexdigest()
         except (OSError, ValueError):
             probe["credential_digest"] = "unreadable"
     return hashlib.sha256(json.dumps(probe, sort_keys=True).encode()).hexdigest()
+
+
+def probe_binding(config):
+    key, source_digest = probe_credential(config["probe"])
+    arguments = {"credential": key, "source_digest": source_digest}
+    return (key, contract_digest(config, **arguments),
+            {contract_digest(config, legacy=True, **arguments),
+             contract_digest(config, legacy_credential=True, **arguments)})
+
+
+class ApiProbeState:
+    """Bounded API retry evidence, independent of route quarantine and budget."""
+    WINDOW = 1800
+    MAX_DELAY = 300
+
+    def __init__(self, now, saved=None, *, monotonic=None):
+        self.monotonic = monotonic
+        self.mono_until = None
+        self.since = now
+        self.history = []
+        self.kind, self.streak, self.paths = "", 0, []
+        self.last_at, self.until, self.delay = 0, 0, 0
+        self.recovery = ""
+        if saved is None:
+            return
+        def stamp(value):
+            return type(value) in (int, float) and math.isfinite(value) and value >= 0
+        valid = (isinstance(saved, dict) and saved.get("version") == 1
+                 and isinstance(saved.get("kind"), str) and saved["kind"] in API_ATTENTION | {""}
+                 and type(saved.get("streak")) is int and 0 <= saved["streak"] <= 1024
+                 and all(stamp(saved.get(k)) for k in ("since", "last_at", "until", "delay"))
+                 and saved["delay"] <= self.MAX_DELAY
+                 and ((saved["delay"] == 0 and saved["until"] == 0)
+                      or (saved["delay"] > 0 and saved["until"] > 0))
+                 and isinstance(saved.get("paths"), list) and len(saved["paths"]) <= 8
+                 and all(isinstance(r, str) and len(r) <= 128 for r in saved["paths"]))
+        if not valid:
+            # Corrupt optional telemetry is not route failure. Defer a bounded
+            # recovery check; never repair it by erasing the paid budget.
+            self.recovery = "invalid_api_state"
+            self.delay, self.until = self.MAX_DELAY, now + self.MAX_DELAY
+        else:
+            self.since = min(now, saved["since"])
+            self.kind, self.streak = saved["kind"], saved["streak"]
+            self.paths = list(dict.fromkeys(saved["paths"]))
+            self.last_at, self.delay = saved["last_at"], saved["delay"]
+            self.until = saved["until"]
+            if self.delay:
+                # A restart cannot prove elapsed monotonic time. Re-arm the
+                # existing finite delay, retaining history and reservations.
+                self.until = now + self.delay
+                self.recovery = "restart"
+            rows = saved.get("history", [])
+            if isinstance(rows, list):
+                for row in rows[-128:]:
+                    if (isinstance(row, dict) and stamp(row.get("at")) and 0 <= now - row["at"] <= self.WINDOW
+                            and isinstance(row.get("kind"), str)
+                            and row["kind"] in API_ATTENTION | LOCAL_FAILURES | {"healthy", "observer_error"}
+                            and type(row.get("status")) is int and 0 <= row["status"] <= 599):
+                        self.history.append({k: row[k] for k in ("at", "kind", "status")})
+        if self.delay and self.monotonic is not None:
+            self.mono_until = self.monotonic() + self.delay
+
+    def record(self, rid, result, now):
+        if not result.deep:
+            return
+        self.since = min(self.since, now)
+        self.history = [r for r in self.history if 0 <= now - r["at"] <= self.WINDOW][-127:]
+        self.history.append({"at": now, "kind": result.kind, "status": result.status})
+        self.recovery = ""
+        if result.kind not in API_ATTENTION:
+            self.kind, self.streak, self.paths = "", 0, []
+            self.last_at, self.until, self.delay = now, 0, 0
+            self.mono_until, self.recovery = None, ""
+            return
+        if result.kind != self.kind or now - self.last_at > 600:
+            self.streak, self.paths = 0, []
+            self.delay, self.until, self.mono_until = 0, 0, None
+        self.kind, self.last_at = result.kind, now
+        self.streak = min(1024, self.streak + 1)
+        self.paths = list(dict.fromkeys([*self.paths, rid]))[-8:]
+        if self.streak >= 3 and len(self.paths) >= 2:
+            self.delay = min(self.MAX_DELAY, 60 * 2 ** min(3, self.streak - 3))
+            self.until = now + self.delay
+            self.mono_until = self.monotonic() + self.delay if self.monotonic is not None else None
+            self.recovery = ""
+
+    def remaining(self, now):
+        if self.mono_until is not None:
+            return max(0, self.mono_until - self.monotonic())
+        return min(self.MAX_DELAY, max(0, self.until - now))
+
+    def snapshot(self, now):
+        history = [r for r in self.history if 0 <= now - r["at"] <= self.WINDOW]
+        counts = {}
+        for row in history:
+            counts[row["kind"]] = counts.get(row["kind"], 0) + 1
+        return {"window_sec": self.WINDOW, "observed_since": max(self.since, now - self.WINDOW),
+                "completed": len(history), "outcomes": counts, "last_result": history[-1] if history else None,
+                "backoff": {"kind": self.kind, "consecutive_failures": self.streak,
+                            "distinct_paths": len(self.paths), "remaining_sec": round(self.remaining(now), 3),
+                            "maximum_sec": self.MAX_DELAY, "recovery": self.recovery}}
+
+    def saved(self):
+        return {"version": 1, "since": self.since, "history": self.history,
+                "kind": self.kind, "streak": self.streak, "paths": self.paths,
+                "last_at": self.last_at, "delay": self.delay, "until": self.until}
 
 
 def private_socket_dir(config):
@@ -220,6 +331,7 @@ class Engine:
         self.hint_route = ""
         self.seed_consumed = False
         now = time.time() if now is None else now
+        self.api = ApiProbeState(now, (saved or {}).get("api_probe"), monotonic=monotonic)
         if saved:
             allowed = {f.name for f in dataclasses.fields(Health)}
             for rid, row in saved.get("health", {}).items():
@@ -287,6 +399,7 @@ class Engine:
         # remain reachable while every generation stream is truncated.
         if result.deep and result.kind == "healthy" and started_at < h.failure_at:
             return
+        self.api.record(rid, result, now)
         h.elapsed_ms, h.status = result.elapsed_ms, result.status
         if result.deep:
             h.deep_at, h.deep_kind = now, result.kind
@@ -411,7 +524,7 @@ class Engine:
     def deep_due(self, now, in_flight):
         interval = max(self.policy["deep_min_interval_sec"], 60 / self.policy["deep_per_minute"])
         self.deep_starts = recent_deep_starts(self.deep_starts, now, interval)
-        if (self.deep_pending is not None
+        if (self.api.remaining(now) > 0 or self.deep_pending is not None
                 or self.deep_settled_at and now - self.deep_settled_at < interval
                 or self._deep_settled_mono is not None and self._monotonic() - self._deep_settled_mono < interval
                 or sum(now - stamp < 60 for stamp in self.deep_starts) >= self.policy["deep_per_minute"]
@@ -426,6 +539,12 @@ class Engine:
                 continue
             period = (self.policy["current_deep_sec"] if rid == self.current else
                       self.policy["standby_deep_sec"] if rid in hot else self.policy["other_deep_sec"])
+            # A previously qualified current route must not monopolize paid
+            # checks after an API failure. Check another eligible path while
+            # this one waits its normal interval; selection stays unchanged.
+            if (self.qualified(rid, now) and h.deep_kind in API_ATTENTION
+                    and now - h.deep_at < min(period, 300)):
+                continue
             urgent = self.hint_at > h.deep_attempt_at and rid == (self.hint_route or self.current)
             if self.qualified(rid, now) and now - h.deep_ok_at < period and not urgent and not h.deep_failures:
                 continue
@@ -456,6 +575,7 @@ class Engine:
         return {"health": {rid: dataclasses.asdict(h) for rid, h in self.health.items()},
                 "current": self.current, "active_pool": self.active_pool,
                 "deep_starts": self.deep_starts, "seed_consumed": self.seed_consumed,
+                "api_probe": self.api.saved(),
                 "deep_budget": {"version": 1, "pending": self.deep_pending,
                                 "settled_at": self.deep_settled_at, "last_recovery": self.deep_recovery}}
 
@@ -664,6 +784,9 @@ class Guard:
         self.storage_errors = {}
         self.control_error = ""
         self.probe_observer_errors = {}
+        self._credential = None
+        self.credential_error = ""
+        self.probe_binding_at = 0
 
     def journal(self, event):
         # Fixed, bounded metadata only: never credentials, response bodies or
@@ -691,11 +814,83 @@ class Guard:
 
     def save(self):
         return self.write_state("health.json", {**self.engine.saved(), "contract": self.contract,
+            "probe_binding_at": self.probe_binding_at,
             "routes": [r.record() for r in self.engine.routes.values()]})
 
+    def bind_probe(self, config, now):
+        previous_error = self.credential_error
+        try:
+            credential, contract, _ = probe_binding(config)
+        except (OSError, ValueError):
+            self._credential = None
+            self.credential_error = "probe credential unavailable; API checks suspended"
+            if not previous_error:
+                self.journal({"event": "probe_credential_unavailable", "at": now, "contract": self.contract})
+            return False
+        self._credential, self.credential_error = credential, ""
+        changed = contract != self.contract
+        if changed:
+            previous, self.contract = self.contract, contract
+            self.probe_binding_at = now
+            for health in self.engine.health.values():
+                health.qualified = False
+                health.deep_attempt_at = 0
+            # Account/model identity changed. Keep route isolation, old
+            # evidence and paid reservations; begin a separately bound sample.
+            self.engine.api = ApiProbeState(now, monotonic=self.engine._monotonic)
+            self.journal({"event": "probe_contract_changed", "at": now, "previous": previous,
+                          "contract": contract, "model": config["probe"].get("model")})
+        elif previous_error:
+            self.journal({"event": "probe_credential_restored", "at": now, "contract": contract})
+        return changed
+
     def observer_error(self):
-        return (self.shadow_error or self.error or next(iter(self.storage_errors.values()), "")
+        return (self.shadow_error or self.error or self.credential_error or next(iter(self.storage_errors.values()), "")
                 or self.probe_observer_errors.get(self.engine.current, ""))
+
+    def automatic_status(self, now, rows):
+        api = self.engine.api.snapshot(now)
+        ready = sum(row["ready"] for row in rows)
+        accessible = sum(row["light_kind"] == "accessible" and not row["light_failures"]
+                         and 0 <= now - row["light_ok_at"] <= self.engine.policy["light_fresh_sec"] for row in rows)
+        last = api["last_result"] or {}
+        if self.credential_error:
+            state, reason = "credential_unavailable", "探测凭据暂不可读，已暂停验证"
+        elif self.observer_error() or not self.link.status()["available"]:
+            state, reason = "observer_error", "本机探测暂不可用，保留已有线路证据"
+        elif api["backoff"]["recovery"] == "invalid_api_state":
+            state, reason = "observer_error", "探测退避记录不完整，等待恢复检查"
+        elif api["backoff"]["remaining_sec"] > 0:
+            if api["backoff"]["consecutive_failures"] >= 3 and api["backoff"]["distinct_paths"] >= 2:
+                state, reason = "api_backoff", "多条路径连续 API 异常，等待恢复检查"
+            else:
+                state, reason = "checking", "等待保守恢复检查"
+        elif ready:
+            state, reason = "ready", "已有完整 API 答复验证通过的候选"
+        elif last.get("kind") == "observer_error":
+            state, reason = "observer_error", "最近一次本机探测失败，等待重检"
+        elif last.get("kind") in API_ATTENTION:
+            state = last["kind"]
+            reason = {"upstream": "上游 API 服务异常", "rate_limit": "API 额度或速率受限",
+                      "auth": "API 拒绝当前凭据", "permission": "API 账号或模型权限不足",
+                      "contract": "API 响应不符合验证要求"}[state]
+        elif accessible:
+            state, reason = "checking", "接口可达，等待完整 API 答复验证"
+        elif last.get("kind") in LOCAL_FAILURES:
+            state, reason = "route_failure", "最近一次线路或流式传输验证失败"
+        else:
+            state, reason = "checking", "等待线路与 API 验证"
+        probe = self.config["probe"]
+        endpoint = urllib.parse.urlsplit(probe.get("url", ""))
+        source = ({"kind": "environment", "name": probe["auth_env"]} if probe.get("auth_env") else
+                  {"kind": "file", "path": probe["auth_file"], "key": probe.get("auth_key", "OPENAI_API_KEY")}
+                  if probe.get("auth_file") else {"kind": "local_test"})
+        return {"state": state, "reason": reason, "candidate_count": len(rows), "ready": ready,
+                "light_accessible": accessible, "summary": f"自动候选 {ready}/{len(rows)} · {reason}",
+                "api": api, "probe": {"model": probe.get("model"), "host": endpoint.hostname,
+                    "path": endpoint.path, "credential_source": source, "credential_available": self._credential is not None,
+                    "contract": self.contract, "bound_since": self.probe_binding_at},
+                "latency_note": "Clash 通用测速与完整 API 验证独立；Timeout 不代表全部手动节点不可用"}
 
     def snapshot(self, now):
         e = self.engine
@@ -714,6 +909,7 @@ class Guard:
                 "storage_errors": dict(self.storage_errors),
                 "probe_observer_errors": dict(self.probe_observer_errors),
                 "physical_link": physical, "last_probe_event": self.last_probe_event,
+                "automatic": self.automatic_status(now, rows),
                 "discarded_probes": self.discarded_probes, "journal_error": self.journal_error,
                 "ready": sum(r["ready"] for r in rows), "qualified": sum(r["qualified"] for r in rows),
                 "quarantined": sum(r["quarantined"] for r in rows),
@@ -769,11 +965,20 @@ class Guard:
 
     def _run(self, sockets):
         os.umask(0o077)
-        self.contract = contract_digest(self.config)
         saved = read_json(self.root / "health.json", {})
-        if saved.get("contract") in {contract_digest(self.config, legacy=True),
-                                     contract_digest(self.config, legacy_credential=True)}:
-            saved["contract"] = self.contract
+        now = time.time()
+        try:
+            self._credential, self.contract, legacy = probe_binding(self.config)
+            if saved.get("contract") in legacy:
+                saved["contract"] = self.contract
+        except (OSError, ValueError):
+            # Retain the last bound evidence for inspection. With no readable
+            # credential we neither dispatch nor alter the automatic provider.
+            self.contract = saved.get("contract", "")
+            self.credential_error = "probe credential unavailable; API checks suspended"
+        bound_at = saved.get("probe_binding_at") if saved.get("contract") == self.contract else None
+        self.probe_binding_at = (bound_at if type(bound_at) in (int, float)
+                                 and math.isfinite(bound_at) and 0 <= bound_at <= now else now)
         try:
             routes = inventory(self.config)
         except (OSError, ValueError, KeyError, RuntimeError, subprocess.TimeoutExpired):
@@ -798,8 +1003,9 @@ class Guard:
                 h["qualified"] = False
                 h["deep_ok_at"] = 0
                 h["deep_attempt_at"] = 0
+            saved.pop("api_probe", None)
         self.engine = Engine(self.config, routes, saved, monotonic=time.monotonic)
-        if self.config.get("seed_file") and not self.engine.seed_consumed:
+        if self._credential is not None and self.config.get("seed_file") and not self.engine.seed_consumed:
             self.engine.seed(read_json(self.config["seed_file"], {}), time.time())
         publisher = ProviderServer(self.config["publish"]["port"], self.config["publish"]["token"], self.config["offline_proxy"])
         if self.config.get("publish_transit"):
@@ -827,6 +1033,24 @@ class Guard:
                 now = time.time()
                 for change in self.link.changes():
                     self.journal({"event": "physical_link", **change})
+                # Refresh identity before collecting old workers. Every worker
+                # receives a frozen key/model paired with its journal contract.
+                if now >= next_config:
+                    try:
+                        updated = load_config(self.path)
+                        immutable = ("controller_socket", "group", "outer_group", "provider", "state_dir", "binary", "interface", "publish")
+                        if any(updated.get(k) != self.config.get(k) for k in immutable):
+                            raise ValueError("network transport changes require a network-guard restart")
+                        if self.bind_probe(updated, time.time()):
+                            next_inventory = 0
+                        self.config = updated
+                        self.engine.config = updated
+                        self.engine.policy = updated["policy"]
+                        self.director.config = updated
+                        self.error = ""
+                    except Exception as exc:
+                        self.error = f"config refresh failed: {type(exc).__name__}"
+                    next_config = time.time() + 2
                 self.consume_hints(hint_socket, now)
                 completed = []
                 for job, (rid, deep, owner, began, contract, generation) in list(self.jobs.items()):
@@ -846,10 +1070,12 @@ class Guard:
                 # see any intervening failure before it can clear quarantine.
                 for completed_at, rid, result, began, owner, contract, generation in sorted(
                         completed, key=lambda item: (item[0], item[2].kind not in LOCAL_FAILURES)):
-                    reason = ("obsolete_contract" if contract != self.contract else
+                    reason = ("probe_credential_unavailable" if self.credential_error else
+                              "obsolete_contract" if contract != self.contract else
                               "probe_core_stopped" if owner.process.poll() is not None else
                               "physical_interface_generation_changed" if not self.link.accepts(generation) else "")
                     event = {"event": "probe", "at": completed_at, "collected_at": time.time(),
+                             "contract": contract,
                              "route_id": rid, "started_at": began, "generation": generation,
                              "accepted": not reason, "discard_reason": reason, **dataclasses.asdict(result)}
                     if reason:
@@ -884,26 +1110,6 @@ class Guard:
                         retry_delay = min(60, retry_delay * 2)
                     pending_core = None
                     next_inventory = now + self.engine.policy["inventory_interval_sec"]
-                if now >= next_config:
-                    try:
-                        updated = load_config(self.path)
-                        immutable = ("controller_socket", "group", "outer_group", "provider", "state_dir", "binary", "interface", "publish")
-                        if any(updated.get(k) != self.config.get(k) for k in immutable):
-                            raise ValueError("network transport changes require a network-guard restart")
-                        if contract_digest(updated) != self.contract:
-                            self.contract = contract_digest(updated)
-                            for h in self.engine.health.values():
-                                h.qualified = False
-                                h.deep_attempt_at = 0
-                            next_inventory = 0
-                        self.config = updated
-                        self.engine.config = updated
-                        self.engine.policy = updated["policy"]
-                        self.director.config = updated
-                        self.error = ""
-                    except Exception as exc:
-                        self.error = f"config refresh failed: {type(exc).__name__}"
-                    next_config = now + 2
                 if self.core is None or self.core.process.poll() is not None:
                     self.shadow_error = "isolated probe core exited; restarting only its replacement"
                     if pending_core is None and now >= next_core_retry:
@@ -934,15 +1140,17 @@ class Guard:
                 # Do not reserve a billable request using the tick's old clock.
                 now = time.time()
                 generation = self.link.current()
-                if generation is not None and self.core and self.core.process.poll() is None:
+                if (generation is not None and self.core and self.core.process.poll() is None
+                        and not self.error and self._credential is not None):
                     occupied = {rid for rid, deep, _, _, _, _ in self.jobs.values() if not deep}
-                    probe = ResponsesProbe(self.config["probe"], self.core.ports)
+                    probe = ResponsesProbe(self.config["probe"], self.core.ports, credential=self._credential)
                     if len(self.jobs) < self.engine.policy["concurrency"] and not any(deep for _, deep, _, _, _, _ in self.jobs.values()):
                         rid = self.engine.deep_due(now, occupied)
                         if rid:
                             self.engine.reserve_deep(rid, now)
                             if self.save():  # Never dispatch an unpersisted reservation.
                                 self.journal({"event": "deep_reserved", "at": now, "route_id": rid,
+                                              "contract": self.contract, "model": self.config["probe"].get("model"),
                                               "generation": generation})
                                 job = executor.submit(self.run_probe, probe, self.engine.routes[rid], True, self.link, generation)
                                 self.jobs[job] = (rid, True, self.core, now, self.contract, generation)

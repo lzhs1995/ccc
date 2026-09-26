@@ -249,6 +249,42 @@ It never reloads Clash or closes existing connections. A route switch affects
 new connections; an already broken remote stream still needs the client's
 normal retry. No network policy can guarantee an upstream API never fails.
 
+### Automatic API checks and the delay-test label
+
+The automatic selector admits only paths with a complete model response. Its
+candidate inventory can be smaller than the independent manual catalog. A
+successful lightweight JSON-validator response proves reachability, not model
+availability. Clash's ordinary delay-test `Timeout` is a separate test/cache;
+it does not identify an API failure or mean that every manual choice is down.
+
+`ccc network status` includes an `automatic` object with ready/candidate counts,
+a reason, recent accepted deep outcomes and a recovery countdown. Its probe
+metadata names the configured model and credential source, plus a contract
+digest; it contains neither the key nor API response bodies. The outcome window
+starts at the recorded `observed_since` and is capped at 30 minutes. These are
+probe samples, not the failure rate of all user requests.
+
+Every queued probe uses a frozen configuration and credential paired with its
+contract. File formatting/metadata changes do not reset admission. A valid
+credential/model change is journaled and requires new complete API validation;
+old-contract worker results are discarded while their reservations stay spent.
+If a credential file is temporarily missing or malformed, the guard suspends
+probes and routing publication, reports a local credential error, and retains
+existing evidence. It never silently falls back to an old key. An independently
+managed `probe.auth_file` can be configured when a dedicated probing account is
+desired; the guard never copies, edits or substitutes the user's credentials.
+
+Three consecutive accepted deep failures of the same API class on at least two
+candidate paths trigger finite recovery delays: 60, 120, 240, then at most 300
+seconds. This includes upstream, rate-limit, credential, permission and protocol
+errors, and does not classify a path as blocked. Light checks keep running.
+Light success, hints and restarts cannot erase this delay or refund the paid
+budget. A restart conservatively re-arms the saved finite delay. Each recovery
+request still requires the ordinary light/admission gates and persistent global
+budget, and a complete successful result clears the API delay. Unrelated deep
+failure classes end the consecutive API streak without granting route health.
+The configured user/manual selector remains independent throughout.
+
 Only a reliably bound AnyRouter failed turn whose effective route is proven
 automatic waits on `network_wait`. GLOBAL/manual routes and unrelated profiles
 cannot inherit a stopped automatic pool's outage; missing or obsolete route

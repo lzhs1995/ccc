@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.23
+
+- Bind each queued network probe to one credential and model snapshot. Pair completed results and reservations with that contract in the event journal. A temporarily unreadable credential file suspends probing and publication without erasing prior qualification or isolation; a real account/model change still requires new API admission.
+- After three consecutive API failures of the same class across at least two candidate paths, delay deep recovery checks by 60, 120, 240 and at most 300 seconds. Light checks continue; completed success ends the delay. Keep durable reservations, completion spacing, restart barriers, route quarantine and manual selection independent.
+- Prevent a previously qualified current path with repeated API errors from monopolizing deep checks. Other eligible paths may be checked while the current path waits its normal interval; API errors still do not trigger node quarantine or rotate the current selection.
+- Add automatic-pool diagnostics to network status: ready/candidate counts, recent API outcomes, recovery delay, configured model, credential source and contract. Distinguish local credential/observer errors, upstream failures, rate limits, permission errors and route failures. Clash's ordinary delay-test Timeout is not a complete API validation result.
+
 ## 0.2.21
 
 - Render only current cmux surfaces and use their current workspace names and references. Historical registrations no longer reappear as paused terminals or relabel a real workspace whose display number was reused.
