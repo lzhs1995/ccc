@@ -197,7 +197,9 @@ def settled_job(config_path, previous, config, client):
         return False
 
 
-def start(config_path, selector, *, client=None, launch=True):
+def start(config_path, selector, *, client=None, launch=True, private_check=False):
+    if type(private_check) is not bool:
+        raise RuntimeError("B private-check mode must be explicitly selected")
     from ccc_batch_guard import AUTOMATIC_POOL_STOP
     guarded = launch and AUTOMATIC_POOL_STOP
     store = core.ConfigStore(Path(config_path))
@@ -237,10 +239,12 @@ def start(config_path, selector, *, client=None, launch=True):
                 and not settled_job(config_path, previous, config, client)))):
             job = previous  # Repeated clicks and retries reuse the same 50 slots.
         else:
-            job = {"id": str(uuid.uuid4()), "workspace_id": wid, "cwd_policy": EMPTY_CWD_POLICY,
-                   "initial_prompt": PROMPT, "name_policy": "before-first-turn-v1",
+            job = {"id": str(uuid.uuid4()), "workspace_id": wid,
                    "created_at": time.time(), "status": "pending",
                    "slots": [{"index": i, "phase": "pending"} for i in range(COUNT)]}
+            if private_check:
+                job.update(cwd_policy=EMPTY_CWD_POLICY, initial_prompt=PROMPT,
+                           name_policy="before-first-turn-v1")
             job_locks.enter_context(core.FileLock(job_path(config_path, job["id"]).parent / "worker.lock", timeout_sec=0))
         if writable:
             job["config_path"] = str(Path(config_path).resolve())
@@ -277,7 +281,9 @@ def start(config_path, selector, *, client=None, launch=True):
         job_locks.close()
         if launch:
             _launch(config_path, job)
-        return {"job_id": job["id"], "workspace_id": wid, **counts(job)}
+        return {"job_id": job["id"], "workspace_id": wid,
+                "startup_mode": "private_check" if job.get("cwd_policy") == EMPTY_CWD_POLICY else "existing",
+                **counts(job)}
 
 
 def sqlite_home(config_path, job_id, index):
