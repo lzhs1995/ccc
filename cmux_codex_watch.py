@@ -146,7 +146,7 @@ PROVIDER_RATE_LIMIT_COMPACT_RE = re.compile(
     r"(?:ratelimitexceeded:){1,2}yourrequeststo[a-z0-9][a-z0-9._:/-]{0,199}"
     r"for[a-z0-9][a-z0-9._:/-]{0,199}"
     r"in[a-z0-9][a-z0-9._-]{0,79}"
-    r"haveexceededratelimit\.$"
+    r"haveexceeded(?:token)?ratelimit\.$"
 )
 RECONNECT_COMPACT_PREFIX_RE = re.compile(
     r"^•reconnecting(?:\.\.\.|…)?(?:\d+/\d+)?"
@@ -330,7 +330,7 @@ CLAUDE_CONTEXT_ABSOLUTE_TIMEOUT_SEC = 900.0
 # through TargetRuntime and suppresses duplicate Hook/fallback deliveries.
 # Human label only.  Acceptance always compares SHA-256 of the loaded source:
 # a revision string is hand-maintained and therefore can lie about what runs.
-FEATURE_REVISION = "0.2.20-fleet-discovery-and-batch-membership"
+FEATURE_REVISION = "0.2.20-native-coverage-and-serialized-batches"
 # How long after our own send a byte-identical UserPromptSubmit can still be
 # our echo.  Must exceed claude_submit_confirm_timeout_sec so that a late
 # echo arriving after the transaction timed out is not read as a human.

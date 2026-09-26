@@ -29,7 +29,7 @@ from ccc_inventory import SharedInventory
 from ccc_scheduling import SnapshotCache, SnapshotClient
 
 COUNT = 50
-WORKER_VERSION = 22
+WORKER_VERSION = 23
 PROMPT = "show me u power"
 INITIALIZING = {"creating", "create_unknown", "created", "restarting", "restart_unknown",
                 "submitted", "submitting", "uncertain"}
@@ -157,30 +157,29 @@ def settled_job(config_path, previous, config, client):
     labelled closed is also retained for reconciliation. Only a new topology
     read can distinguish it from an actually closed tab; failure to read keeps
     the old job, without creating replacements or resetting its delivery log.
+    The caller holds this job's worker lock through the authorization change.
     """
     if previous.get("status") != "needs_attention":
         return False
     try:
-        with core.FileLock(job_path(config_path, previous["id"]).parent / "worker.lock", timeout_sec=0):
-            job = core.load_json(job_path(config_path, previous["id"]), {})
-            slots = job.get("slots", [])
-            if job.get("status") != "needs_attention" or not slots:
+        slots = previous.get("slots", [])
+        if not slots:
+            return False
+        for slot in slots:
+            if slot.get("phase") not in {"confirmed", "surface_closed", "blocked"}:
                 return False
-            for slot in slots:
-                if slot.get("phase") not in {"confirmed", "surface_closed", "blocked"}:
-                    return False
-                if slot.get("phase") == "blocked" and slot.get("error") not in {
-                    "此 session 已有任务，未发送批量 prompt", "此路授权已被修改，未发送 prompt",
-                }:
-                    return False  # Legacy recoverable waits are still resumed.
-            closed = {s.get("surface_id") for s in slots if s.get("phase") == "surface_closed"}
-            if closed:
-                reader = client or _client(config)
-                tree = reader.fresh_tree() if isinstance(reader, SnapshotClient) else reader.tree()
-                present = {r["surface_id"] for r in core.workspace_surface_records(tree, job["workspace_id"]).values()}
-                if closed & present:
-                    return False
-            return True
+            if slot.get("phase") == "blocked" and slot.get("error") not in {
+                "此 session 已有任务，未发送批量 prompt", "此路授权已被修改，未发送 prompt",
+            }:
+                return False  # Legacy recoverable waits are still resumed.
+        closed = {s.get("surface_id") for s in slots if s.get("phase") == "surface_closed"}
+        if closed:
+            reader = client or _client(config)
+            tree = reader.fresh_tree() if isinstance(reader, SnapshotClient) else reader.tree()
+            present = {r["surface_id"] for r in core.workspace_surface_records(tree, previous["workspace_id"]).values()}
+            if closed & present:
+                return False
+        return True
     except (OSError, ValueError, RuntimeError):
         return False
 
@@ -192,7 +191,7 @@ def start(config_path, selector, *, client=None, launch=True):
     config = store.load()
     workspace = workspace_record(config_path, selector, config, client)
     wid = workspace["workspace_id"]
-    with core.FileLock(Path(config_path).parent / f"batch-start-{wid}.lock", timeout_sec=5):
+    with core.FileLock(Path(config_path).parent / f"batch-start-{wid}.lock", timeout_sec=5), contextlib.ExitStack() as job_locks:
         config = store.load()
         rule = next((r for r in config["workspace_rules"] if r.get("workspace_id") == wid), {})
         if config.get("mode") != "armed" or config.get("global_paused"):
@@ -208,21 +207,34 @@ def start(config_path, selector, *, client=None, launch=True):
             raise RuntimeError("本池已暂停；请先按 W 恢复，再创建或补做")
         cancel_epoch = rule.get("batch_cancelled_at")
         previous = core.load_json(job_path(config_path, rule["last_batch_id"]), {}) if rule.get("last_batch_id") else {}
-        if (previous and previous.get("status") not in {"complete", "stopped_success"}
+        writable = True
+        if previous:
+            path = job_path(config_path, previous["id"])
+            try:
+                job_locks.enter_context(core.FileLock(path.parent / "worker.lock", timeout_sec=0))
+            except (OSError, RuntimeError):
+                # A worker owns this job. Reuse its identity, but never replace
+                # its progress with the snapshot read before taking the lock.
+                writable = False
+            else:
+                previous = core.load_json(path, {})
+        if (previous and (not writable or (
+                previous.get("status") not in {"complete", "stopped_success"}
                 and previous.get("created_at", 0) > rule.get("batch_success_at", 0)
-                and not settled_job(config_path, previous, config, client)):
+                and not settled_job(config_path, previous, config, client)))):
             job = previous  # Repeated clicks and retries reuse the same 50 slots.
         else:
             job = {"id": str(uuid.uuid4()), "workspace_id": wid,
                    "created_at": time.time(), "status": "pending",
                    "slots": [{"index": i, "phase": "pending"} for i in range(COUNT)]}
+            job_locks.enter_context(core.FileLock(job_path(config_path, job["id"]).parent / "worker.lock", timeout_sec=0))
+        if writable:
+            job["config_path"] = str(Path(config_path).resolve())
+            if guarded:
+                job["guard_version"] = 1
+            if launch:
+                job["launch_mode"] = "guarded" if guarded else "native"
             core.atomic_write_json(job_path(config_path, job["id"]), job)
-        job["config_path"] = str(Path(config_path).resolve())
-        if guarded:
-            job["guard_version"] = 1
-        if launch:
-            job["launch_mode"] = "guarded" if guarded else "native"
-        core.atomic_write_json(job_path(config_path, job["id"]), job)
         def authorize(latest):
             current = next((r for r in latest["workspace_rules"] if r.get("workspace_id") == wid), None)
             if (latest.get("mode") != "armed" or latest.get("global_paused")
@@ -246,6 +258,9 @@ def start(config_path, selector, *, client=None, launch=True):
         if guarded:
             from ccc_batch_guard import arm
             arm(config_path, wid, resume=resume_success)
+        # Neither the old reconciler nor the new helper may run until the
+        # authorization commit above is durable. Release before spawning.
+        job_locks.close()
         if launch:
             _launch(config_path, job)
         return {"job_id": job["id"], "workspace_id": wid, **counts(job)}
@@ -1000,7 +1015,7 @@ class BatchWorker:
             workspace_present = any(w.get("id") == self.job["workspace_id"]
                                     for win in tree.get("windows", []) for w in win.get("workspaces", []))
             missing = any(s.get("surface_id") and s["surface_id"] not in present
-                          and s.get("phase") in INITIALIZING | {"startup_wait", "restart_pending", "pty_wait"}
+                          and s.get("phase") in INITIALIZING | {"startup_wait", "restart_pending", "pty_wait", "surface_closed"}
                           and self.clock() - s.get("launched_at", s.get("created_at", self.clock())) >= 5
                           for s in self.job.get("slots", []))
             if not workspace_present or missing:
@@ -1176,11 +1191,12 @@ class BatchReconciler:
                     if worker is None:
                         worker = self.workers[jid] = BatchWorker(self.path, jid, client=self.client)
                     worker.job = job
-                    if allowed(config, job) and any(s.get("phase") == "surface_closed" for s in job.get("slots", [])):
+                    current_config = self.store.load()
+                    if allowed(current_config, job) and any(s.get("phase") == "surface_closed" for s in job.get("slots", [])):
                         if membership is None:
-                            membership = self.client.tree()
+                            membership = self.client.fresh_tree() if isinstance(self.client, SnapshotClient) else self.client.tree()
                         worker._restore_present_slots(membership)
-                    rule = next((r for r in config["workspace_rules"] if r.get("workspace_id") == job["workspace_id"]), {})
+                    rule = next((r for r in current_config["workspace_rules"] if r.get("workspace_id") == job["workspace_id"]), {})
                     for slot in job.get("slots", []):
                         if slot.get("phase") == "confirmed" and not core.batch_start_hold(rule, slot.get("surface_id")):
                             continue
