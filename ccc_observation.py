@@ -150,8 +150,18 @@ def observation_row(target, record, process, terminal, runtime, *, owner_alive, 
             row.update(status="live_unreadable", reason_code="live_owner_without_surface")
         elif inventory_complete and owner_alive is False and not pid:
             row.update(status="missing", reason_code="surface_closed_owner_exited")
+        elif not inventory_complete:
+            row["reason_code"] = "process_inventory_incomplete"
     elif str(record.get("workspace_id") or "") != wid:
         row["reason_code"] = "workspace_identity_mismatch"
+    elif not inventory_complete and not pid and owner_alive is not True:
+        # An incomplete OS scan cannot establish that a shell has no agent.
+        # Keep that uncertainty separate from stale viewport/Hook failures;
+        # positive native ownership still follows the normal observation path.
+        if (target.get("paused") or not target.get("enabled", True)) and pause_health(target)[0] == "paused":
+            row.update(status="paused", reason_code="explicitly_paused_or_disabled")
+        else:
+            row["reason_code"] = "process_inventory_incomplete"
     elif (inventory_complete and process.get("process_snapshot_present")
           and not process.get("identity_conflicts") and owner_alive is False and not pid
           and kind in {"shell", "other"}):
@@ -238,6 +248,17 @@ def continuation_row(target, runtime, *, now, poll_interval=1.0, observation=Non
         status, reason = "inactive", str(observed.get("reason_code") or "no_supported_agent")
     elif not target.get("enabled", True):
         status, reason = "paused", "explicitly_paused_or_disabled"
+    elif (current and observed.get("status") == "unknown"
+          and observed.get("reason_code") == "process_inventory_incomplete"
+          and (not target.get("paused") or pause_health(target)[0] != "paused")
+          and delivery not in {"unknown", "failed", "sending"}
+          and phase not in {"cmux_unavailable", "send_guard_unavailable", "incompatible", "claude_viewport_blind",
+                            "provider_blocked", "token_exhausted", "network_wait", "queue_recovery_unconfirmed",
+                            "claude_hook_config_degraded", "claude_hook_gap_exhausted", "claude_model_unavailable"}):
+        # Without current presence evidence, old pauses or shell/Hook history
+        # do not establish a new continuation outage. Do not turn uncertainty
+        # into green health or hide an independently known delivery/read fault.
+        status, reason = "unknown", "process_inventory_incomplete"
     elif target.get("paused"):
         status, reason = pause_health(target)
     elif age is None or age < 0:

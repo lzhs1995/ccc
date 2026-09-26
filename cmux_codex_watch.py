@@ -5538,20 +5538,14 @@ class WatchDaemon:
             sid = str(target["surface_id"])
             runtime = state.get(sid, {})
             explicit_owner = process_owners.get(runtime.get("claude_process_pid"))
-            if explicit_owner:
-                owner = explicit_owner == (sid, str(target["workspace_id"]))
-            elif isinstance(client, SnapshotClient):
-                # Absence from an incomplete process snapshot cannot prove exit.
-                pid = int(runtime.get("claude_process_pid") or 0)
-                owner = None if pid else False
-                if pid:
-                    try:
-                        os.kill(pid, 0)
-                    except ProcessLookupError:
-                        owner = False
-                    except (OSError, PermissionError):
-                        pass
+            if explicit_owner and explicit_owner != (sid, str(target["workspace_id"])):
+                owner = False
             else:
+                # A saved PID can now belong to a different process, including
+                # a shell in the same surface. Only the original generation
+                # establishes a surviving owner. This read runs in maintenance,
+                # never on the observation/sending scheduler; failed inspection
+                # stays unknown, even when the global inventory is complete.
                 owner = self._observation_owner_alive(runtime)
             owners[sid] = owner
         if monitoring_config_key(config) != monitoring_config_key(self.config):
@@ -5609,6 +5603,8 @@ class WatchDaemon:
                     "observed_at": now, "monitored_targets": [
                         {k: t[k] for k in ("surface_id", "workspace_id", "enabled", "paused") if k in t}
                         for t in targets],
+                    "diagnostics": {"inventory_complete": metadata.get("inventory_complete", False),
+                                    "observed_at": metadata_at, "config_matches": metadata_matches},
                     "continuation_health": observation_health.continuation_report(
                         targets, state, now=now, poll_interval=float(config.get("poll_interval_sec", 1)),
                         observations=rows),
