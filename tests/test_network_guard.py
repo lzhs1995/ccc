@@ -1,5 +1,6 @@
 import copy
 import concurrent.futures
+import errno
 import json
 from pathlib import Path
 import socket
@@ -71,6 +72,19 @@ class EngineTests(unittest.TestCase):
         self.e.current, self.e.active_pool = self.ids[2], "Yeye"
         self.assertEqual(self.e.decision(1001), (self.ids[2], "healthy"))
 
+    def test_credential_metadata_does_not_revoke_routes_but_key_changes_do(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "auth.json"
+            path.write_text(json.dumps({"OPENAI_API_KEY": "fixture-key", "refreshed_at": 1}))
+            config = {"probe": {"auth_file": str(path), "url": "https://example.invalid/v1/responses", "model": "test"}}
+            digest = contract_digest(config)
+            legacy = contract_digest(config, legacy_credential=True)
+            path.write_text(json.dumps({"OPENAI_API_KEY": "fixture-key", "refreshed_at": 2}, indent=2))
+            self.assertEqual(contract_digest(config), digest)
+            self.assertNotEqual(contract_digest(config, legacy_credential=True), legacy)
+            path.write_text(json.dumps({"OPENAI_API_KEY": "changed-key", "refreshed_at": 2}))
+            self.assertNotEqual(contract_digest(config), digest)
+
     def test_single_timeout_rechecks_without_flapping(self):
         self.all_good()
         self.e.record(self.ids[0], ProbeResult("timeout"), 1001)
@@ -125,7 +139,9 @@ class EngineTests(unittest.TestCase):
     def test_billable_probe_budget_survives_restart(self):
         self.good(self.ids[0])
         self.e.reserve_deep(self.ids[0], 1000)
+        self.e.settle_deep(1000)
         self.e.reserve_deep(self.ids[1], 1031)
+        self.e.settle_deep(1031)
         restored = Engine(self.config, self.routes, self.e.saved(), now=1032)
         restored.record(self.ids[2], ProbeResult("accessible"), 1032)
         self.assertIsNone(restored.deep_due(1033, set()))
@@ -137,7 +153,9 @@ class EngineTests(unittest.TestCase):
             with self.subTest(restart=restart):
                 engine = Engine(self.config, self.routes, now=995)
                 engine.reserve_deep(self.ids[0], 1000)
+                engine.settle_deep(1000)
                 engine.reserve_deep(self.ids[1], 1031)
+                engine.settle_deep(1031)
                 if restart:
                     engine = Engine(self.config, self.routes, engine.saved(), now=995)
                 engine.record(self.ids[2], ProbeResult("accessible"), 995)
@@ -155,14 +173,83 @@ class EngineTests(unittest.TestCase):
                 config['policy']['deep_min_interval_sec'] = 90
                 engine = Engine(config, self.routes, now=1000)
                 engine.reserve_deep(self.ids[0], 1000)
+                engine.settle_deep(1000)
                 if restart:
                     engine = Engine(config, self.routes, engine.saved(), now=1061)
                 engine.record(self.ids[2], ProbeResult('accessible'), 1061)
                 self.assertIsNone(engine.deep_due(1061, set()))
                 engine.record(self.ids[2], ProbeResult('accessible'), 1089)
                 self.assertIsNone(engine.deep_due(1089, set()))
-                engine.record(self.ids[2], ProbeResult('accessible'), 1090)
-                self.assertEqual(engine.deep_due(1090, set()), self.ids[2])
+                due = 1151 if restart else 1090
+                engine.record(self.ids[2], ProbeResult('accessible'), due - 1)
+                self.assertIsNone(engine.deep_due(due - 1, set()))
+                engine.record(self.ids[2], ProbeResult('accessible'), due)
+                self.assertEqual(engine.deep_due(due, set()), self.ids[2])
+
+    def test_unfinished_reservation_cannot_expire_while_worker_is_queued(self):
+        self.e.reserve_deep(self.ids[0], 1000)
+        self.e.record(self.ids[1], ProbeResult("accessible"), 1200)
+        self.assertIsNone(self.e.deep_due(1200, set()))
+        self.assertEqual(self.e.saved()["deep_budget"]["pending"]["reserved_at"], 1000)
+        self.e.settle_deep(1200)
+        self.e.record(self.ids[1], ProbeResult("accessible"), 1229)
+        self.assertIsNone(self.e.deep_due(1229, set()))
+        self.assertEqual(self.e.deep_due(1230, set()), self.ids[1])
+
+    def test_restart_recovers_unfinished_legacy_and_settled_budgets_conservatively(self):
+        self.e.reserve_deep(self.ids[0], 1000)
+        unfinished = copy.deepcopy(self.e.saved())
+        legacy = copy.deepcopy(unfinished)
+        legacy.pop("deep_budget")
+        self.e.settle_deep(1008)
+        settled = copy.deepcopy(self.e.saved())
+        invalid = {**settled, "deep_budget": {"version": 1, "settled_at": "unknown"}}
+        for saved in (unfinished, legacy, settled, invalid):
+            with self.subTest(budget=saved.get("deep_budget")):
+                # A wall-clock jump across restart cannot instantly release
+                # a dispatched request with an old reservation timestamp.
+                engine = Engine(self.config, self.routes, saved, now=5000)
+                engine.record(self.ids[1], ProbeResult("accessible"), 5029)
+                self.assertIsNone(engine.deep_due(5029, set()))
+                self.assertEqual(engine.deep_due(5030, set()), self.ids[1])
+                self.assertIsNone(engine.saved()["deep_budget"]["pending"])
+                self.assertEqual(engine.saved()["deep_budget"]["last_recovery"]["at"], 5000)
+        restored = Engine(self.config, self.routes, unfinished, now=1009)
+        self.assertEqual(restored.deep_starts, [1000])
+        self.assertEqual(restored.deep_recovery["reservation"], unfinished["deep_budget"]["pending"])
+        restarted_again = Engine(self.config, self.routes, restored.saved(), now=1010)
+        restarted_again.record(self.ids[1], ProbeResult("accessible"), 1039)
+        self.assertIsNone(restarted_again.deep_due(1039, set()))
+        self.assertEqual(restarted_again.deep_due(1040, set()), self.ids[1])
+
+    def test_completion_barrier_honors_tightened_rate_and_longer_intervals(self):
+        self.e.reserve_deep(self.ids[0], 1000)
+        self.e.settle_deep(1008)
+        self.e.record(self.ids[1], ProbeResult("accessible"), 1038)
+        self.assertEqual(self.e.deep_due(1038, set()), self.ids[1])
+        self.e.policy["deep_per_minute"] = 1
+        self.assertIsNone(self.e.deep_due(1038, set()))
+        self.e.record(self.ids[1], ProbeResult("accessible"), 1067)
+        self.assertIsNone(self.e.deep_due(1067, set()))
+        self.assertEqual(self.e.deep_due(1068, set()), self.ids[1])
+        self.e.policy["deep_min_interval_sec"] = 90
+        self.e.record(self.ids[1], ProbeResult("accessible"), 1097)
+        self.assertIsNone(self.e.deep_due(1097, set()))
+        self.assertEqual(self.e.deep_due(1098, set()), self.ids[1])
+
+    def test_wall_clock_jump_cannot_shorten_real_completion_interval(self):
+        clock = [10]
+        engine = Engine(self.config, self.routes, now=1000, monotonic=lambda: clock[0])
+        engine.reserve_deep(self.ids[0], 1000)
+        engine.settle_deep(1001)
+        clock[0] = 11
+        engine.record(self.ids[1], ProbeResult("accessible"), 5000)
+        self.assertIsNone(engine.deep_due(5000, set()))
+        clock[0] = 40
+        self.assertEqual(engine.deep_due(5000, set()), self.ids[1])
+        clock[0] = 100
+        engine.record(self.ids[1], ProbeResult("accessible"), 995)
+        self.assertIsNone(engine.deep_due(995, set()))
 
     def test_stale_or_future_qualification_cannot_admit_a_standby(self):
         self.all_good()
@@ -246,7 +333,11 @@ class FakeController:
     def __init__(self, names, now):
         self.names, self.now, self.calls = names, now, []
     def get(self, path):
-        return {"now": self.now, "all": self.names}
+        if path == "/configs":
+            return {"mode": "rule"}
+        if path == "/rules":
+            return {"rules": [{"type": "Domain", "payload": "anyrouter.test", "proxy": "AnyRouter"}]}
+        return {"type": "Selector", "now": self.now, "all": self.names}
     def refresh(self, provider):
         self.calls.append(("refresh", provider))
     def select(self, group, name):
@@ -320,9 +411,9 @@ class GuardLoopTests(unittest.TestCase):
         self.addCleanup(patch.stop)
         return value
 
-    def stepped_loop(self, ticks, *, setup=None):
+    def stepped_loop(self, ticks, *, setup=None, on_tick=None):
         clock = [ticks[0]]
-        self.patch("time", new=types.SimpleNamespace(time=lambda: clock[0]))
+        self.patch("time", new=types.SimpleNamespace(time=lambda: clock[0], monotonic=lambda: clock[0]))
         self.patch("concurrent.futures.ThreadPoolExecutor", new=ImmediateExecutor)
         pending = iter(ticks)
 
@@ -331,6 +422,8 @@ class GuardLoopTests(unittest.TestCase):
             if value is None:
                 return True
             clock[0] = value
+            if on_tick:
+                on_tick(clock)
             return False
 
         self.guard.stop = types.SimpleNamespace(wait=tick)
@@ -446,6 +539,135 @@ class GuardLoopTests(unittest.TestCase):
         self.stepped_loop([1000, 1001], setup=setup)
         self.assertEqual(dispatched, [1007])
         self.assertEqual(self.guard.engine.deep_starts, dispatched)
+
+    def budget_fixture(self, clock, dispatched):
+        engine = Engine(self.config, self.routes, now=clock[0])
+        for item in self.routes:
+            engine.record(item.id, ProbeResult("accessible"), clock[0] - 1)
+        self.save_engine(engine)
+
+        def probe(item, deep):
+            if deep:
+                dispatched.append(clock[0])
+            return ProbeResult("upstream" if deep else "accessible", deep=deep)
+        self.probe.run.side_effect = probe
+
+    def assert_paid_rate(self, starts, *, limit=2, interval=30):
+        self.assertGreaterEqual(len(starts), 3, "fixture must exercise repeated real dispatches")
+        self.assertTrue(all(b - a >= interval for a, b in zip(starts, starts[1:])), starts)
+        self.assertLessEqual(max(sum(0 <= stamp - start < 60 for stamp in starts) for start in starts), limit, starts)
+
+    def test_slow_reservation_persistence_cannot_accelerate_actual_dispatches(self):
+        dispatched = []
+        def setup(clock):
+            self.budget_fixture(clock, dispatched)
+            save = self.guard.save
+            delayed = False
+            def slow_save():
+                nonlocal delayed
+                result = save()
+                if self.guard.engine.deep_starts and not delayed:
+                    delayed = True
+                    clock[0] += 8
+                return result
+            self.guard.save = slow_save
+        self.stepped_loop([1000, *range(1009, 1136)], setup=setup)
+        self.assertEqual(dispatched[0], 1008)
+        self.assert_paid_rate(dispatched)
+
+    def test_slow_reservation_journal_cannot_accelerate_actual_dispatches(self):
+        dispatched = []
+        def setup(clock):
+            self.budget_fixture(clock, dispatched)
+            journal = self.guard.journal
+            delayed = False
+            def slow_journal(event):
+                nonlocal delayed
+                if event.get("event") == "deep_reserved" and not delayed:
+                    delayed = True
+                    clock[0] += 8
+                journal(event)
+            self.guard.journal = slow_journal
+        self.stepped_loop([1000, *range(1009, 1136)], setup=setup)
+        self.assertEqual(dispatched[0], 1008)
+        self.assert_paid_rate(dispatched)
+
+    def test_queued_worker_and_discarded_result_cannot_release_next_probe_early(self):
+        dispatched, queued = [], []
+        def setup(clock):
+            self.budget_fixture(clock, dispatched)
+            class QueuedExecutor(ImmediateExecutor):
+                def submit(inner, function, *args):
+                    if function == Guard.run_probe and args[2] and not queued:
+                        future = concurrent.futures.Future()
+                        queued.append((future, function, args))
+                        return future
+                    return super().submit(function, *args)
+            self.patch("concurrent.futures.ThreadPoolExecutor", new=QueuedExecutor)
+        def advance(clock):
+            if queued and not queued[0][0].done() and clock[0] >= 1040:
+                future, function, args = queued[0]
+                future.set_result(function(*args))
+                # Simulate a changed API contract while the paid job waited.
+                # Discarding its health evidence cannot refund its budget.
+                self.guard.contract = "obsolete-fixture-contract"
+        self.stepped_loop(range(1000, 1166), setup=setup, on_tick=advance)
+        self.assertEqual(dispatched[0], 1040)
+        self.assertGreaterEqual(self.guard.discarded_probes, 1)
+        self.assert_paid_rate(dispatched)
+
+    def test_restart_unfinished_reservation_waits_before_dispatch_and_persists_pending(self):
+        dispatched, durable = [], []
+        def setup(clock):
+            self.budget_fixture(clock, dispatched)
+            engine = Engine(self.config, self.routes, now=1000)
+            engine.reserve_deep(self.routes[0].id, 900)
+            self.save_engine(engine)
+            run = self.probe.run.side_effect
+            def probe(item, deep):
+                if deep:
+                    durable.append(json.loads((self.root / "health.json").read_text()))
+                return run(item, deep)
+            self.probe.run.side_effect = probe
+        self.stepped_loop(range(1000, 1131), setup=setup)
+        self.assertGreaterEqual(dispatched[0], 1030)
+        self.assert_paid_rate(dispatched)
+        self.assertTrue(all(row["deep_budget"]["pending"] for row in durable))
+        self.assertTrue(all(row["deep_budget"]["last_recovery"]["reason"] == "unfinished" for row in durable))
+
+    def test_failed_slow_health_write_settles_without_refunding_or_dispatching(self):
+        dispatched = []
+        write = network.atomic_json.side_effect
+        def setup(clock):
+            self.budget_fixture(clock, dispatched)
+            failed = False
+            def disk(path, value):
+                nonlocal failed
+                if Path(path).name == "health.json" and value.get("deep_starts") and not failed:
+                    failed = True
+                    clock[0] += 8
+                    raise OSError(errno.ENOSPC, "fixture full after delayed fsync")
+                return write(path, value)
+            self.patch("atomic_json", side_effect=disk)
+        self.stepped_loop([1000, *range(1009, 1151)], setup=setup)
+        self.assertGreaterEqual(dispatched[0], 1038)
+        self.assert_paid_rate(dispatched)
+        self.assertFalse(self.guard.storage_errors)
+
+    def test_worker_exception_settles_paid_budget_before_retry(self):
+        dispatched = []
+        def setup(clock):
+            self.budget_fixture(clock, dispatched)
+            run = self.probe.run.side_effect
+            def probe(item, deep):
+                if deep:
+                    dispatched.append(clock[0])
+                    raise RuntimeError("fixture worker failure")
+                return run(item, deep)
+            self.probe.run.side_effect = probe
+        self.stepped_loop(range(1000, 1131), setup=setup)
+        self.assert_paid_rate(dispatched)
+        self.assertIsNone(self.guard.engine.deep_pending)
 
     def test_completed_light_failure_precedes_old_deep_success(self):
         item = self.routes[0]
@@ -625,10 +847,11 @@ class GuardLoopTests(unittest.TestCase):
         save = self.guard.save
 
         def saved_then_down():
-            save()
+            result = save()
             if self.guard.engine.deep_starts:
                 self.link_reader.return_value = ()
                 self.link.sample()
+            return result
 
         self.guard.save = saved_then_down
         self.stepped_loop([1000, 1001])
@@ -658,6 +881,69 @@ class GuardLoopTests(unittest.TestCase):
         payload = network.plistlib.loads(Path(installed["plist"]).read_bytes())
         self.assertEqual(payload["ProcessType"], "Interactive")
         self.assertEqual(payload["ProgramArguments"][-2:], ["--config", str((self.root / "network.json").resolve())])
+
+
+    def test_disk_full_status_keeps_loop_and_cleanup_alive(self):
+        write = network.atomic_json.side_effect
+        attempts = []
+        def full(path, value):
+            if Path(path).name == "status.json":
+                attempts.append(value["phase"])
+                raise OSError(errno.ENOSPC, "fixture disk full")
+            return write(path, value)
+        self.patch("atomic_json", side_effect=full)
+        self.stepped_loop([1000, 1001, 1002])
+        self.assertEqual(len(attempts), 4)  # Three heartbeats and final cleanup.
+        self.assertEqual(attempts[-1], "stopped")
+        self.assertIn("ENOSPC", self.guard.storage_errors["status.json"])
+        self.core.close.assert_called_once()
+        self.publisher.close.assert_called_once()
+
+    def test_failed_health_write_cannot_dispatch_deep_or_publish_empty_pool(self):
+        engine = Engine(self.config, self.routes, now=1000)
+        engine.current = self.routes[0].id
+        engine.record(self.routes[0].id, ProbeResult("accessible"), 999)
+        self.save_engine(engine)
+        self.publisher.routes = [self.routes[0]]
+        write = network.atomic_json.side_effect
+        def full(path, value):
+            if Path(path).name == "health.json":
+                raise OSError(errno.ENOSPC, "fixture disk full")
+            return write(path, value)
+        self.patch("atomic_json", side_effect=full)
+        self.stepped_loop([1000, 1001, 1002])
+        self.assertFalse(any(call.args[1] for call in self.probe.run.call_args_list))
+        self.assertEqual(self.guard.engine.deep_starts, [1000])
+        self.assertEqual(self.controller.calls, [])
+        self.assertEqual(self.publisher.routes, [self.routes[0]])
+        self.assertEqual(self.guard.phase, "observer_fault")
+        self.assertTrue(self.snapshots[-1]["storage_errors"])
+
+    def test_storage_recovery_keeps_reserved_budget_and_requires_durable_dispatch(self):
+        engine = Engine(self.config, self.routes, now=1000)
+        engine.current = self.routes[0].id
+        engine.record(self.routes[0].id, ProbeResult("accessible"), 999)
+        self.save_engine(engine)
+        write = network.atomic_json.side_effect
+        paid = []
+        def setup(clock):
+            def disk(path, value):
+                if Path(path).name == "health.json" and clock[0] < 1002:
+                    raise OSError(errno.ENOSPC, "fixture disk full")
+                return write(path, value)
+            self.patch("atomic_json", side_effect=disk)
+            def probe(item, deep):
+                if deep:
+                    durable = json.loads((self.root / "health.json").read_text())
+                    self.assertIn(clock[0], durable["deep_starts"])
+                    paid.append(clock[0])
+                return ProbeResult("healthy" if deep else "accessible", deep=deep)
+            self.probe.run.side_effect = probe
+        self.stepped_loop([1000, 1001, 1002, 1030, 1031, 1032], setup=setup)
+        self.assertEqual(len(paid), 1)
+        self.assertGreaterEqual(paid[0] - 1000, 30)
+        self.assertEqual(self.guard.engine.deep_starts, [1000, paid[0]])
+        self.assertEqual(self.guard.storage_errors, {})
 
 
 class PublicationTests(unittest.TestCase):

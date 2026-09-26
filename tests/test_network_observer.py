@@ -71,11 +71,15 @@ class LocalProbeFailureTests(unittest.TestCase):
         self.assertEqual(result.stage, "tunnel")
 
     def test_connect_headers_and_remote_tls_obey_total_deadline(self):
+        # This test isolates remote stages; CA-store I/O belongs to the
+        # separate setup-delay test and can exceed 200 ms under host load.
+        context = ssl.create_default_context()
         for mode, stage in (("slow_headers", "tunnel"), ("slow_tls", "tls")):
             with self.subTest(mode=mode):
                 item, probe = self.probe(self.server(mode))
                 started = time.monotonic()
-                result = probe.run(item)
+                with mock.patch("ccc_mihomo.ssl.create_default_context", return_value=context):
+                    result = probe.run(item)
                 self.assertEqual(result.kind, "timeout")
                 self.assertEqual(result.stage, stage)
                 self.assertLess(time.monotonic() - started, .6)

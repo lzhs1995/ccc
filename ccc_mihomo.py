@@ -30,6 +30,19 @@ import zlib
 from pathlib import Path
 
 
+def probe_key(config):
+    if config.get("auth_env"):
+        key = os.environ.get(config["auth_env"], "")
+    else:
+        auth = json.loads(Path(config["auth_file"]).read_text()) if config.get("auth_file") else {}
+        if not isinstance(auth, dict):
+            raise ValueError("probe credential unavailable")
+        key = auth.get(config.get("auth_key", "OPENAI_API_KEY"), "")
+    if not isinstance(key, str) or (not key and not config.get("allow_unauthenticated_test", False)):
+        raise ValueError("probe credential unavailable")
+    return key
+
+
 def atomic_json(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -158,6 +171,12 @@ class UnixHTTPConnection(http.client.HTTPConnection):
         self.sock.connect(self.path)
 
 
+class ControllerError(RuntimeError):
+    def __init__(self, method, path, status):
+        self.status = status
+        super().__init__(f"Mihomo {method} {path}: HTTP {status}")
+
+
 class Controller:
     def __init__(self, path, secret="", timeout=3):
         self.path, self.secret, self.timeout = str(path), secret, timeout
@@ -172,7 +191,7 @@ class Controller:
             response = connection.getresponse()
             data = response.read(4 * 1024 * 1024)
             if response.status >= 400:
-                raise RuntimeError(f"Mihomo {method} {path}: HTTP {response.status}")
+                raise ControllerError(method, path, response.status)
             return json.loads(data) if data else {}
         finally:
             connection.close()
@@ -185,6 +204,54 @@ class Controller:
 
     def refresh(self, provider):
         return self.request("PUT", "/providers/proxies/" + urllib.parse.quote(provider, safe=""))
+
+
+def effective_service_route(controller, config):
+    """Prove whether this service currently traverses the managed selector.
+
+    A different profile, GLOBAL choice, or manual outer selection is not an
+    automatic-pool outage. Rule-mode binding deliberately requires the exact
+    service domain as the first rule: earlier process/IP rules are not safely
+    inferable without the request's complete metadata.
+    """
+    mode = str(controller.get("/configs").get("mode", "")).lower()
+    result = {"managed": False, "mode": mode, "kind": "inactive", "selection": "", "chain": []}
+    if mode == "direct":
+        return {**result, "kind": "manual", "selection": "DIRECT"}
+    if mode == "global":
+        name = "GLOBAL"
+    elif mode == "rule":
+        rules = controller.get("/rules").get("rules", [])
+        first = rules[0] if rules else {}
+        expected = config.get("outer_group") or config["group"]
+        if (first.get("type") != "Domain" or first.get("payload") != config["service_host"]
+                or first.get("proxy") != expected):
+            return result
+        name = expected
+    else:
+        return {**result, "kind": "unknown"}
+    chain = []
+    for _ in range(16):
+        if name in chain:
+            return {**result, "kind": "unknown", "chain": chain}
+        chain.append(name)
+        try:
+            node = controller.get("/proxies/" + urllib.parse.quote(name, safe=""))
+        except ControllerError as exc:
+            if exc.status == 404:
+                return {"managed": False, "mode": mode, "kind": "inactive", "selection": name, "chain": chain}
+            raise
+        if name == config["group"] and node.get("type") == "Selector":
+            return {**result, "managed": True, "kind": "automatic", "selection": name, "chain": chain}
+        selected = node.get("now")
+        if not selected:
+            return {**result, "kind": "manual", "selection": name, "chain": chain}
+        # Only selectors have an explicit user choice. A fallback/load-balance
+        # can use another child per connection, so it cannot bind network_wait.
+        if node.get("type") != "Selector":
+            return {**result, "kind": "manual", "selection": selected, "chain": chain}
+        name = selected
+    return {**result, "kind": "unknown", "chain": chain}
 
 
 class ShadowCore:
@@ -596,15 +663,8 @@ class ResponsesProbe:
         if endpoint.scheme != "https" and not (endpoint.scheme == "http" and endpoint.hostname in {"127.0.0.1", "localhost"}):
             raise ValueError("probe endpoint must be HTTPS or a local test server")
         try:
-            auth = json.loads(Path(self.config["auth_file"]).read_text()) if self.config.get("auth_file") else {}
+            key = probe_key(self.config)
         except (OSError, ValueError):
-            return ProbeResult("auth", detail="probe credential unavailable", deep=deep)
-        if not isinstance(auth, dict):
-            return ProbeResult("auth", detail="probe credential unavailable", deep=deep)
-        key = auth.get(self.config.get("auth_key", "OPENAI_API_KEY"), "")
-        if self.config.get("auth_env"):
-            key = os.environ.get(self.config["auth_env"], "")
-        if not key and not self.config.get("allow_unauthenticated_test", False):
             return ProbeResult("auth", detail="probe credential unavailable", deep=deep)
         timeout = float(self.config.get("deep_timeout_sec", 45) if deep else self.config.get("timeout_sec", 5))
         if not deep:

@@ -11,6 +11,7 @@ import concurrent.futures
 import contextlib
 import copy
 import dataclasses
+import errno
 import fcntl
 import hashlib
 import http.server
@@ -28,7 +29,8 @@ import urllib.parse
 import uuid
 from pathlib import Path
 
-from ccc_mihomo import Controller, PhysicalLink, ProbeResult, ResponsesProbe, Route, ShadowCore, atomic_json, inventory, validate_dependencies
+from ccc_mihomo import (Controller, ControllerError, PhysicalLink, ProbeResult, ResponsesProbe,
+                        Route, ShadowCore, atomic_json, effective_service_route, inventory, probe_key, validate_dependencies)
 
 
 DEFAULTS = {
@@ -70,6 +72,10 @@ def load_config(path):
             raise ValueError(f"network {key} is required")
     if config["offline_proxy"] == "DIRECT":
         raise ValueError("DIRECT cannot stand in for a failed service route")
+    if "outer_group" in config and (not isinstance(config["outer_group"], str)
+            or not config["outer_group"] or config["outer_group"] in {config["group"], "GLOBAL"}
+            or config["group"] == "GLOBAL"):
+        raise ValueError("outer_group must be a separate user-owned selector")
     pools = config.get("commercial_pools")
     if not isinstance(pools, list) or not pools or len(set(pools)) != len(pools):
         raise ValueError("commercial_pools must be a nonempty ordered list")
@@ -113,18 +119,25 @@ def load_config(path):
     return config
 
 
-def contract_digest(config, *, legacy=False):
+def contract_digest(config, *, legacy=False, legacy_credential=False):
     probe = dict(config["probe"])
     if not legacy:
         for key in ("timeout_sec", "deep_timeout_sec", "light_timeout_by_pool"):
             probe.pop(key, None)  # Scheduling/deadline changes do not change API identity.
-    if probe.get("auth_file"):
+    if (legacy or legacy_credential) and probe.get("auth_file"):
         try:
             probe["credential_digest"] = hashlib.sha256(Path(probe["auth_file"]).read_bytes()).hexdigest()
         except OSError:
             probe["credential_digest"] = "unreadable"
     if probe.get("auth_env"):
         probe["credential_digest"] = hashlib.sha256(os.environ.get(probe["auth_env"], "").encode()).hexdigest()
+    elif not (legacy or legacy_credential) and probe.get("auth_file"):
+        try:
+            # Only the credential sent by ResponsesProbe identifies the API
+            # contract. Formatting/metadata writes must not revoke all routes.
+            probe["credential_digest"] = hashlib.sha256(probe_key(probe).encode()).hexdigest()
+        except (OSError, ValueError):
+            probe["credential_digest"] = "unreadable"
     return hashlib.sha256(json.dumps(probe, sort_keys=True).encode()).hexdigest()
 
 
@@ -188,7 +201,7 @@ def recent_deep_starts(starts, now, minimum_interval=60):
 
 class Engine:
     """Pure route policy. Probe results never constitute terminal-send grants."""
-    def __init__(self, config, routes, saved=None, now=None):
+    def __init__(self, config, routes, saved=None, now=None, *, monotonic=None):
         self.config = config
         self.policy = {**DEFAULTS, **config.get("policy", {})}
         self.routes = {r.id: r for r in routes}
@@ -197,6 +210,11 @@ class Engine:
         self.current = ""
         self.active_pool = config["commercial_pools"][0]
         self.deep_starts = []
+        self.deep_pending = None
+        self.deep_settled_at = 0
+        self.deep_recovery = None
+        self._monotonic = monotonic
+        self._deep_settled_mono = None
         self.last_switch = 0
         self.hint_at = 0
         self.hint_route = ""
@@ -230,6 +248,23 @@ class Engine:
             self.deep_starts = recent_deep_starts(saved.get("deep_starts", []), now,
                                                   self.policy["deep_min_interval_sec"])
             self.seed_consumed = bool(saved.get("seed_consumed"))
+            budget = saved.get("deep_budget")
+            settled = budget.get("settled_at") if isinstance(budget, dict) else None
+            valid = (isinstance(budget, dict) and budget.get("version") == 1
+                     and type(settled) in (int, float) and math.isfinite(settled) and settled >= 0)
+            if valid:
+                self.deep_settled_at = settled
+                self.deep_recovery = budget.get("last_recovery")
+            # A previous process cannot prove the actual dispatch time of an
+            # unfinished/legacy reservation. Even a settled restart waits a
+            # full interval, because wall-clock correction may span restarts.
+            # Keep its spent history; this is a new barrier, never a refund.
+            if not valid or budget.get("pending") is not None or settled or self.deep_starts:
+                pending = budget.get("pending") if isinstance(budget, dict) else None
+                self.deep_recovery = {"at": now,
+                    "reason": "legacy_or_invalid" if not valid else "unfinished" if pending else "restart",
+                    "reservation": pending}
+                self.settle_deep(now)
 
     def update_inventory(self, routes):
         self.active = {r.id for r in routes}
@@ -374,8 +409,12 @@ class Engine:
         return sorted((rid for rid in self.routes if rid not in in_flight and order(rid)[1] <= now), key=order)
 
     def deep_due(self, now, in_flight):
-        self.deep_starts = recent_deep_starts(self.deep_starts, now, self.policy["deep_min_interval_sec"])
-        if (sum(now - stamp < 60 for stamp in self.deep_starts) >= self.policy["deep_per_minute"]
+        interval = max(self.policy["deep_min_interval_sec"], 60 / self.policy["deep_per_minute"])
+        self.deep_starts = recent_deep_starts(self.deep_starts, now, interval)
+        if (self.deep_pending is not None
+                or self.deep_settled_at and now - self.deep_settled_at < interval
+                or self._deep_settled_mono is not None and self._monotonic() - self._deep_settled_mono < interval
+                or sum(now - stamp < 60 for stamp in self.deep_starts) >= self.policy["deep_per_minute"]
                 or self.deep_starts and now - self.deep_starts[-1] < self.policy["deep_min_interval_sec"]):
             return None
         hot = set(self.standbys(now))
@@ -397,13 +436,28 @@ class Engine:
         return min(candidates)[-1] if candidates else None
 
     def reserve_deep(self, rid, now):
+        if self.deep_pending is not None:
+            raise RuntimeError("an unfinished deep reservation still owns the budget")
         self.deep_starts.append(now)
+        self.deep_pending = {"route_id": rid, "reserved_at": now}
         self.health[rid].deep_attempt_at = now
+
+    def settle_deep(self, now):
+        # Only call once the worker is known to have finished, or when no
+        # worker was submitted. Queue/fsync/journal delays therefore cannot
+        # shorten the next actual request's spacing. Collection may be late;
+        # using its clock conservatively adds delay, without refreshing health.
+        self.deep_pending = None
+        self.deep_settled_at = max(self.deep_settled_at, now)
+        if self._monotonic is not None:
+            self._deep_settled_mono = self._monotonic()
 
     def saved(self):
         return {"health": {rid: dataclasses.asdict(h) for rid, h in self.health.items()},
                 "current": self.current, "active_pool": self.active_pool,
-                "deep_starts": self.deep_starts, "seed_consumed": self.seed_consumed}
+                "deep_starts": self.deep_starts, "seed_consumed": self.seed_consumed,
+                "deep_budget": {"version": 1, "pending": self.deep_pending,
+                                "settled_at": self.deep_settled_at, "last_recovery": self.deep_recovery}}
 
 
 class ProviderServer:
@@ -488,11 +542,42 @@ class Director:
         self.published = set()
         self.pending_refresh = False
         self.actual_name = ""
+        self.effective_route = {"managed": False, "kind": "unknown", "selection": "", "chain": []}
+        self.reconciliation_error = ""
 
-    def sync(self, now, *, link=None):
+    def sync(self, now, *, link=None, observer_error=""):
+        # A manual choice may happen while an automatic refresh is in flight.
+        self.effective_route = effective_service_route(self.controller, self.config)
+        failure = None
+        try:
+            phase, target = self._sync(now, link=link, observer_error=observer_error)
+            self.reconciliation_error = ""
+        except Exception as exc:
+            failure = exc
+            self.reconciliation_error = "automatic selector reconciliation failed: " + type(exc).__name__
+            phase, target = "observer_fault", self.engine.current
+        self.effective_route = effective_service_route(self.controller, self.config)
+        if not self.effective_route["managed"]:
+            kind = self.effective_route["kind"]
+            phase = "manual" if kind == "manual" else "inactive" if kind == "inactive" else "observer_fault"
+        elif failure is not None:
+            raise failure
+        return phase, target
+
+    def _sync(self, now, *, link=None, observer_error=""):
         e, c = self.engine, self.config
+        if not (self.effective_route["managed"] or c.get("outer_group") in self.effective_route.get("chain", [])):
+            # A same-named group in an unrelated profile is not ours to edit.
+            self.actual_name = ""
+            return "inactive", e.current
         generation = link.current() if link is not None else None
-        group = self.controller.get("/proxies/" + urllib.parse.quote(c["group"], safe=""))
+        try:
+            group = self.controller.get("/proxies/" + urllib.parse.quote(c["group"], safe=""))
+        except ControllerError as exc:
+            if exc.status != 404:
+                raise
+            self.actual_name = ""
+            return "inactive", e.current
         actual = group.get("now", "")
         ids = {r.name: rid for rid, r in e.routes.items()}
         known = ids.get(actual) or c.get("bootstrap_aliases", {}).get(actual)
@@ -504,7 +589,7 @@ class Director:
         self.actual_name = actual
 
         def observer_unavailable():
-            return link is not None and not link.accepts(generation)
+            return bool(observer_error) or (link is not None and not link.accepts(generation))
 
         def held():
             return ("network_wait" if actual == c["offline_proxy"] else "observer_fault", e.current)
@@ -576,6 +661,9 @@ class Guard:
         self.last_probe_event = None
         self.discarded_probes = 0
         self.journal_error = ""
+        self.storage_errors = {}
+        self.control_error = ""
+        self.probe_observer_errors = {}
 
     def journal(self, event):
         # Fixed, bounded metadata only: never credentials, response bodies or
@@ -590,9 +678,24 @@ class Guard:
         except OSError as exc:
             self.journal_error = "event journal unavailable: " + type(exc).__name__
 
+    def write_state(self, filename, value):
+        # Disk-full/status errors cannot terminate the provider or bypass the
+        # cleanup path. A failed health write also prevents a paid dispatch.
+        try:
+            atomic_json(self.root / filename, value)
+            self.storage_errors.pop(filename, None)
+            return True
+        except OSError as exc:
+            self.storage_errors[filename] = "persistence unavailable: " + errno.errorcode.get(exc.errno, type(exc).__name__)
+            return False
+
     def save(self):
-        atomic_json(self.root / "health.json", {**self.engine.saved(), "contract": self.contract,
+        return self.write_state("health.json", {**self.engine.saved(), "contract": self.contract,
             "routes": [r.record() for r in self.engine.routes.values()]})
+
+    def observer_error(self):
+        return (self.shadow_error or self.error or next(iter(self.storage_errors.values()), "")
+                or self.probe_observer_errors.get(self.engine.current, ""))
 
     def snapshot(self, now):
         e = self.engine
@@ -601,17 +704,22 @@ class Guard:
                  **dataclasses.asdict(e.health[rid]), "qualified": e.qualified(rid, now),
                  "ready": e.ready(rid, now)} for rid, r in e.routes.items()]
         return {"version": 1, "pid": os.getpid(), "at": now, "mode": self.config["mode"],
+                "group": self.config["group"], "outer_group": self.config.get("outer_group"),
                 "service_host": self.config["service_host"], "phase": self.phase,
                 "current_id": e.current, "current": self.director.actual_name,
                 "active_pool": e.active_pool, "last_switch": e.last_switch,
-                "error": self.error or self.shadow_error or physical["detail"] or self.inventory_error or self.journal_error,
+                "error": self.control_error or self.observer_error() or physical["detail"] or self.inventory_error or self.journal_error,
                 "inventory_error": self.inventory_error, "routes": rows,
+                "effective_route": dict(self.director.effective_route),
+                "storage_errors": dict(self.storage_errors),
+                "probe_observer_errors": dict(self.probe_observer_errors),
                 "physical_link": physical, "last_probe_event": self.last_probe_event,
                 "discarded_probes": self.discarded_probes, "journal_error": self.journal_error,
                 "ready": sum(r["ready"] for r in rows), "qualified": sum(r["qualified"] for r in rows),
                 "quarantined": sum(r["quarantined"] for r in rows),
                 "probe_in_flight": len(self.jobs),
                 "deep_in_last_minute": sum(now - stamp < 60 for stamp in e.deep_starts),
+                "deep_budget": e.saved()["deep_budget"],
                 "hint_count": self.hint_count, "hint_socket": str(private_socket_dir(self.config) / "hint.sock"),
                 "shadow_pid": self.core.process.pid if self.core and self.core.process else None}
 
@@ -663,7 +771,8 @@ class Guard:
         os.umask(0o077)
         self.contract = contract_digest(self.config)
         saved = read_json(self.root / "health.json", {})
-        if saved.get("contract") == contract_digest(self.config, legacy=True):
+        if saved.get("contract") in {contract_digest(self.config, legacy=True),
+                                     contract_digest(self.config, legacy_credential=True)}:
             saved["contract"] = self.contract
         try:
             routes = inventory(self.config)
@@ -689,7 +798,7 @@ class Guard:
                 h["qualified"] = False
                 h["deep_ok_at"] = 0
                 h["deep_attempt_at"] = 0
-        self.engine = Engine(self.config, routes, saved)
+        self.engine = Engine(self.config, routes, saved, monotonic=time.monotonic)
         if self.config.get("seed_file") and not self.engine.seed_consumed:
             self.engine.seed(read_json(self.config["seed_file"], {}), time.time())
         publisher = ProviderServer(self.config["publish"]["port"], self.config["publish"]["token"], self.config["offline_proxy"])
@@ -723,6 +832,10 @@ class Guard:
                 for job, (rid, deep, owner, began, contract, generation) in list(self.jobs.items()):
                     if job.done():
                         del self.jobs[job]
+                        if deep:
+                            # Budget settlement precedes contract/core/link
+                            # rejection and also covers cancelled/failed jobs.
+                            self.engine.settle_deep(time.time())
                         try:
                             result, completed_at = job.result()
                         except Exception:
@@ -743,6 +856,10 @@ class Guard:
                         self.discarded_probes += 1
                     else:
                         self.engine.record(rid, result, completed_at, started_at=began)
+                        if result.kind == "observer_error":
+                            self.probe_observer_errors[rid] = result.detail or "local probe observer unavailable"
+                        else:
+                            self.probe_observer_errors.pop(rid, None)
                     self.journal(event)
                     self.last_probe_event = event
                 for old in list(self.retired):
@@ -759,6 +876,7 @@ class Guard:
                         if self.config.get("publish_transit"):
                             publisher.set_catalog(routes, self.config["commercial_pools"])
                         self.shadow_error = ""
+                        self.probe_observer_errors.clear()
                         retry_delay = 5
                     except Exception as exc:
                         self.shadow_error = f"isolated probe core unavailable: {type(exc).__name__}"
@@ -769,7 +887,7 @@ class Guard:
                 if now >= next_config:
                     try:
                         updated = load_config(self.path)
-                        immutable = ("controller_socket", "group", "provider", "state_dir", "binary", "interface", "publish")
+                        immutable = ("controller_socket", "group", "outer_group", "provider", "state_dir", "binary", "interface", "publish")
                         if any(updated.get(k) != self.config.get(k) for k in immutable):
                             raise ValueError("network transport changes require a network-guard restart")
                         if contract_digest(updated) != self.contract:
@@ -823,11 +941,15 @@ class Guard:
                         rid = self.engine.deep_due(now, occupied)
                         if rid:
                             self.engine.reserve_deep(rid, now)
-                            self.save()  # Reserve before a billable request can run.
-                            self.journal({"event": "deep_reserved", "at": now, "route_id": rid,
-                                          "generation": generation})
-                            job = executor.submit(self.run_probe, probe, self.engine.routes[rid], True, self.link, generation)
-                            self.jobs[job] = (rid, True, self.core, now, self.contract, generation)
+                            if self.save():  # Never dispatch an unpersisted reservation.
+                                self.journal({"event": "deep_reserved", "at": now, "route_id": rid,
+                                              "generation": generation})
+                                job = executor.submit(self.run_probe, probe, self.engine.routes[rid], True, self.link, generation)
+                                self.jobs[job] = (rid, True, self.core, now, self.contract, generation)
+                            else:
+                                # No worker was submitted. Retain the spent
+                                # reservation and wait a full interval anyway.
+                                self.engine.settle_deep(time.time())
                     for rid in self.engine.light_due(now, occupied):
                         if len(self.jobs) >= self.engine.policy["concurrency"]:
                             break
@@ -838,26 +960,26 @@ class Guard:
                     try:
                         self.save()  # Proof and full route definition precede publication.
                         previous_selection = self.director.actual_name
-                        self.phase, _ = self.director.sync(now, link=self.link)
+                        self.phase, _ = self.director.sync(now, link=self.link, observer_error=self.observer_error())
+                        self.control_error = self.director.reconciliation_error
                         if self.director.actual_name != previous_selection:
                             self.journal({"event": "selection", "at": time.time(), "phase": self.phase,
                                           "previous": previous_selection, "current": self.director.actual_name})
-                        if self.shadow_error and self.phase != "network_wait":
-                            self.phase = "observer_fault"
                     except Exception as exc:
                         self.phase = "observer_fault"
-                        self.error = f"controller reconciliation failed: {type(exc).__name__}"
+                        self.control_error = f"controller reconciliation failed: {type(exc).__name__}"
+                        self.director.effective_route = {"managed": False, "kind": "unknown", "selection": "", "chain": []}
                     next_sync = now + 1
                 if now >= next_save:
                     self.save()
                     next_save = now + 5
                 if now >= next_snapshot:
-                    atomic_json(self.root / "status.json", self.snapshot(time.time()))
+                    self.write_state("status.json", self.snapshot(time.time()))
                     next_snapshot = now + 1
         finally:
             self.link.close()
             hint_socket.close()
-            atomic_json(self.root / "status.json", {"version": 1, "at": time.time(), "phase": "stopped", "mode": self.config["mode"]})
+            self.write_state("status.json", {"version": 1, "at": time.time(), "phase": "stopped", "mode": self.config["mode"]})
             if self.core:
                 self.core.close()
             for core in self.retired:

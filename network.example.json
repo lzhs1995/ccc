@@ -6,8 +6,9 @@
   "controller_socket": "/var/run/clash-verge-service/users/501/verge-mihomo.sock",
   "interface": "en0",
   "service_host": "anyrouter.top",
-  "group": "Transit-Auto-Select",
-  "provider": "CCC-AnyRouter-Verified-v217",
+  "group": "AnyRouter-Auto",
+  "outer_group": "Transit-Auto-Select",
+  "provider": "CCC-AnyRouter-Verified-v219",
   "offline_proxy": "AR/Offline",
   "commercial_pools": ["NTHU", "Yeye"],
   "sources": [
