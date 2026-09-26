@@ -201,7 +201,7 @@ def recent_deep_starts(starts, now, minimum_interval=60):
 
 class Engine:
     """Pure route policy. Probe results never constitute terminal-send grants."""
-    def __init__(self, config, routes, saved=None, now=None):
+    def __init__(self, config, routes, saved=None, now=None, *, monotonic=None):
         self.config = config
         self.policy = {**DEFAULTS, **config.get("policy", {})}
         self.routes = {r.id: r for r in routes}
@@ -210,6 +210,11 @@ class Engine:
         self.current = ""
         self.active_pool = config["commercial_pools"][0]
         self.deep_starts = []
+        self.deep_pending = None
+        self.deep_settled_at = 0
+        self.deep_recovery = None
+        self._monotonic = monotonic
+        self._deep_settled_mono = None
         self.last_switch = 0
         self.hint_at = 0
         self.hint_route = ""
@@ -243,6 +248,23 @@ class Engine:
             self.deep_starts = recent_deep_starts(saved.get("deep_starts", []), now,
                                                   self.policy["deep_min_interval_sec"])
             self.seed_consumed = bool(saved.get("seed_consumed"))
+            budget = saved.get("deep_budget")
+            settled = budget.get("settled_at") if isinstance(budget, dict) else None
+            valid = (isinstance(budget, dict) and budget.get("version") == 1
+                     and type(settled) in (int, float) and math.isfinite(settled) and settled >= 0)
+            if valid:
+                self.deep_settled_at = settled
+                self.deep_recovery = budget.get("last_recovery")
+            # A previous process cannot prove the actual dispatch time of an
+            # unfinished/legacy reservation. Even a settled restart waits a
+            # full interval, because wall-clock correction may span restarts.
+            # Keep its spent history; this is a new barrier, never a refund.
+            if not valid or budget.get("pending") is not None or settled or self.deep_starts:
+                pending = budget.get("pending") if isinstance(budget, dict) else None
+                self.deep_recovery = {"at": now,
+                    "reason": "legacy_or_invalid" if not valid else "unfinished" if pending else "restart",
+                    "reservation": pending}
+                self.settle_deep(now)
 
     def update_inventory(self, routes):
         self.active = {r.id for r in routes}
@@ -387,8 +409,12 @@ class Engine:
         return sorted((rid for rid in self.routes if rid not in in_flight and order(rid)[1] <= now), key=order)
 
     def deep_due(self, now, in_flight):
-        self.deep_starts = recent_deep_starts(self.deep_starts, now, self.policy["deep_min_interval_sec"])
-        if (sum(now - stamp < 60 for stamp in self.deep_starts) >= self.policy["deep_per_minute"]
+        interval = max(self.policy["deep_min_interval_sec"], 60 / self.policy["deep_per_minute"])
+        self.deep_starts = recent_deep_starts(self.deep_starts, now, interval)
+        if (self.deep_pending is not None
+                or self.deep_settled_at and now - self.deep_settled_at < interval
+                or self._deep_settled_mono is not None and self._monotonic() - self._deep_settled_mono < interval
+                or sum(now - stamp < 60 for stamp in self.deep_starts) >= self.policy["deep_per_minute"]
                 or self.deep_starts and now - self.deep_starts[-1] < self.policy["deep_min_interval_sec"]):
             return None
         hot = set(self.standbys(now))
@@ -410,13 +436,28 @@ class Engine:
         return min(candidates)[-1] if candidates else None
 
     def reserve_deep(self, rid, now):
+        if self.deep_pending is not None:
+            raise RuntimeError("an unfinished deep reservation still owns the budget")
         self.deep_starts.append(now)
+        self.deep_pending = {"route_id": rid, "reserved_at": now}
         self.health[rid].deep_attempt_at = now
+
+    def settle_deep(self, now):
+        # Only call once the worker is known to have finished, or when no
+        # worker was submitted. Queue/fsync/journal delays therefore cannot
+        # shorten the next actual request's spacing. Collection may be late;
+        # using its clock conservatively adds delay, without refreshing health.
+        self.deep_pending = None
+        self.deep_settled_at = max(self.deep_settled_at, now)
+        if self._monotonic is not None:
+            self._deep_settled_mono = self._monotonic()
 
     def saved(self):
         return {"health": {rid: dataclasses.asdict(h) for rid, h in self.health.items()},
                 "current": self.current, "active_pool": self.active_pool,
-                "deep_starts": self.deep_starts, "seed_consumed": self.seed_consumed}
+                "deep_starts": self.deep_starts, "seed_consumed": self.seed_consumed,
+                "deep_budget": {"version": 1, "pending": self.deep_pending,
+                                "settled_at": self.deep_settled_at, "last_recovery": self.deep_recovery}}
 
 
 class ProviderServer:
@@ -678,6 +719,7 @@ class Guard:
                 "quarantined": sum(r["quarantined"] for r in rows),
                 "probe_in_flight": len(self.jobs),
                 "deep_in_last_minute": sum(now - stamp < 60 for stamp in e.deep_starts),
+                "deep_budget": e.saved()["deep_budget"],
                 "hint_count": self.hint_count, "hint_socket": str(private_socket_dir(self.config) / "hint.sock"),
                 "shadow_pid": self.core.process.pid if self.core and self.core.process else None}
 
@@ -756,7 +798,7 @@ class Guard:
                 h["qualified"] = False
                 h["deep_ok_at"] = 0
                 h["deep_attempt_at"] = 0
-        self.engine = Engine(self.config, routes, saved)
+        self.engine = Engine(self.config, routes, saved, monotonic=time.monotonic)
         if self.config.get("seed_file") and not self.engine.seed_consumed:
             self.engine.seed(read_json(self.config["seed_file"], {}), time.time())
         publisher = ProviderServer(self.config["publish"]["port"], self.config["publish"]["token"], self.config["offline_proxy"])
@@ -790,6 +832,10 @@ class Guard:
                 for job, (rid, deep, owner, began, contract, generation) in list(self.jobs.items()):
                     if job.done():
                         del self.jobs[job]
+                        if deep:
+                            # Budget settlement precedes contract/core/link
+                            # rejection and also covers cancelled/failed jobs.
+                            self.engine.settle_deep(time.time())
                         try:
                             result, completed_at = job.result()
                         except Exception:
@@ -900,6 +946,10 @@ class Guard:
                                               "generation": generation})
                                 job = executor.submit(self.run_probe, probe, self.engine.routes[rid], True, self.link, generation)
                                 self.jobs[job] = (rid, True, self.core, now, self.contract, generation)
+                            else:
+                                # No worker was submitted. Retain the spent
+                                # reservation and wait a full interval anyway.
+                                self.engine.settle_deep(time.time())
                     for rid in self.engine.light_due(now, occupied):
                         if len(self.jobs) >= self.engine.policy["concurrency"]:
                             break

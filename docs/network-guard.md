@@ -38,8 +38,17 @@ Defaults are 2 seconds for the current path, 5 seconds for hot standbys and
 These small real API requests can consume quota. Reservations survive restarts;
 status and manual hints cannot reset the budget. Reservations dated ahead of a
 corrected system clock remain spent; clock rollback cannot refund a probe.
-Minimum spacing longer than a minute retains its last reservation until that
-interval expires, independently of the per-minute request count.
+Before dispatch, a durable pending marker occupies the budget until that worker
+finishes. The next check waits at least `max(deep_min_interval_sec,
+60 / deep_per_minute)` after completion is collected, using both wall and
+monotonic clocks. Slow persistence, journaling, worker queues and discarded
+results cannot shorten actual request spacing. Failed reservation writes send
+no request and still consume the interval. Restoring legacy, unfinished or
+previously consumed budget state conservatively adds a full startup interval;
+it never replays an unfinished probe or refunds its reservation. Runtime policy
+tightening also extends the completion barrier. Minimum spacing longer than a
+minute retains its last reservation until that interval expires, independently
+of the per-minute request count.
 The default complete-check
 periods are 120 seconds for the active path, 300 seconds for hot standbys and
 one hour for other admitted candidates. A real API response remains necessary
