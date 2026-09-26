@@ -20,6 +20,7 @@ class BatchFixture:
     def __init__(self, test):
         self.test = test
         self.calls, self.sent, self.bindings, self.states = [], [], {}, {}
+        self.names, self.rename_drafts, self.rename_sent, self.rename_enter = {}, {}, [], []
         self.open_file_sources = {}
         self.viewport_socket = None
         self.lose_create = self.lose_send = False
@@ -57,6 +58,7 @@ class BatchFixture:
         path.write_text(json.dumps({'type': 'session_meta', 'payload': {'id': session}}) + '\n')
         self.bindings[session] = {'surfaceId': sid, 'workspaceId': wid, 'transcriptPath': str(path)}
         self.states[sid] = {'kind': 'unknown', 'session_id': session, 'pid': 1000 + index}
+        self.names[sid] = getattr(self.test, 'initial_name', 'Fixture session')
         if self.lose_create:
             raise core.CmuxError('create reply lost')
         return sid
@@ -71,11 +73,18 @@ class BatchFixture:
         self.test.assertEqual(wid, self.test.wid)
         frame = grid_payload([], **self.frame_options)
         frame['render_grid']['surface_id'] = sid
+        if sid in self.rename_drafts:
+            grid = frame['render_grid']
+            row = grid['cursor']['row']
+            grid['row_spans'] = [s for s in grid['row_spans'] if s['row'] != row]
+            grid['row_spans'].extend([span(row, 0, '›', 1), span(row, 1, ' ', 0),
+                                      span(row, 2, self.rename_drafts[sid], 0)])
+            grid['cursor']['column'] = 2 + len(self.rename_drafts[sid])
         return frame
 
     def send(self, wid, sid, message):
-        self.test.assertEqual((wid, message), (self.test.wid, batch.PROMPT))
         job = core.load_json(self.test.worker.path, {})
+        self.test.assertEqual((wid, message), (self.test.wid, batch.job_prompt(job)))
         self.test.assertEqual(next(s for s in job['slots'] if s.get('surface_id') == sid)['phase'], 'submitting')
         self.test.assertEqual(core.batch_start_hold(self.test.store.load()['workspace_rules'][0], sid)['job_id'], job['id'])
         self.sent.append(sid)
@@ -93,7 +102,19 @@ class BatchFixture:
             raise core.UncertainDeliveryError('send acknowledgement lost')
 
     def send_text(self, wid, sid, message):
+        if message.startswith('/rename '):
+            self.rename_sent.append((sid, message))
+            self.rename_drafts[sid] = message
+            return
         self.send(wid, sid, message)
+
+    def send_key(self, wid, sid, key):
+        self.test.assertEqual((wid, key), (self.test.wid, 'enter'))
+        self.rename_enter.append(sid)
+        self.names[sid] = self.rename_drafts.pop(sid).removeprefix('/rename ')
+
+    def draft_batch_session_name(self, wid, sid, job_id, index):
+        self.send_text(wid, sid, f'/rename B-check-{job_id[:8]}-{index + 1:02d}')
 
 
 class WorkspaceBatchTests(unittest.TestCase):
@@ -121,6 +142,10 @@ class WorkspaceBatchTests(unittest.TestCase):
         self.store = core.ConfigStore(self.config)
         self.store.mutate(lambda c: c.update(mode='armed', global_paused=False))
         self.client = BatchFixture(self)
+        names = patch.object(batch, 'native_thread_name', side_effect=lambda target, native:
+                             {'name': self.client.names.get(target['surface_id'], '')})
+        names.start()
+        self.addCleanup(names.stop)
         self.job = batch.start(self.config, self.wid, client=self.client, launch=False)
         self.now = time.time()
         self.worker = batch.BatchWorker(self.config, self.job['job_id'], client=self.client, queue=self.client,

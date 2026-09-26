@@ -50,7 +50,10 @@ class BatchStartupTests(unittest.TestCase):
         self.worker.job["guard_version"] = 1
         command = self.worker._launch_command(slot)
         self.assertNotIn("ccc_batch_guard.py", command)
-        self.assertIn(" /test/native/codex -c ", command)
+        self.assertIn('--launch-native', shlex.split(command))
+        tokens = batch.native_launch_argv(self.config, self.worker.job, slot['index'])
+        self.assertEqual(tokens[0], '/test/native/codex')
+        self.assertNotIn('--remote', tokens)
 
     def test_native_sqlite_is_per_batch_without_replacing_codex_home(self):
         self.worker.step()
@@ -61,10 +64,13 @@ class BatchStartupTests(unittest.TestCase):
         values = []
         for slot in (first, second):
             command = self.worker._launch_command(slot)
-            tokens = shlex.split(command)
             self.assertNotIn('CODEX_HOME', command)
-            self.assertEqual(tokens[-3:-1], ['/test/native/codex', '-c'])
-            path = Path(json.loads(tokens[-1].split('=', 1)[1]))
+            tokens = batch.native_launch_argv(self.config, self.worker.job, slot['index'])
+            self.assertEqual(tokens[0], '/test/native/codex')
+            overrides = [tokens[i + 1] for i, value in enumerate(tokens[:-1]) if value == '-c']
+            sqlite = [value for value in overrides if value.startswith('sqlite_home=')]
+            self.assertEqual(len(sqlite), 1)
+            path = Path(json.loads(sqlite[0].split('=', 1)[1]))
             self.assertTrue(path.is_dir())
             values.append(path)
         self.assertEqual(*values)

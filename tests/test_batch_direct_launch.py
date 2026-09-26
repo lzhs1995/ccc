@@ -36,13 +36,15 @@ class DirectBatchTests(unittest.TestCase):
         (directory / 'codex-launcher.json').write_text(json.dumps({'native_binary': str(native)}))
         with patch.object(Path, 'home', return_value=self.root), \
              patch.object(guard, 'native_binary', side_effect=resolve_native_binary):
-            command = self.worker._launch_command(slot).split(' && ', 1)[1]
-        result = subprocess.run(['/bin/sh', '-c', command], env={**os.environ, 'PATH': str(self.root)},
+            argv = batch.native_launch_argv(self.config, self.worker.job, slot['index'])
+        result = subprocess.run(argv, env={**os.environ, 'PATH': str(self.root)},
                                 capture_output=True, text=True, timeout=15)
         self.assertEqual(result.returncode, 0, result.stderr)
         args = json.loads(result.stdout)
-        self.assertEqual(args[0], '-c')
-        self.assertTrue(args[1].startswith('sqlite_home='))
+        self.assertEqual(args[args.index('--cd') + 1], str(
+            batch.working_directory(self.config, self.worker.job['id'], slot['index'])))
+        overrides = [args[i + 1] for i, value in enumerate(args[:-1]) if value == '-c']
+        self.assertEqual(sum(value.startswith('sqlite_home=') for value in overrides), 1)
         self.assertNotIn('--remote', args)
 
     def test_disabled_batch_does_not_adopt_or_arm_original_sessions(self):

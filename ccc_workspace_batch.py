@@ -18,6 +18,7 @@ import re
 import shlex
 import signal
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -30,8 +31,10 @@ from ccc_inventory import SharedInventory
 from ccc_scheduling import SnapshotCache, SnapshotClient
 
 COUNT = 50
-WORKER_VERSION = 23
-PROMPT = "show me u power"
+WORKER_VERSION = 24
+LEGACY_PROMPT = "show me u power"
+PROMPT = "Reply only OK. Do not use tools. End the turn."
+EMPTY_CWD_POLICY = "private-empty-v1"
 INITIALIZING = {"creating", "create_unknown", "created", "restarting", "restart_unknown",
                 "submitted", "submitting", "uncertain"}
 STARTABLE = {"pending", "restart_pending", "pty_wait"}
@@ -62,6 +65,15 @@ def _startup_context(message):
 def job_path(config_path, job_id):
     uuid.UUID(job_id)
     return Path(config_path).parent / "workspace-batches" / job_id / "job.json"
+
+
+def job_prompt(job):
+    # Already-submitted jobs must retain their exact original confirmation and
+    # draft-recovery contract across upgrades.
+    value = job.get("initial_prompt", LEGACY_PROMPT)
+    if not isinstance(value, str) or value not in {LEGACY_PROMPT, PROMPT}:
+        raise RuntimeError("unknown B initial prompt policy")
+    return value
 
 
 def allowed(config, job):
@@ -225,7 +237,8 @@ def start(config_path, selector, *, client=None, launch=True):
                 and not settled_job(config_path, previous, config, client)))):
             job = previous  # Repeated clicks and retries reuse the same 50 slots.
         else:
-            job = {"id": str(uuid.uuid4()), "workspace_id": wid,
+            job = {"id": str(uuid.uuid4()), "workspace_id": wid, "cwd_policy": EMPTY_CWD_POLICY,
+                   "initial_prompt": PROMPT, "name_policy": "before-first-turn-v1",
                    "created_at": time.time(), "status": "pending",
                    "slots": [{"index": i, "phase": "pending"} for i in range(COUNT)]}
             job_locks.enter_context(core.FileLock(job_path(config_path, job["id"]).parent / "worker.lock", timeout_sec=0))
@@ -271,6 +284,119 @@ def sqlite_home(config_path, job_id, index):
     # Keep CODEX_HOME, transcripts, hooks and credentials in their normal
     # locations. Only the native SQLite writers of this new CLI are isolated.
     return job_path(config_path, job_id).parent / "native-db"
+
+
+def working_directory(config_path, job_id, index):
+    """A private per-slot root, separate from batch records and native databases."""
+    if type(index) is not int or not 0 <= index < COUNT:
+        raise RuntimeError("invalid batch workspace index")
+    return job_path(Path(config_path).resolve(), job_id).parent / "work" / str(index)
+
+
+def prepare_working_directory(config_path, job, index):
+    if job.get("cwd_policy") is None:
+        return None  # An existing batch keeps its original launch context.
+    if job["cwd_policy"] != EMPTY_CWD_POLICY:
+        raise RuntimeError("unknown B working-directory policy")
+    directory = working_directory(config_path, job["id"], index)
+    if directory.parent.parent.is_symlink():
+        raise RuntimeError("B private workspace parent is a symbolic link")
+    for path in (directory.parent, directory):
+        path.mkdir(mode=0o700, exist_ok=True)
+        info = path.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+                or info.st_mode & 0o022):
+            raise RuntimeError("B private workspace is not an owned private directory")
+    if any(directory.iterdir()):
+        raise RuntimeError("B private workspace is not empty; existing files were preserved")
+    return directory
+
+
+def workspace_launch_context(config_path, job, index):
+    """Only this native invocation trusts the exact CCC-created working root."""
+    if job.get("cwd_policy") is None:
+        return None, []
+    if job["cwd_policy"] != EMPTY_CWD_POLICY:
+        raise RuntimeError("unknown B working-directory policy")
+    directory = working_directory(config_path, job["id"], index)
+    # CLI dotted keys do not parse quoted path components. Use a TOML inline
+    # table instead; no trust entry is written into the user's config.toml.
+    trust = "projects={" + json.dumps(str(directory), ensure_ascii=False) + '={trust_level="trusted"}}'
+    return directory, ["-c", trust]
+
+
+def native_launch_argv(config_path, job, index):
+    """Resolve the exact native executable without putting long argv in a PTY."""
+    from ccc_batch_guard import AUTOMATIC_POOL_STOP, native_binary
+    if job.get("guard_version") == 1 and AUTOMATIC_POOL_STOP:
+        return [sys.executable, "-B", str(Path(__file__).with_name("ccc_batch_guard.py")),
+                "launch", "--config", str(config_path), "--job", job["id"], "--index", str(index)]
+    directory, context = workspace_launch_context(config_path, job, index)
+    return [native_binary(), *(["--cd", str(directory)] if directory else []), *context,
+            "-c", "sqlite_home=" + json.dumps(str(sqlite_home(config_path, job["id"], index).resolve()))]
+
+
+def native_thread_name(target, native):
+    """Read only this live process's original native name index."""
+    from ccc_guard_scope import process, birth
+    record = process(native.get("pid"), launch=True)
+    if (not record or record.get("remote")
+            or record["process_start"] != native.get("process_start")
+            or record["surface_id"] != str(target["surface_id"]).upper()
+            or record["environment_workspace_id"] != str(target["workspace_id"]).upper()):
+        return None
+    env = record["environment"]
+    root = Path(env.get("CODEX_HOME") or Path(env.get("HOME") or Path.home()) / ".codex")
+    if not root.is_absolute():
+        return None
+    path = root / "session_index.jsonl"
+    name = ""
+    try:
+        with path.open("rb") as handle:
+            before = os.fstat(handle.fileno())
+            offset = max(0, before.st_size - 1024 * 1024)
+            handle.seek(offset)
+            data = handle.read(1024 * 1024)
+            after = os.fstat(handle.fileno())
+        current = path.stat()
+        identity = lambda st: (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+        if identity(before) != identity(after) or identity(before) != identity(current):
+            return None
+        if data and not data.endswith(b"\n"):
+            return None
+        if offset:
+            data = data.partition(b"\n")[2]
+        for line in reversed(data.splitlines()):
+            if not line.strip():
+                continue
+            try:
+                value = json.loads(line)
+            except ValueError:
+                return None
+            if isinstance(value, dict) and value.get("id") == native.get("session_id"):
+                if not isinstance(value.get("thread_name"), str):
+                    return None
+                name = value["thread_name"]
+                break
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return None
+    if birth(native["pid"], codex=True) != record["birth"]:
+        return None
+    return {"name": name, "birth": record["birth"]}
+
+
+def launch_registered(config_path, job_id, index, launch_id):
+    register(config_path, job_id, index, launch_id)
+    job = core.load_json(job_path(config_path, job_id), {})
+    if (job["slots"][index].get("launch_id") != launch_id
+            or not allowed(core.ConfigStore(Path(config_path)).load(), job)):
+        raise RuntimeError("batch authorization changed before native launch")
+    # exec retains the registered shell parent and original terminal. There is
+    # no relay, alternate session, shell expansion, or global config write.
+    argv = native_launch_argv(config_path, job, index)
+    os.execv(argv[0], argv)
 
 
 def prepare_sqlite_home(config_path, job_id):
@@ -365,10 +491,12 @@ def register(config_path, job_id, index, launch_id=""):
                 raise RuntimeError("batch slot already belongs to another surface")
             store.mutate(protect)
             prepare_sqlite_home(config_path, job_id)
+            directory = prepare_working_directory(config_path, job, index)
             core.atomic_write_json(receipt, {"surface_id": sid, "workspace_id": wid,
                                             "launch_id": launch_id, "registered_at": time.time(),
                                             "shell_pid": os.getppid(),
-                                            "shell_start": batch_shell_identity(os.getppid())})
+                                            "shell_start": batch_shell_identity(os.getppid()),
+                                            **({"working_directory": str(directory)} if directory else {})})
 
 
 class BatchWorker:
@@ -382,11 +510,12 @@ class BatchWorker:
         self.client = client or SnapshotClient(_client(self.store.load()), self.cache,
                                                SharedInventory(self.config_path.parent))
         self.queue = queue or QueueRecovery(self.path.parent / "unused-queue-ledger.json",
-            Path.home() / ".cmuxterm/codex-hook-sessions.json", Path.home() / ".codex/sessions", PROMPT)
+            Path.home() / ".cmuxterm/codex-hook-sessions.json", Path.home() / ".codex/sessions", job_prompt(self.job))
         self.processes = {}
         self.queue.process_lookup = self._process_label
         self.clock = clock
         self.pty_probe = pty_probe or pty_available
+        self.name_lookup = native_thread_name
         self._top_due = 0.0
         self._saved = None
         self._shell_hints = {}
@@ -460,6 +589,7 @@ class BatchWorker:
                 self.job.update(status="waiting", error="系统 PTY 名额已满；保留剩余名额，空位释放后自动继续")
                 return
             prepare_sqlite_home(self.config_path, self.job["id"])
+            prepare_working_directory(self.config_path, self.job, slot["index"])
             tree = self.client.tree()
             panes = [(win, p) for win in tree.get("windows", []) for w in win.get("workspaces", [])
                      if w.get("id") == wid for p in w.get("panes", [])
@@ -517,18 +647,12 @@ class BatchWorker:
         return True
 
     def _launch_command(self, slot):
-        bootstrap = shlex.join([sys.executable, "-B", str(Path(__file__).resolve()), "register",
+        # cmux submits this while the new shell may still be starting. A long
+        # command can overflow its canonical input line and never execute.
+        # Construct cwd/trust/database argv inside this short owned bootstrap.
+        return shlex.join([sys.executable, "-B", str(Path(__file__).resolve()), "register", "--launch-native",
                                 "--config", str(self.config_path), "--job", self.job["id"],
                                 "--index", str(slot["index"]), "--launch-id", slot["launch_id"]])
-        from ccc_batch_guard import AUTOMATIC_POOL_STOP, native_binary
-        native = shlex.join([native_binary(), "-c", "sqlite_home=" + json.dumps(
-            str(sqlite_home(self.config_path, self.job["id"], slot["index"]).resolve()))])
-        # The guard relay is only the auto-pause cut. With that cut off, Codex
-        # starts in this terminal. A dead unix endpoint never receives the prompt.
-        if self.job.get("guard_version") == 1 and AUTOMATIC_POOL_STOP:
-            native = shlex.join([sys.executable, "-B", str(Path(__file__).with_name("ccc_batch_guard.py")),
-                "launch", "--config", str(self.config_path), "--job", self.job["id"], "--index", str(slot["index"])])
-        return bootstrap + " && " + native
 
     def _protect_created(self, slot):
         def protect(config):
@@ -617,6 +741,7 @@ class BatchWorker:
             if not ((self._pty_failure(grid) if no_pty else self._startup_failure(grid)) or guard_refusal):
                 return
             prepare_sqlite_home(self.config_path, self.job["id"])
+            prepare_working_directory(self.config_path, self.job, slot["index"])
             if not self._reserve_start(slot, restarting=True):
                 return
             if guard_refusal:
@@ -729,7 +854,7 @@ class BatchWorker:
                     if _startup_context(message):
                         continue
                 if message is not None:
-                    if message != PROMPT:
+                    if message != job_prompt(self.job):
                         proof["blocked"] = "different user prompt"
                         return False
                     proof["prompt"] = True
@@ -778,7 +903,7 @@ class BatchWorker:
         return native
 
     @staticmethod
-    def _own_prompt_draft(grid):
+    def _own_prompt_draft(grid, prompt=PROMPT):
         """Only the exact recorded ASCII prompt, including a legacy pasted newline."""
         cursor = grid.cursor
         if not cursor.visible or core._menu_present(grid.lines) or core._working_present(grid.lines):
@@ -791,7 +916,7 @@ class BatchWorker:
         if not starts:
             return False
         row = max(starts)
-        if cursor.column != (2 + len(PROMPT) if row == cursor.row else 2):
+        if cursor.column != (2 + len(prompt) if row == cursor.row else 2):
             return False
         cells = [" "] * grid.columns
         for span in grid.spans:
@@ -811,7 +936,7 @@ class BatchWorker:
                     or not text.isascii() or len(span.text) != span.cell_width):
                 return False
             cells[max(2, span.column):span.column + span.cell_width] = text
-        return "".join(cells[2:]).rstrip() == PROMPT
+        return "".join(cells[2:]).rstrip() == prompt
 
     def _finish_submission(self, slot):
         if slot.get("enter_attempt_at") or self.clock() - slot.get("submit_at", self.clock()) < .2:
@@ -828,7 +953,7 @@ class BatchWorker:
                     or any(native.get(k) != slot.get(k) for k in ("session_id", "pid", "process_start"))):
                 return
             grid = core.Grid.from_rpc(self.client.replay(target["workspace_id"], target["surface_id"]), target["surface_id"])
-            if not self._own_prompt_draft(grid) or self._native(target, slot) != native:
+            if not self._own_prompt_draft(grid, job_prompt(self.job)) or self._native(target, slot) != native:
                 return
             slot["enter_attempt_at"] = self.clock()
             self.save()  # A missing Enter acknowledgement is never retried.
@@ -836,6 +961,100 @@ class BatchWorker:
                 self.client.send_key(target["workspace_id"], target["surface_id"], "enter")
             except (core.CmuxError, RuntimeError) as exc:
                 slot.update(phase="uncertain", error=str(exc))
+
+    def _send_name_input(self, slot, target, native, field, send):
+        naming = slot["naming"]
+        naming[field] = self.clock()
+        self.save()
+        # A final read can fail after the intent was saved. Until send() is
+        # called we KNOW no input was attempted. Keep that distinction on disk
+        # so an ordinary observation race cannot strand the slot forever.
+        try:
+            config = self.store.load()
+            ready = (allowed(config, self.job) and self._protected(config, slot)
+                     and self._native(target, slot) == native)
+            if ready and naming.get("birth"):
+                from ccc_guard_scope import birth
+                ready = birth(native["pid"], codex=True) == naming["birth"]
+        except (OSError, ValueError, core.CmuxError, RuntimeError):
+            ready = False
+        if not ready:
+            naming.pop(field, None)
+            naming.update(deferred_at=self.clock(), deferred_stage=field)
+            slot["error"] = "命名前检查暂未通过；本次未发送输入"
+            self.save()
+            return False
+        try:
+            send()
+        except (core.CmuxError, RuntimeError) as exc:
+            # The transport was entered: do not reset or replay this attempt.
+            slot["error"] = "原生命名输入待核验：" + str(exc)
+        else:
+            naming[field + "_acknowledged"] = self.clock()
+            slot["error"] = "等待原生命名确认；未发送模型请求"
+        self.save()
+        return False
+
+    def _prepare_name(self, slot, target, native):
+        """A local /rename avoids a hidden paid title-generation turn.
+
+        Only a fresh B session can reach this path. Both the draft and Enter
+        have durable one-shot records; an uncertain acknowledgement never
+        permits a second command or bypasses an operator's input.
+        """
+        policy = self.job.get("name_policy")
+        if policy is None:
+            return True
+        if policy != "before-first-turn-v1":
+            raise RuntimeError("unknown B session-name policy")
+        if native.get("kind") not in {"unknown", "uninitialized"} or not native.get("session_id"):
+            return False
+        expected = {"session_id": native["session_id"], "pid": native["pid"],
+                    "process_start": native.get("process_start")}
+        naming = slot.get("naming")
+        if naming and any(naming.get(key) != value for key, value in expected.items()):
+            slot["error"] = "原命名 session 已改变；未发送批量任务"
+            return False
+        with core.workspace_input_lock(self.config_path, self.job["workspace_id"], shared=True):
+            config = self.store.load()
+            if not allowed(config, self.job) or not self._protected(config, slot):
+                return False
+            target = self._target(slot, fresh=True)
+            if self._native(target, slot) != native:
+                return False
+            known = self.name_lookup(target, native)
+            if known is None:
+                slot["error"] = "等待原生名称身份核验；未发送模型请求"
+                return False
+            if naming and naming.get("birth") and naming["birth"] != known.get("birth"):
+                slot["error"] = "原命名进程身份已改变；未发送批量任务"
+                return False
+            if known.get("birth"):
+                expected["birth"] = known["birth"]
+            if known.get("name"):
+                # A manually chosen name also suppresses automatic generation.
+                # Preserve it rather than overwriting it with our label.
+                slot["naming"] = {**(naming or expected), "confirmed_name": known["name"],
+                                  "confirmed_at": self.clock()}
+                self.save()
+                return True
+            grid = core.Grid.from_rpc(self.client.replay(target["workspace_id"], target["surface_id"]), target["surface_id"])
+            if naming and naming.get("submitted_at"):
+                if naming.get("enter_at") or self.clock() - naming["submitted_at"] < .2:
+                    return False
+                if not self._own_prompt_draft(grid, naming["command"]) or self._native(target, slot) != native:
+                    return False
+                return self._send_name_input(slot, target, native, "enter_at", lambda:
+                    self.client.send_key(target["workspace_id"], target["surface_id"], "enter"))
+            if core.classify_grid(grid).kind != "idle" or core._composer_status(grid)[0] != "empty":
+                return False
+            if self._native(target, slot) != native:
+                return False
+            command = f"/rename B-check-{self.job['id'][:8]}-{slot['index'] + 1:02d}"
+            slot["naming"] = {**(naming or {}), **expected, "command": command}
+            return self._send_name_input(slot, target, native, "submitted_at", lambda:
+                self.client.draft_batch_session_name(target["workspace_id"], target["surface_id"],
+                                                     self.job["id"], slot["index"]))
 
     def _advance(self, slot, *, confirmation_only=False):
         receipt = core.load_json(self.path.parent / f"surface-{slot['index']}.json", {})
@@ -889,6 +1108,9 @@ class BatchWorker:
             slot["native_seen_session_id"] = native["session_id"]
         if native and native.get("session_id") and native.get("kind") not in {"unknown", "uninitialized"}:
             slot.update(phase="blocked", error="此 session 已有任务，未发送批量 prompt")
+            return
+        if (self.job.get("name_policy") is not None and native and native.get("session_id") and native.get("pid")
+                and not self._prepare_name(slot, target, native)):
             return
         grid = core.Grid.from_rpc(self.client.replay(target["workspace_id"], target["surface_id"]), target["surface_id"])
         if core.classify_grid(grid).kind != "idle" or core._composer_status(grid)[0] != "empty":
@@ -944,7 +1166,7 @@ class BatchWorker:
                         process_start=native.get("process_start"), native_uninitialized=uninitialized)
             self.save()
             try:
-                self.client.send_text(target["workspace_id"], target["surface_id"], PROMPT)
+                self.client.send_text(target["workspace_id"], target["surface_id"], job_prompt(self.job))
                 slot["phase"] = "submitted"
             except (core.CmuxError, RuntimeError) as exc:
                 slot.update(phase="uncertain", error=str(exc))
@@ -1284,9 +1506,13 @@ def main():
     parser.add_argument("--job", required=True)
     parser.add_argument("--index", type=int, default=0)
     parser.add_argument("--launch-id", default="")
+    parser.add_argument("--launch-native", action="store_true")
     args = parser.parse_args()
     if args.action == "register":
-        register(args.config, args.job, args.index, args.launch_id)
+        if args.launch_native:
+            launch_registered(args.config, args.job, args.index, args.launch_id)
+        else:
+            register(args.config, args.job, args.index, args.launch_id)
     else:
         BatchWorker(args.config, args.job).run()
 

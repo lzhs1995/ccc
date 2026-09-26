@@ -125,17 +125,26 @@ requests. The selected workspace has clickable controls (the same keys work):
 - `w` 整池授权：覆盖该池现有和后续 Codex，保留单路排除。
 - `P` 暂停 + Interrupt：先落盘停止整池续跑、取消批量创建，再向本池 Codex 请求 Escape；保留原 session。未确认的进程或投递单独报失败。
 - `W` 恢复整池：恢复续跑，保留单路暂停、排除；不会自行重启被取消的创建任务。
-- `B` 新开50 + 授权：在选定 workspace 的主区域 pane 新建最多50个后台 Codex 标签页。每路确认原 session 和空输入框后发送一次 `show me u power`。模型响应不再自动切断本池。
+- `B` 新开50 + 授权：在选定 workspace 的主区域 pane 新建最多50个后台 Codex 标签页。新批次使用各自的私有空目录，原生 CLI 只为该次启动信任这个精确目录；不修改用户主目录或全局信任。确认原 session 和空输入框后先通过原生 `/rename` 设置固定名称，避免额外的模型标题请求，再发送一次简短的 `Reply only OK. Do not use tools. End the turn.`。成功后自然待机，自动切断仍关闭。
 
 `B` requires global sending to be enabled and the selected pool to be unpaused.
 It never changes another pool or silently clears existing pauses. At most four
 new sessions wait for startup together. Progress reports created, ready,
-submitted, started and incomplete counts. Startup dialogs and drafts are left
-for the operator. Repeating `B` resumes an incomplete batch; a lost create reply
+submitted, started and incomplete counts. `started` proves submission, not API
+success. Other startup dialogs and operator drafts are left untouched. A short
+bootstrap builds native argv after shell startup so long directory/config
+arguments cannot be truncated by terminal input. Repeating `B` resumes an incomplete batch; a lost create reply
 is recovered from its startup receipt and an uncertain prompt is not resent.
 After all 50 slots finish, another confirmed `B` starts a new batch. Jobs run in
 the background and survive closing the panel; `P` cancels their authorization.
 CLI equivalent: `ccc batch-workspace FULL_WORKSPACE_UUID`.
+
+Existing batches retain their original prompt and working directory. The new
+short task and fixed name reduce needless work; neither an empty directory nor
+a prompt is a hard token/spending limit. Native instructions, tools and model
+settings still contribute context. No model/reasoning setting, credential,
+automatic pause, request retry setting or other workspace is changed by B's
+directory and naming policy.
 
 Codex 0.154 creates its first rollout only after the first prompt. For a newly
 created batch slot, CCC verifies the native writer lock's new session UUID and
@@ -294,7 +303,7 @@ B 的实时保护只接受配置中 `batch_guard.origin_job_id` 与真实 `works
 
 旧迁移功能仍需在任何停止或替换前完成预检；本版本的 B 不调用迁移。原进程若仍持有已删除或被替换的历史文件，不能销毁唯一存活的历史。
 
-启动保护记录在 `batch_start_holds`，面板显示 `整池／启动中`，不计入人工暂停。原 session 日志必须包含提交后的首个 task_started 和精确的 `show me u power` 才解除保护；AGENTS 与 environment_context 合并消息、大消息、未写完的 JSONL 行均支持增量确认。回执丢失或 worker 重启不会重开同一名额、重发 prompt 或 Enter。守卫持续核对历史批次，只清理有原始证据的批次保护，保留人工排除和暂停。
+启动保护记录在 `batch_start_holds`，面板显示 `整池／启动中`，不计入人工暂停。原 session 日志必须包含提交后的首个 task_started 和批次持久记录的精确初始 prompt 才解除保护；旧批次继续识别 `show me u power`。AGENTS 与 environment_context 合并消息、大消息、未写完的 JSONL 行均支持增量确认。原生固定命名的文本和 Enter 也分别先落盘，并用原 session 的名称记录确认；不重复不确定的命名输入。回执丢失或 worker 重启不会重开同一名额、重发 prompt 或 Enter。守卫持续核对历史批次，只清理有原始证据的批次保护，保留人工排除和暂停。
 
 `w` 可重复执行授权和核对，不解除整池暂停。`W` 恢复所属工作区的续跑授权，归档该池旧 STOP 证据，不接管或重启已有进程；需要新批次时显式按 B。已有会话的历史和暂停记录不会在升级时回灌或清空。
 
