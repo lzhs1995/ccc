@@ -73,9 +73,14 @@ class NativeProcessIndex:
             return dict(self._snapshot)
 
     def lookup(self, target):
-        row = (self.snapshot() or {}).get(str(target.get("surface_id")))
-        if row and row["workspace_id"] == str(target.get("workspace_id")):
-            return dict(row)
+        # Single-target checks are frequent while GUI discovery is stalled.
+        # Avoid copying the whole fleet map for each original-session check.
+        with self._lock:
+            if self._snapshot is None or not 0 <= self.clock() - self._started <= self.max_age:
+                return None
+            row = self._snapshot.get(str(target.get("surface_id")))
+            if row and row["workspace_id"] == str(target.get("workspace_id")):
+                return dict(row)
         return None
 
     def start(self):
