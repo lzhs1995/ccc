@@ -132,7 +132,10 @@ q_fingerprint() {
 
 stat_or_missing() {
   if [ ! -e "$2" ]; then printf MISSING; return 0; fi
-  "$STAT" "-f$1" "$2"
+  local value
+  value=$("$STAT" "-f%$1" "$2") || return 3
+  case "$value" in ''|*[!0-9]*) return 3 ;; esac
+  printf '%s' "$value"
 }
 
 read_config() {
