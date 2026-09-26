@@ -7,6 +7,7 @@ This module never reloads or stops the production core.
 from __future__ import annotations
 
 from collections import deque
+import copy
 import dataclasses
 import ctypes
 import hashlib
@@ -30,17 +31,31 @@ import zlib
 from pathlib import Path
 
 
-def probe_key(config):
+def probe_credential(config):
+    """Read one credential snapshot; its raw digest is only for legacy state."""
+    source_digest = None
     if config.get("auth_env"):
         key = os.environ.get(config["auth_env"], "")
     else:
-        auth = json.loads(Path(config["auth_file"]).read_text()) if config.get("auth_file") else {}
+        if config.get("auth_file"):
+            with Path(config["auth_file"]).open("rb") as handle:
+                raw = handle.read(1024 * 1024 + 1)
+            if len(raw) > 1024 * 1024:
+                raise ValueError("probe credential document exceeds size limit")
+            source_digest = hashlib.sha256(raw).hexdigest()
+            auth = json.loads(raw)
+        else:
+            auth = {}
         if not isinstance(auth, dict):
             raise ValueError("probe credential unavailable")
         key = auth.get(config.get("auth_key", "OPENAI_API_KEY"), "")
     if not isinstance(key, str) or (not key and not config.get("allow_unauthenticated_test", False)):
         raise ValueError("probe credential unavailable")
-    return key
+    return key, source_digest
+
+
+def probe_key(config):
+    return probe_credential(config)[0]
 
 
 def atomic_json(path, value):
@@ -639,8 +654,16 @@ class _DeadlineTLSConnection(_DeadlineConnection):
 
 
 class ResponsesProbe:
-    def __init__(self, config, ports):
-        self.config, self.ports = config, ports
+    def __init__(self, config, ports, *, credential=None):
+        # Queue delay or an atomic auth/config replacement must not change the
+        # account/model of a request after the guard bound its contract.
+        self.config, self.ports = copy.deepcopy(config), ports
+        self._credential = credential
+        if credential is None:
+            try:
+                self._credential = probe_key(self.config)
+            except (OSError, ValueError):
+                pass
 
     def request_body(self):
         # Codex's wire contract, without starting a Codex session or writing
@@ -662,10 +685,9 @@ class ResponsesProbe:
         endpoint = urllib.parse.urlsplit(self.config["url"])
         if endpoint.scheme != "https" and not (endpoint.scheme == "http" and endpoint.hostname in {"127.0.0.1", "localhost"}):
             raise ValueError("probe endpoint must be HTTPS or a local test server")
-        try:
-            key = probe_key(self.config)
-        except (OSError, ValueError):
-            return ProbeResult("auth", detail="probe credential unavailable", deep=deep)
+        key = self._credential
+        if key is None:
+            return ProbeResult("observer_error", detail="probe credential unavailable", deep=deep, stage="credentials")
         timeout = float(self.config.get("deep_timeout_sec", 45) if deep else self.config.get("timeout_sec", 5))
         if not deep:
             timeout = float(self.config.get("light_timeout_by_pool", {}).get(item.pool, timeout))
