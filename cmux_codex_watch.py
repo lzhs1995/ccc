@@ -42,6 +42,7 @@ from claude_ccc_protocol import EVENT_JOURNAL_PATH, EVENT_SOCKET_PATH
 import ccc_observation as observation_health
 import ccc_network_client as network_health
 from ccc_codex_queue import NativeCompletionWatcher, QueueRecovery
+from ccc_native_processes import NativeProcessIndex
 from ccc_scheduling import CoalescingWriter, SnapshotCache, SnapshotClient, SurfaceScheduler
 
 
@@ -60,7 +61,7 @@ DEFAULT_LABEL = f"{LABEL_PREFIX}.{APP_NAME}"
 PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_APP_DIR = Path.home() / "Library" / "Application Support" / APP_NAME
 DEFAULT_RUNTIME_ROOT = DEFAULT_APP_DIR / "runtime"
-RUNTIME_FILES = ("cmux_codex_watch.py", "claude_ccc_protocol.py", "claude_ccc_event_hook.py", "ccc_observation.py", "ccc_scheduling.py", "ccc_codex_queue.py", "ccc_codex_goal.py", "ccc_workspace_batch.py", "ccc_inventory.py", "ccc_batch_guard.py", "ccc_guard_transport.py", "ccc_guard_watchdog.py", "ccc_guard_scope.py", "ccc_guard_migration.py", "ccc_codex_launcher.py", "ccc_network_client.py", "ccc_network_guard.py", "ccc_mihomo.py")
+RUNTIME_FILES = ("cmux_codex_watch.py", "claude_ccc_protocol.py", "claude_ccc_event_hook.py", "ccc_observation.py", "ccc_scheduling.py", "ccc_codex_queue.py", "ccc_codex_goal.py", "ccc_workspace_batch.py", "ccc_inventory.py", "ccc_batch_guard.py", "ccc_guard_transport.py", "ccc_guard_watchdog.py", "ccc_guard_scope.py", "ccc_guard_migration.py", "ccc_codex_launcher.py", "ccc_network_client.py", "ccc_network_guard.py", "ccc_mihomo.py", "ccc_native_processes.py")
 DEFAULT_LOG_DIR = Path.home() / "Library" / "Logs" / APP_NAME
 DEFAULT_CONFIG_PATH = DEFAULT_APP_DIR / "config.json"
 DEFAULT_STATE_PATH = DEFAULT_APP_DIR / "state.json"
@@ -329,7 +330,7 @@ CLAUDE_CONTEXT_ABSOLUTE_TIMEOUT_SEC = 900.0
 # through TargetRuntime and suppresses duplicate Hook/fallback deliveries.
 # Human label only.  Acceptance always compares SHA-256 of the loaded source:
 # a revision string is hand-maintained and therefore can lie about what runs.
-FEATURE_REVISION = "0.2.18-native-batch-response-streak"
+FEATURE_REVISION = "0.2.20-fleet-discovery-and-batch-membership"
 # How long after our own send a byte-identical UserPromptSubmit can still be
 # our echo.  Must exceed claude_submit_confirm_timeout_sec so that a late
 # echo arriving after the transaction timed out is not read as a human.
@@ -4534,8 +4535,9 @@ def batch_start_hold(rule, surface_id):
 class DiscoverySnapshot:
     """One topology/process collection per discovery pass, never an input grant."""
 
-    def __init__(self, client):
+    def __init__(self, client, native_labels=None):
         self.client = client
+        self.native_labels = native_labels
         self.records = {r["surface_id"]: r for r in main_surface_records(client.tree())}
         self.workspaces = {}
         for record in self.records.values():
@@ -4548,7 +4550,14 @@ class DiscoverySnapshot:
     def _load(self, workspace_id):
         key = "" if self.fleet else workspace_id
         if key not in self.tops:
-            top = self.client.top_all() if self.fleet else self.client.top(workspace_id)
+            if self.native_labels is not None and isinstance(self.client, SnapshotClient):
+                # Local ownership is independently available. Start the shared
+                # GUI refresh, but do not make every new UUID wait behind it.
+                top = self.client.cached_top(workspace_id, wait=False)
+                if top is None:
+                    top = {"windows": [], "sample": {"enumeration_complete": False}}
+            else:
+                top = self.client.top_all() if self.fleet else self.client.top(workspace_id)
             self.tops[key] = top
             self.labels[key] = classify_surface_processes(top)
         return self.tops[key], self.labels[key]
@@ -4558,7 +4567,13 @@ class DiscoverySnapshot:
         if not records:
             return []
         _, labels = self._load(workspace_id)
-        return sorted((dict(r) for r in records if surface_process_label(labels, r)["agent_kind"] == "codex"),
+        def codex(record):
+            label = surface_process_label(labels, record)
+            hint = (self.native_labels or {}).get(record["surface_id"], {})
+            return label["agent_kind"] == "codex" or (
+                label["agent_kind"] == "unknown" and hint.get("agent_kind") == "codex"
+                and hint.get("workspace_id") == record["workspace_id"])
+        return sorted((dict(r) for r in records if codex(r)),
                       key=lambda record: _ref_number(record["ref"]))
 
     def incomplete(self, workspace_id):
@@ -4675,7 +4690,13 @@ def effective_targets(
         surface_id = str(target.get("surface_id") or "")
         if surface_id:
             combined[surface_id] = target
-    return sorted((apply_workspace_pause(config, target) for target in combined.values()),
+    # Build the workspace gate once. A fleet pass runs on the scheduler and
+    # native-event threads: rescanning hundreds of historical rules for each
+    # surface held the target lock long enough to starve both of them.
+    paused_workspaces = {r.get("workspace_id") for r in config.get("workspace_rules", []) if r.get("paused")}
+    return sorted(({**target, "paused": True, "paused_reason": "workspace interrupt pause"}
+                   if target.get("workspace_id") in paused_workspaces else target
+                   for target in combined.values()),
                   key=lambda target: _ref_number(str(target.get("ref") or "")))
 
 
@@ -4918,6 +4939,7 @@ class WatchDaemon:
         self._process_cache_lock = threading.RLock()
         self._config_reload_lock = threading.RLock()
         self._process_snapshots = SnapshotCache(workers=MAINTENANCE_WORKERS)
+        self._native_process_index = NativeProcessIndex()
         from ccc_inventory import SharedInventory
         self._shared_inventory = SharedInventory(config_path.parent, owner=True)
         self.codex_queue_recovery.process_lookup = lambda target: self._candidate_process_label(target, self._observation_client())
@@ -5448,7 +5470,8 @@ class WatchDaemon:
         self._check_claude_hook_settings()
         config = copy.deepcopy(self.config)
         with self._targets_lock:
-            targets = effective_targets(config, list(self.dynamic_targets.values()))
+            dynamic = list(self.dynamic_targets.values())
+        targets = effective_targets(config, dynamic)
         records = {r["surface_id"]: r for r in main_surface_records(client.tree())}
         inventory_complete = True
         if isinstance(client, SnapshotClient):
@@ -5525,7 +5548,8 @@ class WatchDaemon:
         """Publish fresh runtime ages without waiting for discovery/diagnostics."""
         config = copy.deepcopy(self.config)
         with self._targets_lock:
-            targets = effective_targets(config, list(self.dynamic_targets.values()))
+            dynamic = list(self.dynamic_targets.values())
+        targets = effective_targets(config, dynamic)
         state = self._runtime_snapshot()
         with self._metadata_lock:
             metadata = self._observation_metadata
@@ -5703,7 +5727,8 @@ class WatchDaemon:
                 # not hold every surface in this workspace behind the same RPC.
                 labels = client.process_labels(workspace_id, classify_surface_processes, wait=False)
                 if labels is None:
-                    return {"agent_kind": "unknown", "summary": "process refresh pending"}
+                    return self._native_process_index.lookup(target) or {
+                        "agent_kind": "unknown", "summary": "process refresh pending"}
             else:
                 labels = self._process_snapshots.get(
                     ("labels", workspace_id),
@@ -5711,8 +5736,12 @@ class WatchDaemon:
                     ttl=CLAUDE_PROCESS_CACHE_SEC,
                 )
         except CmuxError:
-            return {"agent_kind": "unknown", "summary": "process lookup unavailable"}
-        return surface_process_label(labels, target)
+            return self._native_process_index.lookup(target) or {
+                "agent_kind": "unknown", "summary": "process lookup unavailable"}
+        label = surface_process_label(labels, target)
+        if label.get("agent_kind") == "unknown":
+            label = self._native_process_index.lookup(target) or label
+        return label
 
     def _inspect_process_cached(self, pid: int) -> dict[str, Any]:
         now = time.monotonic()
@@ -6183,7 +6212,8 @@ class WatchDaemon:
 
     def _native_wakeup_sources(self):
         with self._targets_lock:
-            targets = effective_targets(self.config, self.dynamic_targets.values())
+            config, dynamic = self.config, list(self.dynamic_targets.values())
+        targets = effective_targets(config, dynamic)
         return self.codex_queue_recovery.wakeup_sources(targets)
 
     def _native_retry_needed(self, sid, wid, failed_at):
@@ -6369,6 +6399,7 @@ class WatchDaemon:
         native_wakeup = NativeCompletionWatcher(self._native_wakeup_sources, scheduler.request_observation,
                                                 retry_needed=self._native_retry_needed)
         scheduler.observation_interval = native_wakeup.observation_interval
+        self._native_process_index.start()
         native_wakeup.start()
         from ccc_workspace_batch import BatchReconciler
         batch_reconciler = BatchReconciler(self.config_path, self._observation_client())
@@ -6407,7 +6438,8 @@ class WatchDaemon:
                     self._shared_inventory.heartbeat()
                 self._schedule_diagnostics()
                 with self._targets_lock:
-                    targets = effective_targets(self.config, self.dynamic_targets.values())
+                    config, dynamic = self.config, list(self.dynamic_targets.values())
+                targets = effective_targets(config, dynamic)
                 scheduler.tick(
                     targets, generation=self._observation_policy.key,
                     interval=float(self.config.get("poll_interval_sec", 1)),
@@ -6423,6 +6455,7 @@ class WatchDaemon:
             sys.setswitchinterval(previous_switch_interval)
             batch_reconciler.close()
             native_wakeup.close()
+            self._native_process_index.close()
             scheduler.close()
             if self._diagnostics_pool is not None:
                 self._diagnostics_pool.shutdown(wait=True, cancel_futures=True)
@@ -8257,7 +8290,7 @@ class WatchDaemon:
         self._last_workspace_discovery_at = now
         config = copy.deepcopy(self.config)
         try:
-            inventory = DiscoverySnapshot(client)
+            inventory = DiscoverySnapshot(client, self._native_process_index.snapshot())
             discovered = discover_rule_targets(inventory, config)
             discovered.extend(discover_pane_follow_targets(inventory, config))
         except RuntimeError as exc:

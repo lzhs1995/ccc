@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import tempfile
 import subprocess
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -95,7 +96,7 @@ class NativeWakeupTests(unittest.TestCase):
                 self.assertEqual(queue.wakeup_sources([{**target, **override}]), [])
             queue.open_file_sources["surface"]["path"] = self.root.parent / "outside.jsonl"
             sources = queue.wakeup_sources([target])
-            self.assertTrue(all(Path(s["path"]).is_relative_to(self.root) for s in sources))
+            self.assertTrue(all(Path(s["path"]).is_relative_to(self.root.resolve()) for s in sources))
 
     def test_failed_observation_retries_cached_hint_until_native_turn_moves_on(self):
         now = [0.0]
@@ -156,6 +157,64 @@ class NativeWakeupTests(unittest.TestCase):
         self.path.write_text(json.dumps({'type': 'event_msg', 'payload': {'type': 'token_count'}})+'\n')
         self.watcher.scan()
         self.assertEqual(self.watcher.coverage, {})
+
+    def test_coverage_is_published_before_the_rest_of_a_slow_scan(self):
+        self.event('task_started', error=False)
+        self.sources[0]['identity_current'] = True
+        other = self.root / 'other.jsonl'
+        other.write_bytes(self.path.read_bytes())
+        self.sources.append({**self.sources[0], 'surface_id': 'other', 'path': other})
+        entered, release = threading.Event(), threading.Event()
+        original = Path.stat
+        def stat(path, *args, **kwargs):
+            if path == other:
+                entered.set()
+                release.wait(3)
+            return original(path, *args, **kwargs)
+        with patch.object(Path, 'stat', stat):
+            thread = threading.Thread(target=self.watcher.scan)
+            thread.start()
+            try:
+                self.assertTrue(entered.wait(1))
+                self.assertEqual(self.watcher.observation_interval(
+                    {'surface_id': 'surface', 'workspace_id': 'workspace'}, 1), 10)
+            finally:
+                release.set()
+                thread.join(3)
+
+    def test_measured_slow_scan_lease_is_bounded_and_failure_removes_it(self):
+        now = [0.0]
+        self.watcher.clock = lambda: now[0]
+        self.sources[0]['identity_current'] = True
+        def sources():
+            now[0] += 3
+            return self.sources
+        self.watcher.sources = sources
+        self.event('task_started', error=False)
+        self.watcher.scan()
+        target = {'surface_id': 'surface', 'workspace_id': 'workspace'}
+        self.assertEqual(self.watcher.coverage_seconds, 5)
+        now[0] = 5
+        self.assertEqual(self.watcher.observation_interval(target, 1), 10)
+        now[0] = 8.1
+        self.assertEqual(self.watcher.observation_interval(target, 1), 1)
+        self.path.unlink()
+        self.watcher.scan()
+        self.assertEqual(self.watcher.coverage, {})
+
+    def test_unchanged_bound_paths_do_not_repeat_filesystem_resolution(self):
+        queue = QueueRecovery(self.root / 'ledger', self.root / 'bindings', self.root, 'continue')
+        records = {'session': {'surfaceId': 'surface', 'workspaceId': 'workspace', 'pid': 123,
+            'pidStartSeconds': 100, 'transcriptPath': str(self.path)}}
+        target = {'surface_id': 'surface', 'workspace_id': 'workspace'}
+        with patch.object(queue, 'records', return_value=records), patch('ccc_codex_queue.codex_process_starts', return_value={123: 100}):
+            first = queue.wakeup_sources([target])
+            with patch.object(Path, 'resolve', side_effect=AssertionError('unchanged path resolved again')):
+                self.assertEqual(queue.wakeup_sources([target]), first)
+            replacement = self.root / 'next.jsonl'
+            records['session']['transcriptPath'] = str(replacement)
+            self.assertEqual(queue.wakeup_sources([target])[0]['path'], replacement.resolve())
+            self.assertEqual(set(queue.wakeup_path_cache), {str(replacement)})
 
     def test_bound_process_coverage_survives_gui_refresh_but_rejects_pid_reuse(self):
         queue = QueueRecovery(self.root / 'ledger', self.root / 'bindings', self.root, 'continue')

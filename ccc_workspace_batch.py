@@ -29,7 +29,7 @@ from ccc_inventory import SharedInventory
 from ccc_scheduling import SnapshotCache, SnapshotClient
 
 COUNT = 50
-WORKER_VERSION = 21
+WORKER_VERSION = 22
 PROMPT = "show me u power"
 INITIALIZING = {"creating", "create_unknown", "created", "restarting", "restart_unknown",
                 "submitted", "submitting", "uncertain"}
@@ -150,6 +150,41 @@ def authorize_workspace(config_path, selector, name=None, *, client=None):
     return {"rule": rule, "reconciliation": "queued"}
 
 
+def settled_job(config_path, previous, config, client):
+    """An explicit new B may follow a finished batch with definitive failures.
+
+    Running/uncertain jobs keep their original 50 slots. A live tab previously
+    labelled closed is also retained for reconciliation. Only a new topology
+    read can distinguish it from an actually closed tab; failure to read keeps
+    the old job, without creating replacements or resetting its delivery log.
+    """
+    if previous.get("status") != "needs_attention":
+        return False
+    try:
+        with core.FileLock(job_path(config_path, previous["id"]).parent / "worker.lock", timeout_sec=0):
+            job = core.load_json(job_path(config_path, previous["id"]), {})
+            slots = job.get("slots", [])
+            if job.get("status") != "needs_attention" or not slots:
+                return False
+            for slot in slots:
+                if slot.get("phase") not in {"confirmed", "surface_closed", "blocked"}:
+                    return False
+                if slot.get("phase") == "blocked" and slot.get("error") not in {
+                    "此 session 已有任务，未发送批量 prompt", "此路授权已被修改，未发送 prompt",
+                }:
+                    return False  # Legacy recoverable waits are still resumed.
+            closed = {s.get("surface_id") for s in slots if s.get("phase") == "surface_closed"}
+            if closed:
+                reader = client or _client(config)
+                tree = reader.fresh_tree() if isinstance(reader, SnapshotClient) else reader.tree()
+                present = {r["surface_id"] for r in core.workspace_surface_records(tree, job["workspace_id"]).values()}
+                if closed & present:
+                    return False
+            return True
+    except (OSError, ValueError, RuntimeError):
+        return False
+
+
 def start(config_path, selector, *, client=None, launch=True):
     from ccc_batch_guard import AUTOMATIC_POOL_STOP
     guarded = launch and AUTOMATIC_POOL_STOP
@@ -174,7 +209,8 @@ def start(config_path, selector, *, client=None, launch=True):
         cancel_epoch = rule.get("batch_cancelled_at")
         previous = core.load_json(job_path(config_path, rule["last_batch_id"]), {}) if rule.get("last_batch_id") else {}
         if (previous and previous.get("status") not in {"complete", "stopped_success"}
-                and previous.get("created_at", 0) > rule.get("batch_success_at", 0)):
+                and previous.get("created_at", 0) > rule.get("batch_success_at", 0)
+                and not settled_job(config_path, previous, config, client)):
             job = previous  # Repeated clicks and retries reuse the same 50 slots.
         else:
             job = {"id": str(uuid.uuid4()), "workspace_id": wid,
@@ -949,6 +985,54 @@ class BatchWorker:
             self._top_due = self.clock() + 5
             self.processes = core.classify_surface_processes(self.client.top_all())
 
+    def _membership_tree(self):
+        """A cached absence is not evidence that a newly created tab closed.
+
+        A tree request can start before creation and finish after its reply.
+        Its cache TTL and the five-second startup grace do not order those
+        events. Confirm an absence with a request started by this worker now.
+        The result is still read-only; prompt delivery keeps its own preflight.
+        """
+        tree = self.client.tree()
+        if isinstance(self.client, SnapshotClient):
+            records = core.workspace_surface_records(tree, self.job["workspace_id"])
+            present = {r["surface_id"] for r in records.values()}
+            workspace_present = any(w.get("id") == self.job["workspace_id"]
+                                    for win in tree.get("windows", []) for w in win.get("workspaces", []))
+            missing = any(s.get("surface_id") and s["surface_id"] not in present
+                          and s.get("phase") in INITIALIZING | {"startup_wait", "restart_pending", "pty_wait"}
+                          and self.clock() - s.get("launched_at", s.get("created_at", self.clock())) >= 5
+                          for s in self.job.get("slots", []))
+            if not workspace_present or missing:
+                tree = self.client.fresh_tree()
+        return tree
+
+    def _restore_present_slots(self, tree):
+        """Recheck old false closures in the same tab; never create a replacement.
+
+        Require both current membership and the original launch receipt.
+        Submitted/uncertain work returns only to its confirmation path, and
+        the normal authorization, native session and composer checks remain.
+        """
+        present = {r["surface_id"] for r in core.workspace_surface_records(tree, self.job["workspace_id"]).values()}
+        restored = False
+        for slot in self.job.get("slots", []):
+            if slot.get("phase") != "surface_closed" or slot.get("surface_id") not in present:
+                continue
+            receipt = core.load_json(self.path.parent / f"surface-{slot['index']}.json", {})
+            if (not slot.get("launch_id") or receipt.get("launch_id") != slot["launch_id"]
+                    or receipt.get("surface_id") != slot["surface_id"]
+                    or receipt.get("workspace_id") != self.job["workspace_id"]):
+                continue
+            phase = "uncertain" if slot.get("submit_at") else "created"
+            slot.update(phase=phase, closure_rechecked_at=self.clock())
+            slot.pop("retry_at", None)
+            slot.pop("error", None)
+            restored = True
+        if restored:
+            self.job["status"] = "running"
+        return restored
+
     def step(self):
         # Disk evidence is independent of cmux's process-table RPC and of B/P.
         # Releasing a proven hold does not override P or any manual exclusion.
@@ -969,7 +1053,7 @@ class BatchWorker:
             self.save()
             return False
         try:
-            tree = self.client.tree()
+            tree = self._membership_tree()
             workspaces = [w.get("id") for win in tree.get("windows", []) for w in win.get("workspaces", [])]
             if self.job["workspace_id"] not in workspaces:
                 # Only a successful, fresh inventory proves a closed pool.
@@ -980,6 +1064,7 @@ class BatchWorker:
             self.job.update(status="waiting", error=str(exc))
             self.save()
             return True
+        self._restore_present_slots(tree)
         try:
             self._refresh_processes()
         except (core.CmuxError, RuntimeError) as exc:
@@ -1077,6 +1162,7 @@ class BatchReconciler:
     def cycle(self):
         config = self.store.load()
         ids = relevant_job_ids(self.path, config)
+        membership = None
         for jid in ids:
             if self.stop.is_set():
                 break
@@ -1090,6 +1176,10 @@ class BatchReconciler:
                     if worker is None:
                         worker = self.workers[jid] = BatchWorker(self.path, jid, client=self.client)
                     worker.job = job
+                    if allowed(config, job) and any(s.get("phase") == "surface_closed" for s in job.get("slots", [])):
+                        if membership is None:
+                            membership = self.client.tree()
+                        worker._restore_present_slots(membership)
                     rule = next((r for r in config["workspace_rules"] if r.get("workspace_id") == job["workspace_id"]), {})
                     for slot in job.get("slots", []):
                         if slot.get("phase") == "confirmed" and not core.batch_start_hold(rule, slot.get("surface_id")):

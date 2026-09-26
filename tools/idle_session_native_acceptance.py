@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import ccc_batch_guard as guard
 import ccc_codex_queue as native
 import ccc_guard_scope as scope
+from ccc_native_processes import NativeProcessIndex
 import cmux_codex_watch as core
 
 ERROR = "We’re currently experiencing high demand, which may cause temporary errors."
@@ -37,22 +38,30 @@ class Handler(BaseHTTPRequestHandler):
         if self.headers.get("Content-Encoding") == "gzip":
             raw = gzip.decompress(raw)
         body = json.loads(raw)
-        self.server.requests.append({"model": body.get("model"), "at": time.time()})
+        messages = [item for item in body.get("input", []) if item.get("role") == "user"]
+        user_text = "\n".join(part.get("text", "") for part in (messages[-1].get("content", []) if messages else [])
+                              if part.get("type") == "input_text")
+        title = user_text.startswith("Generate a concise, single-line task title")
+        self.server.requests.append({"model": body.get("model"), "at": time.time(),
+                                     "user_text": user_text, "native_title": title,
+                                     "thread_id": self.headers.get("thread-id"),
+                                     "body_sha256": hashlib.sha256(raw).hexdigest()})
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.end_headers()
         response = {"id": "resp_" + uuid.uuid4().hex, "object": "response", "status": "in_progress", "output": []}
         events = [{"type": "response.created", "response": response}]
-        if len(self.server.requests) == 1:
+        if getattr(self.server, "fail_first", True) and len(self.server.requests) == 1:
             events.append({"type": "response.failed", "response": {
                 **response, "status": "failed", "error": {"code": "server_error", "message": ERROR}}})
         else:
+            reply = json.dumps({"title": "Show power"}) if title else "OK"
             item = {"id": "msg_" + uuid.uuid4().hex, "type": "message", "role": "assistant",
-                    "status": "completed", "content": [{"type": "output_text", "text": "OK", "annotations": []}]}
+                    "status": "completed", "content": [{"type": "output_text", "text": reply, "annotations": []}]}
             events.extend([{"type": "response.output_item.added", "output_index": 0,
                             "item": {**item, "status": "in_progress", "content": []}},
                            {"type": "response.output_text.delta", "item_id": item["id"],
-                            "output_index": 0, "content_index": 0, "delta": "OK"},
+                            "output_index": 0, "content_index": 0, "delta": reply},
                            {"type": "response.output_item.done", "output_index": 0, "item": item},
                            {"type": "response.completed", "response": {**response, "status": "completed", "output": [item]}}])
         for event in events:
@@ -103,7 +112,9 @@ def main():
                     os.write(master, b"\x1b[1;1R")
         try:
             queue = native.QueueRecovery(root / "ledger", root / "missing-hooks", native_home / "sessions", "continue")
-            queue.process_lookup = lambda _: {"agent_kind": "codex", "agent_pids": [process.pid]}
+            index = NativeProcessIndex()
+            index.start()
+            queue.process_lookup = lambda target: index.lookup(target) or {"agent_kind": "unknown", "summary": "process refresh pending"}
             deadline = time.monotonic() + 90
             turn = None
             while time.monotonic() < deadline:
@@ -119,7 +130,12 @@ def main():
             birth = scope.birth(process.pid, codex=True)
             # Exercise the exact writer-lock path even if this native build
             # still has its original rollout open at this instant.
-            idle = queue._idle_process_turn(target, process.pid)
+            idle_deadline = time.monotonic() + 3
+            while True:
+                idle = queue._idle_process_turn(target, process.pid)
+                if idle.get("kind") != "unknown" or time.monotonic() >= idle_deadline:
+                    break
+                drain()
             assert idle.get("session_id") == turn["session_id"] and idle.get("turn_id") == turn["turn_id"], idle
             observer = core.WatchDaemon.__new__(core.WatchDaemon)
             observer.config = core.default_config()
@@ -159,6 +175,8 @@ def main():
             print(json.dumps({"requests": server.requests, "screen_tail": raw_screen[-2000:].decode(errors="replace")}))
             raise
         finally:
+            if 'index' in locals():
+                index.close()
             if process.poll() is None:
                 process.terminate()
                 try:

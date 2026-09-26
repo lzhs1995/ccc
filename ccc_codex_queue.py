@@ -395,13 +395,15 @@ class NativeCompletionWatcher:
         self.signatures, self.seen_turns = {}, {}
         self.pending, self.retry_needed, self.clock = {}, retry_needed, clock
         self.lifecycle, self.coverage = {}, {}
+        self.scan_seconds = 0.0
+        self.coverage_seconds = max(1, 3 * interval)
         self.stop = threading.Event()
         self.thread = None
 
     def scan(self):
+        started = self.clock()
         sources = self.sources()
         active = set()
-        covered = {}
         for source in sources:
             key = (source["surface_id"], source["workspace_id"],
                    source["session_id"], str(source["path"]))
@@ -412,11 +414,13 @@ class NativeCompletionWatcher:
                 signature = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
                 if self.signatures.get(key) == signature:
                     if key in self.lifecycle and source.get("identity_current"):
-                        covered[key[:2]] = self.clock()
+                        self.coverage[key[:2]] = self.clock()
+                    else:
+                        self.coverage.pop(key[:2], None)
                     pending = self.pending.get(key)
-                    if (pending and self.retry_needed and self.clock() >= pending[1]
-                            and self.retry_needed(key[0], key[1], pending[0])):
-                        self.wake(key[0], key[1])
+                    if pending and self.retry_needed and self.clock() >= pending[1]:
+                        if self.retry_needed(key[0], key[1], pending[0]):
+                            self.wake(key[0], key[1])
                         self.pending[key] = (pending[0], self.clock() + 1)
                     continue
                 with path.open("rb") as handle:
@@ -425,6 +429,7 @@ class NativeCompletionWatcher:
                     tail = handle.read(self.tail_bytes)
                 after = path.stat()
                 if signature != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+                    self.coverage.pop(key[:2], None)
                     continue
                 lines = tail.splitlines()
                 if offset:
@@ -453,26 +458,37 @@ class NativeCompletionWatcher:
                 if latest:
                     self.lifecycle[key] = latest["payload"]["type"]
                     if source.get("identity_current"):
-                        covered[key[:2]] = self.clock()
+                        self.coverage[key[:2]] = self.clock()
+                    else:
+                        self.coverage.pop(key[:2], None)
                 else:
                     self.lifecycle.pop(key, None)
+                    self.coverage.pop(key[:2], None)
                 self.signatures[key] = signature
             except (OSError, ValueError, TypeError, AttributeError):
+                self.coverage.pop(key[:2], None)
                 continue
         self.signatures = {key: value for key, value in self.signatures.items() if key in active}
         self.seen_turns = {key: value for key, value in self.seen_turns.items() if key in active}
         self.pending = {key: value for key, value in self.pending.items() if key in active}
         self.lifecycle = {key: value for key, value in self.lifecycle.items() if key in active}
-        self.coverage = covered
+        active_surfaces = {key[:2] for key in active}
+        self.coverage = {key: at for key, at in self.coverage.items() if key in active_surfaces}
+        self.scan_seconds = max(0, self.clock() - started)
+        # A busy fleet must not lose all coverage merely because one pass
+        # takes longer than the idle polling interval. Publish each surface
+        # immediately, and bound the measured scan allowance to five seconds.
+        # Missing/unreadable/mismatched sources are removed on that same pass.
+        self.coverage_seconds = max(1, min(5, 2 * self.scan_seconds + 3 * self.interval))
 
     def observation_interval(self, target, fallback):
         """Healthy native monitoring replaces redundant reads, never send guards.
 
-        A missing/stalled source immediately falls back to regular viewport
-        polling. Native failures still request an immediate priority read.
+        A failed source falls back on that scan; a stalled scanner loses its
+        bounded lease. Native failures still request an immediate priority read.
         """
         checked = self.coverage.get((str(target["surface_id"]), str(target["workspace_id"])))
-        if checked is not None and 0 <= self.clock() - checked <= max(1, 3 * self.interval):
+        if checked is not None and 0 <= self.clock() - checked <= self.coverage_seconds:
             return max(fallback, 10.0)
         return fallback
 
@@ -506,6 +522,8 @@ class QueueRecovery:
         self.idle_file_cache = {}
         self.open_file_sources = {}
         self.wakeup_process_cache = (0.0, frozenset(), {})
+        self.wakeup_root_cache = (None, None)
+        self.wakeup_path_cache = {}
         try:
             self.attempts = json.loads(self.ledger.read_text())
         except FileNotFoundError:
@@ -538,18 +556,35 @@ class QueueRecovery:
                            "process_start": r.get("pidStartSeconds", 0)}
                           for sid, r in records.items())
         chosen = {}
-        root = self.sessions_root.resolve()
+        root_key = str(self.sessions_root)
+        if self.wakeup_root_cache[0] != root_key:
+            self.wakeup_root_cache = (root_key, self.sessions_root.resolve())
+            self.wakeup_path_cache = {}
+        root = self.wakeup_root_cache[1]
+        paths = set()
         for source in candidates:
             sid = source["surface_id"]
             if active.get(sid) != source["workspace_id"] or not source["path"]:
                 continue
             try:
-                if not Path(source["path"]).resolve().is_relative_to(root):
-                    continue
+                path_key = str(source["path"])
+                paths.add(path_key)
+                path = self.wakeup_path_cache.get(path_key)
+                if path is None:
+                    path = Path(path_key).resolve()
+                    if not path.is_relative_to(root):
+                        continue
+                    self.wakeup_path_cache[path_key] = path
+                # Keep the original canonical file as an advisory source.
+                # Re-resolving hundreds of unchanged paths every 250 ms made
+                # the event thread compete with the viewport fleet for I/O/GIL.
+                # A later symlink retarget cannot redirect this pinned hint;
+                # actual sends independently verify the current native writer.
                 if sid not in chosen or source["process_start"] > chosen[sid]["process_start"]:
-                    chosen[sid] = source
+                    chosen[sid] = {**source, "path": path}
             except (OSError, ValueError, TypeError):
                 continue
+        self.wakeup_path_cache = {key: value for key, value in self.wakeup_path_cache.items() if key in paths}
         # Scheduling must not depend on cmux's expensive GUI process snapshot:
         # its normal refresh gap used to discard every healthy native monitor
         # at once, producing another full-fleet burst of viewport requests.
