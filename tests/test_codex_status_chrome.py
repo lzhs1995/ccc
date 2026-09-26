@@ -22,6 +22,7 @@ PROVIDER_RATE_LIMIT = (
     "rate limit exceeded: Your requests to gpt-6-astra for gpt-6-astra in eastus2 "
     "have exceeded rate limit."
 )
+PROVIDER_TOKEN_RATE_LIMIT = PROVIDER_RATE_LIMIT.replace('exceeded rate limit.', 'exceeded token rate limit.')
 
 
 def captured_payload():
@@ -58,6 +59,52 @@ def visible_text(payload):
 
 
 class CodexProviderRateLimitTests(unittest.TestCase):
+    def test_token_rate_limit_reaches_structural_parser_through_both_wrap_forms(self):
+        for columns in (40, 80, 126, 160):
+            for hard_wrap in (False, True):
+                with self.subTest(columns=columns, hard_wrap=hard_wrap):
+                    payload = status_payload(PROVIDER_TOKEN_RATE_LIMIT, columns=columns)
+                    if hard_wrap:
+                        text = '■ ' + PROVIDER_TOKEN_RATE_LIMIT
+                        grid = payload['render_grid']
+                        grid['row_spans'] = [s for s in grid['row_spans'] if s['row'] >= 49]
+                        grid['row_spans'] += [span(43 + i // columns, 0, text[i:i + columns], 3)
+                                              for i in range(0, len(text), columns)]
+                    self.assertEqual(core.classify_text_prefilter(visible_text(payload)).kind, 'candidate')
+                    state = core.classify_grid(core.Grid.from_rpc(payload, 'surface-uuid'))
+                    self.assertEqual((state.kind, state.error_type), ('recoverable_error', 'rate_limit'))
+
+    def test_token_rate_limit_still_rejects_quotes_partial_text_and_user_draft(self):
+        for text in ('example: ' + PROVIDER_TOKEN_RATE_LIMIT,
+                     PROVIDER_TOKEN_RATE_LIMIT + ' This is documentation.',
+                     PROVIDER_TOKEN_RATE_LIMIT.replace('have exceeded', 'may exceed')):
+            payload = status_payload(text)
+            self.assertEqual(core.classify_grid(core.Grid.from_rpc(payload, 'surface-uuid')).kind, 'idle')
+        payload = status_payload(PROVIDER_TOKEN_RATE_LIMIT)
+        grid = payload['render_grid']
+        prompt = next(s for s in grid['row_spans'] if s['row'] == 54 and s['column'] == 2)
+        prompt.update(text='keep my draft', style_id=0, cell_width=13)
+        grid['cursor']['column'] = 15
+        with tempfile.TemporaryDirectory() as directory:
+            client = FakeClient(payload, visible_text(payload))
+            daemon = armed_daemon(directory, client)
+            daemon.process_once(client)
+            self.assertEqual(client.sent, [])
+
+    def test_token_rate_limit_retries_once_and_prompt_echo_stops_redelivery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            payload = status_payload(PROVIDER_TOKEN_RATE_LIMIT)
+            client = FakeClient(payload, visible_text(payload))
+            daemon = armed_daemon(directory, client)
+            daemon.process_once(client)
+            self.assertEqual(len(client.sent), 1)
+            self.assertEqual(daemon.runtime['surface-uuid'].error_type, 'rate_limit')
+            payload['render_grid']['row_spans'].append(span(49, 0, '› 任务请继续'))
+            client.text = visible_text(payload)
+            for _ in range(3):
+                daemon.process_once(client)
+            self.assertEqual(len(client.sent), 1)
+
     def test_provider_banner_survives_word_and_cell_wrapping(self):
         for columns in (40, 58, 80, 106, 126, 160):
             for hard_wrap in (False, True):

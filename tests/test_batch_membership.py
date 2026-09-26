@@ -1,7 +1,7 @@
 """Late topology replies must not strand live B slots or cause replacements."""
 import copy
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import ccc_workspace_batch as batch
 import cmux_codex_watch as core
@@ -124,6 +124,120 @@ class BatchMembershipTests(unittest.TestCase):
         self.assertEqual(restored['slots'][0]['phase'], 'created')
         self.assertEqual(self.client.sent, [])
         self.assertEqual(len(self.client.calls), 1)
+
+    def test_reconciler_cannot_leave_live_original_closed_using_a_precreation_cache(self):
+        old = copy.deepcopy(self.client.tree())
+        slot = self.false_closed()
+        client = self.cached_client(old)
+        reconciler = batch.BatchReconciler(self.config, client)
+        self.addCleanup(lambda: [w.cache.close() for w in reconciler.workers.values()])
+        with patch.object(batch, '_launch') as launch:
+            reconciler.cycle()
+        launch.assert_called_once()
+        self.assertEqual(launch.call_args.args[1]['id'], self.job['job_id'])
+        restored = core.load_json(self.worker.path, {})
+        self.assertEqual(restored['slots'][0]['phase'], 'created')
+        self.assertEqual(restored['slots'][0]['surface_id'], slot['surface_id'])
+        self.assertEqual(self.client.sent, [])
+
+    def test_reconciler_failed_fresh_read_preserves_original_closure_and_hold(self):
+        self.false_closed()
+        client = self.cached_client(self.client.tree())
+        reconciler = batch.BatchReconciler(self.config, client)
+        self.addCleanup(lambda: [w.cache.close() for w in reconciler.workers.values()])
+        old = self.worker.path.read_bytes()
+        with patch.object(client, 'fresh_tree', side_effect=core.CmuxError('unavailable')), \
+                patch.object(batch, '_launch') as launch:
+            reconciler.cycle()
+        launch.assert_not_called()
+        self.assertEqual(self.worker.path.read_bytes(), old)
+
+    def test_reconciliation_cannot_revive_old_job_between_settlement_and_new_authorization(self):
+        slot = self.false_closed()
+        old = self.worker.path.read_bytes()
+        absent = copy.deepcopy(self.client.tree())
+        absent['windows'][0]['workspaces'][0]['panes'][0]['surfaces'] = []
+        reader = Mock()
+        reader.tree.return_value = absent
+        reconciler = batch.BatchReconciler(self.config, self.client)
+        self.addCleanup(lambda: [w.cache.close() for w in reconciler.workers.values()])
+        mutate = core.ConfigStore.mutate
+        checked = []
+        def at_authorization(store, callback):
+            if callback.__name__ == 'authorize':
+                # The old launch receipt and a present surface reappear just
+                # after settlement, while the old authorization is still live.
+                checked.append(True)
+                reconciler.cycle()
+            return mutate(store, callback)
+        with patch.object(core.ConfigStore, 'mutate', at_authorization), patch.object(batch, '_launch') as launch:
+            result = batch.start(self.config, self.wid, client=reader, launch=False)
+        self.assertEqual(checked, [True])
+        launch.assert_not_called()
+        self.assertNotEqual(result['job_id'], self.job['job_id'])
+        self.assertEqual(self.worker.path.read_bytes(), old)
+        self.assertEqual(self.client.calls, [slot['surface_id']])
+
+    def test_repeat_b_does_not_overwrite_progress_owned_by_running_worker(self):
+        self.worker.step()
+        self.worker.save()
+        previous = copy.deepcopy(self.worker.job)
+        updated = {**previous, 'progress_marker': 'written by active worker'}
+        load = core.load_json
+        first = [True]
+        def race(path, *args, **kwargs):
+            if path == self.worker.path and first[0]:
+                first[0] = False
+                core.atomic_write_json(path, updated)
+                return previous
+            return load(path, *args, **kwargs)
+        with core.FileLock(self.worker.path.parent / 'worker.lock'), patch.object(core, 'load_json', race):
+            result = batch.start(self.config, self.wid, client=self.client, launch=False)
+        self.assertEqual(result['job_id'], self.job['job_id'])
+        self.assertEqual(load(self.worker.path, {}).get('progress_marker'), updated['progress_marker'])
+        self.assertEqual(len(self.client.calls), 1)
+
+    def test_repeat_b_preserves_progress_completed_before_it_acquires_ownership(self):
+        self.worker.step()
+        self.worker.save()
+        previous = copy.deepcopy(self.worker.job)
+        updated = {**previous, 'progress_marker': 'last worker write before unlock'}
+        load = core.load_json
+        first = [True]
+        def race(path, *args, **kwargs):
+            if path == self.worker.path and first[0]:
+                first[0] = False
+                core.atomic_write_json(path, updated)
+                return previous
+            return load(path, *args, **kwargs)
+        with patch.object(core, 'load_json', race):
+            result = batch.start(self.config, self.wid, client=self.client, launch=False)
+        self.assertEqual(result['job_id'], self.job['job_id'])
+        self.assertEqual(load(self.worker.path, {}).get('progress_marker'), updated['progress_marker'])
+
+    def test_final_status_does_not_allow_another_batch_while_original_worker_still_owns_it(self):
+        self.worker.job['status'] = 'complete'
+        self.worker.save()
+        old = self.worker.path.read_bytes()
+        with core.FileLock(self.worker.path.parent / 'worker.lock'):
+            result = batch.start(self.config, self.wid, client=self.client, launch=False)
+        self.assertEqual(result['job_id'], self.job['job_id'])
+        self.assertEqual(self.worker.path.read_bytes(), old)
+
+    def test_reconciler_does_not_restore_old_batch_after_its_authorization_snapshot_changes(self):
+        self.false_closed()
+        reconciler = batch.BatchReconciler(self.config, self.client)
+        self.addCleanup(lambda: [w.cache.close() for w in reconciler.workers.values()])
+        def changed_authorization(path, config):
+            self.store.mutate(lambda c: c['workspace_rules'][0].pop('active_batch_id'))
+            return [self.job['job_id']]
+        with patch.object(batch, 'relevant_job_ids', side_effect=changed_authorization), \
+                patch.object(batch, '_launch') as launch:
+            reconciler.cycle()
+        launch.assert_not_called()
+        restored = core.load_json(self.worker.path, {})
+        self.assertEqual(restored['slots'][0]['phase'], 'surface_closed')
+        self.assertEqual(self.client.sent, [])
 
     def test_b_reuses_a_live_falsely_closed_tab_before_allowing_another_batch(self):
         slot = self.false_closed()
