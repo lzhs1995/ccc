@@ -329,7 +329,7 @@ CLAUDE_CONTEXT_ABSOLUTE_TIMEOUT_SEC = 900.0
 # through TargetRuntime and suppresses duplicate Hook/fallback deliveries.
 # Human label only.  Acceptance always compares SHA-256 of the loaded source:
 # a revision string is hand-maintained and therefore can lie about what runs.
-FEATURE_REVISION = "0.2.17-service-aware-network-guard"
+FEATURE_REVISION = "0.2.18-native-batch-response-streak"
 # How long after our own send a byte-identical UserPromptSubmit can still be
 # our echo.  Must exceed claude_submit_confirm_timeout_sec so that a late
 # echo arriving after the transaction timed out is not read as a human.
@@ -9279,7 +9279,7 @@ class WatchDaemon:
                     runtime.delivery_status = "cancelled"
                     self.save(wait=False)
                     return
-                if runtime.codex_goal_resume and not self._codex_turn_ready(target, runtime, state, reserved=True):
+                if not self._codex_turn_ready(target, runtime, state, reserved=True):
                     runtime.delivery_status = "cancelled"
                     self.save(wait=False)
                     return
@@ -9357,14 +9357,20 @@ class WatchDaemon:
                     runtime.codex_goal_resume = True
                     runtime.codex_observed_turn_key = key
                     return True
+                # This stalled goal is already resumed. Do not also send 任务请继续.
+                runtime.codex_goal_resume = False
+                return False
+            if reserved and runtime.codex_goal_resume:
+                # The proof disappeared while the resume was being persisted.
+                runtime.codex_goal_resume = False
+                return False
+            # The footer is visible but the sqlite proof is missing. That must
+            # not freeze a still-visible high-demand failure; continue below.
             runtime.codex_goal_resume = False
-            self._record_state(str(target["surface_id"]), runtime, ScreenState(
-                "awaiting_transition", message_kind="codex", error_type=state.error_type,
-                reason="waiting for verified original Codex stalled-goal evidence before native resume",
-            ))
-            return False
         runtime.codex_goal_resume = False
         turn = self.codex_queue_recovery.current_turn(target)
+        if turn is None and state.native_goal_stalled:
+            turn = {"kind": "unknown"}
         if turn is None:
             if not (reserved and runtime.codex_observed_turn_key):
                 runtime.codex_observed_turn_key = ""
@@ -9383,8 +9389,12 @@ class WatchDaemon:
                 and _match_error_block("■ " + str(error.get("message") or "")) == state.error_type):
             key = f"{turn.get('session_id')}:{turn.get('turn_id')}:{turn.get('at')}"
             already_sent = key == runtime.codex_sent_turn_key
+            # The renderer can retain an old error after accepting input.
+            # Only a new failed turn or independently proved non-delivery may
+            # authorize another prompt; accepted/unknown are not retry proofs.
+            retryable = runtime.delivery_status in {"failed", "cancelled", "retryable"}
             if (reserved and key == runtime.codex_observed_turn_key) or (
-                    not reserved and (not already_sent or runtime.delivery_status in {"failed", "cancelled", "retryable"})):
+                    not reserved and (not already_sent or retryable)):
                 runtime.codex_observed_turn_key = key
                 return True
         phase = "working" if turn.get("kind") in {"task_started", "user_message"} else "awaiting_transition"

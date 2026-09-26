@@ -65,6 +65,22 @@ class CodexTurnGateTests(unittest.TestCase):
         self.assertEqual(self.client.sent, [])
         self.assertEqual(self.daemon.runtime["surface-uuid"].delivery_status, "cancelled")
 
+    def test_new_turn_while_waiting_for_workspace_lock_cancels_io(self):
+        self.turn.side_effect = [self.finished, self.finished, {"kind": "task_started"}]
+        self.daemon.process_once(self.client)
+        self.assertEqual(self.client.sent, [])
+        self.assertEqual(self.daemon.runtime['surface-uuid'].delivery_status, 'cancelled')
+
+    def test_unknown_delivery_never_retries_without_unsent_confirmation(self):
+        self.daemon.process_once(self.client)
+        runtime = self.daemon.runtime['surface-uuid']
+        runtime.delivery_status = 'unknown'
+        runtime.awaiting = False
+        runtime.last_send_at = 0
+        # No stable native signature: the renderer alone cannot prove non-delivery.
+        self.daemon.process_once(self.client)
+        self.assertEqual(len(self.client.sent), 1)
+
     def test_missing_hook_and_pending_process_snapshot_do_not_bypass_native_gate(self):
         # Exercise the real QueueRecovery wiring, including the advisory
         # nonblocking process lookup used by the production daemon.

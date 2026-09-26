@@ -22,6 +22,12 @@ def current_workspace(config_path, surface_id):
 
 
 def run(config_path, native, args):
+    # With automatic pause off, no session needs a guardian backend. In
+    # particular an old B workspace must not trigger adoption of live Codex.
+    # B bootstrap and the watcher still enforce the operator's input gates.
+    if not guard.AUTOMATIC_POOL_STOP:
+        os.execv(native, [native, *args])
+        return
     wid = os.environ.get("CMUX_WORKSPACE_ID", "")
     try:
         wid = guard.uid(wid)

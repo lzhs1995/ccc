@@ -114,7 +114,7 @@ requests. The selected workspace has clickable controls (the same keys work):
 - `w` 整池授权：覆盖该池现有和后续 Codex，保留单路排除。
 - `P` 暂停 + Interrupt：先落盘停止整池续跑、取消批量创建，再向本池 Codex 请求 Escape；保留原 session。未确认的进程或投递单独报失败。
 - `W` 恢复整池：恢复续跑，保留单路暂停、排除；不会自行重启被取消的创建任务。
-- `B` 新开50 + 授权：在选定 workspace 的主区域 pane 新建最多50个后台 Codex 标签页。每路确认原 session 和空输入框后发送一次 `show me u power`。任一路收到新的模型响应，即关闭本池请求入口，并在1秒内 Interrupt 本池全部 Codex（含成功路和原有会话），取消剩余创建名额。
+- `B` 新开50 + 授权：在选定 workspace 的主区域 pane 新建最多50个后台 Codex 标签页。每路确认原 session 和空输入框后发送一次 `show me u power`。模型响应不再自动切断本池。
 
 `B` requires global sending to be enabled and the selected pool to be unpaused.
 It never changes another pool or silently clears existing pauses. At most four
@@ -269,38 +269,41 @@ a hint never authorizes input or clears a delivery record.
 
 ### 批量启动与授权恢复
 
-`B 新开50+授权` 先保存50个持久化名额，后台绑定目标 workspace 的主区域 pane。尚未接入时重复按 B 复用未完成批次；首个成功响应会停止全池并取消余下名额。停止已确认后再次按 B 创建新批次。全系统共享4个启动许可，相邻创建至少间隔0.5秒。等待人工确认/草稿的路会让出许可；创建回执不明的记录持续核对，30秒后让出许可，但不会重发创建请求。
+`B 新开50+授权` 先保存50个持久化名额，后台绑定目标 workspace 的主区域 pane。重复按 B 复用未完成批次；完成后再次按 B 创建新批次。全系统共享4个初始化许可，相邻创建至少间隔0.5秒；标签页已创建、原生 Codex 尚未就绪时仍占用许可。启动租约30秒后让出许可并继续核对原名额，不能重发回执不明的创建请求。
 
 B 的实时保护只接受配置中 `batch_guard.origin_job_id` 与真实 `workspace-batches/JOB_UUID/job.json` 一致的工作区。每次输入、成功判定和信号发送均核对当前 cmux workspace/surface 完整 UUID；强制信号还核对本机 PID 的微秒级创建时间与进程归属。工作区名称、临时 `surface:N` 编号、相同目录均不能扩大停止范围。人工排除的会话仍属于本池的成本停止范围，但原排除设置会保留。
 
 全局 Dock 属于窗口，即使界面把它显示在当前 workspace 下，也不进入该 workspace 的 B 停止范围。移入全局 Dock 的 surface 同样按新的归属排除。
 
-**接入成功**：当前活跃原生 thread/turn 的非空模型文本、推理、计划增量，或可证明由模型发起的工具事件。登录、授权、`task_started`、HTTP 200、`Working`、工具输出、用户引用与旧 transcript 都不算成功。旧会话恢复返回的历史不会触发保护。
+**自动暂停保持关闭**：模型响应、成员检查超时、协议错误和保护安装失败都不会自动暂停或 Interrupt 会话。`B` 直接使用已核实的原生 Codex 绝对路径，不经过 PATH 中可能残留的旧守卫启动器，不接管或重启已有 session。首条 prompt 仍须确认原 session 和空输入框，只有手动按 `P` 才暂停所属工作区。
 
-**停止已确认**：所有目标的原生任务已结束，且请求后端已经退出。`turn/interrupt` 的 RPC 回执仅表示请求已送达。首个模型事件立即锁住入口，并并行发送原生 Interrupt；350ms 时向仍未停止的精确进程发 SIGTERM，650ms 时发 SIGKILL，1000ms 前核验结果。超时、成员关系不明或进程身份变化均显示保护异常，不能显示“全部已停”。取消后关闭后端标准输入，阻止内部 goal、队列和自动重试继续发请求；surface 和原会话日志保留。
+保留的连通判定要求**同一 session、同一进程连续完成3个非空成功回复**。流式片段、推理、工具调用、错误、重复通知和历史回放不计数；失败清零，不跨 session、进程或工作区累加。第3个成功完成事件后仍须核对当前归属，才能在显式启用此功能时触发所属 workspace 的自动暂停；本版本不启用它。
 
-每个受保护 surface 使用 `codex app-server` 与私有 Unix WebSocket relay，普通 TUI 通过 `codex --remote` 连接。独立 watchdog 监测守护进程心跳；观察、控制或全池覆盖失败时关闭本池入口并按同样的 UUID/进程约束停止。B 启动前原位接管旧会话，保留原 surface/session、目录、配置及可验证的草稿；接管未完成则保持停池并报告异常。条件启动器在非 B 工作区直接执行原 Codex 二进制，不启用自动中断。直接绕过启动器产生未受观察的本池进程，会被覆盖核对识别并触发保护停池。
+已存在的旧中继连接在升级时保留；新 B 启动不依赖中继、全局守护健康或会话迁移。断开提示不能授权删除 session、提交记录或重开终端。仅确认尚无 session、没有提交、原 surface 仍属于本批次且处于空 shell 的启动失败，才可在原 surface 重试。
 
-旧会话的迁移预检在停止或替换进程前完成。原进程若仍持有已删除或被替换的历史文件，B 会关闭批量启动和续跑入口、报告历史无法安全恢复，并保留原进程；不能为完成接管而销毁唯一存活的历史。
+旧迁移功能仍需在任何停止或替换前完成预检；本版本的 B 不调用迁移。原进程若仍持有已删除或被替换的历史文件，不能销毁唯一存活的历史。
 
 启动保护记录在 `batch_start_holds`，面板显示 `整池／启动中`，不计入人工暂停。原 session 日志必须包含提交后的首个 task_started 和精确的 `show me u power` 才解除保护；AGENTS 与 environment_context 合并消息、大消息、未写完的 JSONL 行均支持增量确认。回执丢失或 worker 重启不会重开同一名额、重发 prompt 或 Enter。守卫持续核对历史批次，只清理有原始证据的批次保护，保留人工排除和暂停。
 
-`w` 可重复执行授权和核对，也不解除整池暂停。`W` 在实时保护就绪后恢复原会话，不重放旧提示、不新建 surface、不补开被取消的名额；需要新批次时显式按 B。原生后端被强制结束后，W 仍使用原 session ID。
+`w` 可重复执行授权和核对，不解除整池暂停。`W` 恢复所属工作区的续跑授权，归档该池旧 STOP 证据，不接管或重启已有进程；需要新批次时显式按 B。已有会话的历史和暂停记录不会在升级时回灌或清空。
 
 面板、普通续跑器与批量 worker 共享带时间戳的清单；常规 `system.top` 扫描间隔至少5秒。B 实时保护独立使用原生事件、直接 libproc 身份核对及合并的当前 cmux 成员查询，不依赖旧清单或延迟落盘的日志。启动等待不再因25秒或360秒到期而被永久放弃。
+
+批次进度、其他 surface 的注册或启动保护更新不会作废本路观察。调度保留等待次序，一次发现过程共享一份拓扑和进程清单；进程枚举不完整时保留仍在原工作区的已有目标及投递记录。真正的暂停、排除、移出或关闭仍会使目标失效，实际发送前继续检查最新配置与原生会话。
 
 本地验收（只连接回环模拟上游，不使用生产凭据）：
 
 ```sh
-python3 -B tools/guard_native_acceptance.py --surfaces 60 --output /tmp/ccc-guard-native-acceptance
-python3 -B tools/guard_native_acceptance.py --surfaces 2 --rearm --response tool --output /tmp/ccc-guard-rearm-acceptance
-python3 -B tools/guard_cmux_acceptance.py --count 50 --legacy --output /tmp/ccc-guard-cmux-acceptance
-python3 -B tools/guard_cmux_acceptance.py --count 50 --early 2 --legacy --lifecycle --output /tmp/ccc-guard-early-acceptance
-python3 -B tools/guard_cmux_acceptance.py --count 2 --fault watchdog-stall --lifecycle --output /tmp/ccc-guard-fault-acceptance
-python3 -B tools/goal_cmux_acceptance.py --output /tmp/ccc-goal-acceptance
+python3 -B -m unittest tests.test_workspace_batch tests.test_batch_direct_launch tests.test_response_streak tests.test_codex_turn_gate
+python3 -B tools/response_streak_native_acceptance.py --output /tmp/ccc-response-streak.json
+python3 -B tools/idle_session_native_acceptance.py --output /tmp/ccc-idle-session.json
 ```
 
 原生界面显示 `Goal stalled (/goal resume)` 且出现可恢复限流错误时，续跑器另行核验精确进程、原 session writer lock、原生 goals/logs 数据库的设备与 inode、当前 blocked goal 和对应 Turn error。即使原 rollout 已失联，也可通过一次 `/goal resume` 恢复原 goal；不伪造 `task_complete`，不追加普通提示词，不把旧错误或仍在运行的 goal 当作恢复许可。命令先写入已验证的空输入框，确认完整草稿后仅发送一次 Enter。
+
+只有旧 `Goal stalled` 页脚、没有当前 blocked goal 证据时，仍可凭同一原 session 的最新失败 `task_complete` 自动续跑 high demand。每个失败轮次最多提交一次；仅画面保留旧错误不能重复排队。确认未送达后允许重试，已有新任务或不能确认投递结果时继续核对；取得工作区输入锁后再次检查原生任务，避免覆盖其他 surface 的输入。
+
+SessionStart Hook 缺失且 Codex 空闲时关闭 rollout 文件的情况，可由原进程仍持有的唯一 thread writer lock 证明会话归属。PID 创建时间、workspace/surface、锁与日志的文件身份、当前失败轮次必须一致；不合成 Hook，不新建或替换 session，不能把其他进程或旧日志的错误用来续跑。
 
 每个新批次使用自己的 `workspace-batches/JOB_UUID/native-db`。首次启动通过 SQLite 只读备份复制已有元数据，保留真实的历史索引完成状态；不复制数 GB 的日志和分页历史库，也不改 `CODEX_HOME`、凭据、hooks 和原始会话日志。这样既避免全局日志库写锁，也避免每个新窗口重新扫描全部历史。新 shell 回执还绑定父进程代次，启动检测可直接核验其 Codex 子进程，不必等待全量 `system.top`。
 

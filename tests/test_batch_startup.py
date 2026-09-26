@@ -44,6 +44,14 @@ class BatchStartupTests(unittest.TestCase):
         self.now += 1
         return slot
 
+    def test_paused_cut_off_starts_codex_directly(self):
+        self.worker.step()
+        slot = self.worker.job["slots"][0]
+        self.worker.job["guard_version"] = 1
+        command = self.worker._launch_command(slot)
+        self.assertNotIn("ccc_batch_guard.py", command)
+        self.assertIn(" /test/native/codex -c ", command)
+
     def test_native_sqlite_is_per_batch_without_replacing_codex_home(self):
         self.worker.step()
         first = self.worker.job['slots'][0]
@@ -55,7 +63,7 @@ class BatchStartupTests(unittest.TestCase):
             command = self.worker._launch_command(slot)
             tokens = shlex.split(command)
             self.assertNotIn('CODEX_HOME', command)
-            self.assertEqual(tokens[-3:-1], ['codex', '-c'])
+            self.assertEqual(tokens[-3:-1], ['/test/native/codex', '-c'])
             path = Path(json.loads(tokens[-1].split('=', 1)[1]))
             self.assertTrue(path.is_dir())
             values.append(path)
@@ -275,6 +283,16 @@ class BatchStartupTests(unittest.TestCase):
         self.assertEqual(restart.call_args.args[1], sid)
         self.assertEqual(self.client.calls, [sid])
         self.assertEqual(slot['phase'], 'restart_unknown')
+
+    def test_tabs_waiting_for_composer_do_not_block_the_rest_of_the_fifty(self):
+        for slot in self.worker.job['slots'][:4]:
+            slot.update(phase='created', surface_id=str(uuid.uuid4()),
+                        launched_at=self.now - 120, created_at=self.now - 120,
+                        error='等待空输入框；启动确认、草稿或运行中任务不会被覆盖')
+        pending = self.worker.job['slots'][4]
+        self.assertEqual(pending['phase'], 'pending')
+        self.assertTrue(self.worker._reserve_start(pending))
+        self.assertEqual(pending['phase'], 'creating')
 
     def test_a_waiting_pool_cannot_keep_other_pool_at_head_of_queue(self):
         batch.start(self.config, str(uuid.uuid4()), launch=False)

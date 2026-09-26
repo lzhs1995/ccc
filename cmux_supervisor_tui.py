@@ -2291,9 +2291,12 @@ def workspace_confirm_prompt(row: ViewRow, action: str, *, live_codex: int | Non
     if action == "pause_workspace":
         return f"确认整池暂停 {pool}？停发续跑并 Interrupt 全部 Codex，保留原 session"
     if action == "resume_workspace":
-        return f"确认恢复 {pool} 整池监控？B 池重新布防原会话，不补开已取消名额；保留单路暂停和排除设置"
+        return f"确认恢复 {pool} 整池监控？保留原会话，不补开已取消名额；保留单路暂停和排除设置"
     if action == "batch_workspace":
-        return f"确认在 {pool} 新开50个Codex并整池授权？每路发送 show me u power；任一路收到模型响应即在1秒内 Interrupt 本池全部 Codex，取消剩余名额"
+        from ccc_batch_guard import AUTOMATIC_POOL_STOP, CONNECTION_CUT_ENABLED
+        policy = ("同一 session 连续完成3轮回复后 Interrupt 本池"
+                  if AUTOMATIC_POOL_STOP and CONNECTION_CUT_ENABLED else "自动暂停已关闭")
+        return f"确认在 {pool} 新开50个Codex并整池授权？每路发送 show me u power；{policy}"
     if action == "untrack_workspace":
         return f"确认取消整个 {pool} 授权？该池将不再自动续跑"
     count = row.counts.get("all", 0) if live_codex is None else live_codex
@@ -2301,6 +2304,8 @@ def workspace_confirm_prompt(row: ViewRow, action: str, *, live_codex: int | Non
 
 
 def batch_guard_label(protection: Mapping[str, Any]) -> str:
+    from ccc_batch_guard import AUTOMATIC_POOL_STOP, CONNECTION_CUT_ENABLED
+    automatic = AUTOMATIC_POOL_STOP and CONNECTION_CUT_ENABLED
     phase = protection.get("phase")
     trip = protection.get("trip") or {}
     rows = [r for r in protection.get("surfaces", {}).values() if r.get("in_scope", True)]
@@ -2310,9 +2315,14 @@ def batch_guard_label(protection: Mapping[str, Any]) -> str:
     sent = sum(bool(r.get("interrupt_requested")) for r in rows)
     confirmed = sum(bool(r.get("stop_proof")) and not r.get("active") and not r.get("pending_turn")
                     and (r.get("backend_exited") or r.get("stop_proof") == "original_process_exited") for r in rows)
-    prefix = "接入已确认" if trip.get("connected") else "接入未确认"
+    evidence = trip.get("evidence") or {}
+    connected = (trip.get("connected") and trip.get("reason") == "three_completed_responses"
+                 and evidence.get("consecutive_responses", 0) >= 3)
+    prefix = "接入已确认" if connected else "接入未确认"
+    if not automatic and phase in {None, "disabled", "watching", "arming", "recovering"}:
+        return "B 自动暂停已关闭；直接启动原生 Codex"
     if phase == "watching":
-        return "B 保护已布防：首个模型响应即整池 Interrupt"
+        return "B 保护已布防：同一 session 连续3轮完整回复后 Interrupt 本池"
     if phase in {"arming", "recovering"}:
         return "B 正在接管原会话；请求入口关闭"
     if phase == "stopping":

@@ -111,12 +111,38 @@ class GoalResumeDeliveryTests(unittest.TestCase):
                 self.daemon.process_once(self.client)
                 self.assertEqual(self.client.sent, [])
 
-    def test_unverified_goal_never_falls_back_to_a_matching_native_failed_turn(self):
+    def test_unverified_goal_continues_a_matching_native_failed_turn(self):
         self.daemon.codex_queue_recovery.current_turn = lambda _: {
             **self.proof, "kind": "task_complete"}
         with patch.object(goal, "blocked_goal", return_value=None):
             self.daemon.process_once(self.client)
+        self.assertEqual([row[-1] for row in self.client.sent], ["任务请继续"])
+
+    def test_unverified_goal_without_native_binding_never_uses_viewport_only(self):
+        self.daemon.codex_queue_recovery.current_turn = lambda _: None
+        with patch.object(goal, 'blocked_goal', return_value=None):
+            self.daemon.process_once(self.client)
         self.assertEqual(self.client.sent, [])
+
+    def test_high_demand_goal_footer_recovers_only_new_original_failed_turn(self):
+        self.payload = status_payload('high_demand')
+        row = self.payload['render_grid']['cursor']['row']
+        self.payload['render_grid']['row_spans'].append(
+            span(row + 2, 2, 'GPT-6-Astra · Goal stalled (/goal resume)', 1))
+        self.client.payload, self.client.text = self.payload, visible_text(self.payload)
+        turn = {**self.proof, 'kind': 'task_complete', 'error': {'message': ERRORS['high_demand']}}
+        self.daemon.codex_queue_recovery.current_turn = lambda _: dict(turn)
+        with patch.object(goal, 'blocked_goal', return_value=None):
+            self.daemon.process_once(self.client)
+            runtime = self.daemon.runtime['surface-uuid']
+            for _ in range(3):
+                runtime.awaiting = False
+                runtime.last_send_at = 0
+                self.daemon.process_once(self.client)
+            self.assertEqual([r[-1] for r in self.client.sent], ['任务请继续'])
+            turn.update(turn_id='new-failure', at=201)
+            self.daemon.process_once(self.client)
+        self.assertEqual([r[-1] for r in self.client.sent], ['任务请继续', '任务请继续'])
 
     def test_already_resumed_goal_cannot_receive_plain_continuation(self):
         self.daemon.codex_queue_recovery.current_turn = lambda _: {

@@ -1,4 +1,4 @@
-"""B-only first-response circuit breaker, using live native Codex RPC events.
+"""Optional B-only response-streak guard, using live native Codex RPC events.
 
 Every model backend belongs to one exact cmux surface. The private websocket
 relay owns its stdio, so closing the workspace gate also rejects already queued
@@ -31,6 +31,13 @@ KILL_AFTER = .650
 STOP_DEADLINE = 1.0
 MODEL_DELTAS = frozenset({"item/agentMessage/delta", "item/reasoning/summaryTextDelta",
                          "item/reasoning/textDelta", "item/plan/delta"})
+# The first-response cut is off. A detected model event must not pause a pool
+# or interrupt its sessions. B only creates and authorizes.
+CONNECTION_CUT_ENABLED = False
+REQUIRED_RESPONSES = 3
+# Coverage, membership, protocol and setup failures were pausing every pool
+# and aborting B. Only the operator's P key may pause or interrupt a pool.
+AUTOMATIC_POOL_STOP = False
 TURN_INPUT = frozenset({"turn/start", "turn/steer", "review/start", "thread/fork",
                         "thread/realtime/start", "thread/goal/set", "thread/compact/start",
                         "thread/rollback", "thread/queue/start", "thread/queue/add", "thread/queue/update",
@@ -46,11 +53,13 @@ def native_binary():
     # The installed conditional launcher delegates here too. Never recurse
     # through that launcher when starting a guardian-owned native backend.
     link = Path.home() / "Library/Application Support/cmux-codex-continue/codex-launcher.json"
-    if link.exists():
-        value = read_json(link).get("native_binary")
-        if value and Path(value).is_file():
-            return value
-    return str(Path("/opt/homebrew/bin/codex").resolve())
+    value = read_json(link).get("native_binary") if link.exists() else "/opt/homebrew/bin/codex"
+    candidate = Path(value) if isinstance(value, str) and value else Path()
+    wrapper = link.with_name("codex-guard").resolve()
+    if (not candidate.is_absolute() or not candidate.is_file()
+            or not os.access(candidate, os.X_OK) or candidate.resolve() == wrapper):
+        raise RuntimeError("original native Codex executable cannot be proved; no session launched")
+    return str(candidate.resolve())
 
 
 def uid(value):
@@ -130,6 +139,22 @@ def blocked(config_path, workspace_id):
         return False
 
 
+def operator_paused(config_path, workspace_id, config=None):
+    """True only for a pause the operator asked for.
+
+    Automatic coverage, setup and migration markers must not keep B from
+    opening Codex. Manual P leaves pause_origin empty or operator_pause.
+    """
+    rule = provenance(config_path, workspace_id, config) or {}
+    if rule.get("paused") and rule.get("pause_origin") in {None, "", "user", "operator_pause"}:
+        return True
+    try:
+        marker = read_json(pool_dir(config_path, workspace_id) / "STOP.json")
+    except (OSError, ValueError):
+        marker = {}
+    return marker.get("reason") == "operator_pause"
+
+
 def snapshot(config_path, workspace_id):
     try:
         return read_json(pool_dir(config_path, workspace_id) / "state.json")
@@ -158,47 +183,91 @@ def binding(config_path, target, *, verify=True):
 
 
 def model_evidence(message, session_id, turn_id):
-    """Positive, typed native events, never text/Working/status heuristics."""
+    """One complete successful answer, never a delta, thought or tool call."""
+    if not CONNECTION_CUT_ENABLED:
+        return None
     if not session_id or not turn_id or not isinstance(message, dict):
         return None
     method, p = message.get("method"), message.get("params")
-    if not isinstance(p, dict) or p.get("threadId") != session_id or p.get("turnId") != turn_id:
+    if method != "turn/completed" or not isinstance(p, dict) or p.get("threadId") != session_id:
         return None
-    if method in MODEL_DELTAS:
-        delta = p.get("delta")
-        if isinstance(delta, str) and delta.strip() and isinstance(p.get("itemId"), str) and p["itemId"]:
-            return {"method": method, "item_id": p["itemId"], "characters": len(delta)}
-    if method == "rawResponseItem/completed":
-        item = p.get("item", {})
-        if not isinstance(item, dict):
-            return None
-        kind = item.get("type")
-        content = item.get("content", [])
-        content = content if isinstance(content, list) else []
-        if (kind == "message" and item.get("role") == "assistant"
-                and any(isinstance(x, dict) and isinstance(x.get("text"), str) and x["text"].strip()
-                        for x in content)):
-            return {"method": method, "item_type": kind}
-        if kind in {"function_call", "custom_tool_call", "local_shell_call", "web_search_call"}:
-            if item.get("call_id") or item.get("id"):
-                return {"method": method, "item_type": kind}
-        if kind == "reasoning" and (item.get("summary") or item.get("content") or item.get("encrypted_content")):
-            return {"method": method, "item_type": kind}
-    # Codex 0.156.1 does not expose experimentalRawEvents on thread/resume.
-    # Native tool-start events are usable only within the new live turn; shell
-    # items must explicitly identify their model source (never UserShell).
-    if method == "item/started":
-        item = p.get("item")
-        if isinstance(item, dict) and item.get("id"):
-            kind = item.get("type")
-            if (kind == "commandExecution" and item.get("source") in {"agent", "unifiedExecStartup", "unifiedExecInteraction"}
-                    and isinstance(item.get("command"), str) and item["command"]):
-                return {"method": method, "item_type": kind, "source": item["source"], "item_id": item["id"]}
-            if ((kind in {"mcpToolCall", "dynamicToolCall"} and item.get("tool") and "arguments" in item)
-                    or (kind == "fileChange" and item.get("changes"))
-                    or (kind == "webSearch" and item.get("query"))):
-                return {"method": method, "item_type": kind, "item_id": item["id"]}
+    turn = p.get("turn")
+    if (not isinstance(turn, dict) or turn.get("id") != turn_id
+            or turn.get("status") != "completed" or turn.get("error") is not None):
+        return None
+    items = turn.get("items")
+    if not isinstance(items, list):
+        return None
+    answers = [item for item in items if completed_answer(item)]
+    if answers:
+        return {"method": method, "session_id": session_id, "turn_id": turn_id,
+                "characters": sum(len(item["text"].strip()) for item in answers)}
     return None
+
+
+def completed_answer(item):
+    return (isinstance(item, dict) and item.get("type") == "agentMessage"
+            and isinstance(item.get("id"), str) and bool(item["id"])
+            and item.get("phase") in (None, "final_answer")
+            and isinstance(item.get("text"), str) and bool(item["text"].strip()))
+
+
+class ResponseStreak:
+    """Per-native-session evidence. A restart starts at zero, never at old history."""
+    def __init__(self):
+        self.identity = None
+        self.turn = None
+        self.seen = set()
+        self.answers = {}
+        self.successes = []
+        self.failed = False
+        self.qualified = None
+
+    def reset_failure(self):
+        self.successes.clear()
+        self.qualified = None
+        self.failed = True
+
+    def observe(self, message, identity):
+        if identity != self.identity:
+            self.__init__()
+            self.identity = identity
+        p = message.get("params")
+        if not isinstance(p, dict) or p.get("threadId") != identity[2]:
+            return None
+        method = message.get("method")
+        turn = p.get("turn") if isinstance(p.get("turn"), dict) else {}
+        tid = turn.get("id")
+        if method == "turn/started":
+            if not isinstance(tid, str) or not tid or tid in self.seen or tid == self.turn:
+                return None
+            if self.turn is not None:
+                self.reset_failure()  # The previous turn never completed.
+            self.turn, self.answers, self.failed = tid, {}, False
+        elif method == "error" and p.get("turnId") == self.turn and self.turn:
+            self.reset_failure()
+        elif method == "item/completed" and p.get("turnId") == self.turn and self.turn:
+            item = p.get("item")
+            if completed_answer(item):
+                self.answers[item["id"]] = dict(item)
+        elif method == "turn/completed" and tid and tid == self.turn and tid not in self.seen:
+            self.seen.add(tid)
+            self.turn = None
+            items = turn.get("items") if isinstance(turn.get("items"), list) else []
+            event = {"method": method, "params": {**p, "turn": {
+                **turn, "items": [*self.answers.values(), *items]}}}
+            evidence = model_evidence(event, identity[2], tid)
+            self.answers = {}
+            if not evidence or self.failed:
+                self.reset_failure()
+                return None
+            self.successes.append(tid)
+            self.successes = self.successes[-REQUIRED_RESPONSES:]
+            if len(self.successes) >= REQUIRED_RESPONSES:
+                self.qualified = {**evidence, "consecutive_responses": len(self.successes),
+                                  "turn_ids": list(self.successes), "identity": identity}
+                return self.qualified
+        return None
 
 
 def request(config_path, command, *, timeout=5, **params):
@@ -219,6 +288,43 @@ def request(config_path, command, *, timeout=5, **params):
         return reply["result"]
 
 
+def _guard_script(command):
+    try:
+        return next(Path(arg).resolve() for arg in shlex.split(command) if arg.endswith("ccc_batch_guard.py"))
+    except (StopIteration, ValueError):
+        return None
+
+
+def _same_guard_bytes(other):
+    import hashlib
+    try:
+        current = Path(__file__).resolve().read_bytes()
+        return other.is_file() and hashlib.sha256(other.read_bytes()).digest() == hashlib.sha256(current).digest()
+    except OSError:
+        return False
+
+
+def _current_guard(state):
+    """True only for this guard logic. An older serve process must not stay in charge.
+
+    The release tree and the staged runtime are the same program at two paths.
+    Either may launch Codex, so a serve process of these exact bytes is current.
+    """
+    pid = state.get("pid")
+    if state.get("version") != VERSION or type(pid) is not int or pid <= 1:
+        return False
+    try:
+        command = subprocess.check_output(["/bin/ps", "-p", str(pid), "-o", "command="], text=True, timeout=1)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if " serve " not in f" {command} ":
+        return False
+    script = _guard_script(command)
+    if script is None:
+        return False
+    return script == Path(__file__).resolve() or _same_guard_bytes(script)
+
+
 def ensure_service(config_path):
     root = guard_root(config_path)
     private_directory(root)
@@ -226,7 +332,7 @@ def ensure_service(config_path):
         running = False
         try:
             state = request(config_path, "ping", timeout=.3)
-            if state.get("version") == VERSION:
+            if state.get("version") == VERSION and (not AUTOMATIC_POOL_STOP or _current_guard(state)):
                 return state
             running = True
         except (OSError, ValueError, RuntimeError):
@@ -239,7 +345,7 @@ def ensure_service(config_path):
         while time.monotonic() < deadline:
             try:
                 state = request(config_path, "ping", timeout=.2)
-                if state.get("ready"):
+                if state.get("ready") and _current_guard(state):
                     return state
             except (OSError, ValueError, RuntimeError):
                 time.sleep(.05)
@@ -249,6 +355,19 @@ def ensure_service(config_path):
 
 
 def arm(config_path, workspace_id, *, resume=False):
+    if not AUTOMATIC_POOL_STOP:
+        if resume:
+            # Only the explicit W action reaches here after unpausing its
+            # config rule. Preserve the old STOP evidence without letting that
+            # marker permanently veto later B starts. Never adopt any process.
+            with core().workspace_input_lock(config_path, uid(workspace_id)):
+                rule = core().workspace_rule_by_id(core().ConfigStore(Path(config_path)).load(), workspace_id)
+                if rule.get("paused") or not rule.get("enabled", True):
+                    raise RuntimeError("workspace was paused again; resume cancelled")
+                marker = pool_dir(config_path, workspace_id) / "STOP.json"
+                if marker.exists():
+                    marker.rename(marker.with_name("STOP.resumed-" + uuid.uuid4().hex + ".json"))
+        return {"phase": "disabled"}
     private_directory(guard_root(config_path))
     directory = pool_dir(config_path, workspace_id)
     private_directory(directory)
@@ -257,6 +376,8 @@ def arm(config_path, workspace_id, *, resume=False):
 
 
 def _arm(config_path, workspace_id, *, resume=False):
+    if not AUTOMATIC_POOL_STOP:
+        return {"phase": "disabled"}
     from ccc_guard_migration import adopt_workspace
     # Adoption owns its preflight-versus-post-capture failure policy. Nothing
     # it raises may enter this caller's generic stop fallback before it returns
@@ -319,12 +440,23 @@ class Workspace:
                 and self.service.healthy() and not blocked(self.service.config_path, self.wid))
 
     def open_gate(self):
+        # Automatic pause is off. Coverage, watchdog and leftover STOP markers
+        # must not refuse the Codex launch B already knew how to start.
+        if not AUTOMATIC_POOL_STOP:
+            return not operator_paused(self.service.config_path, self.wid)
         return not self.pending_evidence and self.ready()
 
     def targets(self):
         return [*self.endpoints.values(), *self.unmanaged.values()]
 
     def trigger(self, reason, source=None, evidence=None, detected=None):
+        if not AUTOMATIC_POOL_STOP and reason != "operator_pause":
+            return
+        if reason == "first_model_response":
+            return  # Removed policy: one model event is never connection proof.
+        if reason == "three_completed_responses" and (not CONNECTION_CUT_ENABLED or
+                not evidence or evidence.get("consecutive_responses", 0) < REQUIRED_RESPONSES):
+            return
         if self.stop_task and not self.stop_task.done():
             return
         if self.phase in {"stopped", "failed"} and not any(e.active or e.awaiting_turn for e in self.targets() if e.in_scope):
@@ -339,7 +471,7 @@ class Workspace:
                      "surface_id": source.sid if source else None,
                      "session_id": source.session_id if source else None,
                      "turn_id": source.turn_id if source else None, "evidence": evidence,
-                     "connected": reason == "first_model_response"}
+                     "connected": reason == "three_completed_responses"}
         self.stop_task = asyncio.create_task(self.finish_stop(now))
         self.pause_task = asyncio.create_task(self.persist_pause())
         self.service.schedule_save(self)
@@ -449,6 +581,12 @@ class Endpoint:
         self.native_completed_proof = None
         self.frontend_identity = None
         self.materialize_task = None
+        self.responses = ResponseStreak()
+
+    def response_identity(self):
+        return (self.pool.wid, self.sid, self.session_id,
+                self.native.pid if self.native else None, self.native_start,
+                tuple((self.identity or {}).get("birth", [])), self.start_id)
 
     def summary(self):
         return {"session_id": self.session_id, "turn_id": self.turn_id, "active": self.active,
@@ -542,9 +680,16 @@ class Endpoint:
                     break
                 message = json.loads(text)
                 if isinstance(message, dict) and message.get("method") in TURN_INPUT | {"thread/start", "thread/resume"}:
-                    await self.service.audit()
-                    if self.in_scope and self.materialize_task:
-                        await asyncio.shield(self.materialize_task)
+                    # A slow workspace audit must not drop the Codex socket.
+                    # That is what left B on "thread ID was not received".
+                    if AUTOMATIC_POOL_STOP:
+                        await self.service.audit()
+                    if self.in_scope and self.materialize_task and not self.materialize_task.done():
+                        try:
+                            await asyncio.wait_for(asyncio.shield(self.materialize_task), 2)
+                        except asyncio.TimeoutError:
+                            if AUTOMATIC_POOL_STOP:
+                                raise
                 self.front_message(message)
                 if writer.transport.get_write_buffer_size() > MAX_MESSAGE:
                     raise RuntimeError("frontend output backpressure exceeded protection budget")
@@ -775,6 +920,7 @@ class Endpoint:
                 self.set_thread(result["thread"])
             if pending == "turn/start" and "error" in message:
                 self.awaiting_turn = False
+                self.responses.reset_failure()
         if method == "thread/started":
             self.set_thread(params["thread"])
         if params.get("threadId") == self.session_id and method == "turn/started":
@@ -786,7 +932,8 @@ class Endpoint:
             self.service.schedule_save(self)
             if self.in_scope and not self.pool.ready():
                 self.fault("late_internal_turn")
-        evidence = model_evidence(message, self.session_id, self.turn_id) if self.active else None
+        evidence = (self.responses.observe(message, self.response_identity())
+                    if CONNECTION_CUT_ENABLED and AUTOMATIC_POOL_STOP else None)
         if evidence and self.in_scope and self.pool.phase == "watching" and (self.evidence_task is None or self.evidence_task.done()):
             # Fence new frontend input synchronously. Membership still has to
             # prove success before any workspace interruption is authorized.
@@ -811,7 +958,9 @@ class Endpoint:
     async def verify_evidence(self, evidence, detected):
         try:
             if await self.service.member(self.pool.wid, self.sid, fresh=True):
-                self.pool.trigger("first_model_response", self, evidence, detected=detected)
+                if (self.responses.qualified is evidence
+                        and evidence.get("identity") == self.response_identity()):
+                    self.pool.trigger("three_completed_responses", self, evidence, detected=detected)
             elif (self.service.inventory is not None and time.monotonic() - self.service.inventory_at < .2
                   and self.service.inventory.get(self.sid) != self.pool.wid):
                 self.in_scope = False
@@ -1110,7 +1259,7 @@ class GuardService:
             # A process scan can contain a short-lived fork that already
             # exec'd another program or exited by the time it is reconciled.
             # Only surviving native processes constitute a coverage gap.
-            if any(e.in_scope for e in pool.unmanaged.values()):
+            if AUTOMATIC_POOL_STOP and any(e.in_scope for e in pool.unmanaged.values()):
                 pool.coverage_error = "unobserved native Codex requires session-preserving migration"
             rule = provenance(self.config_path, pool.wid, config)
             if notify and pool.phase == "watching":
@@ -1148,6 +1297,19 @@ class GuardService:
             self.schedule_save(pool)
             return {"phase": pool.phase}
         if command == "arm":
+            if not AUTOMATIC_POOL_STOP:
+                if operator_paused(self.config_path, pool.wid) and not message.get("resume"):
+                    raise RuntimeError("B 工作区已停止；请按 W 重新布防")
+                pool.coverage_error = None
+                pool.phase = "watching"
+                pool.trip = None
+                with contextlib.suppress(FileNotFoundError, OSError, ValueError):
+                    marker = pool.directory / "STOP.json"
+                    if marker.exists() and read_json(marker).get("reason") != "operator_pause":
+                        marker.unlink()
+                pool.save()
+                self.publish_ownership()
+                return {"phase": pool.phase, "epoch": pool.epoch}
             if (pool.phase in {"stopping", "stopped", "failed"} or blocked(self.config_path, pool.wid)) and not message.get("resume"):
                 raise RuntimeError("B 工作区已停止；请按 W 重新布防")
             await self.audit(notify=False)
@@ -1185,9 +1347,24 @@ class GuardService:
             return {"phase": pool.phase, "epoch": pool.epoch}
         if command == "register":
             sid = uid(message.get("surface_id"))
-            if not pool.open_gate() and not (message.get("migration") and pool.phase == "arming"):
+            if not AUTOMATIC_POOL_STOP:
+                if operator_paused(self.config_path, pool.wid):
+                    raise RuntimeError("B 工作区已停止；不会启动额外请求")
+                pool.coverage_error = None
+                if pool.phase not in {"watching", "arming"}:
+                    pool.phase = "watching"
+                    pool.trip = None
+            elif not pool.open_gate() and not (message.get("migration") and pool.phase == "arming"):
                 raise RuntimeError("B 工作区已停止；不会启动额外请求")
-            if not await self.member(pool.wid, sid, fresh=True):
+            placed = False
+            for _ in range(6):
+                placed = await self.member(pool.wid, sid, fresh=True)
+                if placed:
+                    break
+                if not AUTOMATIC_POOL_STOP and self.inventory and self.inventory.get(sid) not in {None, pool.wid}:
+                    break
+                await asyncio.sleep(.2)
+            if not placed:
                 raise RuntimeError("surface is not currently inside its authorized B workspace")
             if sid in pool.endpoints:
                 existing = pool.endpoints[sid]
@@ -1262,6 +1439,9 @@ class GuardService:
                 if self.pools:
                     await self.audit()
             except Exception as exc:
+                if not AUTOMATIC_POOL_STOP:
+                    await asyncio.sleep(.025)
+                    continue
                 for pool in tuple(self.pools.values()):
                     pool.coverage_error = str(exc)
                     if pool.phase == "watching":
@@ -1317,7 +1497,11 @@ def launch(config_path, *, job_id=None, index=None, resume_session=None, config_
     record = read_json(record_path) if record_path else {}
     if record and (record.get("workspace_id") != wid or record.get("surface_id") != sid):
         raise RuntimeError("migration record does not match this original surface")
-    if not provenance(config_path, wid) or (blocked(config_path, wid) and not record):
+    if not provenance(config_path, wid):
+        raise RuntimeError("此 B 工作区的实时保护未就绪；未启动 Codex")
+    # Only an operator pause still refuses the original Codex launch.
+    refused = operator_paused(config_path, wid) if not AUTOMATIC_POOL_STOP else blocked(config_path, wid)
+    if refused and not record:
         raise RuntimeError("此 B 工作区的实时保护未就绪；未启动 Codex")
     args = list(record.get("config_args", config_args or []))
     resume_session = record.get("resume_session", resume_session)
