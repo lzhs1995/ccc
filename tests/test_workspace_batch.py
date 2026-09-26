@@ -146,7 +146,8 @@ class WorkspaceBatchTests(unittest.TestCase):
                              {'name': self.client.names.get(target['surface_id'], '')})
         names.start()
         self.addCleanup(names.stop)
-        self.job = batch.start(self.config, self.wid, client=self.client, launch=False)
+        self.job = batch.start(self.config, self.wid, client=self.client, launch=False,
+                               private_check=getattr(self, 'private_check', True))
         self.now = time.time()
         self.worker = batch.BatchWorker(self.config, self.job['job_id'], client=self.client, queue=self.client,
                                         clock=lambda: self.now, pty_probe=lambda: True)

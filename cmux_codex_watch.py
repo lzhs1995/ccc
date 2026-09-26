@@ -10537,6 +10537,9 @@ def build_parser() -> argparse.ArgumentParser:
     for command in ("pause-workspace", "resume-workspace", "batch-workspace"):
         item = sub.add_parser(command)
         item.add_argument("workspace")
+        if command == "batch-workspace":
+            item.add_argument("--private-check", action="store_true",
+                              help="opt in to empty private directories and short named checks; default keeps existing B behavior")
     discover = sub.add_parser("discover")
     discover.add_argument("workspace")
     exclude = sub.add_parser("exclude")
@@ -10788,7 +10791,7 @@ def cli(argv: Sequence[str] | None = None) -> int:
         return 1 if result["failed"] else 0
     if args.command == "batch-workspace":
         from ccc_workspace_batch import start
-        print(json.dumps(start(config_path, args.workspace), ensure_ascii=False, indent=2))
+        print(json.dumps(start(config_path, args.workspace, private_check=args.private_check), ensure_ascii=False, indent=2))
         return 0
     if args.command == "resume-workspace":
         def resume_pool(latest):

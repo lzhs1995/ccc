@@ -29,13 +29,13 @@ class BatchWorkingDirectoryTests(unittest.TestCase):
         with patch("ccc_batch_guard.native_binary", return_value="/original/native/codex"):
             return batch.native_launch_argv(self.config, self.job, index)
 
-    def test_new_batch_pins_the_private_working_directory_policy(self):
+    def test_explicit_private_check_pins_the_working_directory_policy(self):
         store = core.ConfigStore(self.config)
         store.mutate(lambda c: c.update(mode="armed", global_paused=False))
         client = Mock()
         client.tree.return_value = {"windows": [{"id": "window", "workspaces": [{
             "id": self.job["workspace_id"], "ref": "workspace:1", "title": "selected", "panes": []}]}]}
-        created = batch.start(self.config, self.job["workspace_id"], client=client, launch=False)
+        created = batch.start(self.config, self.job["workspace_id"], client=client, launch=False, private_check=True)
         saved = core.load_json(batch.job_path(self.config, created["job_id"]), {})
         self.assertEqual(saved["cwd_policy"], batch.EMPTY_CWD_POLICY)
         self.assertEqual(saved["initial_prompt"], batch.PROMPT)

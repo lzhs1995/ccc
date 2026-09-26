@@ -125,7 +125,7 @@ requests. The selected workspace has clickable controls (the same keys work):
 - `w` 整池授权：覆盖该池现有和后续 Codex，保留单路排除。
 - `P` 暂停 + Interrupt：先落盘停止整池续跑、取消批量创建，再向本池 Codex 请求 Escape；保留原 session。未确认的进程或投递单独报失败。
 - `W` 恢复整池：恢复续跑，保留单路暂停、排除；不会自行重启被取消的创建任务。
-- `B` 新开50 + 授权：在选定 workspace 的主区域 pane 新建最多50个后台 Codex 标签页。新批次使用各自的私有空目录，原生 CLI 只为该次启动信任这个精确目录；不修改用户主目录或全局信任。确认原 session 和空输入框后先通过原生 `/rename` 设置固定名称，避免额外的模型标题请求，再发送一次简短的 `Reply only OK. Do not use tools. End the turn.`。成功后自然待机，自动切断仍关闭。
+- `B` 新开50 + 授权：保留原有模式，在选定 workspace 的主区域 pane 新建最多50个后台 Codex 标签页。继承原工作目录，确认原 session 和空输入框后发送一次 `show me u power`；Folder access 等确认仍由用户处理。自动切断保持关闭。
 
 `B` requires global sending to be enabled and the selected pool to be unpaused.
 It never changes another pool or silently clears existing pauses. At most four
@@ -139,12 +139,20 @@ After all 50 slots finish, another confirmed `B` starts a new batch. Jobs run in
 the background and survive closing the panel; `P` cancels their authorization.
 CLI equivalent: `ccc batch-workspace FULL_WORKSPACE_UUID`.
 
-Existing batches retain their original prompt and working directory. The new
-short task and fixed name reduce needless work; neither an empty directory nor
-a prompt is a hard token/spending limit. Native instructions, tools and model
-settings still contribute context. No model/reasoning setting, credential,
-automatic pause, request retry setting or other workspace is changed by B's
-directory and naming policy.
+The optional `ccc batch-workspace FULL_WORKSPACE_UUID --private-check` selects
+an experimental startup policy for a **new** batch. Each slot uses its own empty
+private directory with invocation-only trust. B confirms the original fresh
+session, names it locally with `/rename` to avoid an extra model title request,
+and sends `Reply only OK. Do not use tools. End the turn.`. The normal `B` key
+and CLI without this flag retain the established behavior. Resuming an unfinished
+batch keeps its saved policy regardless of the flag; it never converts live slots.
+
+The short task and fixed name reduce needless work; neither an empty directory
+nor a prompt is a hard token/spending limit. Native instructions, tools and model
+settings still contribute context. This mode has local startup/request-count
+validation, not proof of improved AnyRouter admission. It does not change the
+model/reasoning setting, credential, automatic pause, native retries or another
+workspace.
 
 Codex 0.154 creates its first rollout only after the first prompt. For a newly
 created batch slot, CCC verifies the native writer lock's new session UUID and
