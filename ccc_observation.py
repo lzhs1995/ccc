@@ -12,6 +12,9 @@ from collections.abc import Mapping
 from typing import Any
 
 
+HEALTH_PUBLISH_INTERVAL_SEC = 1.0
+
+
 def transient_observation_error(error: BaseException | str) -> bool:
     """Recognize a failed read transport, never an input delivery outcome.
 
@@ -192,7 +195,7 @@ def summarize_observation(rows, *, now, stale_after):
             "stale_after_sec": stale_after, "counts": counts, "targets": projected}
 
 
-def continuation_row(target, runtime, *, now, poll_interval=1.0, observation=None):
+def continuation_row(target, runtime, *, now, poll_interval=1.0, observation=None, published_at=None):
     """Current scheduling/delivery health; enabling monitoring is not freshness."""
     checked = float(runtime.get("viewport_checked_at") or 0)
     age = now - checked if checked > 0 else None
@@ -208,6 +211,27 @@ def continuation_row(target, runtime, *, now, poll_interval=1.0, observation=Non
     current = (observed.get("surface_id") == target["surface_id"]
                and observed.get("workspace_id") == target["workspace_id"]
                and 0 <= now - float(observed.get("observed_at") or 0) <= max(30.0, 3 * poll_interval))
+    deadline_age, publication_age = age, None
+    # The producer evaluates the actual observation deadline. Readers see a
+    # periodically published snapshot: adding its transport age to that same
+    # deadline invents misses between healthy publications. Credit only the
+    # exact UUID-bound observation, for at most two publication intervals.
+    # Keep send-ack deadlines on the reader's real clock; never cache a verdict
+    # indefinitely or make an already-late producer observation look healthy.
+    published_checked = observed.get("viewport_checked_at")
+    if (current and observed.get("status") == "readable"
+            and type(published_checked) in (int, float) and math.isfinite(published_checked)
+            and published_checked >= checked and published_checked > 0
+            and type(published_at) in (int, float) and math.isfinite(published_at)
+            and published_checked <= published_at <= now
+            and now - published_at <= 2 * HEALTH_PUBLISH_INTERVAL_SEC):
+        # State and health use independent atomic writers. A newer verified
+        # observation must not be replaced by an older durable state snapshot.
+        checked = published_checked
+        age = now - checked
+        deadline_age = published_at - checked
+        publication_age = now - published_at
+        reason = "current_published_observation"
     if current and observed.get("status") == "missing":
         status, reason = "missing", "surface_closed_owner_exited"
     elif current and observed.get("status") == "dormant":
@@ -218,7 +242,7 @@ def continuation_row(target, runtime, *, now, poll_interval=1.0, observation=Non
         status, reason = pause_health(target)
     elif age is None or age < 0:
         status, reason = "unknown", "no_current_observation"
-    elif age > 2 * cadence:
+    elif deadline_age > 2 * cadence:
         status, reason = "delayed", "observation_deadline_missed"
     elif delivery == "unknown":
         status, reason = "delivery_unknown", "send_receipt_unconfirmed"
@@ -248,6 +272,8 @@ def continuation_row(target, runtime, *, now, poll_interval=1.0, observation=Non
         "surface_id": str(target["surface_id"]), "workspace_id": str(target["workspace_id"]),
         "status": status, "reason_code": reason, "state": phase,
         "viewport_checked_at": checked, "observation_age_sec": round(age, 3) if age is not None else None,
+        "observation_deadline_age_sec": round(deadline_age, 3) if deadline_age is not None else None,
+        "publication_age_sec": round(publication_age, 3) if publication_age is not None else None,
         "poll_interval_sec": poll_interval,
         "observation_cadence_sec": cadence,
         "observation_interval_ms": runtime.get("observation_interval_ms", 0),
@@ -264,10 +290,10 @@ def continuation_row(target, runtime, *, now, poll_interval=1.0, observation=Non
     }
 
 
-def continuation_report(targets, runtime, *, now, poll_interval=1.0, observations=()):
+def continuation_report(targets, runtime, *, now, poll_interval=1.0, observations=(), published_at=None):
     by_id = {r.get("surface_id"): r for r in observations if isinstance(r, Mapping)}
     rows = [continuation_row(t, runtime.get(str(t["surface_id"]), {}), now=now, poll_interval=poll_interval,
-                             observation=by_id.get(t["surface_id"]))
+                             observation=by_id.get(t["surface_id"]), published_at=published_at)
             for t in targets]
     counts = {key: 0 for key in ("ok", "paused", "unknown", "delayed", "delivery_unknown",
                                "send_failed", "unavailable", "blocked", "missing", "inactive", "waiting")}

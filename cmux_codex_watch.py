@@ -6462,7 +6462,7 @@ class WatchDaemon:
                     interval=float(self.config.get("poll_interval_sec", 1)),
                 )
                 now = time.monotonic()
-                if now - last_publish >= 1:
+                if now - last_publish >= observation_health.HEALTH_PUBLISH_INTERVAL_SEC:
                     self._request_health_publish()
                     self.save(wait=False)
                     last_publish = now
@@ -10076,7 +10076,8 @@ def continuation_status(config: Mapping[str, Any], state: Mapping[str, Any], sna
     targets = effective_targets(config, dynamic if isinstance(dynamic, list) else [])
     result = observation_health.continuation_report(
         targets, state, now=time.time(), poll_interval=float(config.get("poll_interval_sec", 1)),
-        observations=snapshot.get("rows", []) if matches and isinstance(snapshot.get("rows"), list) else [])
+        observations=snapshot.get("rows", []) if matches and isinstance(snapshot.get("rows"), list) else [],
+        published_at=snapshot.get("observed_at") if matches else None)
     if not targets and config.get("workspace_rules"):
         result["status"] = "unknown"
     return result
