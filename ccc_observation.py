@@ -122,7 +122,8 @@ def native_runtime_ready(terminal: Mapping[str, Any]) -> bool | None:
     return value
 
 
-def observation_row(target, record, process, terminal, runtime, *, owner_alive, now, stale_after):
+def observation_row(target, record, process, terminal, runtime, *, owner_alive, now, stale_after,
+                    inventory_complete=True):
     sid, wid = str(target["surface_id"]), str(target["workspace_id"])
     native = native_runtime_ready(terminal)
     kind = str(process.get("agent_kind") or "unknown")
@@ -139,20 +140,27 @@ def observation_row(target, record, process, terminal, runtime, *, owner_alive, 
         "viewport_source": str(runtime.get("viewport_source") or ""),
         "status": "unknown", "reason_code": "identity_or_observation_unknown",
     }
-    if target.get("paused") or not target.get("enabled", True):
-        health, reason = pause_health(target)
-        row.update(status="live_unreadable" if health == "unavailable" else health, reason_code=reason)
-    elif record is None:
+    # Historical automatic pauses say why observation stopped, not whether the
+    # terminal still exists. Current UUID/owner evidence must outrank that flag.
+    if record is None:
         if live_agent or owner_alive is True:
             row.update(status="live_unreadable", reason_code="live_owner_without_surface")
-        elif owner_alive is False and not pid:
+        elif inventory_complete and owner_alive is False and not pid:
             row.update(status="missing", reason_code="surface_closed_owner_exited")
     elif str(record.get("workspace_id") or "") != wid:
         row["reason_code"] = "workspace_identity_mismatch"
+    elif (inventory_complete and process.get("process_snapshot_present")
+          and not process.get("identity_conflicts") and owner_alive is False and not pid
+          and kind in {"shell", "other"}):
+        row.update(status="dormant", reason_code="no_supported_agent")
+    elif target.get("paused") or not target.get("enabled", True):
+        health, reason = pause_health(target)
+        row.update(status="live_unreadable" if health == "unavailable" else health, reason_code=reason)
     elif native is False:
         if live_agent or owner_alive is True:
             row.update(status="live_unreadable", reason_code="live_owner_runtime_uninitialized")
-        elif (process.get("process_snapshot_present") and owner_alive is False and not pid
+        elif (inventory_complete and process.get("process_snapshot_present")
+              and not process.get("identity_conflicts") and owner_alive is False and not pid
               and kind in {"shell", "other", "unknown"}):
             row.update(status="dormant", reason_code="runtime_uninitialized_no_agent")
     elif not fresh:
@@ -184,20 +192,33 @@ def summarize_observation(rows, *, now, stale_after):
             "stale_after_sec": stale_after, "counts": counts, "targets": projected}
 
 
-def continuation_row(target, runtime, *, now, poll_interval=1.0):
+def continuation_row(target, runtime, *, now, poll_interval=1.0, observation=None):
     """Current scheduling/delivery health; enabling monitoring is not freshness."""
     checked = float(runtime.get("viewport_checked_at") or 0)
     age = now - checked if checked > 0 else None
     status, reason = "ok", "current_observation"
     phase = str(runtime.get("state") or "unknown")
     delivery = str(runtime.get("delivery_status") or "")
-    if not target.get("enabled", True):
+    cadence = runtime.get("observation_cadence_sec", poll_interval)
+    if type(cadence) not in (int, float) or not math.isfinite(cadence) or cadence < poll_interval:
+        cadence = poll_interval
+    # Only the scheduler's bounded native-monitor lease permits the 10s scan.
+    cadence = min(cadence, max(10.0, poll_interval))
+    observed = observation if isinstance(observation, Mapping) else {}
+    current = (observed.get("surface_id") == target["surface_id"]
+               and observed.get("workspace_id") == target["workspace_id"]
+               and 0 <= now - float(observed.get("observed_at") or 0) <= max(30.0, 3 * poll_interval))
+    if current and observed.get("status") == "missing":
+        status, reason = "missing", "surface_closed_owner_exited"
+    elif current and observed.get("status") == "dormant":
+        status, reason = "inactive", str(observed.get("reason_code") or "no_supported_agent")
+    elif not target.get("enabled", True):
         status, reason = "paused", "explicitly_paused_or_disabled"
     elif target.get("paused"):
         status, reason = pause_health(target)
     elif age is None or age < 0:
         status, reason = "unknown", "no_current_observation"
-    elif age > 2 * poll_interval:
+    elif age > 2 * cadence:
         status, reason = "delayed", "observation_deadline_missed"
     elif delivery == "unknown":
         status, reason = "delivery_unknown", "send_receipt_unconfirmed"
@@ -213,7 +234,11 @@ def continuation_row(target, runtime, *, now, poll_interval=1.0):
         status, reason = "unknown", phase
     elif phase in {"claude_hook_config_degraded", "claude_hook_gap_exhausted", "claude_model_unavailable"}:
         status, reason = "blocked", phase
-    elif phase in {"unknown", "error_superseded", "queued_followup", "queue_recovery_submitted"}:
+    elif phase in {"error_superseded", "queued_followup"}:
+        # Waiting on the agent is not a failed watcher. This explicitly does
+        # not claim successful model access, task completion or queue delivery.
+        status, reason = "waiting", "previous_error_superseded" if phase == "error_superseded" else "followup_queued"
+    elif phase in {"unknown", "queue_recovery_submitted"}:
         status, reason = "unknown", "task_progress_unconfirmed"
     elif phase == "missing_or_error":
         status, reason = "unavailable", phase
@@ -224,6 +249,7 @@ def continuation_row(target, runtime, *, now, poll_interval=1.0):
         "status": status, "reason_code": reason, "state": phase,
         "viewport_checked_at": checked, "observation_age_sec": round(age, 3) if age is not None else None,
         "poll_interval_sec": poll_interval,
+        "observation_cadence_sec": cadence,
         "observation_interval_ms": runtime.get("observation_interval_ms", 0),
         "scheduler_lag_ms": runtime.get("scheduler_lag_ms", 0),
         "read_duration_ms": runtime.get("read_duration_ms", 0),
@@ -238,11 +264,13 @@ def continuation_row(target, runtime, *, now, poll_interval=1.0):
     }
 
 
-def continuation_report(targets, runtime, *, now, poll_interval=1.0):
-    rows = [continuation_row(t, runtime.get(str(t["surface_id"]), {}), now=now, poll_interval=poll_interval)
+def continuation_report(targets, runtime, *, now, poll_interval=1.0, observations=()):
+    by_id = {r.get("surface_id"): r for r in observations if isinstance(r, Mapping)}
+    rows = [continuation_row(t, runtime.get(str(t["surface_id"]), {}), now=now, poll_interval=poll_interval,
+                             observation=by_id.get(t["surface_id"]))
             for t in targets]
     counts = {key: 0 for key in ("ok", "paused", "unknown", "delayed", "delivery_unknown",
-                               "send_failed", "unavailable", "blocked")}
+                               "send_failed", "unavailable", "blocked", "missing", "inactive", "waiting")}
     for row in rows:
         counts[row["status"]] += 1
     bad = sum(counts[key] for key in ("delayed", "delivery_unknown", "send_failed", "unavailable", "blocked"))

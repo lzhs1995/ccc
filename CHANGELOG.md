@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.21
+
+- Render only current cmux surfaces and use their current workspace names and references. Historical registrations no longer reappear as paused terminals or relabel a real workspace whose display number was reused.
+- Copy the selected full native session ID with `y`/`Y` or by clicking its session cell. Unknown, conflicting and truncated IDs never replace the clipboard; clipboard work runs outside the input thread.
+- Distinguish confirmed closed surfaces, inactive shells and queued followups from continuation faults. Require fresh matching workspace/process evidence, honor the native monitor's actual bounded observation cadence, and retain unconfirmed-delivery and live-owner failures.
+- Treat failed janitor measurements as temporarily unavailable instead of inventing configuration drift. Block cleanup until a complete check succeeds, preserve genuine trips and operator pauses, and expose the original trip reason in the controller and Supervisor.
+- Read janitor safety configuration consistently without a grep/tail/cut pipeline, replace baselines atomically, keep status read-only, and retain the cleanup gate when state publication fails. Recovery still requires the existing rearm/resume checks.
+- Preserve existing B, continuation authorization and network behavior. Automatic workspace pause remains disabled; its optional rule still requires three consecutive complete real replies from one original session.
+
 ## 0.2.20
 
 - Keep fleet target merging linear in targets and workspace rules, and move it outside shared target locks. Native completion monitoring and authorization no longer wait for a full fleet merge.

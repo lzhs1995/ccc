@@ -235,7 +235,7 @@ def probe_watcher() -> dict:
         counts = continuation.get("counts", {})
         row["continuation_health"]["counts"] = {
             key: counts.get(key) for key in ("ok", "paused", "unknown", "delayed", "delivery_unknown",
-                                            "send_failed", "unavailable", "blocked")
+                                            "send_failed", "unavailable", "blocked", "missing", "inactive", "waiting")
         } if isinstance(counts, dict) else {}
     rules = payload.get("workspace_rules")
     row["explicit_target_count"] = len(targets) if isinstance(targets, list) else None
@@ -373,6 +373,7 @@ def probe_janitor() -> dict:
 
     row["paused"] = control.get("paused") is True
     row["guard_tripped"] = control.get("guard_tripped") is True
+    row["guard_unavailable"] = control.get("guard_unavailable") is True
     row["guard_health"] = guard.get("health") if isinstance(guard.get("health"), str) else None
     row["janitor_stale"] = janitor.get("stale") is True
     row["guard_stale"] = guard.get("stale") is True
@@ -430,6 +431,8 @@ def _janitor_verdict(row: dict) -> tuple[bool | None, str | None]:
                        "can never trip, so its health reading proves nothing")
     if row.get("guard_tripped") is True:
         return False, "guard tripped (manual review required; no auto-rearm)"
+    if row.get("guard_unavailable") is True:
+        return False, "guard measurement unavailable; waiting for a complete check"
     if (row.get("violation_count") or 0) > 0:
         return False, f"{row['violation_count']} guard violation(s)"
     if row.get("guard_invalid") is True:
@@ -450,6 +453,8 @@ def _janitor_verdict(row: dict) -> tuple[bool | None, str | None]:
     if row.get("guard_stale") is True:
         return False, ("guard state is stale; guard.sh runs every 60s regardless of pause, "
                        "so staleness means the guard stopped publishing")
+    if row.get("guard_health") != "healthy":
+        return False, "guard has not completed a healthy check"
     if row.get("janitor_stale") is True and row.get("paused") is not True:
         return False, "janitor state is stale while not paused; sweeps are not completing"
     if row.get("launchd_loaded") is None or row.get("guard_launchd_loaded") is None:

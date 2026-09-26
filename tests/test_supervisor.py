@@ -257,7 +257,7 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(config["manager_surface_id"], "dock-uuid")
         self.assertEqual(json.loads(output.getvalue())["manager_surface_id"], "dock-uuid")
 
-    def test_supervisor_lists_excluded_and_missing_explicit_targets(self):
+    def test_supervisor_lists_live_excluded_but_not_missing_explicit_targets(self):
         class Client:
             def tree(self):
                 return {
@@ -295,8 +295,8 @@ class SupervisorTests(unittest.TestCase):
             self.assertEqual(by_id["codex-a"].source, "workspace_excluded")
             self.assertTrue(by_id["codex-a"].paused)
             self.assertEqual(by_id["codex-a"].status_detail, "manual exclusion")
-            self.assertEqual(by_id["missing-uuid"].source, "explicit")
-            self.assertEqual(by_id["missing-uuid"].state, "missing")
+            self.assertNotIn("missing-uuid", by_id)
+            self.assertEqual(json.loads(config_path.read_text())["targets"], config["targets"])
 
     def test_tracked_rows_always_show_error_short_name_and_send_count(self):
         from cmux_supervisor_tui import error_label, send_label, watch_label
@@ -4820,8 +4820,8 @@ class SessionModelWiringTests(unittest.TestCase):
         self.assertEqual(sorted(resolved), ["surface-59"])
         self.assertEqual(resolved["surface-59"].session_id, SID_A)
 
-    def test_a_vanished_target_row_is_unmeasured(self):
-        """No process, so there is nothing to resolve and nothing to claim."""
+    def test_a_vanished_target_row_is_not_presented_as_a_current_session(self):
+        """Registration history must not invent a current surface."""
 
         import cmux_supervisor_tui as tui
 
@@ -4836,8 +4836,7 @@ class SessionModelWiringTests(unittest.TestCase):
                                         janitor=_StubJanitor())
             model.refresh(force=True)
             vanished = [c for c in model.candidates if c.surface_id == "gone-1"]
-            self.assertEqual(len(vanished), 1)
-            self.assertEqual(vanished[0].session_text, tui.SESSION_UNMEASURED)
+            self.assertEqual(vanished, [])
 
 
 class CollabColumnTests(unittest.TestCase):
