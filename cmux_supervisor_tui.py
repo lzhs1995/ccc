@@ -250,7 +250,7 @@ ACCESS_LABELS = {
     'stale': ('状态过期', '状态过期', '节费网关状态过期；续跑暂不发送'),
     'fault': ('网关故障', '网关故障', '节费网关故障；已停止新增请求，保留账本'),
     'uncertain': ('结果不明', '结果不明', '请求已发出，结果未确认；本路不自动重发，避免重复计费'),
-    'retryable': ('待续跑', '上游拒绝', '本次未成功；预算内可自动续跑，正在等待原生重试或守卫器安全提交'),
+    'retryable': ('待续跑', '上游拒绝', '本次未成功；等待原生重连，结束后守卫器可继续提交短请求'),
     'rejected': ('请求被拒', '上游拒绝', '上游返回不可自动重试错误；需要修正请求或认证'),
     'exhausted': ('次数用完', '次数用完', '本批已用完请求次数；不会自动清账本或另建批次'),
     'paused': ('暂停检查', '—', '本批当前无新增请求授权；保留账本'),
@@ -308,17 +308,22 @@ def access_batch_progress(value):
         text = '已有完整答复·停止新增'
     elif blocked >= 50:
         text = '50路结果不明·不自动重发'
-    elif value['attempts'] >= value['max_attempts']:
+    elif value['max_attempts'] is not None and value['attempts'] >= value['max_attempts']:
         text = '次数用完·停止新增'
     elif value.get('authorized') is not True:
         text = '暂停检查'
     elif blocked:
-        text = f'{blocked}路结果不明·其余按预算检查'
+        text = f'{blocked}路结果不明·其余继续检查'
     elif value.get('in_flight'):
         text = '检查中'
     else:
-        text = '等待预算内续跑'
-    return (f"节费50 {text} | HTTP {value.get('forwarded', 0)}/{value['max_attempts']}"
+        text = '等待原生重连或续跑'
+    count = str(value.get('forwarded', 0))
+    if value.get('attempt_mode') == 'sustained':
+        count += ' · 持续接入，无累计次数上限'
+    else:
+        count += '/' + str(value['max_attempts'])
+    return (f"节费50 {text} | HTTP {count}"
             f" | 在途 {value.get('in_flight', 0)}（仍可能计费） | 自动Interrupt关闭")
 
 
@@ -2386,7 +2391,7 @@ def private_batch_prompt(pool: str) -> str:
 
 
 def access_batch_prompt(pool: str) -> str:
-    return (f"在 {pool} 新开节费50？50路并发，只检查短答；本批最多1000次HTTP、每次请求上限128输出token。"
+    return (f"在 {pool} 新开节费50？50路持续尝试，保留Codex原生重连，不设累计HTTP次数或运行时长上限；每次只发短问、请求上限128输出token。"
             "一条完整回复后停止新增检查，在途请求自行结束；不自动Interrupt。原B保留，不能用检查页执行实际任务。")
 
 

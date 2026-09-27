@@ -89,7 +89,8 @@ class AccessServiceBoundaryTests(unittest.TestCase):
 
     def test_binding_is_exact_and_cannot_be_reassigned(self):
         # Binding validation is independent of TOML/native-provider discovery.
-        policy = service.Policy(self.job['workspace_id'], self.job['id'])
+        policy = service.Policy(self.job['workspace_id'], self.job['id'],
+                                max_attempts=None, attempt_mode='sustained')
         descriptor = {'version': service.VERSION, 'mode': service.MODE,
                       'config_path': str(self.config), 'policy': service.asdict(policy)}
         service.job_root(self.config, self.job['id']).mkdir(parents=True)
