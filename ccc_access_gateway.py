@@ -28,12 +28,35 @@ RESPONSE_LIMIT = 256 * 1024
 CHECK_INPUT = 'Reply exactly OK.'
 CHECK_INSTRUCTIONS = 'Return OK. Do not call tools.'
 
+# These fields determine framing or interpretation. Even identical duplicate
+# values are rejected. Other upstream fields are never forwarded to native.
+SINGLE_RESPONSE_HEADERS = frozenset({
+    'content-length', 'transfer-encoding', 'content-type', 'content-encoding', 'connection',
+})
+SAFE_PROTOCOL_REASONS = frozenset({
+    'HTTP header too large', 'ambiguous HTTP header', 'invalid HTTP header value',
+    'ambiguous HTTP body framing', 'invalid HTTP chunk', 'HTTP trailers too large',
+    'HTTP body too large', 'truncated HTTP chunk', 'invalid HTTP chunk ending',
+    'invalid HTTP content length', 'truncated HTTP body',
+    'native request must have bounded body framing',
+    'proxy did not establish the configured connection',
+    'HTTPS proxy checks require Python 3.11 or newer',
+    'no complete upstream response', 'invalid upstream output',
+    'tool or unsupported output blocked before native execution',
+    'unsupported response content', 'empty assistant output', 'no complete assistant answer',
+    'invalid upstream usage', 'upstream did not honor the requested output limit',
+    'invalid upstream response status', 'upstream ignored identity encoding',
+    'upstream did not return Responses SSE', 'invalid Responses event',
+    'upstream turn did not complete exactly once',
+    'upstream stream ended before a full response',
+})
+
 
 class ProtocolFault(ValueError):
     pass
 
 
-async def read_head(reader):
+async def read_head(reader, *, response=False):
     raw = await reader.readuntil(b'\r\n\r\n')
     if len(raw) > HEADER_LIMIT:
         raise ProtocolFault('HTTP header too large')
@@ -42,13 +65,41 @@ async def read_head(reader):
     for line in lines[1:]:
         key, separator, value = line.partition(':')
         key = key.lower()
-        if not separator or not re.fullmatch(r'[a-z0-9!#$%&*+.^_`|~-]+', key) or key in headers:
+        if not separator or not re.fullmatch(r'[a-z0-9!#$%&*+.^_`|~-]+', key):
             raise ProtocolFault('ambiguous HTTP header')
         value = value.strip(' \t')
-        if any(ord(char) < 32 and char != '\t' for char in value):
+        if any((ord(char) < 32 and char != '\t') or ord(char) == 127 for char in value):
             raise ProtocolFault('invalid HTTP header value')
+        if key in headers:
+            if not response or key in SINGLE_RESPONSE_HEADERS:
+                raise ProtocolFault('ambiguous HTTP header')
+            # Set-Cookie must not be comma-combined. We do not keep cookies or
+            # pass any of them onward; validate every occurrence, retain only
+            # the first in this private parser result. Repeated non-framing
+            # metadata such as Vary/Via cannot affect body interpretation.
+            if key != 'set-cookie':
+                headers[key] += ', ' + value
+            continue
         headers[key] = value
     return lines[0], headers
+
+
+def error_detail(exc, stage):
+    """Bounded diagnostics made only from local constants, never server text."""
+    if isinstance(exc, ProtocolFault):
+        reason = str(exc) if str(exc) in SAFE_PROTOCOL_REASONS else 'HTTP protocol validation failed'
+        kind = 'ProtocolFault'
+    elif isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        reason, kind = 'operation timed out', 'TimeoutError'
+    elif isinstance(exc, asyncio.IncompleteReadError):
+        reason, kind = 'connection ended before the expected bytes arrived', 'IncompleteReadError'
+    elif isinstance(exc, asyncio.LimitOverrunError):
+        reason, kind = 'HTTP framing exceeded the read limit', 'LimitOverrunError'
+    elif isinstance(exc, OSError):
+        reason, kind = 'connection or local storage operation failed', 'OSError'
+    else:
+        reason, kind = 'local request validation or processing failed', 'ValidationError'
+    return {'stage': stage, 'type': kind, 'reason': reason}
 
 
 async def body_chunks(reader, headers, limit, *, require_length=False):
@@ -202,7 +253,7 @@ class Upstream:
             writer.write(('CONNECT ' + destination + ' HTTP/1.1\r\n' +
                 ''.join(key + ': ' + value + '\r\n' for key, value in fields.items()) + '\r\n').encode())
             await writer.drain()
-            line, _ = await read_head(reader)
+            line, _ = await read_head(reader, response=True)
             if not re.fullmatch(r'HTTP/1\.\d 200(?: .*)?', line):
                 raise ProtocolFault('proxy did not establish the configured connection')
             if context:
@@ -266,7 +317,7 @@ def response_events(response):
 
 
 async def read_response(reader, output_limit, *, on_complete=None):
-    line, headers = await read_head(reader)
+    line, headers = await read_head(reader, response=True)
     if not re.fullmatch(r'HTTP/1\.\d [1-5]\d\d(?: .*)?', line):
         raise ProtocolFault('invalid upstream response status')
     status = int(line.split(' ', 2)[1])
@@ -338,6 +389,8 @@ class BatchChannel:
         self.first_wave_sent = False
         self.dispatched_numbers = set()
         self.wave_fault = ''
+        self.last_error = None
+        self.slot_results = {}
         self.metrics = {'received': 0, 'forwarded': 0, 'denied': 0, 'complete': 0, 'rejected': 0,
                         'uncertain': 0, 'active': 0, 'peak_active': 0, 'dispatch_times': [],
                         'completion_gate_times': []}
@@ -355,7 +408,24 @@ class BatchChannel:
     def snapshot(self):
         value = self.budget.snapshot()
         return {**value, 'fault': value['fault'] or self.wave_fault,
-                'forwarded': self.metrics['forwarded'], 'complete': self.metrics['complete']}
+                'forwarded': self.metrics['forwarded'], 'complete': self.metrics['complete'],
+                'last_error': dict(self.last_error) if self.last_error else None,
+                'slot_results': {str(slot): dict(result) for slot, result in self.slot_results.items()}}
+
+    def record_result(self, reservation, outcome, detail=None):
+        prior = self.slot_results.get(reservation.slot, {})
+        if (detail is None and prior.get('attempt') == reservation.number
+                and prior.get('outcome') == outcome):
+            return
+        # The parser's success gate is irreversible, including when a later
+        # native delivery or storage operation fails.
+        if prior.get('outcome') != 'complete':
+            self.slot_results[reservation.slot] = {
+                'outcome': outcome, 'attempt': reservation.number, 'updated_at': time.time(),
+                **({'error': dict(detail)} if detail else {}),
+            }
+        if detail:
+            self.last_error = {**detail, 'slot': reservation.slot, 'at': time.time()}
 
     async def check_session(self, slot, session_id, storage):
         if slot not in self.sessions and self.binding_loader is not None:
@@ -373,6 +443,7 @@ class BatchChannel:
         # Both calls run on this event loop, with no await between the gate and
         # request bytes. Every asynchronous connect/queue wait is already over.
         self.dispatched_numbers.add(reservation.number)
+        self.record_result(reservation, 'in_flight')
         self.metrics['forwarded'] += 1
         self.metrics['active'] += 1
         self.metrics['peak_active'] = max(self.metrics['peak_active'], self.metrics['active'])
@@ -485,6 +556,7 @@ class Gateway:
         dispatched = finished = False
         outcome = 'cancelled_before_dispatch'
         completed_response = None
+        stage = 'native_request'
         try:
             line, headers = await asyncio.wait_for(read_head(reader), 15)
             if self.health_token and hmac.compare_digest(line, 'GET /health/' + self.health_token + ' HTTP/1.1'):
@@ -503,6 +575,7 @@ class Gateway:
             session_id = headers.get('thread-id', '')
             uuid.UUID(session_id)
             channel.metrics['received'] += 1
+            stage = 'native_binding'
             await channel.check_session(slot, session_id, self.storage)
             channel.check_admission(slot, session_id)
             # Drop native context without deserializing its potentially huge
@@ -510,6 +583,7 @@ class Gateway:
             async def discard():
                 async for _ in body_chunks(reader, headers, NATIVE_BODY_LIMIT, require_length=True):
                     pass
+            stage = 'native_body'
             await asyncio.wait_for(discard(), 20)
             async def monitor_client():
                 # Reqwest cancellation closes this local HTTP exchange. It
@@ -522,8 +596,11 @@ class Gateway:
                 task.cancel()
             client_monitor = asyncio.create_task(monitor_client())
             wire = channel.upstream.request(channel.budget.policy, headers)
+            stage = 'budget_reservation'
             reservation = await self.storage(channel.budget.reserve, slot, session_id)
+            stage = 'upstream_connect'
             upstream_reader, upstream_writer = await asyncio.wait_for(channel.upstream.connect(), 20)
+            stage = 'cohort_dispatch'
             await channel.dispatch(reservation, upstream_writer, wire, reader, writer)
             dispatched = True
             outcome = 'uncertain'
@@ -532,26 +609,35 @@ class Gateway:
                 nonlocal outcome, completed_response
                 observed = time.monotonic()
                 channel.budget.note_success(reservation, response['id'])
+                channel.record_result(reservation, 'complete')
                 completed_response = response
                 outcome = 'complete'
                 channel.metrics['completion_gate_times'].append({'response_observed': observed,
                     'gate_closed': time.monotonic(), 'reservation': reservation.number})
+            stage = 'upstream_response'
             status, response = await asyncio.wait_for(read_response(upstream_reader,
                 channel.budget.policy.max_output_tokens, on_complete=complete), channel.upstream.timeout)
             if response is None:
                 outcome = 'rejected'
+                channel.record_result(reservation, outcome, {'stage': 'upstream_response',
+                    'type': 'UpstreamRejected', 'reason': 'API check rejected with HTTP ' + str(status),
+                    'http_status': status})
+                stage = 'budget_completion'
                 await self.storage(channel.budget.finish, reservation, outcome)
                 finished = True
                 channel.metrics['rejected'] += 1
                 # Preserve congestion as a retryable native error; no upstream
                 # body, tool content, credentials or guessed success is relayed.
                 message = ('We are currently experiencing high demand. ' if status in (429, 500, 502, 503, 504) else '')
+                stage = 'native_response'
                 await self.reject(writer, status, message + 'API check rejected with HTTP ' + str(status) + '.')
             else:
+                stage = 'budget_completion'
                 await self.storage(channel.budget.finish, reservation, outcome,
                                    response_id=response['id'], usage=response.get('usage'))
                 finished = True
                 channel.metrics['complete'] += 1
+                stage = 'native_response'
                 await self.reply(writer, 200, response_events(response), 'text/event-stream')
         except asyncio.CancelledError:
             if channel:
@@ -566,15 +652,22 @@ class Gateway:
                 await self.reject(writer, 409, str(exc))
             except (OSError, RuntimeError):
                 pass
-        except (OSError, ValueError, RuntimeError, asyncio.TimeoutError, asyncio.IncompleteReadError) as exc:
+        except (OSError, ValueError, RuntimeError, asyncio.TimeoutError,
+                asyncio.IncompleteReadError, asyncio.LimitOverrunError) as exc:
+            detail = error_detail(exc, stage)
             if channel:
                 dispatched = dispatched or (reservation is not None
                     and reservation.number in channel.dispatched_numbers)
                 channel.metrics['uncertain'] += int(dispatched)
+                if reservation is not None:
+                    channel.record_result(reservation, outcome if dispatched else 'cancelled_before_dispatch', detail)
+                else:
+                    channel.last_error = {**detail, 'at': time.time()}
                 if not channel.first_wave_sent:
                     channel.fail_wave('first-wave setup failed; no partial substitute for fifty checks')
             try:
-                await self.reject(writer, 502, 'The bounded API check did not complete (' + type(exc).__name__ + ').')
+                await self.reject(writer, 502, 'The bounded API check did not complete (' +
+                    detail['type'] + '; ' + detail['stage'] + '): ' + detail['reason'] + '.')
             except (OSError, RuntimeError):
                 pass
         finally:
@@ -591,6 +684,7 @@ class Gateway:
                 if outcome == 'cancelled_before_dispatch':
                     outcome = 'uncertain'
             if reservation is not None and not finished:
+                channel.record_result(reservation, outcome)
                 try:
                     # note_success is irreversible; a client/storage error
                     # after completion cannot downgrade it into a retry.

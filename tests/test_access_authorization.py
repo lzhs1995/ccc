@@ -39,7 +39,7 @@ class RealAuthorizationLeaseTests(unittest.IsolatedAsyncioTestCase):
                 'workspace_id': job['workspace_id'], 'active_batch_id': job['id'],
                 'enabled': True, 'paused': False} for job in jobs])
             core.atomic_write_json(config_path, config)
-            service.root(config_path).mkdir(mode=0o700)
+            service.root(config_path).mkdir(mode=0o700, parents=True)
             waiting, release = threading.Event(), threading.Event()
             real_load, real_write = core.ConfigStore.load, core.atomic_write_json
             calls = 0

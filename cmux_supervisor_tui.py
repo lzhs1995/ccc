@@ -21,7 +21,7 @@ import sys
 import threading
 import time
 import unicodedata
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
@@ -234,13 +234,92 @@ DETAIL_SHORT = {
     "cmux_unavailable": "无cmux",
 }
 
-FILTERS = ("all", "watched", "untracked")
+FILTERS = ("all", "watched", "untracked", "errors")
 DEFAULT_FILTER = "all"
 FILTER_LABELS = {
     "watched": "只看已监控",
     "untracked": "只看未登记",
     "all": "全部workspace/surface",
+    "errors": "只看当前异常",
 }
+
+
+ACCESS_LABELS = {
+    'missing': ('状态待验', '状态缺失', '节费网关尚无有效状态；不会据此发送续跑'),
+    'invalid': ('状态异常', '状态异常', '节费状态与本路身份不符或记录损坏；已停止新增请求'),
+    'stale': ('状态过期', '状态过期', '节费网关状态过期；续跑暂不发送'),
+    'fault': ('网关故障', '网关故障', '节费网关故障；已停止新增请求，保留账本'),
+    'uncertain': ('结果不明', '结果不明', '请求已发出，结果未确认；本路不自动重发，避免重复计费'),
+    'retryable': ('待续跑', '上游拒绝', '本次未成功；预算内可自动续跑，正在等待原生重试或守卫器安全提交'),
+    'rejected': ('请求被拒', '上游拒绝', '上游返回不可自动重试错误；需要修正请求或认证'),
+    'exhausted': ('次数用完', '次数用完', '本批已用完请求次数；不会自动清账本或另建批次'),
+    'paused': ('暂停检查', '—', '本批当前无新增请求授权；保留账本'),
+    'complete': ('已接通', '—', '本路已收到完整答复；本批停止新增检查，其他在途请求仍可能计费'),
+    'settling': ('在途收尾', '—', '本批已有成功答复，本路在途请求尚未结束；不再新增检查'),
+    'stopped': ('停止新增', '—', '本批已有成功答复；本路不再新增检查'),
+    'in_flight': ('检查中', '—', '检查已发送，等待上游；本路不会重复提交'),
+    'ready': ('待检查', '—', '请求入口可用；等待原生会话或守卫器续跑'),
+    'preparing': ('准备中', '—', '正在准备本批原生会话；全50路就绪后才提交检查'),
+}
+
+
+def access_detail(value):
+    text = ACCESS_LABELS.get(value.get('phase'), ACCESS_LABELS['invalid'])[2]
+    error = value.get('error') or {}
+    reason = error.get('reason')
+    if reason:
+        translations = {
+            'upstream did not return Responses SSE': '上游返回非 SSE 响应',
+            'ambiguous HTTP header': 'HTTP响应头格式或关键字段重复异常',
+            'invalid HTTP header value': 'HTTP响应头包含非法字符',
+            'upstream stream ended before a full response': '上游连接在完整答复前结束',
+            'operation timed out': '等待连接或答复超时',
+            'connection or local storage operation failed': '连接或本地存储操作失败',
+        }
+        text += '；' + translations.get(reason, reason)
+    return text
+
+
+def access_error_label(value):
+    label = ACCESS_LABELS.get(value.get('phase'), ACCESS_LABELS['invalid'])[1]
+    if label == '—':
+        return label
+    error = value.get('error') or {}
+    if error.get('type') == 'ProtocolFault':
+        return '协议异常'
+    if error.get('http_status'):
+        return 'HTTP' + str(error['http_status'])
+    return label
+
+
+def access_batch_progress(value):
+    from ccc_access_service import continuation_decision
+    if not isinstance(value, dict):
+        return '节费50 ' + access_detail({'phase': 'invalid'})
+    decision = continuation_decision({'job_id': value.get('job_id'), 'index': 0},
+                                     value, value.get('workspace_id'))
+    phase = decision['phase']
+    if phase in {'missing', 'invalid', 'stale'}:
+        return '节费50 ' + access_detail(decision)
+    blocked = len(value['blocked_slots'])
+    if value.get('fault') or value.get('closed'):
+        text = '网关故障·停止新增'
+    elif value.get('first_complete'):
+        text = '已有完整答复·停止新增'
+    elif blocked >= 50:
+        text = '50路结果不明·不自动重发'
+    elif value['attempts'] >= value['max_attempts']:
+        text = '次数用完·停止新增'
+    elif value.get('authorized') is not True:
+        text = '暂停检查'
+    elif blocked:
+        text = f'{blocked}路结果不明·其余按预算检查'
+    elif value.get('in_flight'):
+        text = '检查中'
+    else:
+        text = '等待预算内续跑'
+    return (f"节费50 {text} | HTTP {value.get('forwarded', 0)}/{value['max_attempts']}"
+            f" | 在途 {value.get('in_flight', 0)}（仍可能计费） | 自动Interrupt关闭")
 
 
 @dataclass
@@ -284,6 +363,9 @@ class Candidate:
     # a side map so `filter_candidates` can search it: that function only ever
     # looks at `item.*`, so an id held anywhere else would be unsearchable.
     session: SessionResult = field(default_factory=lambda: SessionResult())
+    # Transport admission is independent of the native viewport. Keeping its
+    # projection separate avoids relabeling old sends or mutating runtime state.
+    access: dict[str, Any] = field(default_factory=dict)
 
     @property
     def session_text(self) -> str:
@@ -390,6 +472,12 @@ def watch_kind(candidate: Candidate) -> str:
 def watch_label(candidate: Candidate) -> str:
     if candidate.source == "workspace_starting":
         return WATCH_LABELS[watch_kind(candidate)]
+    if candidate.access and not candidate.paused:
+        phase = candidate.access.get('phase')
+        if candidate.access.get('alarming') and phase != 'retryable':
+            return 'N异常'
+        return ('N续跑' if phase == 'retryable' else
+                'N完成' if phase in {'complete', 'stopped'} else 'N检查')
     if candidate.source not in {"untracked", "workspace_excluded", "workspace_non_codex"} and not candidate.paused:
         health_labels = {"unknown": "待检测", "delivery_unknown": "投递待验",
                          "send_failed": "发送失败", "unavailable": "读取异常", "blocked": "服务阻塞"}
@@ -417,6 +505,8 @@ def screen_label(candidate: Candidate) -> str:
     """
     if candidate.source == "untracked":
         return "—"
+    if candidate.access:
+        return ACCESS_LABELS.get(candidate.access.get('phase'), ACCESS_LABELS['invalid'])[0]
     if is_idling(candidate) and candidate.state not in DETAIL_FALLBACKS:
         return "—"
     return state_label(candidate.state)
@@ -512,6 +602,8 @@ def hook_label(candidate: Candidate) -> str:
 
 def diagnostic_detail(candidate: Candidate) -> str:
     """Full reason the daemon recorded, with its command noise stripped."""
+    if candidate.access:
+        return access_detail(candidate.access)
     detail = " ".join(str(candidate.status_detail or "").split())
     for prefix in ("incompatible: ", "cmux read-screen --workspace failed: ", "Error: "):
         while detail.lower().startswith(prefix.lower()):
@@ -539,6 +631,8 @@ def error_label(candidate: Candidate) -> str:
     """
     if candidate.source == "untracked":
         return "—"
+    if candidate.access:
+        return access_error_label(candidate.access)
     if candidate.context_status == "stalled":
         return "压缩失败"
     if candidate.context_status == "limit_waiting":
@@ -1834,6 +1928,16 @@ def workspace_rule_name(record: Mapping[str, Any]) -> str:
     return f"ws{suffix}" if suffix else str(record.get("workspace_id") or "")[:8]
 
 
+def current_error(candidate: Candidate) -> bool:
+    if candidate.access:
+        return bool(candidate.access.get('alarming'))
+    return candidate.source != 'untracked' and (
+        candidate.state in {'recoverable_error', 'provider_blocked', 'send_failed', 'delivery_unknown',
+                            'missing_or_error', 'incompatible', 'cmux_unavailable', 'send_guard_unavailable',
+                            'token_exhausted', 'claude_model_unavailable', 'claude_context_stalled'}
+        or candidate.continuation_status in {'delivery_unknown', 'send_failed', 'unavailable', 'blocked'})
+
+
 def filter_candidates(candidates: list[Candidate], view: str, query: str = "") -> list[Candidate]:
     # A pool member with no live Codex is still registered, so it belongs on the
     # watched side of this filter even though it is idling.
@@ -1841,6 +1945,8 @@ def filter_candidates(candidates: list[Candidate], view: str, query: str = "") -
         filtered = [item for item in candidates if item.source != "untracked"]
     elif view == "untracked":
         filtered = [item for item in candidates if item.source == "untracked"]
+    elif view == 'errors':
+        filtered = [item for item in candidates if current_error(item)]
     else:
         filtered = list(candidates)
     needle = query.strip().lower()
@@ -1861,6 +1967,7 @@ def filter_candidates(candidates: list[Candidate], view: str, query: str = "") -
         # prefix pass is needed.  Only a validated ID is searchable: an
         # unmeasured row must not be findable by someone else's UUID.
         str(item.session.session_id or ""),
+        access_detail(item.access) if item.access else '',
     )).lower()]
 
 
@@ -1875,18 +1982,20 @@ def focus_summary(candidate: Candidate | None, workspace_ref: str = "") -> str:
     facts.append(watch_label(candidate))
     if candidate.source != "untracked" and candidate.observation_age_sec is not None:
         facts.append(f"上次检测 {max(0, candidate.observation_age_sec):.1f} 秒前")
-    if candidate.continuation_status not in {"", "ok", "paused"}:
+    if not candidate.access and candidate.continuation_status not in {"", "ok", "paused"}:
         facts.append(candidate.continuation_reason)
     if candidate.agent_kind == "claude" or candidate.state.startswith("claude"):
         facts.append(f"Hook {hook_label(candidate)}")
     if candidate.source != "untracked":
-        facts.append(state_label(candidate.state))
+        facts.append(screen_label(candidate))
         if is_idling(candidate):
             # Registered but nothing to rescue: say so, or the row reads as if
             # it were being actively watched.
             program = candidate.process_summary or agent_label(candidate.agent_kind)
             facts.append(f"这一格当前没有 Codex 在跑（{program}），守护器不会发送")
-        if candidate.state == "error_superseded":
+        if candidate.access:
+            facts.append(access_detail(candidate.access))
+        elif candidate.state == "error_superseded":
             facts.append(f"错误 {error_label(candidate)}")
             facts.append(diagnostic_detail(candidate) or "错误后存在其他输出，未发送续跑")
         elif candidate.state in DETAIL_FALLBACKS:
@@ -1974,6 +2083,7 @@ def group_counts(candidates: list[Candidate]) -> dict[str, int]:
                                    for item in candidates)),
         "untracked": sum(1 for item in candidates if item.source == "untracked"),
         "warnings": sum(1 for item in candidates if item.repeat_warning),
+        "errors": sum(1 for item in candidates if current_error(item)),
         "all": len(candidates),
     }
 
@@ -2156,6 +2266,8 @@ def group_row_text(row: ViewRow, width: int) -> str:
     if row.workspace_title:
         left = f"{left}  {row.workspace_title}"
     bits = []
+    if row.counts.get('errors'):
+        bits.append(f"{row.counts['errors']} 异常")
     if has_pool_rule(row):
         bits.append("整池授权")
     watched = row.counts.get("watching", 0) + row.counts.get("pool", 0)
@@ -2696,10 +2808,38 @@ class SupervisorModel:
 
     def _refresh_batch_snapshots(self):
         from ccc_workspace_batch import snapshots
+        from ccc_access_service import continuation_decision, status
         # The panel displays live cmux rows, not the complete batch archive.
         # Keep history on disk without rereading all of it every second.
         self.batch_jobs = snapshots(self.config_path, self.config, workspace_ids={
             str(row.record.get("workspace_id") or "") for row in self.candidates})
+        rules = {r.get('workspace_id'): r for r in self.config.get('workspace_rules', [])}
+        # Reuse the footer's read, then read each other visible N job at most
+        # once. This runs every panel refresh, including between inventory scans.
+        values = {batch['id']: batch['access'] for batch in self.batch_jobs.values()
+                  if batch.get('id') and 'access' in batch}
+        rows = []
+        now = time.time()
+        for row in self.candidates:
+            wid = row.record.get('workspace_id')
+            bindings = rules.get(wid, {}).get('access_check_slots', {})
+            binding = bindings.get(row.surface_id) if isinstance(bindings, dict) else None
+            access = {}
+            if binding is not None:
+                jid = binding.get('job_id') if isinstance(binding, dict) else None
+                jid = jid if isinstance(jid, str) else None
+                if jid not in values:
+                    try:
+                        values[jid] = status(self.config_path, jid) if jid else {}
+                    except (OSError, ValueError, TypeError):
+                        values[jid] = {}
+                access = continuation_decision(binding, values[jid], wid, now=now)
+                if access['phase'] == 'missing' and row.source == 'workspace_starting':
+                    access = {**access, 'phase': 'preparing', 'alarming': False}
+            # maybe_refresh uses a shallow model copy; never change a Candidate
+            # still visible on the curses thread until the snapshot is published.
+            rows.append(replace(row, access=access))
+        self.candidates = rows
 
     def run_cli(self, args: list[str]) -> str:
         # Redirecting Python's global stdout on a worker would capture curses
@@ -3891,6 +4031,8 @@ def attr(key: str) -> int:
 
 
 def row_attr(candidate: Candidate) -> int:
+    if candidate.access and candidate.access.get('alarming'):
+        return attr('error') | curses.A_BOLD
     if (candidate.source not in {"untracked", "workspace_excluded", "workspace_non_codex"}
             and not candidate.paused and candidate.continuation_status not in {"", "ok", "paused"}):
         return attr("paused")
@@ -4324,6 +4466,16 @@ def _draw(
         _safe_addnstr(stdscr, at["focus_keys"], 0, f"  {row_action_hint(focus)}", clip)
     if model.error:
         _safe_addnstr(stdscr, at["message"], 0, f"错误: {model.error}", clip, attr("paused") | curses.A_BOLD)
+    elif (focus and (batch := getattr(model, 'batch_jobs', {}).get(focus.workspace_id))
+          and batch.get('startup_mode') == 'access_check' and batch.get('access')
+          and not status.startswith(('失败:', '错误:'))):
+        # An old "submitted" action message must not hide a later transport
+        # failure indefinitely. Current N outcomes are part of every redraw.
+        progress = access_batch_progress(batch['access'])
+        alarming = any(row.access.get('alarming') for row in model.candidates
+                       if row.record.get('workspace_id') == focus.workspace_id)
+        _safe_addnstr(stdscr, at['message'], 0, progress, clip,
+                      attr('error') | curses.A_BOLD if alarming else attr('dim'))
     elif status:
         _safe_addnstr(stdscr, at["message"], 0, status, clip, attr("error"))
     elif focus and (batch := getattr(model, "batch_jobs", {}).get(focus.workspace_id)):
@@ -4333,13 +4485,7 @@ def _draw(
         if batch.get("protection"):
             progress = batch_guard_label(batch["protection"])
         if batch.get('startup_mode') == 'access_check' and (check := batch.get('access')):
-            result = ('已接通·不再新增检查' if check.get('first_complete') else
-                      '已到次数上限' if check.get('attempts', 0) >= check.get('max_attempts', 1000) else
-                      '待核查·已停新检查' if check.get('fault') or check.get('closed') else
-                      '结果未确认·本批停止' if len(check.get('blocked_slots', [])) >= 50 else
-                      '已暂停检查' if not check.get('authorized') else '检查中')
-            progress = (f"节费50 {result} | HTTP {check.get('forwarded', 0)}/{check.get('max_attempts', 1000)}"
-                        f" | 在途 {check.get('in_flight', 0)} | 自动Interrupt关闭")
+            progress = access_batch_progress(check)
         _safe_addnstr(stdscr, at["message"], 0, progress, clip, attr("dim"))
     _safe_addnstr(stdscr, at["keys_rule"], 0, rule("-", clip), clip, attr("rule"))
     _safe_addnstr(stdscr, at["keys1"], 0, GLOBAL_KEYS_1, clip, attr("dim"))

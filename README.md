@@ -129,6 +129,13 @@ requests. The selected workspace has clickable controls (the same keys work):
 - `b` 空目录50（试用）：单独选择空目录短答模式。新批次每路使用独立空目录，仅在该次启动信任该目录，并请求只回复 `OK`；未完成旧批次继续原模式，界面显示实际模式。自动暂停、自动切断保持关闭。
 - `N` 节费50（独立试用，Python 3.11+）：保留50路实际并发，以固定短请求检查 API；每批最多1000次HTTP尝试，每次申请最多128个输出token。一条完整回复后不再新增检查，在途请求自然结束。不会自动 Interrupt，也不改原B。
 
+N 的“画面／错误”列直接显示本路请求结果：`检查中`、`待续跑`、`结果不明`、
+`网关故障`、`状态过期`、`次数用完`、`已接通`、`在途收尾`或`停止新增`。
+工作区标题行同时列出异常数量；按 `f` 可切到“只看当前异常”，选中行查看原因。
+明确的 HTTP/SSE 拥堵拒绝按原预算自动续跑；请求已发出但结果不明时，本路不会
+自动重发或退回 B。启动完成不代表 API 成功，停止新增也不代表已取消在途计费。
+升级 N 会为新批次使用独立网关；旧批次的端口、进程和账本继续保留，不自动迁移或重放。
+
 `B` requires global sending to be enabled and the selected pool to be unpaused.
 It never changes another pool or silently clears existing pauses. At most four
 new sessions wait for startup together. Progress reports created, ready,

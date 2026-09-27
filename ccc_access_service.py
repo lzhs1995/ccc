@@ -13,6 +13,7 @@ from dataclasses import asdict
 import hashlib
 import http.client
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -37,7 +38,11 @@ _started_processes = {}
 
 
 def root(config_path):
-    return Path(config_path).resolve().parent / 'access-gateway'
+    # A new implementation gets a separate listener/owner. Existing native
+    # clients keep their frozen port and service; an upgrade never kills an
+    # active connection or rebinds an old descriptor to a new transport.
+    generation = hashlib.sha256(json.dumps(fingerprint(), sort_keys=True).encode()).hexdigest()
+    return Path(config_path).resolve().parent / 'access-gateway' / ('runtime-' + generation)
 
 
 def job_root(config_path, job_id):
@@ -114,8 +119,8 @@ def is_access_job(config_path, job):
     return True
 
 
-def fingerprint():
-    directory = Path(__file__).resolve().parent
+def fingerprint(directory=None):
+    directory = Path(directory) if directory is not None else Path(__file__).resolve().parent
     return {name: hashlib.sha256((directory / name).read_bytes()).hexdigest()
             for name in ('ccc_access_service.py', 'ccc_access_gateway.py', 'ccc_access_budget.py')}
 
@@ -127,10 +132,16 @@ def owner_alive(owner, config_path, *, check_runtime=True):
         return False
     try:
         argv, _ = arguments(pid)
-        expected = ['-B', str(Path(__file__).resolve()), 'serve', '--config', str(Path(config_path).resolve())]
+        source = owner.get('source_path', str(Path(__file__).resolve()))
+        if not isinstance(source, str) or not Path(source).is_absolute() or Path(source).name != 'ccc_access_service.py':
+            return False
+        expected = ['-B', source, 'serve', '--config', str(Path(config_path).resolve())]
         if argv[1:] != expected or birth(pid) != owner['birth']:
             return False
-        return not check_runtime or owner.get('source') == fingerprint()
+        # Package and copied watcher runtime share bytes, not a filesystem
+        # path. Verify the recorded live argv and both complete fingerprints;
+        # never stop/relaunch that owner just because its caller is a copy.
+        return not check_runtime or owner.get('source') == fingerprint() == fingerprint(Path(source).parent)
     except (OSError, ValueError, RuntimeError):
         return False
 
@@ -287,23 +298,130 @@ def bind_slot(config_path, job, slot, target, native):
 
 def status(config_path, job_id):
     try:
-        return read_private(job_root(config_path, job_id) / 'access-status.json')
+        value = read_private(job_root(config_path, job_id) / 'access-status.json')
+        return value if isinstance(value, dict) else {}
     except (OSError, ValueError):
         return {}
 
 
+def access_binding(config, target):
+    rule = next((r for r in config.get('workspace_rules', [])
+                 if r.get('workspace_id') == target.get('workspace_id')), {})
+    bindings = rule.get('access_check_slots', {})
+    return bindings.get(target.get('surface_id')) if isinstance(bindings, dict) else None
+
+
+def _status_error(value):
+    """Only fixed local descriptions can leave a private status record."""
+    from ccc_access_gateway import ProtocolFault, error_detail
+    if not isinstance(value, dict):
+        return {}
+    stage = value.get('stage')
+    if not isinstance(stage, str) or stage not in {'native_request', 'native_binding', 'native_body', 'budget_reservation',
+                     'upstream_connect', 'cohort_dispatch', 'upstream_response',
+                     'budget_completion', 'native_response'}:
+        stage = 'upstream_response'
+    kind = value.get('type')
+    if not isinstance(kind, str):
+        return {}
+    if kind == 'UpstreamRejected':
+        code = value.get('http_status')
+        if type(code) is int and 100 <= code <= 599:
+            return {'type': kind, 'stage': stage, 'http_status': code,
+                    'reason': 'API check rejected with HTTP ' + str(code)}
+        return {}
+    examples = {'ProtocolFault': ProtocolFault(str(value.get('reason', ''))),
+                'OSError': OSError(), 'TimeoutError': TimeoutError(),
+                'IncompleteReadError': asyncio.IncompleteReadError(b'', 1),
+                'LimitOverrunError': asyncio.LimitOverrunError('', 0),
+                'ValidationError': ValueError()}
+    return error_detail(examples[kind], stage) if kind in examples else {}
+
+
+def continuation_decision(binding, value, workspace_id, *, now=None):
+    """Pure projection shared by the send guard and panel; no inventory scan.
+
+    A transport result is scoped by workspace, job and slot. Terminal titles
+    and a completed *launch* never mean that an API request succeeded.
+    """
+    def result(phase, *, allowed=False, detail=None):
+        return {'phase': phase, 'allowed': allowed,
+                'alarming': phase in {'missing', 'invalid', 'stale', 'fault', 'uncertain',
+                                     'exhausted', 'rejected', 'retryable'},
+                **({'error': detail} if detail else {})}
+
+    if not value:
+        return result('missing')
+    if not isinstance(binding, dict) or not isinstance(value, dict):
+        return result('invalid')
+    index = binding.get('index')
+    if (type(index) is not int or not 0 <= index < 50 or not binding.get('job_id')
+            or value.get('job_id') != binding['job_id'] or value.get('workspace_id') != workspace_id):
+        return result('invalid')
+    attempts, maximum = value.get('attempts'), value.get('max_attempts')
+    blocked = value.get('blocked_slots')
+    if (type(attempts) is not int or type(maximum) is not int or not 50 <= maximum <= 10000
+            or not 0 <= attempts <= maximum or not isinstance(blocked, list)
+            or any(type(slot) is not int or not 0 <= slot < 50 for slot in blocked)
+            or len(blocked) != len(set(blocked))):
+        return result('invalid')
+    for key in ('in_flight', 'forwarded', 'complete'):
+        counter = value.get(key, 0)
+        if type(counter) is not int or not 0 <= counter <= (50 if key != 'forwarded' else attempts):
+            return result('invalid')
+    first = value.get('first_complete')
+    if first is not None and (not isinstance(first, dict) or not isinstance(first.get('response_id'), str)
+            or not first['response_id'] or type(first.get('number')) is not int
+            or not 1 <= first['number'] <= attempts):
+        return result('invalid')
+    updated = value.get('updated_at')
+    now = time.time() if now is None else now
+    if (type(updated) not in (int, float) or not math.isfinite(updated)
+            or not 0 <= now - updated <= 3):
+        return result('stale')
+    slots = value.get('slot_results', {})
+    slot = slots.get(str(index), {}) if isinstance(slots, dict) else None
+    if not isinstance(slot, dict):
+        return result('invalid')
+    outcome = slot.get('outcome')
+    if (outcome is not None and not isinstance(outcome, str)) or outcome not in {
+            None, 'in_flight', 'complete', 'rejected', 'uncertain', 'cancelled_before_dispatch'}:
+        return result('invalid')
+    if slot and (type(slot.get('attempt')) is not int or not 1 <= slot['attempt'] <= attempts):
+        return result('invalid')
+    detail = _status_error(slot.get('error'))
+    if index in blocked or outcome == 'uncertain':
+        return result('uncertain', detail=detail)
+    if value.get('fault') or value.get('closed'):
+        return result('fault', detail=detail or _status_error(value.get('last_error')))
+    if value.get('first_complete'):
+        return result('complete' if outcome == 'complete' else
+                      'settling' if outcome == 'in_flight' else 'stopped')
+    if attempts >= maximum:
+        return result('exhausted', detail=detail)
+    if value.get('authorized') is not True:
+        return result('paused', detail=detail)
+    if outcome == 'complete':
+        return result('invalid')  # A success without its batch gate is corrupt.
+    if outcome == 'in_flight':
+        return result('in_flight')
+    if outcome == 'rejected':
+        code = detail.get('http_status')
+        if code in (429, 500, 502, 503, 504):
+            return result('retryable', allowed=True, detail=detail)
+        return result('rejected', detail=detail)
+    if outcome == 'cancelled_before_dispatch':
+        return result('fault', detail=detail)
+    return result('ready', allowed=True)
+
+
 def continuation_allowed(config_path, config, target):
-    rule = next((r for r in config.get('workspace_rules', []) if r.get('workspace_id') == target.get('workspace_id')), {})
-    binding = rule.get('access_check_slots', {}).get(target.get('surface_id'))
+    binding = access_binding(config, target)
     if binding is None:
         return True
     try:
         value = status(config_path, binding['job_id'])
-        return (value.get('job_id') == binding['job_id'] and value.get('workspace_id') == target['workspace_id']
-                and 0 <= time.time() - value['updated_at'] <= 3
-                and not value.get('first_complete') and not value.get('fault') and not value.get('closed')
-                and binding['index'] not in value['blocked_slots']
-                and value['attempts'] < value['max_attempts'] and value.get('authorized') is True)
+        return continuation_decision(binding, value, target['workspace_id'])['allowed']
     except (KeyError, TypeError, ValueError):
         return False
 
@@ -316,7 +434,8 @@ async def serve(config_path):
     if not born:
         raise RuntimeError('access service requires exact local process identity support')
     instance, health_token = str(uuid.uuid4()), secrets.token_urlsafe(32)
-    owner = {'pid': os.getpid(), 'birth': born, 'instance': instance, 'source': fingerprint()}
+    owner = {'pid': os.getpid(), 'birth': born, 'instance': instance, 'source': fingerprint(),
+             'source_path': str(Path(__file__).resolve())}
     last_success = time.monotonic()
     current = ConfigStore(Path(config_path)).load()
     def authorized(policy):
