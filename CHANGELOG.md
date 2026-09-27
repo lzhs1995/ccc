@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.28
+
+- Keep sustained N batches retryable after a connection failure before any request bytes are sent. Return a retryable 503 after durably completing the unused reservation, preserve the other waiting slots, and check every upstream reader for EOF before releasing the initial fifty requests. Finite batches and uncertain dispatched requests retain their existing limits.
+- Show connection preparation, actual upstream activity and fixed transport diagnostics in N status. Preserve native reconnect and original-session continuation, the short request, tool/title exclusion, and the per-batch success gate.
+- Add a separate, explicit one-shot repair for an idle old N listener whose entire accounting history proves no request was dispatched. Bind the complete historical job inventory, original listener, fifty native sessions and failed local 409 turns. Retain the old port and journal; record each paste and Enter before issuing it. Normal upgrades never invoke this repair automatically.
+- Keep original B/b, automatic pause/Interrupt policy, native settings and network modules unchanged. Extend isolated native acceptance to reproduce the old connection refusal and recover the same fifty original CLI sessions.
+
 ## 0.2.27
 
 - Make new N batches explicitly sustained: retain all 50 slots, inherit the provider's native HTTP and stream retries, and continue confirmed retryable failures in the original sessions. Remove the cumulative 1000-attempt cutoff from new batches. Existing finite batches retain their limits, listeners and journals.

@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+import contextlib
 from dataclasses import asdict
 import hashlib
 import http.client
@@ -150,6 +151,13 @@ def owner_alive(owner, config_path, *, check_runtime=True):
         if not isinstance(source, str) or not Path(source).is_absolute() or Path(source).name != 'ccc_access_service.py':
             return False
         expected = ['-B', source, 'serve', '--config', str(Path(config_path).resolve())]
+        recovery = owner.get('recovery_path')
+        if recovery is not None:
+            if not isinstance(recovery, str) or not Path(recovery).is_absolute():
+                return False
+            if hashlib.sha256(Path(recovery).read_bytes()).hexdigest() != owner.get('recovery_sha256'):
+                return False
+            expected += ['--recovery', recovery]
         if argv[1:] != expected or birth(pid) != owner['birth']:
             return False
         # Package and copied watcher runtime share bytes, not a filesystem
@@ -330,7 +338,7 @@ def access_binding(config, target):
 
 def _status_error(value):
     """Only fixed local descriptions can leave a private status record."""
-    from ccc_access_gateway import ProtocolFault, error_detail
+    from ccc_access_gateway import ProtocolFault, RetryableSetup, error_detail
     if not isinstance(value, dict):
         return {}
     stage = value.get('stage')
@@ -347,8 +355,13 @@ def _status_error(value):
             return {'type': kind, 'stage': stage, 'http_status': code,
                     'reason': 'API check rejected with HTTP ' + str(code)}
         return {}
+    if kind == 'TLSVerificationError':
+        return {'type': kind, 'stage': stage, 'reason': 'upstream TLS certificate verification failed'}
+    number = value.get('errno')
+    os_error = OSError(number, '') if type(number) is int else OSError()
     examples = {'ProtocolFault': ProtocolFault(str(value.get('reason', ''))),
-                'OSError': OSError(), 'TimeoutError': TimeoutError(),
+                'OSError': os_error, 'TimeoutError': TimeoutError(),
+                'RetryableSetup': RetryableSetup(),
                 'IncompleteReadError': asyncio.IncompleteReadError(b'', 1),
                 'LimitOverrunError': asyncio.LimitOverrunError('', 0),
                 'ValidationError': ValueError()}
@@ -435,6 +448,11 @@ def continuation_decision(binding, value, workspace_id, *, now=None):
             return result('retryable', allowed=True, detail=detail)
         return result('rejected', detail=detail)
     if outcome == 'cancelled_before_dispatch':
+        if attempt_mode == 'sustained' and (
+                detail.get('stage') == 'upstream_connect'
+                and detail.get('type') in {'OSError', 'TimeoutError', 'IncompleteReadError'}
+                or detail.get('stage') == 'cohort_dispatch' and detail.get('type') == 'RetryableSetup'):
+            return result('retryable', allowed=True, detail=detail)
         return result('fault', detail=detail)
     return result('ready', allowed=True)
 
@@ -450,16 +468,171 @@ def continuation_allowed(config_path, config, target):
         return False
 
 
-async def serve(config_path):
+def cancelled_setup_history(path, policy):
+    """Read-only proof for the narrow pre-dispatch repair, never a refund.
+
+    Live journals remain owned by their gateway. This inspection does not take
+    that ownership, truncate a record, or reinterpret any dispatched outcome.
+    The actual new owner subsequently replays the same bytes with AccessBudget.
+    """
+    path = Path(path)
+    fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+    try:
+        before = os.fstat(fd)
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
+                or before.st_mode & 0o077 or not 0 < before.st_size <= 16 * 1024 * 1024):
+            raise ValueError('repair requires a private completed setup journal')
+        digest = hashlib.sha256()
+        active, active_slots, sessions = {}, {}, {}
+        attempts = 0
+        with os.fdopen(fd, 'rb', closefd=False) as handle:
+            def read_line():
+                raw = handle.readline(65537)
+                if raw and (len(raw) > 65536 or not raw.endswith(b'\n')):
+                    raise ValueError('repair cannot accept an incomplete journal')
+                digest.update(raw)
+                if not raw:
+                    return None
+                value = json.loads(raw)
+                if not isinstance(value, dict):
+                    raise ValueError('repair accounting event must be an object')
+                return value
+            if read_line() != policy.journal_header():
+                raise ValueError('repair policy differs from the original journal')
+            while (event := read_line()) is not None:
+                if not isinstance(event, dict):
+                    raise ValueError('invalid repair accounting event')
+                number = event.get('number')
+                if type(number) is not int:
+                    raise ValueError('invalid repair reservation number')
+                if event.get('kind') == 'reserved':
+                    slot, session = event.get('slot'), event.get('session_id')
+                    if (number != attempts + 1 or type(slot) is not int or not 0 <= slot < 50
+                            or slot in active_slots or not isinstance(session, str) or not 0 < len(session) <= 128
+                            or slot in sessions and sessions[slot] != session):
+                        raise ValueError('repair reservation identity or order differs')
+                    attempts = number
+                    active[number], active_slots[slot], sessions[slot] = slot, number, session
+                elif event.get('kind') == 'finished':
+                    if (number not in active or event.get('outcome') != 'cancelled_before_dispatch'
+                            or event.get('response_id') not in ('', None) or event.get('usage') is not None):
+                        raise ValueError('repair is restricted to requests never dispatched')
+                    active_slots.pop(active.pop(number))
+                else:
+                    raise ValueError('unknown repair accounting event')
+        after = os.fstat(fd)
+        if active or (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+            raise ValueError('repair journal is active or changed during inspection')
+        return {'sha256': digest.hexdigest(), 'bytes': before.st_size, 'attempts': attempts,
+                'sessions': {str(k): v for k, v in sessions.items()}}
+    finally:
+        os.close(fd)
+
+
+def validate_recovery_plan(config_path, path, *, require_old_dead=True):
+    """Validate an explicitly prepared repair; regular upgrades never use it.
+
+    The one-shot operator holds config.lock and the old runtime start.lock
+    across its final inventory, stopping the idle old gateway and this start.
+    No job with a dispatched, successful or unresolved request is eligible.
+    """
+    from cmux_codex_watch import ConfigStore, load_json
+    from ccc_guard_scope import birth
+    config_path, path = Path(config_path).resolve(), Path(path).resolve()
+    plan = read_private(path)
+    if (not isinstance(plan, dict) or plan.get('version') != 1
+            or plan.get('purpose') != 'recover-sustained-before-first-dispatch'
+            or plan.get('config_path') != str(config_path) or plan.get('source') != fingerprint()
+            or hashlib.sha256(config_path.read_bytes()).hexdigest() != plan.get('config_sha256')):
+        raise ValueError('repair plan does not match current source and configuration')
+    old = plan.get('old_owner')
+    if (not isinstance(old, dict) or type(old.get('pid')) is not int or not old.get('birth')
+            or not isinstance(old.get('source_path'), str) or not isinstance(old.get('source'), dict)
+            or type(old.get('port')) is not int or not 0 < old['port'] < 65536):
+        raise ValueError('repair has no exact original gateway identity')
+    uuid.UUID(old['instance'])
+    old_source = Path(old['source_path'])
+    if (not old_source.is_absolute() or old_source.name != 'ccc_access_service.py'
+            or fingerprint(old_source.parent) != old['source']):
+        raise ValueError('original gateway source changed')
+    generation = hashlib.sha256(json.dumps(old['source'], sort_keys=True).encode()).hexdigest()
+    old_root = config_path.parent / 'access-gateway' / ('runtime-' + generation)
+    if old_root == root(config_path):
+        raise ValueError('repair must use a distinct verified implementation')
+    if read_private(old_root / 'owner.json') != old:
+        raise ValueError('original gateway owner changed')
+    if require_old_dead and birth(old['pid']) == old['birth']:
+        raise ValueError('original gateway is still alive; no replacement was started')
+    jobs, restore = plan.get('jobs'), plan.get('restore_jobs')
+    if (not isinstance(jobs, dict) or not jobs or not isinstance(restore, list) or not restore
+            or len(set(restore)) != len(restore) or any(jid not in jobs for jid in restore)):
+        raise ValueError('repair needs an explicit subset of original jobs')
+    config = ConfigStore(config_path).load()
+    if config.get('mode') != 'armed' or config.get('global_paused') is not False:
+        raise ValueError('repair cannot authorize paused operation')
+    # Formerly active jobs can still have a request on the wire. Inspect the
+    # entire generation, not only today's active_batch_id references. A damaged
+    # N descriptor is never treated as an ordinary B job.
+    batches = config_path.parent / 'workspace-batches'
+    for directory in batches.iterdir():
+        if not directory.is_dir():
+            continue
+        job = load_json(directory / 'job.json', {})
+        try:
+            descriptor = read_private(directory / 'access.json')
+        except FileNotFoundError:
+            if 'access_mode' in job or 'access_policy' in job:
+                raise ValueError('an N job has no descriptor; repair cannot establish its scope')
+            continue
+        if descriptor.get('gateway_instance') == old['instance'] and directory.name not in jobs:
+            raise ValueError('a new active job or historical job belongs to the original gateway; repair was not applied')
+    for jid, expected in jobs.items():
+        directory = job_root(config_path, jid)
+        descriptor = read_private(directory / 'access.json')
+        job = load_json(directory / 'job.json', {})
+        policy = verify_descriptor(descriptor, config_path, job)
+        if (policy.attempt_mode != 'sustained' or descriptor.get('gateway_instance') != old['instance']
+                or descriptor.get('port') != old['port'] or not isinstance(expected, dict)
+                or descriptor_sha(descriptor) != expected.get('descriptor_sha256')
+                or hashlib.sha256((directory / 'job.json').read_bytes()).hexdigest() != expected.get('job_sha256')
+                or cancelled_setup_history(directory / 'access-journal.jsonl', policy) != expected.get('journal')):
+            raise ValueError('repair job or completed setup ledger changed')
+        bindings = expected.get('bindings')
+        if not isinstance(bindings, dict) or set(bindings) != {str(i) for i in range(50)}:
+            raise ValueError('repair requires all fifty original native bindings')
+        for slot, digest in bindings.items():
+            binding_path = directory / f'access-session-{slot}.json'
+            if hashlib.sha256(binding_path.read_bytes()).hexdigest() != digest:
+                raise ValueError('original native binding changed')
+        if jid in restore:
+            rule = next((r for r in config.get('workspace_rules', [])
+                         if r.get('workspace_id') == policy.workspace_id), {})
+            if rule.get('active_batch_id') != jid or not rule.get('enabled', True) or rule.get('paused'):
+                raise ValueError('repair cannot restore an unauthorized original job')
+    return plan, old_root
+
+
+def recovery_root(config_path, plan):
+    # A repaired old listener must not compete with the normal new-version
+    # gateway that future N jobs may already have started.
+    return root(config_path) / ('repair-' + str(uuid.UUID(plan['old_owner']['instance'])))
+
+
+async def serve(config_path, *, recovery_path=None):
     from cmux_codex_watch import ConfigStore, atomic_write_json, load_json
     from ccc_guard_scope import birth
-    directory = root(config_path)
+    recovery = validate_recovery_plan(config_path, recovery_path)[0] if recovery_path else None
+    directory = recovery_root(config_path, recovery) if recovery else root(config_path)
     born = birth(os.getpid())
     if not born:
         raise RuntimeError('access service requires exact local process identity support')
-    instance, health_token = str(uuid.uuid4()), secrets.token_urlsafe(32)
+    instance = recovery['old_owner']['instance'] if recovery else str(uuid.uuid4())
+    health_token = secrets.token_urlsafe(32)
     owner = {'pid': os.getpid(), 'birth': born, 'instance': instance, 'source': fingerprint(),
              'source_path': str(Path(__file__).resolve())}
+    if recovery:
+        owner.update(port=recovery['old_owner']['port'], recovery_path=str(Path(recovery_path).resolve()),
+                     recovery_sha256=hashlib.sha256(Path(recovery_path).read_bytes()).hexdigest())
     last_success = time.monotonic()
     current = ConfigStore(Path(config_path)).load()
     def authorized(policy):
@@ -471,6 +644,8 @@ async def serve(config_path):
                 and rule.get('enabled', True) and not rule.get('paused')
                 and rule.get('active_batch_id') == policy.job_id)
     def load_channel(job_id):
+        if recovery and job_id not in recovery['restore_jobs']:
+            raise AdmissionClosed('this historical job was not selected for repair')
         path = job_root(config_path, job_id)
         descriptor = read_private(path / 'access.json')
         job = load_json(path / 'job.json', {})
@@ -497,8 +672,15 @@ async def serve(config_path):
         return BatchChannel(budget, upstream, descriptor['tokens'], binding_loader=session,
                             dispatch_check=lambda: authorized(policy))
     gateway = Gateway(channel_loader=load_channel, health_token=health_token)
-    owner.update(port=await gateway.start(), health_token=health_token)
-    atomic_write_json(directory / 'owner.json', owner)
+    try:
+        if recovery:
+            for jid in recovery['restore_jobs']:
+                gateway.channels[jid] = await gateway.storage(load_channel, jid)
+        owner.update(port=await gateway.start(recovery['old_owner']['port'] if recovery else 0), health_token=health_token)
+        atomic_write_json(directory / 'owner.json', owner)
+    except BaseException:
+        await gateway.close()
+        raise
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for signum in (signal.SIGTERM, signal.SIGINT):
@@ -547,14 +729,24 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action', choices=['serve'])
     parser.add_argument('--config', type=Path, required=True)
+    parser.add_argument('--recovery', type=Path)
     args = parser.parse_args()
     from cmux_codex_watch import FileLock
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     desired = min(16384, hard) if hard != resource.RLIM_INFINITY else 16384
     if soft < desired:
         resource.setrlimit(resource.RLIMIT_NOFILE, (desired, hard))
-    with FileLock(root(args.config) / 'owner.lock', timeout_sec=0):
-        asyncio.run(serve(args.config.resolve()))
+    with contextlib.ExitStack() as locks:
+        if args.recovery:
+            plan, old_root = validate_recovery_plan(args.config, args.recovery)
+            root(args.config).mkdir(mode=0o700, parents=True, exist_ok=True)
+            directory = recovery_root(args.config, plan)
+            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            locks.enter_context(FileLock(directory / 'owner.lock', timeout_sec=0))
+            locks.enter_context(FileLock(old_root / 'owner.lock', timeout_sec=0))
+        else:
+            locks.enter_context(FileLock(root(args.config) / 'owner.lock', timeout_sec=0))
+        asyncio.run(serve(args.config.resolve(), recovery_path=args.recovery))
 
 
 if __name__ == '__main__':

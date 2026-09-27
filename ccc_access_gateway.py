@@ -10,6 +10,7 @@ import asyncio
 import base64
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+import errno
 import functools
 import hmac
 import ipaddress
@@ -56,6 +57,18 @@ class ProtocolFault(ValueError):
     pass
 
 
+class RetryableSetup(RuntimeError):
+    """No request bytes were sent; the original slot may prepare again."""
+
+
+def retryable_setup(exc, stage):
+    if stage == 'cohort_dispatch':
+        return isinstance(exc, RetryableSetup)
+    return (stage == 'upstream_connect'
+            and isinstance(exc, (OSError, TimeoutError, asyncio.IncompleteReadError))
+            and not isinstance(exc, ssl.SSLCertVerificationError))
+
+
 async def read_head(reader, *, response=False):
     raw = await reader.readuntil(b'\r\n\r\n')
     if len(raw) > HEADER_LIMIT:
@@ -86,7 +99,11 @@ async def read_head(reader, *, response=False):
 
 def error_detail(exc, stage):
     """Bounded diagnostics made only from local constants, never server text."""
-    if isinstance(exc, ProtocolFault):
+    if isinstance(exc, RetryableSetup):
+        reason, kind = 'waiting for fifty live connections; no request was sent', 'RetryableSetup'
+    elif isinstance(exc, ssl.SSLCertVerificationError):
+        reason, kind = 'upstream TLS certificate verification failed', 'TLSVerificationError'
+    elif isinstance(exc, ProtocolFault):
         reason = str(exc) if str(exc) in SAFE_PROTOCOL_REASONS else 'HTTP protocol validation failed'
         kind = 'ProtocolFault'
     elif isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
@@ -99,7 +116,11 @@ def error_detail(exc, stage):
         reason, kind = 'connection or local storage operation failed', 'OSError'
     else:
         reason, kind = 'local request validation or processing failed', 'ValidationError'
-    return {'stage': stage, 'type': kind, 'reason': reason}
+    detail = {'stage': stage, 'type': kind, 'reason': reason}
+    number = getattr(exc, 'errno', None)
+    if type(number) is int and number in errno.errorcode:
+        detail.update(errno=number, errno_name=errno.errorcode[number])
+    return detail
 
 
 async def body_chunks(reader, headers, limit, *, require_length=False):
@@ -409,6 +430,9 @@ class BatchChannel:
         value = self.budget.snapshot()
         return {**value, 'fault': value['fault'] or self.wave_fault,
                 'forwarded': self.metrics['forwarded'], 'complete': self.metrics['complete'],
+                'upstream_in_flight': self.metrics['active'],
+                'preparing_connections': max(0, value['in_flight'] - self.metrics['active']),
+                'waiting_connections': len(self.waiting), 'first_wave_sent': self.first_wave_sent,
                 'last_error': dict(self.last_error) if self.last_error else None,
                 'slot_results': {str(slot): dict(result) for slot, result in self.slot_results.items()}}
 
@@ -434,9 +458,13 @@ class BatchChannel:
             raise AdmissionClosed('this is not the registered main native session')
 
     def dispatch_now(self, ticket):
-        reservation, writer, wire, client_reader, client_writer, ready = ticket
+        reservation, writer, wire, client_reader, client_writer, upstream_reader, ready = ticket
         if self.wave_fault or client_writer.is_closing() or client_reader.at_eof():
             raise AdmissionClosed(self.wave_fault or 'native client disconnected before dispatch')
+        if writer.is_closing() or upstream_reader is not None and upstream_reader.at_eof():
+            if self.budget.policy.attempt_mode == 'sustained':
+                raise RetryableSetup()
+            raise AdmissionClosed('upstream connection ended before dispatch')
         if self.dispatch_check is not None and not self.dispatch_check():
             raise AdmissionClosed('this batch is no longer authorized to start checks')
         self.budget.begin_dispatch(reservation)
@@ -462,22 +490,47 @@ class BatchChannel:
             if not ticket[-1].done():
                 ticket[-1].set_exception(AdmissionClosed(reason))
 
-    async def dispatch(self, reservation, writer, wire, client_reader, client_writer):
+    def discard_stale_waiters(self):
+        # A cancelled handler may finish its journal after a replacement has
+        # arrived. Remove only the exact old ticket; never clear another slot.
+        for slot, ticket in tuple(self.waiting.items()):
+            _, upstream, _, reader, writer, upstream_reader, ready = ticket
+            if (reader.at_eof() or writer.is_closing() or upstream.is_closing() or ready.done()
+                    or upstream_reader is not None and upstream_reader.at_eof()):
+                if self.waiting.get(slot) is ticket:
+                    self.waiting.pop(slot)
+                if not ready.done():
+                    ready.set_exception(RetryableSetup())
+
+    async def dispatch(self, reservation, writer, wire, client_reader, client_writer, *, upstream_reader=None):
         loop = asyncio.get_running_loop()
         ready = loop.create_future()
-        ticket = (reservation, writer, wire, client_reader, client_writer, ready)
+        ticket = (reservation, writer, wire, client_reader, client_writer, upstream_reader, ready)
         if self.first_wave_sent:
             self.dispatch_now(ticket)
             return
         if self.wave_fault:
             raise AdmissionClosed(self.wave_fault)
+        sustained = self.budget.policy.attempt_mode == 'sustained'
+        if sustained:
+            self.discard_stale_waiters()
         self.waiting[reservation.slot] = ticket
+        if sustained:
+            # The just-connected peer may already have sent FIN too. Inspect
+            # the complete set before the first write, including this ticket.
+            self.discard_stale_waiters()
         if len(self.waiting) == 50:
             tickets, self.waiting = self.waiting, {}
             if ((self.dispatch_check is not None and not self.dispatch_check())
                     or any(t[3].at_eof() or t[4].is_closing() or t[-1].done() for t in tickets.values())):
-                self.waiting = tickets
-                self.fail_wave('the fifty-slot cohort is no longer fully connected and authorized')
+                if sustained:
+                    for pending in tickets.values():
+                        if not pending[-1].done():
+                            pending[-1].set_exception(AdmissionClosed(
+                                'the fifty-slot cohort is no longer authorized'))
+                else:
+                    self.waiting = tickets
+                    self.fail_wave('the fifty-slot cohort is no longer fully connected and authorized')
                 return await ready
             # Fifty completed TCP/TLS connects form the first cohort. Write all
             # fifty before yielding to receive any upstream response.
@@ -491,15 +544,21 @@ class BatchChannel:
         try:
             await asyncio.wait_for(ready, self.cohort_timeout)
         except asyncio.TimeoutError:
+            if sustained:
+                raise RetryableSetup() from None
             self.fail_wave('fifty native checks did not become ready before the deadline')
             if ready.done() and not ready.cancelled():
                 ready.exception()
             raise AdmissionClosed(self.wave_fault)
         except asyncio.CancelledError:
-            self.fail_wave('a native check was cancelled before the fifty-slot cohort was ready')
+            if not sustained:
+                self.fail_wave('a native check was cancelled before the fifty-slot cohort was ready')
             if ready.done() and not ready.cancelled():
                 ready.exception()
             raise
+        finally:
+            if sustained and self.waiting.get(reservation.slot) is ticket:
+                self.waiting.pop(reservation.slot)
 
 
 class Gateway:
@@ -603,7 +662,8 @@ class Gateway:
             stage = 'upstream_connect'
             upstream_reader, upstream_writer = await asyncio.wait_for(channel.upstream.connect(), 20)
             stage = 'cohort_dispatch'
-            await channel.dispatch(reservation, upstream_writer, wire, reader, writer)
+            await channel.dispatch(reservation, upstream_writer, wire, reader, writer,
+                                   upstream_reader=upstream_reader)
             dispatched = True
             outcome = 'uncertain'
             await upstream_writer.drain()
@@ -643,7 +703,8 @@ class Gateway:
                 await self.reply(writer, 200, response_events(response), 'text/event-stream')
         except asyncio.CancelledError:
             if channel:
-                channel.fail_wave('native request cancelled before the initial cohort completed')
+                if channel.budget.policy.attempt_mode != 'sustained':
+                    channel.fail_wave('native request cancelled before the initial cohort completed')
                 channel.metrics['uncertain'] += int(dispatched or (reservation is not None
                     and reservation.number in channel.dispatched_numbers))
             raise
@@ -657,18 +718,34 @@ class Gateway:
         except (OSError, ValueError, RuntimeError, asyncio.TimeoutError,
                 asyncio.IncompleteReadError, asyncio.LimitOverrunError) as exc:
             detail = error_detail(exc, stage)
+            retry_setup = False
             if channel:
                 dispatched = dispatched or (reservation is not None
                     and reservation.number in channel.dispatched_numbers)
+                retry_setup = (channel.budget.policy.attempt_mode == 'sustained'
+                    and reservation is not None and not dispatched and retryable_setup(exc, stage))
                 channel.metrics['uncertain'] += int(dispatched)
                 if reservation is not None:
                     channel.record_result(reservation, outcome if dispatched else 'cancelled_before_dispatch', detail)
                 else:
                     channel.last_error = {**detail, 'at': time.time()}
-                if not channel.first_wave_sent:
+                if not channel.first_wave_sent and not retry_setup:
                     channel.fail_wave('first-wave setup failed; no partial substitute for fifty checks')
+            if retry_setup:
+                # Finish the unused reservation before replying. Otherwise a
+                # fast native retry could hit its predecessor's in-flight gate
+                # and become a non-retryable local 409 during a slow fsync.
+                if upstream_writer:
+                    upstream_writer.close()
+                try:
+                    await self.storage(channel.budget.finish, reservation, 'cancelled_before_dispatch')
+                    finished = True
+                except (OSError, ValueError, RuntimeError):
+                    retry_setup = False
             try:
-                await self.reject(writer, 502, 'The bounded API check did not complete (' +
+                await self.reject(writer, 503 if retry_setup else 502,
+                    ('Connection preparation failed before sending the API request. ' if retry_setup else '') +
+                    'The bounded API check did not complete (' +
                     detail['type'] + '; ' + detail['stage'] + '): ' + detail['reason'] + '.')
             except (OSError, RuntimeError):
                 pass

@@ -9,6 +9,7 @@ from collections import Counter
 import ctypes
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -239,10 +240,13 @@ def main():
                         help='send legal repeated Cookie/Vary fields on every local API response (N only)')
     parser.add_argument('--native-reconnect', action='store_true',
                         help='N only: native retry defaults, 5/5 viewport proof, >1000 requests and >150s before success')
+    parser.add_argument('--recover-setup-from', type=Path,
+                        help='N only: reproduce old setup 409 with this prior source, then repair the same fifty sessions')
     args = parser.parse_args()
     access_check = args.mode == 'access-check'
     assert not args.repeat_response_headers or access_check
     assert not args.native_reconnect or (access_check and args.verify_continuation)
+    assert not args.recover_setup_from or (access_check and args.native_reconnect and not args.workspace)
     private_check = args.mode != 'existing'
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -250,7 +254,12 @@ def main():
     assert not guard.AUTOMATIC_POOL_STOP and not guard.CONNECTION_CUT_ENABLED
     assert batch.COUNT == 50
     server = (AccessHTTPServer if access_check else ThreadingHTTPServer)(
-        ('127.0.0.1', 0), AccessHandler if access_check else Handler)
+        ('127.0.0.1', 0), AccessHandler if access_check else Handler,
+        bind_and_activate=not bool(args.recover_setup_from))
+    if args.recover_setup_from:
+        # Reserve the port without listening: the original gateway experiences
+        # a real TCP refusal, with no HTTP request to any provider.
+        server.server_bind()
     server.condition, server.active, server.peak = threading.Condition(), 0, 0
     server.requests = []
     server.fail_first = False
@@ -259,7 +268,9 @@ def main():
     server.sustained_probe = SustainedNativeProbe(output) if args.native_reconnect else None
     server.failed_sessions = set()
     server.failure_lock = threading.Lock()
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    server_started = not bool(args.recover_setup_from)
+    if server_started:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
     root = Path(tempfile.mkdtemp(prefix='ccc-b50-native-')).resolve()
     home = root / 'codex'
     home.mkdir()
@@ -294,6 +305,9 @@ def main():
                     for name in (*core.RUNTIME_FILES, 'cmux_supervisor_tui.py',
                                  'tools/batch_native_acceptance.py', 'tools/idle_session_native_acceptance.py',
                                  'tools/access_sustained_native_probe.py')}
+    if args.recover_setup_from:
+        source_files['tools/recover_access_setup.py'] = hashlib.sha256(
+            (source_root / 'tools/recover_access_setup.py').read_bytes()).hexdigest()
     record = {'phase': 'prepared', 'root': str(root), 'production_requests': 0,
               'automatic_pause': False, 'native_before': original, 'startup_mode': args.mode,
               'repeat_response_headers': args.repeat_response_headers,
@@ -305,6 +319,7 @@ def main():
     captured_waits = set()
     input_calls = []
     original_env = dict(os.environ)
+    original_ensure, previous_service = None, None
     try:
         name = 'CCC B50 本地验证·约2分钟后自动清理 ' + uuid.uuid4().hex[:12]
         record['fixture_name'] = name
@@ -365,19 +380,40 @@ def main():
             core.ConfigStore(config_path).mutate(exclude_original)
         options = ({'access_check': True, '_access_fixture': True} if access_check
                    else {'private_check': True} if private_check else {})
+        if args.recover_setup_from:
+            import ccc_access_service as access_service
+            old_path = args.recover_setup_from.resolve() / 'ccc_access_service.py'
+            spec = importlib.util.spec_from_file_location('ccc_acceptance_previous_service', old_path)
+            previous_service = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(previous_service)
+            record['previous_service_source'] = previous_service.fingerprint()
+            original_ensure = access_service.ensure_gateway
+            access_service.ensure_gateway = previous_service.ensure_gateway
         job = batch.start(config_path, wid, client=wrapped, launch=False, **options)
         if access_check:
-            from ccc_access_service import read_private, root as gateway_root
-            access_owner = read_private(gateway_root(config_path) / 'owner.json')
+            from ccc_access_service import ensure_gateway
+            access_owner = ensure_gateway(config_path)
         expected_prompt = batch.PROMPT if private_check else batch.LEGACY_PROMPT
         queue = native.QueueRecovery(root / 'ledger.json', root / 'missing-hooks', home / 'sessions', expected_prompt)
         worker = batch.BatchWorker(config_path, job['job_id'], client=wrapped, queue=queue)
         launch = worker._launch_command
         # Pin the provider environment again for every real B-created child;
         # shell startup files cannot route this fixture to a real account.
-        worker._launch_command = lambda slot: shlex.join([
-            '/usr/bin/env', *(key + '=' + value for key, value in overrides.items()),
-            '/bin/sh', '-c', launch(slot)])
+        def fixture_launch(slot):
+            command = launch(slot)
+            if args.recover_setup_from:
+                old_batch = args.recover_setup_from.resolve() / 'ccc_workspace_batch.py'
+                assert old_batch.read_bytes() == Path(batch.__file__).read_bytes()
+                argv = shlex.split(command)
+                original_path = str(Path(batch.__file__).resolve())
+                assert argv.count(original_path) == 1
+                argv[argv.index(original_path)] = str(old_batch)
+                # Native argv is constructed in this registered child, too.
+                # It must use the same original gateway as its parent worker.
+                command = shlex.join(argv)
+            return shlex.join(['/usr/bin/env', *(key + '=' + value for key, value in overrides.items()),
+                               '/bin/sh', '-c', command])
+        worker._launch_command = fixture_launch
         started, last_report = time.monotonic(), 0.0
         with core.FileLock(worker.path.parent / 'worker.lock', timeout_sec=0):
             worker.job.update(worker_pid=os.getpid(), worker_version=batch.WORKER_VERSION)
@@ -464,6 +500,45 @@ def main():
             time.sleep(.1)
         assert all(t and t['kind'] == 'task_complete'
                    and bool(t.get('error')) == args.verify_continuation for t in completions)
+        if args.recover_setup_from:
+            import ccc_access_service as access_service
+            from tools import recover_access_setup as repair
+            access_service.ensure_gateway = original_ensure
+            original_ensure = None
+            access_service._started_processes.update(previous_service._started_processes)
+            desc = access_service.read_private(worker.path.parent / 'access.json')
+            assert all(repair.terminal_failure(t, desc, s) for t, s in zip(completions, worker.job['slots']))
+            assert not server.requests, 'old setup fault must not have sent an HTTP request'
+            old_turns = {s['surface_id']: t for s, t in zip(worker.job['slots'], completions)}
+            core.atomic_write_json(output / 'original-local-409-turns.json', old_turns)
+            plan_path = output / 'setup-recovery-plan.json'
+            repair.prepare(config_path, job['job_id'], plan_path, client=client)
+            server.server_activate()
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            server_started = True
+            receipt = repair.apply(plan_path, output / 'setup-recovery-receipt.json', client=client)
+            access_owner = receipt['new_owner']
+            assert receipt['phase'] == 'resumed_requires_observation'
+            assert len(receipt['inputs']) == 50 and all(r.get('new_turn_id') for r in receipt['inputs'].values())
+            assert all(scope.matches(row) for row in owned)
+            record['setup_recovery'] = {'original_local_409_sessions': 50,
+                'same_native_sessions_resumed': 50, 'prior_http_requests': 0,
+                'original_port_retained': access_owner['port'] == desc['port'],
+                'original_instance_retained': access_owner['instance'] == desc['gateway_instance']}
+            # Also witness the repaired sessions exhausting normal native retry
+            # and then the real watcher continuing them, not only our one input.
+            complete_deadline = time.monotonic() + 180
+            while time.monotonic() < complete_deadline:
+                server.sustained_probe.sample(client, wid, worker.job['slots'])
+                completions = [native.task_snapshot(Path(s['transcript']), s['session_id']) for s in worker.job['slots']]
+                if all(t and t['kind'] == 'task_complete' and t.get('error')
+                       and t['turn_id'] != old_turns[s['surface_id']]['turn_id']
+                       for t, s in zip(completions, worker.job['slots'])):
+                    break
+                time.sleep(.1)
+            assert all(t and t['kind'] == 'task_complete' and t.get('error')
+                       and t['turn_id'] != old_turns[s['surface_id']]['turn_id']
+                       for t, s in zip(completions, worker.job['slots']))
         if access_check and args.repeat_response_headers and args.verify_continuation:
             deadline = time.monotonic() + 5
             while True:
@@ -572,6 +647,9 @@ def main():
             core.atomic_write_json(output / 'job.json', worker.job)
         raise
     finally:
+        if original_ensure is not None:
+            import ccc_access_service as access_service
+            access_service.ensure_gateway = original_ensure
         os.environ.clear()
         os.environ.update(original_env)
         if args.workspace and wid and worker:
@@ -619,12 +697,21 @@ def main():
             cache.close()
         if access_owner:
             from ccc_access_service import owner_alive, _started_processes
-            if owner_alive(access_owner, config_path):
-                os.kill(access_owner['pid'], signal.SIGTERM)
-                process = _started_processes.pop(access_owner['pid'], None)
-                if process:
-                    process.wait(timeout=10)
-        server.shutdown()
+            owners = [access_owner]
+            if args.recover_setup_from:
+                from ccc_access_service import read_private
+                owners += [read_private(p) for p in (config_path.parent / 'access-gateway').rglob('owner.json')]
+                _started_processes.update(previous_service._started_processes if previous_service else {})
+            stopped = set()
+            for owner in owners:
+                if owner['pid'] not in stopped and owner_alive(owner, config_path, check_runtime=False):
+                    os.kill(owner['pid'], signal.SIGTERM)
+                    stopped.add(owner['pid'])
+                    process = _started_processes.pop(owner['pid'], None)
+                    if process:
+                        process.wait(timeout=10)
+        if server_started:
+            server.shutdown()
         server.server_close()
         record['original_identity_changes_after_cleanup'] = [r for r in original if not scope.matches(r)]
         if record['original_identity_changes_after_cleanup']:
