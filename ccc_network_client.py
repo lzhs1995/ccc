@@ -267,6 +267,10 @@ def summary(snapshot):
         checked = time.strftime("%H:%M:%S", time.localtime(stamp)) if isinstance(stamp, (int, float)) and stamp > 0 else "尚未检测"
         prefix = f"AnyRouter {labels.get(phase, '启动中')}" + (f" · {selected}" if selected else "")
         result = f"{prefix} · {automatic['summary']} · 最近 {checked}"
+        manual = snapshot.get("manual_failover")
+        if isinstance(manual, dict) and manual.get("enabled") is True and isinstance(manual.get("summary"), str):
+            # Put actual-route protection before background candidate counts.
+            result = f"{prefix} · {manual['summary']} · {automatic['summary']} · 最近 {checked}"
         if not automatic.get("ready"):
             result += " · " + automatic.get("reason", "等待可达性检测")
         return result

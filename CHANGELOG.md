@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.29
+
+- Add explicit manual-route failover in anonymous reachability mode. Probe the actual selected fixed route, retain a healthy manual choice, and transfer the named service selector to its automatic child only after consecutive fresh failures and a newly verified replacement. Show actual manual protection before background candidate counts.
+- Bind each check to live proxy identities, fixed dialers, the configured provider, selector edges and physical-interface generation. Reject conflicting global/provider names and recheck the user's current selection before the single selector update. HTTP 401/429/500 remain reachable; the live HEAD check rejects 403 and transport failure using fresh URL-specific Mihomo health, not a generic delay/alive flag.
+- Share the four probe workers and prioritize the route carrying user traffic. Anonymous checks use no API key or model generation. Failover changes new connections without a Clash reload or connection deletion; existing streams retain their original path and broken remote streams use native retries.
+- Preserve original B/b, sustained N, its existing gateways and journals, and fixed non-AnyRouter routing. Manual failover requires an explicit policy and does not activate for legacy response-mode configurations.
+
 ## 0.2.28
 
 - Keep sustained N batches retryable after a connection failure before any request bytes are sent. Return a retryable 503 after durably completing the unused reservation, preserve the other waiting slots, and check every upstream reader for EOF before releasing the initial fifty requests. Finite batches and uncertain dispatched requests retain their existing limits.
