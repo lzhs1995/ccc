@@ -253,6 +253,8 @@ def start(config_path, selector, *, client=None, launch=True, private_check=Fals
             resume_success = (state.get("phase") == "stopped" and trip.get("connected") is True
                               and trip.get("within_deadline") is True)
         if (rule.get("paused") and not resume_success) or not rule.get("enabled", True):
+            if access_check:
+                raise RuntimeError("本池的暂停和原会话已保留；请在新的 workspace 使用节费50，不要为试用恢复本池旧批次")
             raise RuntimeError("本池已暂停；请先按 W 恢复，再创建或补做")
         cancel_epoch = rule.get("batch_cancelled_at")
         previous = core.load_json(job_path(config_path, rule["last_batch_id"]), {}) if rule.get("last_batch_id") else {}

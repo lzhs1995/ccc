@@ -30,6 +30,26 @@ class AccessServiceBoundaryTests(unittest.TestCase):
         self.environment.start()
         self.addCleanup(self.environment.stop)
 
+    def test_paused_check_keeps_old_job_and_directs_to_new_workspace(self):
+        import ccc_workspace_batch as batch
+        store = core.ConfigStore(self.config)
+        store.mutate(lambda c: c.update(mode='armed', global_paused=False))
+        old = batch.start(self.config, self.job['workspace_id'], launch=False)
+        store.mutate(lambda c: c['workspace_rules'][0].update(paused=True))
+        path = batch.job_path(self.config, old['job_id'])
+        before_config, before_job = self.config.read_bytes(), path.read_bytes()
+        with patch.object(service, 'ensure_gateway') as gateway, patch.object(batch, '_launch') as launch:
+            with self.assertRaisesRegex(RuntimeError, '新的 workspace') as error:
+                batch.start(self.config, self.job['workspace_id'], access_check=True)
+            self.assertNotIn(' W ', str(error.exception))
+            for private in (False, True):
+                with self.assertRaisesRegex(RuntimeError, '按 W 恢复'):
+                    batch.start(self.config, self.job['workspace_id'], private_check=private)
+            gateway.assert_not_called()
+            launch.assert_not_called()
+        self.assertEqual(self.config.read_bytes(), before_config)
+        self.assertEqual(path.read_bytes(), before_job)
+
     @unittest.skipIf(__import__('sys').version_info < (3, 11), 'new mode explicitly requires stdlib tomllib')
     def test_prepare_and_launch_only_override_this_invocation(self):
         before = self.native_config.read_bytes()
