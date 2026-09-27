@@ -3,6 +3,10 @@ from pathlib import Path
 import shlex
 import stat
 import tempfile
+try:
+    import tomllib
+except ModuleNotFoundError:  # Test-only parser for the supported Python 3.10 runner.
+    import tomli as tomllib
 import unittest
 import uuid
 from unittest.mock import Mock, patch
@@ -123,12 +127,23 @@ class BatchWorkingDirectoryTests(unittest.TestCase):
             batch.prepare_working_directory(self.config, self.job, 0)
         self.assertFalse((parent / "0").exists())
 
-    def test_legacy_jobs_keep_their_original_context(self):
+    def test_original_B_keeps_the_directory_and_grants_invocation_only_trust(self):
         self.job.pop("cwd_policy")
         self.assertIsNone(batch.prepare_working_directory(self.config, self.job, 0))
-        self.assertEqual(batch.workspace_launch_context(self.config, self.job, 0), (None, []))
-        self.assertNotIn("--cd", self.command())
+        inherited = self.root / 'original "quoted" directory.with-dots'
+        inherited.mkdir()
+        sentinel = inherited / "notes.txt"
+        sentinel.write_text("preserve original data")
+        with patch.object(Path, "cwd", return_value=inherited):
+            args = self.command()
+        self.assertEqual(args[args.index("--cd") + 1], str(inherited))
+        trust = next(value for value in args if value.startswith("projects="))
+        self.assertEqual(tomllib.loads(trust), {
+            "projects": {str(inherited): {"trust_level": "trusted"}}})
+        self.assertEqual(list(inherited.iterdir()), [sentinel])
+        self.assertEqual(sentinel.read_text(), "preserve original data")
         self.assertFalse((self.job_dir / "work").exists())
+        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", args)
 
     def test_unknown_policy_does_not_silently_fall_back_to_the_user_home(self):
         self.job["cwd_policy"] = "unrecognized"

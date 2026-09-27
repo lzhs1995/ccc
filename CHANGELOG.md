@@ -2,9 +2,12 @@
 
 ## 0.2.24
 
+- Make original B authorize folder access for the exact inherited directory in that native invocation, including first-time home-directory launches. Keep the directory and original prompt, and do not change global Codex trust or approval settings. Native B50 acceptance starts from an untrusted directory and checks all 50 original-session continuations.
 - Recognize Codex's pathless global AGENTS context when confirming the original B startup prompt. Explicit user events, malformed context and appended human text remain separate input and cannot grant continuation.
 - Revalidate saved `different user prompt` startup blocks against the original session, transcript identity, submission offset and task. Persist bounded progress, keep the old rejection as evidence, and release only the confirmed slot's startup hold without replaying its prompt or changing operator pauses and exclusions.
 - Cache batch reconciliation's validated configuration while its file identity is unchanged; check for changes at every authorization boundary. Skip fully confirmed completed jobs, bound idle worker caches, and read UI batch summaries only for visible workspaces while retaining all history.
+- Share and index each native binding-file generation across historical B workers instead of repeatedly decoding the full archive. Detect replacement, deletion and malformed files on every use; keep fresh native identity and send checks. Share the existing fleet snapshot and preserve bytes/mtime of unchanged historical jobs after worker eviction.
+- Expose the existing empty-directory short-answer policy as a separate `b` button/key, with explicit confirmation and the persisted mode shown in progress. Preserve uppercase `B`, unfinished batch policies and both automatic-pause/cut switches OFF. This opt-in startup avoids the first folder-trust dialog without trusting the user's home or changing global Codex configuration.
 - Extend real native B50 acceptance to fail every initial turn on a private loopback API and require exactly one CCC continuation in each original session. Keep the default prompt, working directory, automatic pause OFF and network behavior unchanged.
 
 ## 0.2.23

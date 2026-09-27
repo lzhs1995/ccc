@@ -125,7 +125,8 @@ requests. The selected workspace has clickable controls (the same keys work):
 - `w` 整池授权：覆盖该池现有和后续 Codex，保留单路排除。
 - `P` 暂停 + Interrupt：先落盘停止整池续跑、取消批量创建，再向本池 Codex 请求 Escape；保留原 session。未确认的进程或投递单独报失败。
 - `W` 恢复整池：恢复续跑，保留单路暂停、排除；不会自行重启被取消的创建任务。
-- `B` 新开50 + 授权：保留原有模式，在选定 workspace 的主区域 pane 新建最多50个后台 Codex 标签页。继承原工作目录，确认原 session 和空输入框后发送一次 `show me u power`；Folder access 等确认仍由用户处理。自动切断保持关闭。
+- `B` 新开50 + 授权：在选定 workspace 的主区域 pane 新建最多50个后台 Codex 标签页。继承原工作目录，并在本次启动中信任该精确目录，自动通过 Folder access；不写全局信任配置。确认原 session 和空输入框后发送一次 `show me u power`。自动切断保持关闭。
+- `b` 空目录50（试用）：单独选择空目录短答模式。新批次每路使用独立空目录，仅在该次启动信任该目录，并请求只回复 `OK`；未完成旧批次继续原模式，界面显示实际模式。自动暂停、自动切断保持关闭。
 
 `B` requires global sending to be enabled and the selected pool to be unpaused.
 It never changes another pool or silently clears existing pauses. At most four
@@ -139,7 +140,7 @@ After all 50 slots finish, another confirmed `B` starts a new batch. Jobs run in
 the background and survive closing the panel; `P` cancels their authorization.
 CLI equivalent: `ccc batch-workspace FULL_WORKSPACE_UUID`.
 
-The optional `ccc batch-workspace FULL_WORKSPACE_UUID --private-check` selects
+The separate `b` button/key, or `ccc batch-workspace FULL_WORKSPACE_UUID --private-check`, selects
 an experimental startup policy for a **new** batch. Each slot uses its own empty
 private directory with invocation-only trust. B confirms the original fresh
 session, names it locally with `/rename` to avoid an extra model title request,
@@ -153,6 +154,14 @@ settings still contribute context. This mode has local startup/request-count
 validation, not proof of improved AnyRouter admission. It does not change the
 model/reasoning setting, credential, automatic pause, native retries or another
 workspace.
+
+Historical batch reconciliation shares a native binding index while its exact
+file generation is unchanged, and selects records by workspace/surface UUID.
+Every use checks the file identity; a missing, corrupt or replaced file cannot
+reuse a stale binding. Native writer and input authorization checks still run
+independently. Idle historical workers share the fleet snapshot and do not
+rewrite unchanged jobs, so a large archive does not multiply JSON parsing or
+memory use. Batch history and delivery records remain on disk.
 
 Codex 0.154 creates its first rollout only after the first prompt. For a newly
 created batch slot, CCC verifies the native writer lock's new session UUID and

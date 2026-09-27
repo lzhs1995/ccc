@@ -32,7 +32,7 @@ from ccc_inventory import SharedInventory
 from ccc_scheduling import SnapshotCache, SnapshotClient
 
 COUNT = 50
-WORKER_VERSION = 25
+WORKER_VERSION = 26
 LEGACY_PROMPT = "show me u power"
 PROMPT = "Reply only OK. Do not use tools. End the turn."
 EMPTY_CWD_POLICY = "private-empty-v1"
@@ -110,7 +110,10 @@ def snapshots(config_path, config, *, workspace_ids=None):
         if jid:
             try:
                 job = core.load_json(job_path(config_path, jid), {})
-                result[rule["workspace_id"]] = {"id": jid, "status": job.get("status"), **counts(job)}
+                result[rule["workspace_id"]] = {
+                    "id": jid, "status": job.get("status"),
+                    "startup_mode": "private_check" if job.get("cwd_policy") == EMPTY_CWD_POLICY else "existing",
+                    **counts(job)}
                 if rule.get("batch_guard"):
                     from ccc_batch_guard import snapshot
                     result[rule["workspace_id"]]["protection"] = snapshot(config_path, rule["workspace_id"])
@@ -309,7 +312,7 @@ def working_directory(config_path, job_id, index):
 
 def prepare_working_directory(config_path, job, index):
     if job.get("cwd_policy") is None:
-        return None  # An existing batch keeps its original launch context.
+        return None  # Original B does not create or clean the inherited cwd.
     if job["cwd_policy"] != EMPTY_CWD_POLICY:
         raise RuntimeError("unknown B working-directory policy")
     directory = working_directory(config_path, job["id"], index)
@@ -327,12 +330,16 @@ def prepare_working_directory(config_path, job, index):
 
 
 def workspace_launch_context(config_path, job, index):
-    """Only this native invocation trusts the exact CCC-created working root."""
+    """The explicit B action grants this invocation access to its exact cwd."""
     if job.get("cwd_policy") is None:
-        return None, []
-    if job["cwd_policy"] != EMPTY_CWD_POLICY:
+        # Resolve inside the registered terminal, immediately before exec.
+        # B inherits that terminal's directory; it must not stop at a folder
+        # confirmation after the operator already authorized the batch.
+        directory = Path.cwd().resolve(strict=True)
+    elif job["cwd_policy"] == EMPTY_CWD_POLICY:
+        directory = working_directory(config_path, job["id"], index)
+    else:
         raise RuntimeError("unknown B working-directory policy")
-    directory = working_directory(config_path, job["id"], index)
     # CLI dotted keys do not parse quoted path components. Use a TOML inline
     # table instead; no trust entry is written into the user's config.toml.
     trust = "projects={" + json.dumps(str(directory), ensure_ascii=False) + '={trust_level="trusted"}}'
@@ -520,9 +527,12 @@ class BatchWorker:
         self.store = core.ConfigStore(self.config_path)
         self.job = core.load_json(self.path, {})
         self.cache = SnapshotCache(workers=1)
-        self.inventory = SharedInventory(self.config_path.parent)
         self.client = client or SnapshotClient(_client(self.store.load()), self.cache,
                                                SharedInventory(self.config_path.parent))
+        # Reconciliation adapters share their client's fleet snapshot. Retaining
+        # a separate parsed top for each historical job multiplied memory use.
+        self.inventory = (self.client.shared if isinstance(self.client, SnapshotClient)
+                          and self.client.shared is not None else SharedInventory(self.config_path.parent))
         self.queue = queue or QueueRecovery(self.path.parent / "unused-queue-ledger.json",
             Path.home() / ".cmuxterm/codex-hook-sessions.json", Path.home() / ".codex/sessions", job_prompt(self.job))
         self.processes = {}
@@ -531,7 +541,7 @@ class BatchWorker:
         self.pty_probe = pty_probe or pty_available
         self.name_lookup = native_thread_name
         self._top_due = 0.0
-        self._saved = None
+        self._saved = self._serialized_job()
         self._shell_hints = {}
 
     def _process_label(self, target):
@@ -575,9 +585,12 @@ class BatchWorker:
             return {"agent_kind": "codex", "agent_pids": [slot["pid"]]}
         return {"agent_kind": "unknown", "summary": "process lookup unavailable"}
 
-    def save(self):
+    def _serialized_job(self):
         value = {k: v for k, v in self.job.items() if k != "updated_at"}
-        serialized = json.dumps(value, sort_keys=True)
+        return json.dumps(value, sort_keys=True)
+
+    def save(self):
+        serialized = self._serialized_job()
         if serialized == self._saved:
             return
         self.job["updated_at"] = self.clock()
@@ -1522,6 +1535,10 @@ class BatchReconciler:
                         continue
                     worker = self._worker(jid)
                     worker.job = job
+                    # This is the snapshot just read under worker.lock. A
+                    # recreated idle adapter must not rewrite unchanged jobs;
+                    # later proof/receipt changes still require a durable save.
+                    worker._saved = worker._serialized_job()
                     if allowed(current_config, job) and any(s.get("phase") == "surface_closed" for s in job.get("slots", [])):
                         if membership is None:
                             membership = self.client.fresh_tree() if isinstance(self.client, SnapshotClient) else self.client.tree()
