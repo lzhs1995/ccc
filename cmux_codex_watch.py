@@ -61,7 +61,7 @@ DEFAULT_LABEL = f"{LABEL_PREFIX}.{APP_NAME}"
 PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_APP_DIR = Path.home() / "Library" / "Application Support" / APP_NAME
 DEFAULT_RUNTIME_ROOT = DEFAULT_APP_DIR / "runtime"
-RUNTIME_FILES = ("cmux_codex_watch.py", "claude_ccc_protocol.py", "claude_ccc_event_hook.py", "ccc_observation.py", "ccc_scheduling.py", "ccc_codex_queue.py", "ccc_codex_goal.py", "ccc_workspace_batch.py", "ccc_inventory.py", "ccc_batch_guard.py", "ccc_guard_transport.py", "ccc_guard_watchdog.py", "ccc_guard_scope.py", "ccc_guard_migration.py", "ccc_codex_launcher.py", "ccc_network_client.py", "ccc_network_guard.py", "ccc_mihomo.py", "ccc_native_processes.py")
+RUNTIME_FILES = ("cmux_codex_watch.py", "claude_ccc_protocol.py", "claude_ccc_event_hook.py", "ccc_observation.py", "ccc_scheduling.py", "ccc_codex_queue.py", "ccc_codex_goal.py", "ccc_workspace_batch.py", "ccc_inventory.py", "ccc_batch_guard.py", "ccc_guard_transport.py", "ccc_guard_watchdog.py", "ccc_guard_scope.py", "ccc_guard_migration.py", "ccc_codex_launcher.py", "ccc_network_client.py", "ccc_network_guard.py", "ccc_mihomo.py", "ccc_native_processes.py", "ccc_access_budget.py", "ccc_access_gateway.py", "ccc_access_service.py")
 DEFAULT_LOG_DIR = Path.home() / "Library" / "Logs" / APP_NAME
 DEFAULT_CONFIG_PATH = DEFAULT_APP_DIR / "config.json"
 DEFAULT_STATE_PATH = DEFAULT_APP_DIR / "state.json"
@@ -6317,6 +6317,9 @@ class WatchDaemon:
                 or str(current.get("workspace_id")) != str(target.get("workspace_id"))
                 or str(target["surface_id"]) in self._local_paused_surface_ids):
             return None
+        from ccc_access_service import continuation_allowed
+        if not continuation_allowed(self.config_path, self.config, current):
+            return None
         sid = str(target["surface_id"])
         if sid == str(self.config.get("manager_surface_id") or ""):
             return None
@@ -10534,8 +10537,11 @@ def build_parser() -> argparse.ArgumentParser:
         item = sub.add_parser(command)
         item.add_argument("workspace")
         if command == "batch-workspace":
-            item.add_argument("--private-check", action="store_true",
+            choices = item.add_mutually_exclusive_group()
+            choices.add_argument("--private-check", action="store_true",
                               help="opt in to empty private directories and short named checks; default keeps existing B behavior")
+            choices.add_argument("--access-check", action="store_true",
+                              help="opt in to 50 concurrent finite API checks; stop new checks after a complete answer")
     discover = sub.add_parser("discover")
     discover.add_argument("workspace")
     exclude = sub.add_parser("exclude")
@@ -10787,7 +10793,8 @@ def cli(argv: Sequence[str] | None = None) -> int:
         return 1 if result["failed"] else 0
     if args.command == "batch-workspace":
         from ccc_workspace_batch import start
-        print(json.dumps(start(config_path, args.workspace, private_check=args.private_check), ensure_ascii=False, indent=2))
+        print(json.dumps(start(config_path, args.workspace, private_check=args.private_check,
+                               access_check=args.access_check), ensure_ascii=False, indent=2))
         return 0
     if args.command == "resume-workspace":
         def resume_pool(latest):

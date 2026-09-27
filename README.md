@@ -127,6 +127,7 @@ requests. The selected workspace has clickable controls (the same keys work):
 - `W` 恢复整池：恢复续跑，保留单路暂停、排除；不会自行重启被取消的创建任务。
 - `B` 新开50 + 授权：在选定 workspace 的主区域 pane 新建最多50个后台 Codex 标签页。继承原工作目录，并在本次启动中信任该精确目录，自动通过 Folder access；不写全局信任配置。确认原 session 和空输入框后发送一次 `show me u power`。自动切断保持关闭。
 - `b` 空目录50（试用）：单独选择空目录短答模式。新批次每路使用独立空目录，仅在该次启动信任该目录，并请求只回复 `OK`；未完成旧批次继续原模式，界面显示实际模式。自动暂停、自动切断保持关闭。
+- `N` 节费50（独立试用，Python 3.11+）：保留50路实际并发，以固定短请求检查 API；每批最多1000次HTTP尝试，每次申请最多128个输出token。一条完整回复后不再新增检查，在途请求自然结束。不会自动 Interrupt，也不改原B。
 
 `B` requires global sending to be enabled and the selected pool to be unpaused.
 It never changes another pool or silently clears existing pauses. At most four
@@ -154,6 +155,37 @@ settings still contribute context. This mode has local startup/request-count
 validation, not proof of improved AnyRouter admission. It does not change the
 model/reasoning setting, credential, automatic pause, native retries or another
 workspace.
+
+`ccc batch-workspace FULL_WORKSPACE_UUID --access-check` selects the separate
+`N` mode for a new batch. Its private loopback gateway drops native history,
+skills, title prompts and tools before contacting the configured provider.
+Only the registered main session for each slot can submit a check. All 50 native
+sessions are first initialized, named and bound without model requests. Only
+then are their prompts released and the gateway forms a 50-connection cohort;
+the HTTP deadline does not include minutes spent waiting for native startup
+capacity across 10–20 workspaces. Concurrency is never silently reduced.
+Durable HTTP reservations include native retries and do not refund after
+cancellation or restart. An unresolved restart closes the batch. A complete
+assistant response closes admission inside the stream parser before storage
+or the supervisor scan. Existing in-flight checks may still finish and cost
+money; this is not the disabled automatic interrupt feature.
+Missing or inconsistent persisted mode records prevent startup, rather than
+falling back to the original provider. Cached sending authorization expires
+after one second even when a configuration read or status write is blocked.
+One dedicated configuration reader keeps authorization refresh independent of
+the four journal/status storage workers.
+
+The finite HTTP count is enforced locally. `max_output_tokens=128` is a request
+to the upstream, not a guarantee of its billing policy. No successful response,
+missing usage, model tool call or automatic title can bypass the request gate.
+If a provider rejects the output limit, the gateway does not remove it and try
+an unlimited request. A successful check does not reserve or transfer an API
+queue position to another session. Use a normal task session for actual work;
+these check tabs intentionally cannot forward arbitrary task context.
+
+An empty directory reduces accidental task context; `~` is the user's home,
+not an empty filesystem root. Do not clean the user's home for this purpose.
+The original B remains available until the separate mode is manually accepted.
 
 Historical batch reconciliation shares a native binding index while its exact
 file generation is unchanged, and selects records by workspace/surface UUID.
