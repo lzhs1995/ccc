@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 import uuid
+import weakref
 
 
 def epoch(value):
@@ -509,13 +510,86 @@ class NativeCompletionWatcher:
             self.thread.join()
 
 
+class _BindingRecords(dict):
+    """Index a single immutable file generation by exact surface/workspace."""
+    def __init__(self, records):
+        super().__init__(records)
+        self.by_target = {}
+        for sid, record in records.items():
+            if not isinstance(sid, str) or not isinstance(record, dict):
+                raise ValueError("invalid native session binding")
+            surface, workspace = record.get("surfaceId"), record.get("workspaceId")
+            if isinstance(surface, str) and isinstance(workspace, str):
+                self.by_target.setdefault((surface, workspace), []).append((sid, record))
+
+
+def _selected_bindings(records, targets):
+    if isinstance(records, _BindingRecords):
+        return (item for target in targets for item in records.by_target.get(target, ()))
+    # Injected clients and legacy tests can still supply an ordinary mapping.
+    return ((sid, record) for sid, record in records.items()
+            if (record.get("surfaceId"), record.get("workspaceId")) in targets)
+
+
+class _BindingFile:
+    """Share advisory bindings, never a cached permission to send input.
+
+    Reconciled historical jobs used to each retain and reparse the same large
+    hook index every two seconds. File identity is checked on every use here;
+    missing, malformed or concurrently replaced files never reuse old data.
+    Actual native process, transcript and send checks remain uncached.
+    """
+    def __init__(self, path):
+        self.path, self.lock = Path(path), threading.RLock()
+        self.signature, self.value = None, None
+
+    @staticmethod
+    def stamp(info):
+        return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+    def read(self):
+        with self.lock:
+            before = self.stamp(self.path.stat())
+            if before == self.signature:
+                return self.value
+            with self.path.open("rb") as handle:
+                opened = self.stamp(os.fstat(handle.fileno()))
+                data = handle.read()
+                if opened != before or self.stamp(os.fstat(handle.fileno())) != opened:
+                    raise OSError("native session bindings changed while reading")
+            document = json.loads(data)
+            if not isinstance(document, dict) or not isinstance(document.get("sessions", {}), dict):
+                raise ValueError("invalid native session bindings")
+            records = _BindingRecords(document.get("sessions", {}))
+            if self.stamp(self.path.stat()) != opened:
+                raise OSError("native session bindings replaced while reading")
+            self.signature, self.value = opened, records
+            return records
+
+
+_binding_files_lock = threading.Lock()
+_binding_files = weakref.WeakValueDictionary()
+
+
+def _shared_binding_file(path):
+    # Keep the pathname, not its resolved symlink target, so replacements are
+    # noticed. Weak entries disappear with their last QueueRecovery owner.
+    key = str(Path(path).absolute())
+    with _binding_files_lock:
+        value = _binding_files.get(key)
+        if value is None:
+            value = _BindingFile(key)
+            _binding_files[key] = value
+        return value
+
+
 class QueueRecovery:
     def __init__(self, ledger, bindings, sessions_root, message):
         self.ledger, self.bindings, self.sessions_root = Path(ledger), Path(bindings), Path(sessions_root)
         self.message = message
         self.lock = threading.RLock()
         self.next_probe = {}
-        self.binding_cache = (0.0, {})
+        self._binding_file = _shared_binding_file(self.bindings)
         self.process_lookup = None
         self.guard_config_path = None
         self.open_file_cache = {}
@@ -532,12 +606,7 @@ class QueueRecovery:
             self.attempts = None  # A broken delivery record cannot be reset.
 
     def records(self):
-        with self.lock:
-            now = time.monotonic()
-            if now - self.binding_cache[0] > 2:
-                data = json.loads(self.bindings.read_text()).get("sessions", {})
-                self.binding_cache = (now, data)
-            return self.binding_cache[1]
+        return self._binding_file.read()
 
     def wakeup_sources(self, targets):
         """Latest known original transcript for each currently enabled UUID."""
@@ -554,7 +623,7 @@ class QueueRecovery:
                            "session_id": sid, "path": r.get("transcriptPath"),
                            "pid": r.get("pid"),
                            "process_start": r.get("pidStartSeconds", 0)}
-                          for sid, r in records.items())
+                          for sid, r in _selected_bindings(records, set(active.items())))
         chosen = {}
         root_key = str(self.sessions_root)
         if self.wakeup_root_cache[0] != root_key:
@@ -635,7 +704,7 @@ class QueueRecovery:
         except (OSError, ValueError):
             return {"kind": "unknown"}
         matches = []
-        for sid, record in records.items():
+        for sid, record in _selected_bindings(records, {(target["surface_id"], target["workspace_id"])}):
             if (record.get("surfaceId") != target["surface_id"]
                     or record.get("workspaceId") != target["workspace_id"]):
                 continue

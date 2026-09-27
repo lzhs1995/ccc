@@ -311,6 +311,26 @@ class BatchHistoryCostTests(unittest.TestCase):
         self.assertIsNone(reconciler._config_cache)
         self.assertTrue(reconciler._config()['global_paused'])
 
+    def test_unchanged_history_survives_idle_adapter_eviction_without_rewrites(self):
+        rules, originals = [], {}
+        for _ in range(batch.RECONCILE_CACHE_LIMIT + 5):
+            jid, wid = str(uuid.uuid4()), str(uuid.uuid4())
+            path = batch.job_path(self.config, jid)
+            core.atomic_write_json(path, {'id': jid, 'workspace_id': wid,
+                                         'status': 'workspace_closed', 'updated_at': 10,
+                                         'slots': [{'index': 0, 'phase': 'pending'}]})
+            originals[path] = (path.read_bytes(), path.stat().st_mtime_ns)
+            rules.append({'workspace_id': wid, 'last_batch_id': jid})
+        self.store.mutate(lambda c: c['workspace_rules'].extend(rules))
+        reconciler = batch.BatchReconciler(self.config, self.client, launch=False)
+        self.addCleanup(lambda: [worker.cache.close() for worker in reconciler.workers.values()])
+        for _ in range(2):
+            reconciler.cycle()
+        for path, (data, mtime) in originals.items():
+            self.assertEqual(path.read_bytes(), data)
+            self.assertEqual(path.stat().st_mtime_ns, mtime)
+        self.assertEqual(self.client.sent, [])
+
 
 if __name__ == '__main__':
     unittest.main()

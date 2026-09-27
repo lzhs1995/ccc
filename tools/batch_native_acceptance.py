@@ -15,6 +15,7 @@ import shlex
 import tempfile
 import threading
 import time
+import tomllib
 import sys
 import uuid
 
@@ -92,7 +93,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--mode', choices=('private-check', 'existing'), default='private-check',
-                        help='existing verifies the default B after fixture-only folder trust')
+                        help='existing verifies default B including first-time folder trust')
     parser.add_argument('--verify-continuation', action='store_true',
                         help='fail every original first turn; require real CCC continuation in all 50 sessions')
     args = parser.parse_args()
@@ -118,7 +119,7 @@ def main():
     (home / 'config.toml').write_text(
         'model = "gpt-6-astra"\nmodel_provider = "local_fixture"\n'
         'approval_policy = "never"\nsandbox_mode = "read-only"\ncheck_for_update_on_startup = false\n'
-        + ('' if private_check else 'projects = {' + json.dumps(str(root)) + ' = {trust_level="trusted"}}\n') +
+        +
         '[tui]\nscreen_reader_detection_done = true\n'
         '[features]\nplugins = false\napps = false\nhooks = false\nskip_host_skill_discovery = true\n'
         '[model_providers.local_fixture]\nname = "Loopback fixture"\nwire_api = "responses"\n'
@@ -255,11 +256,12 @@ def main():
         for slot in worker.job['slots']:
             expected = batch.working_directory(config_path, worker.job['id'], slot['index']) if private_check else root
             native_argv = native_arguments[slot['pid']]
+            assert '--cd' in native_argv and native_argv[native_argv.index('--cd') + 1] == str(expected)
+            trust = [a for a in native_argv if a.startswith('projects=')]
+            assert len(trust) == 1 and tomllib.loads(trust[0]) == {
+                'projects': {str(expected): {'trust_level': 'trusted'}}}
             if private_check:
-                assert '--cd' in native_argv and native_argv[native_argv.index('--cd') + 1] == str(expected)
                 assert expected.is_dir() and not any(expected.iterdir())
-            else:
-                assert '--cd' not in native_argv and not any(a.startswith('projects=') for a in native_argv)
             with Path(slot['transcript']).open() as transcript:
                 metadata = json.loads(transcript.readline())
             assert metadata['type'] == 'session_meta' and Path(metadata['payload']['cwd']).resolve() == expected
@@ -324,7 +326,7 @@ def main():
                       local_requests=len(server.requests), primary_requests=len(primary), native_title_requests=len(titles),
                       original_native_retained=len(original), native_owned=owned,
                       working_directories=working_roots, persistent_trust_config_unchanged=True,
-                      pretrusted_fixture_directory=not private_check, completed_responses=50,
+                      pretrusted_fixture_directory=False, completed_responses=50,
                       named_before_model_request=private_check, legacy_prompt_preserved=not private_check)
         if private_check:
             record['distinct_empty_working_directories'] = working_roots

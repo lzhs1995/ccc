@@ -2268,6 +2268,11 @@ def batch_pause_policy() -> str:
             if AUTOMATIC_POOL_STOP and CONNECTION_CUT_ENABLED else "自动暂停已关闭")
 
 
+def private_batch_prompt(pool: str) -> str:
+    return (f"确认在 {pool} 试用空目录50+授权？每路独立空目录，只请求回复 OK；"
+            f"未完成旧批次仍用原模式；{batch_pause_policy()}")
+
+
 def confirm_prompt(action: str, candidate: Candidate, *, live_codex: int | None = None) -> str:
     location = f"{candidate.workspace_ref}/{candidate.ref}"
     if action == "pause_workspace":
@@ -2276,6 +2281,8 @@ def confirm_prompt(action: str, candidate: Candidate, *, live_codex: int | None 
         return f"确认恢复 {candidate.workspace_ref} 的整池监控？保留原会话，不补开已取消名额；保留单路暂停和排除设置"
     if action == "batch_workspace":
         return f"确认在 {candidate.workspace_ref} 新开50个Codex并整池授权？每路发送 show me u power；{batch_pause_policy()}"
+    if action == "private_batch_workspace":
+        return private_batch_prompt(candidate.workspace_ref)
     if action == "workspace":
         title = str(candidate.record.get("workspace_title") or "").strip()
         pool = f"{candidate.workspace_ref}{f'「{title}」' if title else ''}"
@@ -2317,6 +2324,8 @@ def workspace_confirm_prompt(row: ViewRow, action: str, *, live_codex: int | Non
         return f"确认恢复 {pool} 整池监控？保留原会话，不补开已取消名额；保留单路暂停和排除设置"
     if action == "batch_workspace":
         return f"确认在 {pool} 新开50个Codex并整池授权？每路发送 show me u power；{batch_pause_policy()}"
+    if action == "private_batch_workspace":
+        return private_batch_prompt(pool)
     if action == "untrack_workspace":
         return f"确认取消整个 {pool} 授权？该池将不再自动续跑"
     count = row.counts.get("all", 0) if live_codex is None else live_codex
@@ -2715,6 +2724,8 @@ class SupervisorModel:
             return self.run_cli([action.replace("_", "-"), candidate.record["workspace_id"]])
         elif action == "batch_workspace":
             self.run_cli(["batch-workspace", candidate.record["workspace_id"]])
+        elif action == "private_batch_workspace":
+            self.run_cli(["batch-workspace", candidate.record["workspace_id"], "--private-check"])
         elif action == "pause":
             if candidate.source in {"workspace_rule", "workspace_starting", "workspace_excluded"}:
                 self.run_cli(["exclude", surface_id])
@@ -2753,6 +2764,8 @@ class SupervisorModel:
             return self.run_cli([action.replace("_", "-"), row.workspace_id])
         elif action == "batch_workspace":
             self.run_cli(["batch-workspace", row.workspace_id])
+        elif action == "private_batch_workspace":
+            self.run_cli(["batch-workspace", row.workspace_id, "--private-check"])
         else:
             raise RuntimeError("组头只支持 w 授权整池 · u 取消整池 · Tab 折叠")
 
@@ -4042,7 +4055,7 @@ def group_action_error(row: ViewRow, action: str) -> str:
     Checked before the confirmation box: a prompt that asks you to confirm an
     action which is about to be refused teaches you to distrust the prompt.
     """
-    if action not in {"workspace", "untrack_workspace", "pause_workspace", "resume_workspace", "batch_workspace"}:
+    if action not in {"workspace", "untrack_workspace", "pause_workspace", "resume_workspace", "batch_workspace", "private_batch_workspace"}:
         return f"这是 {row.workspace_ref} 的组头。整池用 w / u，单路请先按 j 进到组里"
     pooled = has_pool_rule(row)
     if action in {"pause_workspace", "resume_workspace"} and not pooled:
@@ -4059,14 +4072,14 @@ def view_row_attr(row: ViewRow) -> int:
 
 
 GLOBAL_KEYS_1 = "↑↓ jk 移动  Tab 折/展  z/Z 全折/展  [ ] 跳 workspace  / 查找  c 清除  y 复制ID（也可点击ID）"
-GLOBAL_KEYS_2 = "P 整池停 W 整池恢复  f 筛选 R 刷新 G 存储 v 三件套 e 配置 A 开启发 S 停发 d 观察 q 退出"
+GLOBAL_KEYS_2 = "b 空目录短答50  f 筛选 R 刷新 G 存储 v 三件套 e 配置 A 开启发 S 停发 d 观察 q 退出"
 
 
 def workspace_buttons():
     column = 0
     result = []
     for key, label in (("w", "整池授权"), ("P", "暂停+Interrupt"),
-                       ("B", "新开50+授权"), ("W", "恢复整池")):
+                       ("B", "新开50+授权"), ("W", "恢复整池"), ("b", "空目录50")):
         text = f"[{key} {label}]"
         result.append((ord(key), column, column + display_width(text), text))
         column += display_width(text) + 2
@@ -4301,7 +4314,8 @@ def _draw(
     elif status:
         _safe_addnstr(stdscr, at["message"], 0, status, clip, attr("error"))
     elif focus and (batch := getattr(model, "batch_jobs", {}).get(focus.workspace_id)):
-        progress = (f"批量50 {batch['status']} | 创建 {batch['created']}/50 | 就绪 {batch['ready']} | "
+        mode = "空目录短答50" if batch.get("startup_mode") == "private_check" else "原B50"
+        progress = (f"{mode} {batch['status']} | 创建 {batch['created']}/50 | 就绪 {batch['ready']} | "
                     f"已提交 {batch['submitted']} | 已启动 {batch['started']} | 未完成 {50 - batch['started']} | 异常 {batch['failed']}")
         if batch.get("protection"):
             progress = batch_guard_label(batch["protection"])
@@ -4933,7 +4947,7 @@ def _run(stdscr: Any, model: SupervisorModel) -> None:
             except Exception as exc:
                 status = f"失败: {exc}"
             continue
-        if not rows or key not in (ord("a"), ord("w"), ord("p"), ord("r"), ord("x"), ord("u"), ord("P"), ord("W"), ord("B")):
+        if not rows or key not in (ord("a"), ord("w"), ord("p"), ord("r"), ord("x"), ord("u"), ord("P"), ord("W"), ord("B"), ord("b")):
             continue
         action = {
             ord("a"): "add",
@@ -4945,6 +4959,7 @@ def _run(stdscr: Any, model: SupervisorModel) -> None:
             ord("P"): "pause_workspace",
             ord("W"): "resume_workspace",
             ord("B"): "batch_workspace",
+            ord("b"): "private_batch_workspace",
         }[key]
         row = rows[index]
         if row.kind == "group":
@@ -4964,6 +4979,8 @@ def _run(stdscr: Any, model: SupervisorModel) -> None:
                               else f"{row.workspace_ref} 已恢复整池监控")
                 elif action == "batch_workspace":
                     success = f"{row.workspace_ref} 批量任务已提交；创建50路并整池授权，P 可停止"
+                elif action == "private_batch_workspace":
+                    success = f"{row.workspace_ref} 批次已提交；新批次用空目录短答，未完成旧批次保留原模式；P 可停止"
                 status = model.start_action(lambda row=row, action=action: model.mutate_workspace(row, action), success,
                                             priority=action == "pause_workspace")
             except Exception as exc:
@@ -4995,7 +5012,7 @@ def _run(stdscr: Any, model: SupervisorModel) -> None:
                 if item.agent_kind == "codex"
                 and str(item.record.get("workspace_id") or "") == workspace_id
             )
-        if action in {"pause", "remove", "add", "workspace", "untrack_workspace", "pause_workspace", "resume_workspace", "batch_workspace"} and not _confirm(
+        if action in {"pause", "remove", "add", "workspace", "untrack_workspace", "pause_workspace", "resume_workspace", "batch_workspace", "private_batch_workspace"} and not _confirm(
             stdscr, confirm_prompt(action, candidate, live_codex=live_codex)
         ):
             status = "已取消"
@@ -5012,6 +5029,7 @@ def _run(stdscr: Any, model: SupervisorModel) -> None:
                 "pause_workspace": f"{candidate.workspace_ref} 已整池停发并发送 Interrupt",
                 "resume_workspace": f"{candidate.workspace_ref} 已恢复整池监控",
                 "batch_workspace": f"{candidate.workspace_ref} 批量任务已提交；创建50路并整池授权，P 可停止",
+                "private_batch_workspace": f"{candidate.workspace_ref} 批次已提交；新批次用空目录短答，未完成旧批次保留原模式；P 可停止",
             }.get(action, f"已处理 {where}")
             status = model.start_action(lambda candidate=candidate, action=action: model.mutate_selected(candidate, action), success,
                                         priority=action == "pause_workspace")

@@ -1,10 +1,12 @@
 """A new B task is short; existing delivery proofs keep their original text."""
 import os
+from pathlib import Path
 import unittest
 from unittest.mock import patch
 
 import ccc_workspace_batch as batch
 import cmux_codex_watch as core
+import cmux_supervisor_tui as tui
 from tests import test_workspace_batch as fixtures
 
 
@@ -35,7 +37,8 @@ class BatchPromptPolicyTests(unittest.TestCase):
         slot = self.worker.job['slots'][0]
         self.assertEqual(slot['phase'], 'confirmed')
         self.assertEqual(len(self.client.sent), 1)
-        self.assertNotIn('--cd', batch.native_launch_argv(self.config, self.worker.job, 0))
+        args = batch.native_launch_argv(self.config, self.worker.job, 0)
+        self.assertEqual(args[args.index('--cd') + 1], str(Path.cwd().resolve()))
 
     def test_prompt_policy_is_not_replaced_when_resuming_an_old_job(self):
         self.worker.job.pop('initial_prompt')
@@ -93,7 +96,8 @@ class ExistingBatchModeTests(unittest.TestCase):
         for key in ('cwd_policy', 'name_policy', 'initial_prompt'):
             self.assertNotIn(key, self.worker.job)
         self.assertEqual(batch.job_prompt(self.worker.job), 'show me u power')
-        self.assertNotIn('--cd', batch.native_launch_argv(self.config, self.worker.job, 0))
+        args = batch.native_launch_argv(self.config, self.worker.job, 0)
+        self.assertEqual(args[args.index('--cd') + 1], str(Path.cwd().resolve()))
         counts = self.finish()
         self.assertEqual(counts['started'], 50)
         self.assertEqual(counts['total'], 50)
@@ -121,6 +125,49 @@ class ExistingBatchModeTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(RuntimeError):
                 batch.start(self.config, self.wid, client=self.client, launch=False, private_check=value)
         self.assertEqual(self.worker.path.read_bytes(), before)
+
+
+class BatchModeUIBoundaryTests(unittest.TestCase):
+    setUp = fixtures.WorkspaceBatchTests.setUp
+    private_check = False
+
+    def test_both_ui_paths_preserve_unfinished_default_batch_when_trying_private_mode(self):
+        candidate = tui.Candidate({'surface_id': 'fixture-surface', 'workspace_id': self.wid,
+            'workspace_ref': 'workspace:2', 'ref': 'surface:3'}, 'workspace_rule', '', '', 0, False)
+        row = tui.build_view_rows([candidate], set(), tui.DEFAULT_FILTER, '')[0]
+        model = object.__new__(tui.SupervisorModel)
+        options, results = [], []
+        def run_cli(argv):
+            args = core.build_parser().parse_args(argv)
+            options.append(args.private_check)
+            results.append(batch.start(self.config, args.workspace, client=self.client,
+                                       launch=False, private_check=args.private_check))
+        model.run_cli = run_cli
+        for action in ('batch_workspace', 'private_batch_workspace'):
+            self.assertEqual(tui.group_action_error(row, action), '')
+            model.mutate_selected(candidate, action)
+            model.mutate_workspace(row, action)
+        self.assertEqual(options, [False, False, True, True])
+        self.assertEqual({r['job_id'] for r in results}, {self.worker.job['id']})
+        self.assertEqual({r['startup_mode'] for r in results}, {'existing'})
+        saved = core.load_json(self.worker.path, {})
+        self.assertEqual(batch.job_prompt(saved), batch.LEGACY_PROMPT)
+        summary = batch.snapshots(self.config, self.store.load())[self.wid]
+        self.assertEqual(summary['startup_mode'], 'existing')
+        self.assertEqual(self.client.sent, [])
+
+    def test_trial_confirmation_does_not_claim_old_batches_or_automatic_stop_change(self):
+        candidate = tui.Candidate({'surface_id': 'fixture-surface', 'workspace_id': self.wid,
+            'workspace_ref': 'workspace:2', 'ref': 'surface:3'}, 'workspace_rule', '', '', 0, False)
+        row = tui.build_view_rows([candidate], set(), tui.DEFAULT_FILTER, '')[0]
+        for text in (tui.confirm_prompt('private_batch_workspace', candidate),
+                     tui.workspace_confirm_prompt(row, 'private_batch_workspace')):
+            for fragment in ('试用', '独立空目录', '只请求回复 OK', '未完成旧批次仍用原模式', '自动暂停已关闭'):
+                self.assertIn(fragment, text)
+        self.assertIn(batch.LEGACY_PROMPT, tui.confirm_prompt('batch_workspace', candidate))
+        keys = [key for key, _, _, _ in tui.workspace_buttons()]
+        self.assertEqual(keys.count(ord('B')), 1)
+        self.assertEqual(keys.count(ord('b')), 1)
 
 
 if __name__ == '__main__':
