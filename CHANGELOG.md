@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.24
+
+- Recognize Codex's pathless global AGENTS context when confirming the original B startup prompt. Explicit user events, malformed context and appended human text remain separate input and cannot grant continuation.
+- Revalidate saved `different user prompt` startup blocks against the original session, transcript identity, submission offset and task. Persist bounded progress, keep the old rejection as evidence, and release only the confirmed slot's startup hold without replaying its prompt or changing operator pauses and exclusions.
+- Cache batch reconciliation's validated configuration while its file identity is unchanged; check for changes at every authorization boundary. Skip fully confirmed completed jobs, bound idle worker caches, and read UI batch summaries only for visible workspaces while retaining all history.
+- Extend real native B50 acceptance to fail every initial turn on a private loopback API and require exactly one CCC continuation in each original session. Keep the default prompt, working directory, automatic pause OFF and network behavior unchanged.
+
 ## 0.2.23
 
 - Bind each queued network probe to one credential and model snapshot. Pair completed results and reservations with that contract in the event journal. A temporarily unreadable credential file suspends probing and publication without erasing prior qualification or isolation; a real account/model change still requires new API admission.
