@@ -44,6 +44,51 @@ CONFIRMABLE = {"submitted", "submitting", "uncertain", "confirmed"}
 CONFIRM_READ_BYTES = 1024 * 1024
 CONTEXT_PARSER_VERSION = 2
 RECONCILE_CACHE_LIMIT = 16
+CAPACITY_HISTORY_LIMIT = 1024
+
+
+def _file_generation(path):
+    value = path.stat()
+    return (value.st_dev, value.st_ino, value.st_size,
+            value.st_mtime_ns, value.st_ctime_ns)
+
+
+class CapacityHistory:
+    """Remember only unchanged jobs that contribute no startup capacity.
+
+    This is not an authorization cache. Current jobs, initializing slots and
+    possible future reservations still take the original fresh-read path.
+    Store file generations, not hundreds of complete historical job objects.
+    """
+    def __init__(self, limit=CAPACITY_HISTORY_LIMIT):
+        self.limit = limit
+        self.neutral = OrderedDict()
+
+    def read(self, path):
+        try:
+            before = _file_generation(path)
+        except FileNotFoundError:
+            self.neutral.pop(path, None)
+            return core.load_json(path, {})
+        previous = self.neutral.pop(path, None)
+        if previous == before and _file_generation(path) == before:
+            self.neutral[path] = before
+            return {}
+        job = core.load_json(path, {})
+        # Never label parsed old bytes with a replacement file's generation.
+        # Defer the reservation if a writer changed the file while reading it.
+        if _file_generation(path) != before:
+            raise RuntimeError("批次状态正在更新；等待下一次启动容量核验")
+        slots = job.get("slots") if isinstance(job, dict) else None
+        if (isinstance(job, dict) and job.get("status") in {"cancelled", "workspace_closed"}) or (
+                isinstance(slots, list) and slots
+                and all(isinstance(s, dict) and s.get("phase") is not None
+                        and s.get("phase") not in INITIALIZING | STARTABLE for s in slots)):
+            self.neutral[path] = before
+            while len(self.neutral) > self.limit:
+                self.neutral.popitem(last=False)
+            return {}
+        return job
 
 
 def pty_available():
@@ -120,6 +165,37 @@ def counts(job):
             "total": len(slots)}
 
 
+def preparation_progress(job):
+    """Preparation is native task acceptance, not a model success counter."""
+    slots = job.get("slots", [])
+    def record(value):
+        return value if isinstance(value, dict) else {}
+    named = (sum(bool(record(s.get("naming")).get("confirmed_at")) for s in slots)
+             if job.get("name_policy") else None)
+    progress_times = [job.get("created_at", 0)]
+    for slot in slots:
+        progress_times.extend(slot.get(key, 0) for key in
+                              ("created_at", "launched_at", "submit_at", "access_ready_at", "hold_released_at"))
+        progress_times.extend((record(slot.get("naming")).get("confirmed_at", 0),
+                               record(slot.get("confirmation")).get("confirmed_at", 0)))
+    last_progress = max((v for v in progress_times if type(v) in {int, float} and 0 <= v < float("inf")), default=0)
+    wait = job.get("preparation_wait")
+    # Older job.error strings can outlive the wait which produced them. Only
+    # expose a current, explicitly maintained wait as a present-day diagnosis.
+    wait = dict(wait) if job.get("status") == "waiting" and isinstance(wait, dict) else {}
+    if not wait and job.get("status") in {"running", "queued", "waiting"}:
+        if any(s.get("phase") in {"created", "startup_wait"}
+               and record(s.get("naming")) and not s["naming"].get("confirmed_at") for s in slots):
+            wait = {"reason": "naming", "message": "等待原生命名确认"}
+        elif any(s.get("phase") in {"submitted", "submitting", "uncertain"} for s in slots):
+            wait = {"reason": "first_task", "message": "等待原生接受首条任务"}
+        elif any(s.get("phase") in INITIALIZING | {"startup_wait", "pty_wait"} for s in slots):
+            wait = {"reason": "native", "message": "等待原会话就绪或空输入框"}
+        elif any(s.get("phase") in STARTABLE for s in slots):
+            wait = {"reason": "scheduled", "message": "等待启动调度"}
+    return {"named": named, "last_progress_at": last_progress, "wait": wait}
+
+
 def snapshots(config_path, config, *, workspace_ids=None):
     result = {}
     for rule in config.get("workspace_rules", []):
@@ -132,7 +208,7 @@ def snapshots(config_path, config, *, workspace_ids=None):
                 result[rule["workspace_id"]] = {
                     "id": jid, "status": job.get("status"),
                     "startup_mode": startup_mode(job, config_path),
-                    **counts(job)}
+                    **counts(job), **preparation_progress(job)}
                 if result[rule['workspace_id']]['startup_mode'] == 'access_check':
                     from ccc_access_service import status
                     result[rule['workspace_id']]['access'] = status(config_path, jid)
@@ -283,6 +359,9 @@ def start(config_path, selector, *, client=None, launch=True, private_check=Fals
             if private_check or access_check:
                 job.update(cwd_policy=EMPTY_CWD_POLICY, initial_prompt=PROMPT,
                            name_policy="before-first-turn-v1")
+            if private_check:
+                from ccc_private_check import POLICY
+                job["check_retry_policy"] = POLICY
             job_locks.enter_context(core.FileLock(job_path(config_path, job["id"]).parent / "worker.lock", timeout_sec=0))
             if access_check:
                 from ccc_access_service import prepare
@@ -585,6 +664,20 @@ class BatchWorker:
         self._top_due = 0.0
         self._saved = self._serialized_job()
         self._shell_hints = {}
+        self._capacity_history = CapacityHistory()
+        self._wait_observed = False
+
+    def _wait(self, reason, message):
+        previous = self.job.get("preparation_wait", {})
+        previous = previous if isinstance(previous, dict) else {}
+        since = previous.get("since", self.clock()) if previous.get("reason") == reason else self.clock()
+        self.job.update(status="waiting", error=message,
+                        preparation_wait={"reason": reason, "message": message, "since": since})
+        self._wait_observed = True
+
+    def _clear_wait(self):
+        self.job.pop("preparation_wait", None)
+        self.job.pop("error", None)
 
     def _process_label(self, target):
         from ccc_batch_guard import binding
@@ -655,7 +748,7 @@ class BatchWorker:
             if not allowed(self.store.load(), self.job):
                 return
             if not self.pty_probe():
-                self.job.update(status="waiting", error="系统 PTY 名额已满；保留剩余名额，空位释放后自动继续")
+                self._wait("pty", "系统 PTY 名额已满；保留剩余名额，空位释放后自动继续")
                 return
             prepare_sqlite_home(self.config_path, self.job["id"])
             prepare_working_directory(self.config_path, self.job, slot["index"])
@@ -1200,6 +1293,9 @@ class BatchWorker:
                 # Proof and phase are durable before changing authorization.
                 # A crash on either side is repaired without replaying input.
                 self.save()
+                if self.job.get("check_retry_policy"):
+                    from ccc_private_check import record_origin
+                    record_origin(self.config_path, self.job, slot)
                 rule = next((r for r in self.store.load()["workspace_rules"]
                              if r.get("workspace_id") == self.job["workspace_id"]), {})
                 if core.batch_start_hold(rule, slot["surface_id"]):
@@ -1312,6 +1408,16 @@ class BatchWorker:
             self.save()
 
     def _reserve_start(self, slot, *, restarting=False):
+        try:
+            return self._reserve_capacity(slot, restarting=restarting)
+        except RuntimeError as exc:
+            lock_path = self.config_path.parent / "batch-capacity.lock"
+            if str(exc) != f"timed out waiting for lock: {lock_path}":
+                raise
+            self._wait("capacity_lock", "共享启动锁繁忙；保留原名额，自动排队")
+            return False
+
+    def _reserve_capacity(self, slot, *, restarting=False):
         # All batch processes share the same capacity and rate limit. Save the
         # reservation before releasing the lock, without holding it over RPC.
         with core.FileLock(self.config_path.parent / "batch-capacity.lock", timeout_sec=2):
@@ -1319,13 +1425,14 @@ class BatchWorker:
             budget = core.load_json(path, {})
             now = self.clock()
             if now - budget.get("last_start", 0) < .5:
+                self._wait("start_spacing", "等待共享启动间隔（0.5秒）")
                 return False
             config = self.store.load()
             ids = sorted({r["active_batch_id"] for r in config["workspace_rules"] if r.get("active_batch_id")})
             active = 0
             pending_jobs = []
             for jid in ids:
-                job = self.job if jid == self.job["id"] else core.load_json(job_path(self.config_path, jid), {})
+                job = self.job if jid == self.job["id"] else self._capacity_history.read(job_path(self.config_path, jid))
                 if not job or job.get("status") in {"cancelled", "workspace_closed"} or not allowed(config, job):
                     continue
                 # An ambiguous RPC remains durable, but cannot monopolize a
@@ -1339,14 +1446,25 @@ class BatchWorker:
                 if any(s.get("phase") in STARTABLE for s in job.get("slots", [])):
                     pending_jobs.append(jid)
             if active >= 4 or now - budget.get("last_start", 0) < .5:
+                self._wait("capacity", "等待共享启动名额（最多4路同时初始化）")
                 return False
             # A busy first pool cannot consume every available startup slot.
             last = budget.get("last_job", "")
             if not pending_jobs:
+                self._wait("authorization", "等待可启动的原批次授权")
                 return False
             next_job = next((jid for jid in pending_jobs if jid > last), pending_jobs[0])
             if next_job != self.job["id"] and now - budget.get("last_start", 0) < 1.5:
+                self._wait("rotation", "等待其他批次轮转启动")
                 return False
+            # A history scan may have waited for disk I/O. The caller's
+            # authorization must still be current before reserving a launch.
+            if not allowed(self.store.load(), self.job):
+                self._wait("authorization", "批次授权已变化；未预约新的启动")
+                return False
+            self._clear_wait()
+            self._wait_observed = False
+            self.job["status"] = "running"
             slot.update(phase="restarting" if restarting else "creating", launched_at=now,
                         launch_id=str(uuid.uuid4()))
             slot.setdefault("created_at", now)
@@ -1433,6 +1551,7 @@ class BatchWorker:
 
     def step(self):
         self._access_membership_ready = False
+        self._wait_observed = False
         # Disk evidence is independent of cmux's process-table RPC and of B/P.
         # Releasing a proven hold does not override P or any manual exclusion.
         rule = next((r for r in self.store.load()["workspace_rules"]
@@ -1449,6 +1568,7 @@ class BatchWorker:
             from ccc_batch_guard import snapshot
             guard = snapshot(self.config_path, self.job["workspace_id"])
             self.job["status"] = "stopped_success" if (guard.get("trip") or {}).get("connected") else "cancelled"
+            self._clear_wait()
             self.save()
             return False
         try:
@@ -1457,10 +1577,11 @@ class BatchWorker:
             if self.job["workspace_id"] not in workspaces:
                 # Only a successful, fresh inventory proves a closed pool.
                 self.job["status"] = "workspace_closed"
+                self._clear_wait()
                 self.save()
                 return False
         except (core.CmuxError, RuntimeError) as exc:
-            self.job.update(status="waiting", error=str(exc))
+            self._wait("topology", "等待工作区拓扑：" + str(exc))
             self.save()
             return True
         self._restore_present_slots(tree)
@@ -1468,7 +1589,7 @@ class BatchWorker:
             self._refresh_processes()
         except (core.CmuxError, RuntimeError) as exc:
             self.processes = {}
-            self.job["error"] = str(exc)
+            self._wait("process_inventory", "等待原进程核验：" + str(exc))
         self.job["status"] = "running"
         present = {r["surface_id"] for r in core.workspace_surface_records(tree, self.job["workspace_id"]).values()}
         if startup_mode(self.job, self.config_path) == 'access_check' and access_cohort_prepared(self.job):
@@ -1479,7 +1600,7 @@ class BatchWorker:
                 except (OSError, ValueError, core.CmuxError, RuntimeError):
                     self._access_membership_ready = False
             if not self._access_membership_ready:
-                self.job.update(status='waiting', error='等待本池全部50个原会话和空输入框；未发送新的接入检查')
+                self._wait('access_cohort', '等待本池全部50个原会话和空输入框；未发送新的接入检查')
                 self.save()
                 return True
         for slot in self.job["slots"]:
@@ -1505,12 +1626,17 @@ class BatchWorker:
             try:
                 self._create(pending)
             except (OSError, ValueError, core.CmuxError, RuntimeError) as exc:
-                self.job.update(status="waiting", error=str(exc))
+                self._wait("create_preflight", "等待启动前核验：" + str(exc))
         if all(s["phase"] == "confirmed" for s in self.job["slots"]):
             self.job["status"] = "complete"
-            self.job.pop("error", None)
+            self._clear_wait()
         elif all(s["phase"] in {"confirmed", "blocked", "surface_closed"} for s in self.job["slots"]):
             self.job["status"] = "needs_attention"
+            self._clear_wait()
+        elif self._wait_observed:
+            self.job["status"] = "waiting"
+        else:
+            self._clear_wait()
         self.save()
         return self.job["status"] not in {"complete", "needs_attention", "cancelled", "workspace_closed"}
 

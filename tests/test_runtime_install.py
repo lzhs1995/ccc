@@ -89,6 +89,43 @@ class RuntimeInstallTests(unittest.TestCase):
         )
         self.assertEqual(hook.returncode, 0, hook.stderr)
 
+    def test_staged_daemon_constructs_without_checkout_or_external_io(self):
+        for name in core.RUNTIME_FILES:
+            shutil.copyfile(SOURCE / name, self.source / name)
+        release = core.stage_runtime_release()
+        core.validate_runtime_release(release)
+        shutil.rmtree(self.source)
+        script = """
+import sys
+from pathlib import Path
+from unittest.mock import patch
+sys.path.insert(0, sys.argv[1])
+import cmux_codex_watch as core
+root = Path(sys.argv[2])
+with patch('socket.socket.connect', side_effect=AssertionError('unexpected network')) as connect, \\
+     patch('socket.socket.connect_ex', side_effect=AssertionError('unexpected network')) as connect_ex, \\
+     patch('os.kill', side_effect=AssertionError('unexpected signal')) as signal:
+    daemon = core.WatchDaemon(root / 'config.json', root / 'state.json', client=object())
+    try:
+        import ccc_private_check
+        assert Path(ccc_private_check.__file__).parent == Path(sys.argv[1])
+        assert isinstance(daemon.private_checks, ccc_private_check.PrivateChecks)
+        connect.assert_not_called()
+        connect_ex.assert_not_called()
+        signal.assert_not_called()
+    finally:
+        daemon._process_snapshots.close()
+print('staged daemon constructed without running watch loop')
+"""
+        result = subprocess.run(
+            [sys.executable, "-I", "-B", "-c", script, str(release), str(self.app)],
+            cwd=self.root, capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("staged daemon constructed", result.stdout)
+        self.assertFalse((self.runtime / "current").exists())
+        self.launch.assert_not_called()
+
     def test_copy_failure_keeps_previous_current_and_removes_partial_stage(self):
         old, old_plist = self.old_install()
         self.change_source()

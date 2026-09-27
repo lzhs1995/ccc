@@ -61,7 +61,7 @@ DEFAULT_LABEL = f"{LABEL_PREFIX}.{APP_NAME}"
 PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_APP_DIR = Path.home() / "Library" / "Application Support" / APP_NAME
 DEFAULT_RUNTIME_ROOT = DEFAULT_APP_DIR / "runtime"
-RUNTIME_FILES = ("cmux_codex_watch.py", "claude_ccc_protocol.py", "claude_ccc_event_hook.py", "ccc_observation.py", "ccc_scheduling.py", "ccc_codex_queue.py", "ccc_codex_goal.py", "ccc_workspace_batch.py", "ccc_inventory.py", "ccc_batch_guard.py", "ccc_guard_transport.py", "ccc_guard_watchdog.py", "ccc_guard_scope.py", "ccc_guard_migration.py", "ccc_codex_launcher.py", "ccc_network_client.py", "ccc_network_guard.py", "ccc_mihomo.py", "ccc_native_processes.py", "ccc_access_budget.py", "ccc_access_gateway.py", "ccc_access_service.py")
+RUNTIME_FILES = ("cmux_codex_watch.py", "claude_ccc_protocol.py", "claude_ccc_event_hook.py", "ccc_observation.py", "ccc_scheduling.py", "ccc_codex_queue.py", "ccc_codex_goal.py", "ccc_workspace_batch.py", "ccc_private_check.py", "ccc_inventory.py", "ccc_batch_guard.py", "ccc_guard_transport.py", "ccc_guard_watchdog.py", "ccc_guard_scope.py", "ccc_guard_migration.py", "ccc_codex_launcher.py", "ccc_network_client.py", "ccc_network_guard.py", "ccc_mihomo.py", "ccc_native_processes.py", "ccc_access_budget.py", "ccc_access_gateway.py", "ccc_access_service.py")
 DEFAULT_LOG_DIR = Path.home() / "Library" / "Logs" / APP_NAME
 DEFAULT_CONFIG_PATH = DEFAULT_APP_DIR / "config.json"
 DEFAULT_STATE_PATH = DEFAULT_APP_DIR / "state.json"
@@ -557,6 +557,7 @@ class TargetRuntime:
     codex_observed_turn_key: str = ""
     codex_sent_turn_key: str = ""
     codex_goal_resume: bool = False
+    codex_private_check: dict[str, Any] = dataclasses.field(default_factory=dict)
     codex_absent_probe: str = ""
     codex_absent_since: float = 0.0
     last_send_error: str = ""
@@ -4927,6 +4928,8 @@ class WatchDaemon:
             native_home / ".codex/sessions", MESSAGE,
         )
         self.codex_queue_recovery.guard_config_path = config_path
+        from ccc_private_check import PrivateChecks
+        self.private_checks = PrivateChecks(config_path, self.codex_queue_recovery.sessions_root)
         self.network = network_health.NetworkClient()
         if hook_settings_manager is not None:
             self.claude_hook_settings = hook_settings_manager
@@ -6828,6 +6831,15 @@ class WatchDaemon:
                 state.kind == "composer_busy" and self.codex_queue_recovery.has_pending_draft(target["surface_id"])
         )) or self._runtime_is_claude(runtime, state):
             return state
+        private_check = runtime.codex_private_check
+        queue_message = private_check.get("message") if private_check else self.codex_queue_recovery.message
+        private_snapshot = {}
+
+        def private_current():
+            return (not private_check or (
+                self.private_checks.accepted(private_check, runtime.send_attempt_id)
+                and self.private_checks.valid(private_check, target,
+                    lambda: self.codex_queue_recovery.current_turn(target), snapshot=private_snapshot)))
 
         def view():
             grid = Grid.from_rpc(client.replay(target["workspace_id"], target["surface_id"]), target["surface_id"])
@@ -6850,23 +6862,54 @@ class WatchDaemon:
                             or any(re.search(r"^[•●]?\s*Reconnecting\.{3}", x.strip()) for x in grid.lines)}
 
         def authorized():
-            return (self.config.get("mode") == "armed" and not self.config.get("global_paused")
+            # poll_once has no scheduler callback: current(fresh=True) alone
+            # cannot authorize a private check's Edit/Enter after disk I/O.
+            if private_check and self._active_send_target(target) is None:
+                return False
+            generation = self._config_mtime_ns
+            allowed = (self.config.get("mode") == "armed" and not self.config.get("global_paused")
                     and str(target["surface_id"]) != str(self.config.get("manager_surface_id") or "")
                     and current(fresh=True)
+                    and private_current()
                     and (not self.config.get("network_guard", {}).get("enabled")
                          or self._network_turn_ready(target, runtime, self.codex_queue_recovery.current_turn(target))))
+            return allowed and (not private_check or (
+                self._active_send_target(target) is not None and generation == self._config_mtime_ns))
 
-        def guarded_key(send):
+        def guarded_key(send, *, editing=False):
+            def own_view():
+                checked = view()
+                expected = (checked.get("empty") and checked.get("editable")
+                            and checked.get("queued") == [queue_message] if editing else
+                            not checked.get("queued") and checked.get("draft") == queue_message)
+                return not checked.get("busy") and expected
+
             with workspace_input_lock(self.config_path, target["workspace_id"], shared=True):
                 if not authorized():
                     raise CmuxError("workspace input no longer authorized")
+                if private_check:
+                    if not own_view() or not authorized():
+                        raise CmuxError("原短检查队列或输入授权已改变；未发送按键")
+                    generation = self._config_mtime_ns
+                    tree = client.fresh_tree() if isinstance(client, SnapshotClient) else client.tree()
+                    located = find_main_surface(tree, target["surface_id"])
+                    # Complete the potentially slow source reads before the
+                    # last composer read. Then only recheck the pinned source
+                    # generations, native identity and current authorization.
+                    if (located.get("workspace_id") != target["workspace_id"]
+                            or is_dock_surface(tree, target["surface_id"]) or not own_view()
+                            or not self.private_checks.matches_turn(private_check,
+                                self.codex_queue_recovery.current_turn(target))
+                            or self._active_send_target(target) is None or generation != self._config_mtime_ns
+                            or not self.private_checks.snapshot_current(private_snapshot)):
+                        raise CmuxError("原短检查来源、位置或草稿已改变；未发送按键")
                 send()
 
         outcome = self.codex_queue_recovery.recover(
             target, runtime, read_view=view,
-            edit_queued=lambda: guarded_key(lambda: client.edit_codex_queued_prompt(target["workspace_id"], target["surface_id"])),
+            edit_queued=lambda: guarded_key(lambda: client.edit_codex_queued_prompt(target["workspace_id"], target["surface_id"]), editing=True),
             enter=lambda: guarded_key(lambda: client.send_key(target["workspace_id"], target["surface_id"], "enter")),
-            authorized=authorized,
+            authorized=authorized, message=queue_message,
         )
         if outcome:
             self.logger.warning("surface=%s %s original_queued_prompt=true", target["surface_id"], outcome)
@@ -9065,6 +9108,42 @@ class WatchDaemon:
             return str(self.config.get("message") or MESSAGE)
         raise RuntimeError(f"send-eligible state lacks a message route: {state.kind}")
 
+    def _private_check_ready(self, proof, target, runtime, state, client, is_current):
+        read_turn = lambda: self.codex_queue_recovery.current_turn(target)
+        snapshot = {}
+        def empty_view():
+            grid = Grid.from_rpc(client.replay(target["workspace_id"], target["surface_id"]), target["surface_id"])
+            fresh = classify_grid(grid)
+            return (_composer_status(grid)[0] == "empty" and fresh.kind in SEND_ELIGIBLE_STATES
+                    and fresh.message_kind == "codex" and fresh.error_type == state.error_type
+                    and not fresh.native_goal_stalled)
+
+        if not self.private_checks.valid(proof, target, read_turn):
+            return False
+        # Source reads and the write-ahead send record can wait for disk. Read
+        # placement and the empty composer after them, then recheck native and
+        # authorization at the actual short-check input boundary.
+        tree = client.fresh_tree() if isinstance(client, SnapshotClient) else client.tree()
+        current = find_main_surface(tree, target["surface_id"])
+        if current.get("workspace_id") != target["workspace_id"] or is_dock_surface(tree, target["surface_id"]):
+            return False
+        if not empty_view() or not self.private_checks.valid(proof, target, read_turn, snapshot=snapshot):
+            return False
+        if (self._active_send_target(target, is_current) is None
+                or self.config.get("mode") != "armed" or self.config.get("global_paused")
+                or not self._codex_turn_ready(target, runtime, state, reserved=True)):
+            return False
+        generation = self._config_mtime_ns
+        tree = client.fresh_tree() if isinstance(client, SnapshotClient) else client.tree()
+        current = find_main_surface(tree, target["surface_id"])
+        if (current.get("workspace_id") != target["workspace_id"] or is_dock_surface(tree, target["surface_id"])
+                or not empty_view() or not self.private_checks.matches_turn(proof, read_turn())):
+            return False
+        return (self._active_send_target(target, is_current) is not None
+                and generation == self._config_mtime_ns
+                and self.config.get("mode") == "armed" and not self.config.get("global_paused")
+                and self.private_checks.snapshot_current(snapshot))
+
     @staticmethod
     def _claude_candidate_key(state: ScreenState) -> str:
         return _short_hash("\0".join((
@@ -9407,6 +9486,11 @@ class WatchDaemon:
             return
         if not self._codex_turn_ready(target, runtime, state):
             return
+        private_check = (self.private_checks.select(target, lambda: self.codex_queue_recovery.current_turn(target))
+                         if state.message_kind == "codex" and not state.native_goal_stalled
+                         and not runtime.codex_goal_resume else None)
+        outgoing_message = private_check["message"] if private_check else None
+        runtime.codex_private_check = private_check or {}
         # Persist the attempt before I/O. A restart during a send must reconcile
         # the viewport rather than blindly treating the attempt as never made.
         runtime.send_started_at = time.time()
@@ -9442,6 +9526,7 @@ class WatchDaemon:
         runtime.detection_to_send_ms = round(max(0, runtime.send_io_started_at -
             (runtime.candidate_observed_at or runtime.observed_at)) * 1000, 3)
         send_started = time.monotonic()
+        private_reserved = input_attempted = False
         try:
             with workspace_input_lock(self.config_path, target["workspace_id"], shared=True):
                 if self._active_send_target(target, is_current) is None:
@@ -9452,23 +9537,43 @@ class WatchDaemon:
                     runtime.delivery_status = "cancelled"
                     self.save(wait=False)
                     return
+                if private_check:
+                    self.private_checks.reserve(private_check, runtime.send_attempt_id)
+                    private_reserved = True
+                    if not self._private_check_ready(private_check, target, runtime, state, client, is_current):
+                        raise CmuxError("原 b 检查来源、任务或输入授权已变化；本次未发送")
                 runtime.send_io_started_at = time.time()
                 runtime.detection_to_send_ms = round(max(0, runtime.send_io_started_at -
                     (runtime.candidate_observed_at or runtime.observed_at)) * 1000, 3)
                 if runtime.codex_goal_resume:
                     client.resume_codex_goal(str(target["workspace_id"]), surface_id)
                 else:
-                    client.send(str(target["workspace_id"]), surface_id, self._outgoing_message(state))
-        except (CmuxError, RuntimeError) as exc:
+                    input_attempted = True
+                    client.send(str(target["workspace_id"]), surface_id,
+                                outgoing_message if private_check else self._outgoing_message(state))
+        except (OSError, CmuxError, RuntimeError) as exc:
             runtime.send_completed_at = time.time()
             runtime.send_duration_ms = round((time.monotonic() - send_started) * 1000, 3)
             runtime.last_send_error = str(exc)[-500:]
             uncertain = isinstance(exc, UncertainDeliveryError) or isinstance(exc.__cause__, subprocess.TimeoutExpired)
+            if private_reserved:
+                with contextlib.suppress(OSError, RuntimeError):
+                    self.private_checks.finish(private_check, runtime.send_attempt_id,
+                        "not_sent" if not input_attempted else "unknown" if uncertain else "failed",
+                        io_started_at=runtime.send_io_started_at if input_attempted else 0)
             runtime.delivery_status = "unknown" if uncertain else "failed"
             runtime.state = "delivery_unknown" if uncertain else "send_failed"
             self.logger.error("surface=%s send failed: %s", surface_id[:8], exc)
             self.save()
             return
+        if private_reserved:
+            try:
+                self.private_checks.finish(private_check, runtime.send_attempt_id, "accepted",
+                                           io_started_at=runtime.send_io_started_at)
+            except (OSError, RuntimeError) as exc:
+                # The actual send already succeeded. A missing private receipt
+                # may disable future short-check semantics, never replay input.
+                self.logger.warning("surface=%s private check receipt unavailable: %s", surface_id[:8], exc)
         now = time.time()
         runtime.send_completed_at = now
         runtime.send_duration_ms = round((time.monotonic() - send_started) * 1000, 3)
