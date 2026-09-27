@@ -113,7 +113,10 @@ class AccessServiceBoundaryTests(unittest.TestCase):
         self.job['access_policy'] = service.prepare(self.config, self.job, owner=self.owner)
         self.job.update(config_path=str(self.config), slots=[{'index': 0, 'launch_id': 'fixture'}])
         before = self.native_config.read_bytes()
-        with patch.object(service, 'ensure_gateway', return_value=self.owner):
+        # This configuration test constructs argv without executing a native CLI.
+        # Binary identity is exercised by separate native acceptance tests.
+        with patch.object(service, 'ensure_gateway', return_value=self.owner), \
+                patch('ccc_batch_guard.native_binary', return_value='/fixture/codex'):
             self.assertEqual(batch.startup_mode(self.job, self.config), 'access_check')
             self.assertTrue(any('127.0.0.1:23456' in value for value in batch.native_launch_argv(self.config, self.job, 0)))
         for missing, value in ((True, None), (False, None), (False, {})):
