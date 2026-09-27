@@ -31,7 +31,7 @@ from pathlib import Path
 
 from ccc_mihomo import (Controller, ControllerError, PhysicalLink, ProbeResult, ResponsesProbe,
                         Route, ShadowCore, atomic_json, effective_service_route, inventory,
-                        probe_credential, probe_key, validate_dependencies)
+                        probe_credential, probe_key, reachability_mode, validate_dependencies)
 
 
 DEFAULTS = {
@@ -86,8 +86,13 @@ def load_config(path):
         if not isinstance(source, dict) or source.get("pool") not in pools or not Path(source.get("path", "")).is_absolute():
             raise ValueError("each subscription needs an absolute path and a commercial pool")
     probe = config.get("probe") or {}
+    if (not isinstance(probe, dict) or not isinstance(probe.get("validation_mode", "response"), str)
+            or probe.get("validation_mode", "response") not in {"response", "reachability"}):
+        raise ValueError("probe validation_mode must be response or reachability")
     endpoint = urllib.parse.urlsplit(probe.get("url", ""))
-    if endpoint.scheme != "https" or endpoint.hostname != config["service_host"] or not probe.get("model"):
+    if (endpoint.scheme != "https" or endpoint.hostname != config["service_host"]
+            or endpoint.username or endpoint.password or endpoint.fragment
+            or not reachability_mode(probe) and not probe.get("model")):
         raise ValueError("probe must use HTTPS on the configured service host and an explicit model")
     for key, default, low, high in (("timeout_sec", 5, .1, 10), ("deep_timeout_sec", 45, 1, 90)):
         number = probe.get(key, default)
@@ -122,6 +127,13 @@ def load_config(path):
 
 def contract_digest(config, *, legacy=False, legacy_credential=False, credential=None, source_digest=None):
     probe = dict(config["probe"])
+    if reachability_mode(probe):
+        # Anonymous reachability has no account/model identity. Never read an
+        # auth file or allow its rotation to revoke otherwise reachable exits.
+        wire = {"validation_mode": "reachability", "classifier_version": 1,
+                "url": probe["url"], "body": "invalid-json-anonymous",
+                "user_agent": probe.get("user_agent", "codex_cli_rs/0.156.1")}
+        return hashlib.sha256(json.dumps(wire, sort_keys=True).encode()).hexdigest()
     if not legacy:
         for key in ("timeout_sec", "deep_timeout_sec", "light_timeout_by_pool"):
             probe.pop(key, None)  # Scheduling/deadline changes do not change API identity.
@@ -146,6 +158,8 @@ def contract_digest(config, *, legacy=False, legacy_credential=False, credential
 
 
 def probe_binding(config):
+    if reachability_mode(config["probe"]):
+        return "", contract_digest(config), set()
     key, source_digest = probe_credential(config["probe"])
     arguments = {"credential": key, "source_digest": source_digest}
     return (key, contract_digest(config, **arguments),
@@ -301,6 +315,46 @@ class Health:
     status: int = 0
 
 
+@dataclasses.dataclass
+class ReachabilityHealth:
+    """Separate admission from retained legacy model/API evidence."""
+    admitted: bool = False
+    quarantined: bool = False
+    quarantine_until: float = 0
+    failures: int = 0
+    successes: int = 0
+    failure_at: float = 0
+    at: float = 0
+    ok_at: float = 0
+    kind: str = "unknown"
+    status: int = 0
+    detail: str = ""
+    stage: str = ""
+    elapsed_ms: float = 0
+
+    def record(self, result, now, started_at, policy):
+        if result.deep or now < self.at or result.kind == "accessible" and started_at < self.failure_at:
+            return
+        self.at, self.kind, self.status = now, result.kind, result.status
+        self.detail, self.stage, self.elapsed_ms = result.detail, result.stage, result.elapsed_ms
+        if result.kind == "accessible":
+            self.ok_at, self.failures = now, 0
+            self.successes = self.successes + 1 if started_at >= self.quarantine_until else 0
+            needed = policy["recover_successes"] if self.quarantined else 1
+            if self.successes >= needed:
+                self.admitted, self.quarantined = True, False
+        elif result.kind in LOCAL_FAILURES:
+            self.successes, self.failure_at = 0, now
+            self.failures += 1
+            if result.kind == "blocked" or self.failures >= policy["failures_before_isolation"]:
+                self.admitted, self.quarantined = False, True
+                self.quarantine_until = now + policy["cooldown_sec"]
+        else:
+            # Unknown HTML, observer faults and ambiguous responses neither
+            # prove a ban nor supply a recovery success.
+            self.successes = 0
+
+
 def recent_deep_starts(starts, now, minimum_interval=60):
     # Clock correction does not refund an already consumed request. Keep
     # future reservations until their window expires on the corrected clock,
@@ -312,12 +366,14 @@ def recent_deep_starts(starts, now, minimum_interval=60):
 
 class Engine:
     """Pure route policy. Probe results never constitute terminal-send grants."""
-    def __init__(self, config, routes, saved=None, now=None, *, monotonic=None):
+    def __init__(self, config, routes, saved=None, now=None, *, monotonic=None,
+                 reuse_reachability_evidence=True):
         self.config = config
         self.policy = {**DEFAULTS, **config.get("policy", {})}
         self.routes = {r.id: r for r in routes}
         self.active = set(self.routes)
         self.health = {r: Health() for r in self.routes}
+        self.reachability = {r: ReachabilityHealth() for r in self.routes}
         self.current = ""
         self.active_pool = config["commercial_pools"][0]
         self.deep_starts = []
@@ -377,23 +433,87 @@ class Engine:
                     "reason": "legacy_or_invalid" if not valid else "unfinished" if pending else "restart",
                     "reservation": pending}
                 self.settle_deep(now)
+        if self.reachability_enabled:
+            self.reset_reachability()
+            if saved and saved.get("validation_mode") == "reachability":
+                for rid, value in saved.get("reachability_health", {}).items():
+                    if rid not in self.routes or not isinstance(value, dict):
+                        continue
+                    try:
+                        h = ReachabilityHealth(**value)
+                        if (any(type(v) is not bool for v in (h.admitted, h.quarantined))
+                                or any(type(v) is not int or v < 0 for v in (h.failures, h.successes))
+                                or any(type(v) not in (int, float) or not math.isfinite(v) or not 0 <= v <= now + 1
+                                       for v in (h.at, h.ok_at, h.failure_at))
+                                or type(h.quarantine_until) not in (int, float)
+                                or not math.isfinite(h.quarantine_until) or h.quarantine_until < 0
+                                or not isinstance(h.kind, str)
+                                or h.kind not in {"unknown", "accessible", "blocked", "timeout", "transport",
+                                                  "truncated", "contract", "observer_error"}
+                                or type(h.status) is not int or not 0 <= h.status <= 599
+                                or not isinstance(h.detail, str) or not isinstance(h.stage, str)
+                                or type(h.elapsed_ms) not in (int, float)
+                                or not math.isfinite(h.elapsed_ms) or h.elapsed_ms < 0
+                                or h.ok_at > h.at or h.failure_at > h.at
+                                or h.admitted and not h.ok_at):
+                            continue
+                        # Persisted wall time cannot impose an unbounded wait
+                        # after a clock correction. A new response is still
+                        # required; clamping never grants admission.
+                        h.quarantine_until = min(h.quarantine_until, now + self.policy["cooldown_sec"])
+                        if not reuse_reachability_evidence:
+                            h = ReachabilityHealth(quarantined=h.quarantined,
+                                                   quarantine_until=h.quarantine_until)
+                        self.reachability[rid] = h
+                    except (TypeError, ValueError):
+                        continue
+
+    @property
+    def reachability_enabled(self):
+        return reachability_mode(self.config.get("probe", {}))
+
+    def reset_reachability(self, *, preserve_current=False):
+        # Old quarantine is evidence to recover from, not a reason to require
+        # paid generation forever. Retain the old Health record unchanged.
+        previous = self.reachability if preserve_current else self.health
+        self.reachability = {rid: ReachabilityHealth(quarantined=h.quarantined,
+            quarantine_until=h.quarantine_until) for rid, h in previous.items()}
+
+    def light_freshness(self):
+        # A normal 60-second polling interval must not expire after 20 seconds.
+        # The existing light window is a bounded scheduling margin; late data
+        # still expires rather than being kept alive by a dashboard refresh.
+        return (max(self.policy["light_fresh_sec"], self.policy["other_interval_sec"] + self.policy["light_fresh_sec"])
+                if self.reachability_enabled else self.policy["light_fresh_sec"])
 
     def update_inventory(self, routes):
         self.active = {r.id for r in routes}
         for route in routes:
             self.routes[route.id] = route
             self.health.setdefault(route.id, Health())
+            self.reachability.setdefault(route.id, ReachabilityHealth())
         # A disappeared subscription entry cannot delete the active, already
         # verified connection path. Retire it after a replacement is selected.
         for rid in set(self.routes) - self.active - {self.current}:
             del self.routes[rid]
             self.health.pop(rid, None)
+            self.reachability.pop(rid, None)
 
     def record(self, rid, result, now, *, started_at=None):
         if rid not in self.health:
             return
         h = self.health[rid]
         started_at = now if started_at is None else started_at
+        if self.reachability_enabled:
+            self.reachability[rid].record(result, now, started_at, self.policy)
+            if not result.deep:
+                # Schedule using actual completion time; retained deep/API and
+                # paid-budget records are not rewritten as reachability proof.
+                h.light_at, h.light_kind = now, result.kind
+                h.light_stage, h.light_detail = result.stage, result.detail
+                if result.kind == "accessible":
+                    h.light_ok_at = now
+            return
         # A slow SSE from before a newer failure is not recovery evidence.
         # Light and generation results are independent: a JSON validator can
         # remain reachable while every generation stream is truncated.
@@ -436,6 +556,8 @@ class Engine:
         h.failures = h.light_failures + h.deep_failures
 
     def seed(self, rows, now):
+        if self.reachability_enabled:
+            return  # Old model completions cannot seed this distinct contract.
         if self.seed_consumed:
             return
         for rid, row in rows.items():
@@ -450,10 +572,16 @@ class Engine:
         self.seed_consumed = True
 
     def qualified(self, rid, now):
+        if self.reachability_enabled:
+            h = self.reachability[rid]
+            return h.admitted and not h.quarantined and 0 < h.ok_at <= now and now - h.ok_at <= self.light_freshness()
         h = self.health[rid]
         return h.qualified and not h.quarantined and 0 <= now - h.deep_ok_at <= self.policy["qualification_ttl_sec"]
 
     def ready(self, rid, now):
+        if self.reachability_enabled:
+            h = self.reachability[rid]
+            return self.qualified(rid, now) and h.failures == 0 and h.kind == "accessible"
         h = self.health[rid]
         return (self.qualified(rid, now) and h.failures == 0
                 and 0 <= now - max(h.light_ok_at, h.deep_ok_at) <= self.policy["light_fresh_sec"])
@@ -469,8 +597,13 @@ class Engine:
             ids = [rid for rid, r in self.routes.items() if r.pool == pool and rid != self.current]
             def recovery_order(rid):
                 h = self.health[rid]
-                accessible = (h.light_kind == "accessible" and not h.light_failures
-                              and 0 <= now - h.light_ok_at <= self.policy["light_fresh_sec"])
+                if self.reachability_enabled:
+                    h = self.reachability[rid]
+                    accessible = (h.kind == "accessible" and not h.failures
+                                  and 0 <= now - h.ok_at <= self.light_freshness())
+                else:
+                    accessible = (h.light_kind == "accessible" and not h.light_failures
+                                  and 0 <= now - h.light_ok_at <= self.policy["light_fresh_sec"])
                 return (not self.ready(rid, now), not self.qualified(rid, now),
                         not accessible, self.routes[rid].priority)
             ids = sorted(ids, key=recovery_order)
@@ -478,6 +611,8 @@ class Engine:
         return list(dict.fromkeys(chosen))
 
     def decision(self, now):
+        if self.reachability_enabled:
+            return self.reachability_decision(now)
         ready = [rid for rid in self.routes if self.ready(rid, now)]
         commercial = [rid for rid in ready if self.routes[rid].pool in self.config["commercial_pools"]]
         active = self.health.get(self.current)
@@ -507,6 +642,28 @@ class Engine:
             return self.current, "api_attention"
         return self.current, "checking"
 
+    def reachability_decision(self, now):
+        ready = [rid for rid in self.routes if self.ready(rid, now)]
+        pools = self.config["commercial_pools"]
+        current = self.reachability.get(self.current)
+        if self.current in ready and self.routes[self.current].pool in pools:
+            return self.current, "healthy"
+        if (current and current.admitted and not current.quarantined
+                and current.failures and self.qualified(self.current, now)):
+            return self.current, "suspect"
+        for pool in dict.fromkeys([self.active_pool, *pools]):
+            if pool not in pools:
+                continue
+            available = self.ranked([rid for rid in ready if self.routes[rid].pool == pool])
+            if available:
+                return available[0], "healthy"
+        fallback = self.ranked([rid for rid in ready if self.routes[rid].pool not in pools])
+        if fallback:
+            return fallback[0], "fallback"
+        if current and current.quarantined:
+            return "", "network_wait"
+        return self.current, "checking"
+
     def light_due(self, now, in_flight):
         hot = set(self.standbys(now))
         def order(rid):
@@ -522,6 +679,8 @@ class Engine:
         return sorted((rid for rid in self.routes if rid not in in_flight and order(rid)[1] <= now), key=order)
 
     def deep_due(self, now, in_flight):
+        if self.reachability_enabled:
+            return None
         interval = max(self.policy["deep_min_interval_sec"], 60 / self.policy["deep_per_minute"])
         self.deep_starts = recent_deep_starts(self.deep_starts, now, interval)
         if (self.api.remaining(now) > 0 or self.deep_pending is not None
@@ -555,6 +714,8 @@ class Engine:
         return min(candidates)[-1] if candidates else None
 
     def reserve_deep(self, rid, now):
+        if self.reachability_enabled:
+            raise RuntimeError("model probes disabled in reachability mode")
         if self.deep_pending is not None:
             raise RuntimeError("an unfinished deep reservation still owns the budget")
         self.deep_starts.append(now)
@@ -573,6 +734,8 @@ class Engine:
 
     def saved(self):
         return {"health": {rid: dataclasses.asdict(h) for rid, h in self.health.items()},
+                "validation_mode": self.config.get("probe", {}).get("validation_mode", "response"),
+                "reachability_health": {rid: dataclasses.asdict(h) for rid, h in self.reachability.items()},
                 "current": self.current, "active_pool": self.active_pool,
                 "deep_starts": self.deep_starts, "seed_consumed": self.seed_consumed,
                 "api_probe": self.api.saved(),
@@ -832,14 +995,19 @@ class Guard:
         if changed:
             previous, self.contract = self.contract, contract
             self.probe_binding_at = now
-            for health in self.engine.health.values():
-                health.qualified = False
-                health.deep_attempt_at = 0
+            if reachability_mode(config["probe"]):
+                self.engine.reset_reachability(preserve_current=self.engine.reachability_enabled)
+            else:
+                for health in self.engine.health.values():
+                    health.qualified = False
+                    health.deep_attempt_at = 0
             # Account/model identity changed. Keep route isolation, old
             # evidence and paid reservations; begin a separately bound sample.
-            self.engine.api = ApiProbeState(now, monotonic=self.engine._monotonic)
+            if not reachability_mode(config["probe"]):
+                self.engine.api = ApiProbeState(now, monotonic=self.engine._monotonic)
             self.journal({"event": "probe_contract_changed", "at": now, "previous": previous,
-                          "contract": contract, "model": config["probe"].get("model")})
+                          "contract": contract, "model": config["probe"].get("model"),
+                          "validation_mode": config["probe"].get("validation_mode", "response")})
         elif previous_error:
             self.journal({"event": "probe_credential_restored", "at": now, "contract": contract})
         return changed
@@ -849,6 +1017,8 @@ class Guard:
                 or self.probe_observer_errors.get(self.engine.current, ""))
 
     def automatic_status(self, now, rows):
+        if self.engine.reachability_enabled:
+            return self.reachability_status(now, rows)
         api = self.engine.api.snapshot(now)
         ready = sum(row["ready"] for row in rows)
         accessible = sum(row["light_kind"] == "accessible" and not row["light_failures"]
@@ -892,13 +1062,53 @@ class Guard:
                     "contract": self.contract, "bound_since": self.probe_binding_at},
                 "latency_note": "Clash 通用测速与完整 API 验证独立；Timeout 不代表全部手动节点不可用"}
 
+    def reachability_status(self, now, rows):
+        counts = dict.fromkeys(("reachable", "blocked", "failed", "uncertain", "pending"), 0)
+        fresh = self.engine.light_freshness()
+        for row in rows:
+            h = self.engine.reachability[row["id"]]
+            kind = ("pending" if not h.at or not 0 <= now - h.at <= fresh else
+                    "reachable" if h.kind == "accessible" else "blocked" if h.kind == "blocked" else
+                    "failed" if h.kind in {"timeout", "transport", "truncated"} else
+                    "pending" if h.kind == "observer_error" else "uncertain")
+            counts[kind] += 1
+        ready = sum(row["ready"] for row in rows)
+        recovering = sum(h.kind == "accessible" and h.quarantined for h in self.engine.reachability.values())
+        if self.observer_error() or not self.link.status()["available"]:
+            state, reason = "observer_error", "本机探测暂不可用，等待重检"
+        elif ready:
+            state, reason = "ready", "接口可达；账号额度与模型响应未验证"
+        elif recovering:
+            state, reason = "recovering", "接口已可达，等待冷却后的连续恢复检查"
+        elif counts["pending"]:
+            state, reason = "checking", "正在收集新的可达性证据"
+        else:
+            state, reason = "no_candidate", "暂无可选线路；查看拦截、传输失败与待确认分类"
+        last = max((h.at for h in self.engine.reachability.values()), default=0)
+        endpoint = urllib.parse.urlsplit(self.config["probe"]["url"])
+        return {"state": state, "reason": reason, "validation_mode": "reachability",
+                "candidate_count": len(rows), "ready": ready, "counts": counts,
+                "recovering": recovering, "last_checked_at": last, "fresh_for_sec": fresh,
+                "light_accessible": counts["reachable"], "model_probes_enabled": False,
+                "summary": (f"可达 {counts['reachable']}/{len(rows)} · 可选 {ready} · "
+                    f"拦截 {counts['blocked']} · 失败 {counts['failed']} · 待确认 {counts['uncertain']} · 待检 {counts['pending']}"),
+                "probe": {"host": endpoint.hostname, "path": endpoint.path, "credential_source": {"kind": "none"},
+                          "contract": self.contract, "bound_since": self.probe_binding_at},
+                "latency_note": "无 Key、无模型任务的接口可达性检测；HTTP 401/429/500 不等于节点被封"}
+
     def snapshot(self, now):
         e = self.engine
         physical = self.link.status()
         rows = [{"id": rid, "name": r.name, "label": r.label, "pool": r.pool,
                  **dataclasses.asdict(e.health[rid]), "qualified": e.qualified(rid, now),
                  "ready": e.ready(rid, now)} for rid, r in e.routes.items()]
+        if e.reachability_enabled:
+            for row in rows:
+                h = e.reachability[row["id"]]
+                row.update(legacy_quarantined=row["quarantined"], quarantined=h.quarantined,
+                           reachability=dataclasses.asdict(h), elapsed_ms=h.elapsed_ms, status=h.status)
         return {"version": 1, "pid": os.getpid(), "at": now, "mode": self.config["mode"],
+                "validation_mode": self.config["probe"].get("validation_mode", "response"),
                 "group": self.config["group"], "outer_group": self.config.get("outer_group"),
                 "service_host": self.config["service_host"], "phase": self.phase,
                 "current_id": e.current, "current": self.director.actual_name,
@@ -995,7 +1205,7 @@ class Guard:
             for old in saved.get("routes", []):
                 if old.get("id") == saved.get("current") and not any(r.id == old["id"] for r in routes):
                     routes.append(Route.restore(old))
-        else:
+        elif not reachability_mode(self.config["probe"]):
             # Preserve rate reservations even if credentials/probe contract
             # changed, as well as isolation history. New credentials require
             # new admission; they cannot erase a route's quarantine.
@@ -1004,7 +1214,8 @@ class Guard:
                 h["deep_ok_at"] = 0
                 h["deep_attempt_at"] = 0
             saved.pop("api_probe", None)
-        self.engine = Engine(self.config, routes, saved, monotonic=time.monotonic)
+        self.engine = Engine(self.config, routes, saved, monotonic=time.monotonic,
+                             reuse_reachability_evidence=saved.get("contract") == self.contract)
         if self._credential is not None and self.config.get("seed_file") and not self.engine.seed_consumed:
             self.engine.seed(read_json(self.config["seed_file"], {}), time.time())
         publisher = ProviderServer(self.config["publish"]["port"], self.config["publish"]["token"], self.config["offline_proxy"])

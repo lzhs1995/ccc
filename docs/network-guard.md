@@ -7,7 +7,58 @@ The watcher and Supervisor only read a small status file and send nonblocking
 recheck hints. Network probes never start Codex, emit a native completion event,
 or participate in B's success, STOP, scope, or heartbeat protocols.
 
-## Health and routing
+## Anonymous reachability mode
+
+Set `probe.validation_mode` to `reachability` when the goal is choosing an
+egress that can reach AnyRouter without an explicit IP/WAF block:
+
+```json
+{
+  "probe": {
+    "validation_mode": "reachability",
+    "url": "https://anyrouter.top/v1/responses",
+    "timeout_sec": 5,
+    "light_timeout_by_pool": {"Tokyo": 8}
+  }
+}
+```
+
+This mode sends only intentionally invalid JSON, without an API key, cookies,
+model value, task prompt or tools. Model-generation probes, their scheduling,
+and direct deep-probe calls are disabled. `model`, `auth_file`, `auth_env`, and
+custom headers left in an older configuration do not enter the request or
+admission fingerprint. Changing the Codex key/model cannot revoke these checks.
+Existing paid reservations, API results and quarantine history remain recorded;
+they are not converted into proof for the new mode.
+
+A structured validator/authentication/permission/rate-limit/upstream error
+proves the API is reachable, including HTTP 401, 403, 429 and 500. It does **not**
+prove account quota, model availability or successful generation. Explicit
+IP-ban or browser-challenge evidence is classified as blocked even when the
+HTTP status is 200 or 500. Generic HTML, generic error pages and unrecognized
+responses remain uncertain rather than becoming an IP-ban or admission result.
+
+One fresh reachable response admits a new route. Previously quarantined routes
+still need cooldown and three subsequent reachable responses; no paid SSE is
+required. A first transport failure requests a recheck; two failures isolate
+the route. Current commercial selections remain sticky, and Tokyo retains its
+configured primary/backup order. Outer/manual selectors remain user-owned.
+
+The existing 2/5/60-second intervals and four-probe concurrency remain in use.
+Reachability evidence expires after `other_interval_sec + light_fresh_sec`
+(80 seconds with defaults), so a normal 60-second polling interval no longer
+expires at 20 seconds. Late collection does not refresh the observation time.
+`ccc network status` reports reachable, blocked, failed, uncertain and pending
+counts, the separately eligible count, recovery state, last observation time,
+and per-route stage/reason. The Supervisor summary shows these counts and time
+even while the user is on a manual route.
+
+Omitting `validation_mode`, or setting it to `response`, preserves the legacy
+authenticated model-check behavior described below. A live upgrade must preserve
+existing proxy connections; changing this setting does not require a main
+Mihomo/TUN restart or a Codex restart.
+
+## Legacy response-mode health and routing
 
 - A malformed JSON POST to `/v1/responses` checks whether the actual API
   validator is reachable without starting a generation. It is not admission.
