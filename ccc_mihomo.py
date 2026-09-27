@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections import deque
 import copy
 import dataclasses
+import datetime
 import ctypes
 import hashlib
 import http.client
@@ -273,6 +274,154 @@ def effective_service_route(controller, config):
     return {**result, "kind": "unknown", "chain": chain}
 
 
+def live_proxy_path(name, provider=""):
+    encoded = urllib.parse.quote(name, safe="")
+    return ("/providers/proxies/" + urllib.parse.quote(provider, safe="") + "/" + encoded
+            if provider else "/proxies/" + encoded)
+
+
+def live_proxy(controller, name, provider=""):
+    value = controller.get(live_proxy_path(name, provider))
+    if provider:
+        if value.get("provider-name") not in {None, "", provider}:
+            raise ValueError("live proxy belongs to another provider")
+        value = {**value, "provider-name": provider}
+    return value
+
+
+def live_proxy_chain(name, lookup):
+    """Bind a concrete live proxy, including every fixed dialer, by object id.
+
+    Friendly names and generic health flags do not identify a route. Dynamic
+    dialer groups cannot prove which exit a subsequent request will use.
+    """
+    result, seen = [], set()
+    fields = ("id", "type", "dialer-proxy", "interface", "routing-mark", "tfo",
+              "mptcp", "udp", "uot", "xudp", "smux", "provider-name")
+    while name:
+        if name in seen or len(seen) >= 16:
+            raise ValueError("live proxy dependency cycle")
+        seen.add(name)
+        node = lookup(name)
+        if (not isinstance(node, dict) or node.get("name", name) != name
+                or not isinstance(node.get("id"), str) or not node["id"]
+                or node.get("type") in {"Direct", "Reject", "RejectDrop", "Pass", "Compatible",
+                                         "Selector", "URLTest", "Fallback", "LoadBalance", "Relay"}
+                or node.get("now")):
+            raise ValueError("live route is not an identified fixed proxy")
+        result.append({"name": name, **{k: node.get(k) for k in fields}})
+        name = node.get("dialer-proxy") or ""
+        if not isinstance(name, str):
+            raise ValueError("invalid live proxy dependency")
+    return result
+
+
+def manual_service_binding(controller, config, *, recheck=False):
+    """Snapshot the explicitly opted-in manual selector and its auto child.
+
+    This reads live proxy object identities, so renames, reloads and changed
+    dialers invalidate pending checks without reading subscription secrets.
+    """
+    policy = config.get("manual_failover") or {}
+    if policy.get("enabled") is not True:
+        return None
+    if str(controller.get("/configs").get("mode", "")).lower() != "rule":
+        return None
+    rules = controller.get("/rules").get("rules", [])
+    first = rules[0] if rules else {}
+    outer = config.get("outer_group") or config["group"]
+    if (first.get("type") != "Domain" or first.get("payload") != config["service_host"]
+            or first.get("proxy") != outer):
+        return None
+    nodes = controller.get("/proxies").get("proxies")
+    if not isinstance(nodes, dict):
+        raise ValueError("live proxy inventory unavailable")
+    name, path, selectors = outer, [], []
+    for _ in range(16):
+        if name in path or name == config["group"]:
+            return None
+        path.append(name)
+        node = nodes.get(name, {})
+        if node.get("type") != "Selector":
+            break
+        child = node.get("now")
+        if not isinstance(child, str) or child not in node.get("all", []):
+            return None
+        selectors.append({"name": name, "now": child})
+        name = child
+    else:
+        return None
+    selector, automatic = policy["selector"], policy["automatic"]
+    if not selectors or selectors[-1]["name"] != selector:
+        return None
+    if automatic not in nodes[selector].get("all", []):
+        return None
+    chain = live_proxy_chain(name, nodes.get)
+    auto_path, auto_seen, child = [], set(), automatic
+    while child != config["group"]:
+        if child in auto_seen or len(auto_seen) >= 16 or child in path:
+            return None
+        auto_seen.add(child)
+        node = nodes.get(child, {})
+        following = node.get("now")
+        if (node.get("type") != "Selector" or not isinstance(following, str)
+                or following not in node.get("all", [])):
+            return None
+        auto_path.append({"name": child, "now": following})
+        child = following
+    group = nodes.get(config["group"], {})
+    if group.get("type") != "Selector":
+        return None
+    candidate = None
+    candidate_name = group.get("now")
+    if isinstance(candidate_name, str) and candidate_name in group.get("all", []):
+        try:
+            # Provider children are absent from Mihomo's global /proxies map.
+            # Resolve just the selected child in the configured provider; a
+            # provider-wide healthcheck would fan out and cannot bind a result.
+            candidate_node = live_proxy(controller, candidate_name, config["provider"])
+            candidate_chain = live_proxy_chain(candidate_name,
+                lambda n: candidate_node if n == candidate_name else nodes.get(n))
+            if candidate_name in nodes:
+                # A global proxy with the same name can shadow a provider
+                # child. Only an identical fixed route is unambiguous.
+                global_chain = live_proxy_chain(candidate_name, nodes.get)
+                identity = lambda chain: [{k: v for k, v in item.items() if k != "provider-name"}
+                                          for item in chain]
+                if (nodes[candidate_name].get("provider-name") not in {None, "", config["provider"]}
+                        or identity(global_chain) != identity(candidate_chain)):
+                    raise ValueError("global and provider proxy identities conflict")
+            candidate = {"name": candidate_name, "chain": candidate_chain}
+        except (ValueError, ControllerError):
+            pass  # Offline or an unproved choice is never a replacement.
+    if recheck:
+        # The provider read above may wait while the operator changes routes.
+        # Recheck all routing inputs after it, ignoring mutable health history.
+        began = time.monotonic()
+        if str(controller.get("/configs").get("mode", "")).lower() != "rule":
+            return None
+        current_rules = controller.get("/rules").get("rules", [])
+        if not current_rules or current_rules[0] != first:
+            return None
+        current_nodes = controller.get("/proxies").get("proxies")
+        if not isinstance(current_nodes, dict):
+            return None
+        names = {*path, config["group"], *(item["name"] for item in chain),
+                 *(item["name"] for item in auto_path)}
+        if candidate is not None:
+            names.update(item["name"] for item in candidate["chain"])
+        fields = ("id", "name", "type", "now", "all", "dialer-proxy", "interface",
+                  "routing-mark", "tfo", "mptcp", "udp", "uot", "xudp", "smux", "provider-name")
+        def identity(node):
+            return {k: node.get(k) for k in fields} if isinstance(node, dict) else None
+        if (any(identity(nodes.get(n)) != identity(current_nodes.get(n)) for n in names)
+                or time.monotonic() - began > .5):
+            return None
+    return {"selector": selector, "selection": name, "automatic": automatic,
+            "selectors": selectors, "chain": chain, "automatic_path": auto_path,
+            "candidate": candidate}
+
+
 class ShadowCore:
     def __init__(self, root, binary, interface):
         self.root, self.binary, self.interface = Path(root), str(binary), interface
@@ -402,6 +551,78 @@ class ProbeResult:
     detail: str = ""
     deep: bool = False
     stage: str = ""
+
+
+class LiveReachabilityProbe:
+    """Anonymous HEAD through the exact live node, with URL-specific proof.
+
+    Mihomo returns a delay even for an unexpected HTTP status, and may return
+    503 for a valid zero-millisecond response. Only fresh extra[url].alive
+    records implement the requested non-403 contract; top-level alive does not.
+    """
+    EXPECTED = "200-402/404-599"
+
+    def __init__(self, controller, url, timeout):
+        self.controller, self.timeout = controller, timeout
+        parsed = urllib.parse.urlsplit(url)
+        query = [(k, v) for k, v in urllib.parse.parse_qsl(parsed.query)
+                 if k != "__ccc_manual_health"]
+        # A stable separate URL avoids interference from UI speed tests and
+        # bounds Mihomo's per-URL history to one entry per proxy/contract.
+        self.url = urllib.parse.urlunsplit(parsed._replace(
+            query=urllib.parse.urlencode([*query, ("__ccc_manual_health", "1")])))
+
+    def run(self, name, expected_chain):
+        started = time.time()
+        proof = {"started_at": started, "name": name, "chain": expected_chain}
+        def finish(kind, detail="", stage="", elapsed=0):
+            return {**self_result, "completed_at": time.time(),
+                    "result": dataclasses.asdict(ProbeResult(kind, elapsed_ms=elapsed,
+                                                              detail=detail, stage=stage))}
+        self_result = proof
+        try:
+            snapshots = {}
+            providers = {item["name"]: item.get("provider-name") or "" for item in expected_chain}
+            def lookup(value):
+                node = live_proxy(self.controller, value, providers.get(value, ""))
+                snapshots[value] = node
+                return node
+            if live_proxy_chain(name, lookup) != expected_chain:
+                return finish("observer_error", "live proxy changed before check", "identity")
+            previous = snapshots[name].get("extra", {}).get(self.url, {}).get("history", [])
+            previous = previous[-1] if previous else None
+            query = urllib.parse.urlencode({"url": self.url, "timeout": int(self.timeout * 1000),
+                                            "expected": self.EXPECTED})
+            reply, control_status = {}, 200
+            try:
+                provider = providers.get(name, "")
+                endpoint = live_proxy_path(name, provider) + ("/healthcheck?" if provider else "/delay?")
+                reply = self.controller.get(endpoint + query)
+            except ControllerError as exc:
+                if exc.status not in {503, 504}:
+                    raise
+                control_status = exc.status
+            if live_proxy_chain(name, lookup) != expected_chain:
+                return finish("observer_error", "live proxy changed during check", "identity")
+            health = snapshots[name].get("extra", {}).get(self.url, {})
+            history = health.get("history", [])
+            last = history[-1] if isinstance(history, list) and history else {}
+            stamp = datetime.datetime.fromisoformat(last.get("time", "").replace("Z", "+00:00")).timestamp()
+            if (type(health.get("alive")) is not bool or last == previous
+                    or not started - .1 <= stamp <= time.time() + .1):
+                return finish("observer_error", "live check has no fresh URL-specific result", "evidence")
+            self_result = {**proof, "history_at": stamp, "controller_status": control_status,
+                           "url_alive": health["alive"], "history_delay": last.get("delay")}
+            if health["alive"]:
+                return finish("accessible", "anonymous live HEAD accepted non-403 status", "http",
+                              last.get("delay", 0))
+            delay = reply.get("delay", 0)
+            if type(delay) in (int, float) and delay > 0:
+                return finish("blocked", "live HTTP status rejected by non-403 contract", "http", delay)
+            return finish("transport", "live route health request failed", "transport")
+        # Controller/identity/evidence failures are not node failure evidence.
+        except Exception as exc:
+            return finish("observer_error", "live check unavailable: " + type(exc).__name__, "observer")
 
 
 class _IfAddrs(ctypes.Structure):

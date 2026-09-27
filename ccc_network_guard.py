@@ -29,9 +29,9 @@ import urllib.parse
 import uuid
 from pathlib import Path
 
-from ccc_mihomo import (Controller, ControllerError, PhysicalLink, ProbeResult, ResponsesProbe,
+from ccc_mihomo import (Controller, ControllerError, LiveReachabilityProbe, PhysicalLink, ProbeResult, ResponsesProbe,
                         Route, ShadowCore, atomic_json, effective_service_route, inventory,
-                        probe_credential, probe_key, reachability_mode, validate_dependencies)
+                        manual_service_binding, probe_credential, probe_key, reachability_mode, validate_dependencies)
 
 
 DEFAULTS = {
@@ -94,6 +94,17 @@ def load_config(path):
             or endpoint.username or endpoint.password or endpoint.fragment
             or not reachability_mode(probe) and not probe.get("model")):
         raise ValueError("probe must use HTTPS on the configured service host and an explicit model")
+    takeover = config.get("manual_failover", {})
+    if (not isinstance(takeover, dict) or set(takeover) - {"enabled", "selector", "automatic"}
+            or type(takeover.get("enabled", False)) is not bool):
+        raise ValueError("manual_failover needs an explicit boolean activation")
+    if takeover.get("enabled"):
+        selector, automatic = takeover.get("selector"), takeover.get("automatic")
+        if (not reachability_mode(probe) or not config.get("outer_group")
+                or any(not isinstance(v, str) or not v or v in {"GLOBAL", "DIRECT", "REJECT", config["offline_proxy"]}
+                       for v in (selector, automatic))
+                or selector in {automatic, config["group"]}):
+            raise ValueError("manual_failover requires reachability and a separate service selector/automatic choice")
     for key, default, low, high in (("timeout_sec", 5, .1, 10), ("deep_timeout_sec", 45, 1, 90)):
         number = probe.get(key, default)
         if isinstance(number, bool) or not isinstance(number, (float, int)) or not low <= number <= high:
@@ -818,6 +829,113 @@ class ProviderServer:
             self.catalog = catalogs
 
 
+class ManualFailover:
+    """Fresh actual-route checks; only an explicitly named selector is owned.
+
+    Failure streaks are intentionally not restored after a restart. A changed
+    live proxy object, user selection or physical link starts new evidence.
+    """
+    def __init__(self):
+        self.epoch, self.key, self.binding = 0, "", None
+        self.failures, self.latest, self.next_probe = 0, None, 0
+        self.enabled, self.state, self.detail = False, "disabled", "手选故障接替未启用"
+        self.last_switch = None
+        self.config = {}
+
+    @staticmethod
+    def binding_key(binding, generation, config):
+        if not binding:
+            return ""
+        value = {k: v for k, v in binding.items() if k != "candidate"}
+        value.update(generation=generation, url=config["probe"]["url"])
+        return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+
+    def observe(self, config, controller, generation, phase):
+        self.config = config
+        self.enabled = (config.get("manual_failover") or {}).get("enabled") is True
+        binding, error = None, ""
+        if self.enabled:
+            try:
+                binding = manual_service_binding(controller, config)
+            except Exception as exc:
+                error = "实际线路身份暂不可核验：" + type(exc).__name__
+        key = self.binding_key(binding, generation, config)
+        if key != self.key:
+            self.epoch += 1
+            self.failures, self.latest, self.next_probe = 0, None, 0
+        self.key, self.binding = key, binding
+        if not self.enabled:
+            self.state, self.detail = "disabled", "手选故障接替未启用"
+        elif error:
+            self.state, self.detail = "observer_error", error
+        elif not binding:
+            self.state, self.detail = (("automatic", "自动线路已接管") if phase not in {"manual", "inactive", "observer_fault"}
+                                      else ("unverified", "当前手选路径不在已授权接替范围"))
+        elif self.latest is None:
+            self.state, self.detail = "checking", "正在检测实际手选线路；故障时自动接替"
+
+    def due(self, monotonic):
+        return self.enabled and self.binding is not None and monotonic >= self.next_probe
+
+    @staticmethod
+    def run_probe(config, binding, candidate, link, generation):
+        controller = Controller(config["controller_socket"], config.get("controller_secret", ""),
+                                timeout=config["probe"].get("timeout_sec", 5) + 2)
+        probe = LiveReachabilityProbe(controller, config["probe"]["url"], config["probe"].get("timeout_sec", 5))
+        started = time.monotonic()
+        if not link.accepts(generation):
+            return None
+        manual = probe.run(binding["selection"], binding["chain"])
+        replacement = None
+        if (manual["result"]["kind"] in LOCAL_FAILURES and candidate is not None
+                and link.accepts(generation)):
+            replacement = probe.run(candidate["name"], candidate["chain"])
+        return {"manual": manual, "candidate": replacement, "started_mono": started,
+                "completed_mono": time.monotonic()}
+
+    def record(self, result, epoch, generation, link):
+        if epoch != self.epoch or not self.binding:
+            return False
+        now = time.monotonic()
+        self.next_probe = now + self.config["policy"]["current_interval_sec"]
+        if result is None or not link.accepts(generation):
+            self.failures, self.latest = 0, None
+            self.state, self.detail = "observer_error", "本机网络或检测器暂不可用，保留手选"
+            return False
+        previous = self.latest
+        self.latest = result
+        kind = result["manual"]["result"]["kind"]
+        if kind == "accessible":
+            self.failures = 0
+            self.state, self.detail = "healthy", "手选线路可达 · 故障自动接替已开启"
+        elif kind in LOCAL_FAILURES:
+            limit = 2 * (self.config["probe"].get("timeout_sec", 5) + 2) + 2 * self.config["policy"]["current_interval_sec"] + 5
+            if previous is None or result["completed_mono"] - previous["completed_mono"] > limit:
+                self.failures = 0
+            self.failures = min(1024, self.failures + 1)
+            self.state, self.detail = "suspect", "手选线路检测失败，正在复核备用线路"
+        else:
+            self.failures = 0
+            self.state, self.detail = "observer_error", "实际线路检测结果待确认，保留手选"
+        return True
+
+    def ready(self, monotonic):
+        latest = self.latest
+        threshold = max(2, self.config.get("policy", {}).get("failures_before_isolation", 2))
+        return bool(self.binding and latest and self.failures >= threshold
+                    and latest["manual"]["result"]["kind"] in LOCAL_FAILURES
+                    and latest["candidate"] and latest["candidate"]["result"]["kind"] == "accessible"
+                    and 0 <= monotonic - latest["completed_mono"] <= min(20, self.config["policy"]["light_fresh_sec"]))
+
+    def snapshot(self):
+        latest = self.latest or {}
+        return {"enabled": self.enabled, "state": self.state, "summary": self.detail,
+                "selection": (self.binding or {}).get("selection"), "consecutive_failures": self.failures,
+                "required_failures": max(2, self.config.get("policy", {}).get("failures_before_isolation", 2)),
+                "last_check": latest.get("manual"), "replacement_check": latest.get("candidate"),
+                "last_switch": self.last_switch, "model_requests": 0}
+
+
 class Director:
     """Publish -> refresh -> select -> read back. Never reload or DELETE."""
     def __init__(self, config, engine, controller, publisher):
@@ -827,6 +945,7 @@ class Director:
         self.actual_name = ""
         self.effective_route = {"managed": False, "kind": "unknown", "selection": "", "chain": []}
         self.reconciliation_error = ""
+        self.manual = ManualFailover()
 
     def sync(self, now, *, link=None, observer_error=""):
         # A manual choice may happen while an automatic refresh is in flight.
@@ -840,12 +959,78 @@ class Director:
             self.reconciliation_error = "automatic selector reconciliation failed: " + type(exc).__name__
             phase, target = "observer_fault", self.engine.current
         self.effective_route = effective_service_route(self.controller, self.config)
+        generation = link.current() if link is not None else None
+        self.manual.observe(self.config, self.controller, generation,
+                            "manual" if self.effective_route.get("kind") == "manual" else phase)
+        if self.manual.binding and failure is None:
+            self._manual_takeover(now, link, generation, observer_error)
+            self.effective_route = effective_service_route(self.controller, self.config)
         if not self.effective_route["managed"]:
             kind = self.effective_route["kind"]
             phase = "manual" if kind == "manual" else "inactive" if kind == "inactive" else "observer_fault"
         elif failure is not None:
             raise failure
         return phase, target
+
+    def _manual_takeover(self, now, link, generation, observer_error):
+        manual, e, c = self.manual, self.engine, self.config
+        if observer_error or link is not None and not link.accepts(generation):
+            manual.state, manual.detail = "observer_error", "本机网络或检测器暂不可用，保留手选"
+            return
+        if not manual.ready(time.monotonic()):
+            if (manual.failures >= 2 and manual.latest
+                    and (manual.latest.get("candidate") or {}).get("result", {}).get("kind") != "accessible"):
+                manual.state, manual.detail = "no_candidate", "手选检测失败，暂无新验证可达的备用线路"
+            return
+        candidate = manual.latest["candidate"]
+        if e.current not in e.routes or self.actual_name != candidate["name"] or not e.ready(e.current, now):
+            manual.state, manual.detail = "no_candidate", "备用线路已变化，等待重新验证"
+            return
+        # Probe completion grants no write on its own. Re-read the actual user
+        # choice, live object ids, fixed dialers and auto child immediately
+        # before this single selector PUT. Never undo a later user choice.
+        checked_at = time.monotonic()
+        fresh = manual_service_binding(self.controller, c, recheck=True)
+        if (manual.binding_key(fresh, generation, c) != manual.key or not fresh
+                or fresh.get("candidate") != {"name": candidate["name"], "chain": candidate["chain"]}
+                or not manual.ready(time.monotonic())
+                or not e.ready(e.current, now + max(0, time.monotonic() - checked_at))
+                or link is not None and not link.accepts(generation)):
+            manual.observe(c, self.controller, link.current() if link is not None else None, "manual")
+            return
+        if c["mode"] != "manage":
+            manual.state, manual.detail = "observe", "已确认可接替；当前仅观察"
+            return
+        # This GET is deliberately after provider and route lookups, closest
+        # to the PUT. Mihomo has no compare-and-swap selector API; an operator
+        # change after this final read still cannot be fenced atomically.
+        began = time.monotonic()
+        choice = self.controller.get("/proxies/" + urllib.parse.quote(fresh["selector"], safe=""))
+        if (choice.get("type") != "Selector" or choice.get("now") != fresh["selection"]
+                or fresh["automatic"] not in choice.get("all", [])
+                or time.monotonic() - began > .5 or not manual.ready(time.monotonic())
+                or not e.ready(e.current, now + max(0, time.monotonic() - checked_at))
+                or link is not None and not link.accepts(generation)):
+            manual.observe(c, self.controller, link.current() if link is not None else None, "manual")
+            return
+        event = {"event": "manual_failover", "at": time.time(), "previous": fresh["selection"],
+                 "selector": fresh["selector"], "automatic": fresh["automatic"],
+                 "replacement": candidate["name"], "failures": manual.failures, "confirmed": False}
+        try:
+            self.controller.select(fresh["selector"], fresh["automatic"])
+            readback = self.controller.get("/proxies/" + urllib.parse.quote(fresh["selector"], safe=""))
+            effective = effective_service_route(self.controller, c)
+            event["confirmed"] = readback.get("now") == fresh["automatic"] and effective["managed"]
+            if not event["confirmed"]:
+                raise RuntimeError("manual failover readback changed")
+            manual.state, manual.detail = "automatic", "手选线路故障，已自动接替；已有连接保持原路径"
+        except Exception as exc:
+            event["error"] = type(exc).__name__
+            manual.state, manual.detail = "observer_error", "接替结果待核验，等待读取实际选择"
+        finally:
+            manual.last_switch = event
+            manual.epoch += 1
+            manual.failures, manual.latest, manual.next_probe = 0, None, time.monotonic() + c["policy"]["current_interval_sec"]
 
     def _sync(self, now, *, link=None, observer_error=""):
         e, c = self.engine, self.config
@@ -934,6 +1119,7 @@ class Guard:
         self.core = None
         self.director = None
         self.jobs = {}
+        self.manual_job = None
         self.retired = []
         self.shadow_error = ""
         self.inventory_error = ""
@@ -1116,6 +1302,7 @@ class Guard:
                 "error": self.control_error or self.observer_error() or physical["detail"] or self.inventory_error or self.journal_error,
                 "inventory_error": self.inventory_error, "routes": rows,
                 "effective_route": dict(self.director.effective_route),
+                "manual_failover": self.director.manual.snapshot(),
                 "storage_errors": dict(self.storage_errors),
                 "probe_observer_errors": dict(self.probe_observer_errors),
                 "physical_link": physical, "last_probe_event": self.last_probe_event,
@@ -1123,7 +1310,7 @@ class Guard:
                 "discarded_probes": self.discarded_probes, "journal_error": self.journal_error,
                 "ready": sum(r["ready"] for r in rows), "qualified": sum(r["qualified"] for r in rows),
                 "quarantined": sum(r["quarantined"] for r in rows),
-                "probe_in_flight": len(self.jobs),
+                "probe_in_flight": len(self.jobs) + int(self.manual_job is not None),
                 "deep_in_last_minute": sum(now - stamp < 60 for stamp in e.deep_starts),
                 "deep_budget": e.saved()["deep_budget"],
                 "hint_count": self.hint_count, "hint_socket": str(private_socket_dir(self.config) / "hint.sock"),
@@ -1263,6 +1450,16 @@ class Guard:
                         self.error = f"config refresh failed: {type(exc).__name__}"
                     next_config = time.time() + 2
                 self.consume_hints(hint_socket, now)
+                if self.manual_job is not None and self.manual_job[0].done():
+                    future, epoch, generation = self.manual_job
+                    self.manual_job = None
+                    try:
+                        result = future.result()
+                    except Exception:
+                        result = None
+                    accepted = self.director.manual.record(result, epoch, generation, self.link)
+                    self.journal({"event": "manual_probe", "at": time.time(), "accepted": accepted,
+                                  "epoch": epoch, "generation": generation, "proof": result})
                 completed = []
                 for job, (rid, deep, owner, began, contract, generation) in list(self.jobs.items()):
                     if job.done():
@@ -1351,11 +1548,23 @@ class Guard:
                 # Do not reserve a billable request using the tick's old clock.
                 now = time.time()
                 generation = self.link.current()
+                manual = self.director.manual
+                if (generation is not None and self.manual_job is None and manual.due(time.monotonic())
+                        and len(self.jobs) < self.engine.policy["concurrency"] and not self.observer_error()):
+                    binding = copy.deepcopy(manual.binding)
+                    candidate = binding.get("candidate")
+                    if (not candidate or candidate["name"] != self.director.actual_name
+                            or self.engine.current not in self.engine.routes or not self.engine.ready(self.engine.current, now)):
+                        candidate = None
+                    future = executor.submit(manual.run_probe, copy.deepcopy(self.config), binding,
+                                             candidate, self.link, generation)
+                    self.manual_job = future, manual.epoch, generation
+                    manual.next_probe = float("inf")  # One check for the actual route, never one per CLI.
                 if (generation is not None and self.core and self.core.process.poll() is None
                         and not self.error and self._credential is not None):
                     occupied = {rid for rid, deep, _, _, _, _ in self.jobs.values() if not deep}
                     probe = ResponsesProbe(self.config["probe"], self.core.ports, credential=self._credential)
-                    if len(self.jobs) < self.engine.policy["concurrency"] and not any(deep for _, deep, _, _, _, _ in self.jobs.values()):
+                    if len(self.jobs) + int(self.manual_job is not None) < self.engine.policy["concurrency"] and not any(deep for _, deep, _, _, _, _ in self.jobs.values()):
                         rid = self.engine.deep_due(now, occupied)
                         if rid:
                             self.engine.reserve_deep(rid, now)
@@ -1370,7 +1579,7 @@ class Guard:
                                 # reservation and wait a full interval anyway.
                                 self.engine.settle_deep(time.time())
                     for rid in self.engine.light_due(now, occupied):
-                        if len(self.jobs) >= self.engine.policy["concurrency"]:
+                        if len(self.jobs) + int(self.manual_job is not None) >= self.engine.policy["concurrency"]:
                             break
                         self.engine.health[rid].light_attempt_at = now
                         job = executor.submit(self.run_probe, probe, self.engine.routes[rid], False, self.link, generation)
@@ -1379,8 +1588,11 @@ class Guard:
                     try:
                         self.save()  # Proof and full route definition precede publication.
                         previous_selection = self.director.actual_name
+                        previous_takeover = self.director.manual.last_switch
                         self.phase, _ = self.director.sync(now, link=self.link, observer_error=self.observer_error())
                         self.control_error = self.director.reconciliation_error
+                        if self.director.manual.last_switch is not previous_takeover:
+                            self.journal(self.director.manual.last_switch)
                         if self.director.actual_name != previous_selection:
                             self.journal({"event": "selection", "at": time.time(), "phase": self.phase,
                                           "previous": previous_selection, "current": self.director.actual_name})

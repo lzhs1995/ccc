@@ -42,7 +42,8 @@ One fresh reachable response admits a new route. Previously quarantined routes
 still need cooldown and three subsequent reachable responses; no paid SSE is
 required. A first transport failure requests a recheck; two failures isolate
 the route. Current commercial selections remain sticky, and Tokyo retains its
-configured primary/backup order. Outer/manual selectors remain user-owned.
+configured primary/backup order. Outer/manual selectors remain user-owned
+unless the explicit manual-failover policy below is enabled.
 
 The existing 2/5/60-second intervals and four-probe concurrency remain in use.
 Reachability evidence expires after `other_interval_sec + light_fresh_sec`
@@ -57,6 +58,57 @@ Omitting `validation_mode`, or setting it to `response`, preserves the legacy
 authenticated model-check behavior described below. A live upgrade must preserve
 existing proxy connections; changing this setting does not require a main
 Mihomo/TUN restart or a Codex restart.
+
+## Failover from a failed manual choice
+
+The background automatic pool does not carry traffic while the outer selector
+uses a manual node. To transfer that traffic after the manual route fails, opt
+in for the exact service selector and its existing automatic child:
+
+```json
+{
+  "manual_failover": {
+    "enabled": true,
+    "selector": "AnyRouter",
+    "automatic": "自动切换（可达性检测）"
+  }
+}
+```
+
+This policy requires anonymous reachability mode and rule mode. The exact
+service domain must be the first rule. Only the named selector can change;
+unrelated rules, fixed US1/US2 routes and GLOBAL choices are outside this policy.
+
+The guard prioritizes an anonymous HEAD through the actual selected live proxy
+within the shared four-worker limit. It checks fresh health for a separate,
+stable URL on that exact Mihomo proxy. HTTP 401, 429 and 500 are reachable;
+403 and connection failures count as failed checks. Generic `alive`, a positive
+delay and the controller's HTTP status alone cannot prove this result.
+No API key, model, task prompt or generated response is used.
+
+A healthy manual choice stays selected. At least two consecutive fresh failures
+and a fresh successful check of an eligible automatic replacement are required.
+The selector path, proxy object IDs, fixed dialers, configured provider and local
+physical-link generation are checked again before the one selector update.
+Routing inputs are reread after the provider lookup, with the manual selector
+read closest to the update. Slow final reads cannot authorize a switch. Mihomo's
+REST selector API has no compare-and-swap operation, so a user change after the
+last read still cannot be excluded atomically.
+Conflicting global/provider names cannot authorize a replacement. Provider
+checks target one node, never a provider-wide healthcheck. An unavailable
+observer or replacement leaves the manual selection in place and reports why.
+Failure streaks are discarded on restart or a changed manual-route identity.
+
+After takeover, normal automatic routing manages new connections. It does not
+switch back to the old manual node when that node recovers. A subsequent user
+selection starts fresh checks. This operation does not reload Clash or delete
+connections; existing streams retain their original route. A stream whose
+remote route has already failed still relies on the client's normal retry.
+
+`ccc network status` exposes `manual_failover` with the actual selection, recent
+checks, failure count and last takeover. The Supervisor shows this status before
+the background candidate count, so a healthy automatic pool is not mistaken for
+protection of traffic that still uses a manual node.
 
 ## Legacy response-mode health and routing
 
@@ -300,7 +352,7 @@ It never reloads Clash or closes existing connections. A route switch affects
 new connections; an already broken remote stream still needs the client's
 normal retry. No network policy can guarantee an upstream API never fails.
 
-### Automatic API checks and the delay-test label
+### Legacy automatic API checks and the delay-test label
 
 The automatic selector admits only paths with a complete model response. Its
 candidate inventory can be smaller than the independent manual catalog. A
