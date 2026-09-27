@@ -41,6 +41,14 @@ class AccessHandler(BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
 
+    def end_headers(self):
+        if getattr(self.server, 'repeat_response_headers', False):
+            self.send_header('Set-Cookie', 'fixture_first=1; Path=/')
+            self.send_header('Set-Cookie', 'fixture_second=2; Path=/')
+            self.send_header('Vary', 'Accept-Encoding')
+            self.send_header('Vary', 'Origin')
+        super().end_headers()
+
     def do_POST(self):
         raw = self.rfile.read(int(self.headers['Content-Length']))
         body = json.loads(raw)
@@ -128,6 +136,25 @@ def native_resources(owned):
             'physical_footprint_median': statistics.median(r['physical_footprint'] for r in rows)}
 
 
+def access_panel_snapshot(config_path, client, slots):
+    import cmux_supervisor_tui as tui
+    from types import SimpleNamespace
+    quiet = SimpleNamespace(maybe_refresh=lambda *args, **kwargs: None, snapshot=lambda: {})
+    model = tui.SupervisorModel(config_path, client=client, janitor=quiet,
+                                stack=quiet, collab=quiet, sessions=quiet)
+    try:
+        model.refresh(force=True)
+        owned_ids = {slot['surface_id'] for slot in slots}
+        rows = {row.surface_id: {'screen': tui.screen_label(row), 'error': tui.error_label(row),
+                                'phase': row.access.get('phase'), 'allowed': row.access.get('allowed'),
+                                'alarming': row.access.get('alarming')}
+                for row in model.candidates if row.surface_id in owned_ids}
+        assert set(rows) == owned_ids
+        return rows
+    finally:
+        model.close()
+
+
 def continue_failed_batch(config_path, root, home, client, slots, owned, output, *, access_check=False, job_id=''):
     """Use the real scheduler, viewport gates and native identity checks."""
     failed = {s['surface_id']: native.task_snapshot(Path(s['transcript']), s['session_id']) for s in slots}
@@ -202,8 +229,11 @@ def main():
     parser.add_argument('--workspace', help='use an existing workspace; clean up only newly created fixture surfaces')
     parser.add_argument('--verify-continuation', action='store_true',
                         help='fail every original first turn; require real CCC continuation in all 50 sessions')
+    parser.add_argument('--repeat-response-headers', action='store_true',
+                        help='send legal repeated Cookie/Vary fields on every local API response (N only)')
     args = parser.parse_args()
     access_check = args.mode == 'access-check'
+    assert not args.repeat_response_headers or access_check
     private_check = args.mode != 'existing'
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -216,6 +246,7 @@ def main():
     server.requests = []
     server.fail_first = False
     server.fail_first_by_session = args.verify_continuation
+    server.repeat_response_headers = args.repeat_response_headers
     server.failed_sessions = set()
     server.failure_lock = threading.Lock()
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -253,6 +284,7 @@ def main():
                                  'tools/batch_native_acceptance.py', 'tools/idle_session_native_acceptance.py')}
     record = {'phase': 'prepared', 'root': str(root), 'production_requests': 0,
               'automatic_pause': False, 'native_before': original, 'startup_mode': args.mode,
+              'repeat_response_headers': args.repeat_response_headers,
               'source_files': source_files,
               'native_binary_sha256': hashlib.sha256(Path(guard.native_binary()).read_bytes()).hexdigest()}
     core.atomic_write_json(output / 'result.json', record)
@@ -412,6 +444,17 @@ def main():
             time.sleep(.1)
         assert all(t and t['kind'] == 'task_complete'
                    and bool(t.get('error')) == args.verify_continuation for t in completions)
+        if access_check and args.repeat_response_headers and args.verify_continuation:
+            deadline = time.monotonic() + 5
+            while True:
+                observed = access_panel_snapshot(config_path, client, worker.job['slots'])
+                if all(row['phase'] == 'retryable' and row['allowed'] for row in observed.values()):
+                    break
+                assert time.monotonic() < deadline, 'first-wave errors were not visible and retryable in the panel'
+                time.sleep(.25)
+            assert Counter(row['error'] for row in observed.values()) == {'HTTP500': 25, 'HTTP503': 25}
+            core.atomic_write_json(output / 'panel-after-cookie-rejections.json', observed)
+            record['panel_initial_errors'] = len(observed)
         if args.verify_continuation:
             pathless_contexts = 0
             for slot in worker.job['slots']:
@@ -456,6 +499,13 @@ def main():
                           first_submit_after_all_ready_seconds=first_submit - prepared_at,
                           first_to_last_submit_seconds=max(s['submit_at'] for s in worker.job['slots']) - first_submit,
                           ccc_continued_original_sessions=len(record.get('continuation', {}).get('continued_turns', {})))
+            if args.repeat_response_headers:
+                observed = access_panel_snapshot(config_path, client, worker.job['slots'])
+                assert all(row['phase'] in {'complete', 'stopped', 'settling'}
+                           and not row['allowed'] and not row['alarming'] for row in observed.values())
+                assert sum(row['phase'] == 'complete' for row in observed.values()) == successful_responses
+                core.atomic_write_json(output / 'panel-after-native-success.json', observed)
+                record['panel_final_stop_visible'] = len(observed)
         elif args.verify_continuation:
             initial = [r for r in primary if r['user_text'] == expected_prompt and r['failed']]
             continued = [r for r in primary if r['user_text'] == core.MESSAGE and not r['failed']]

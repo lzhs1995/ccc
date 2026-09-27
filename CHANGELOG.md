@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.25
+
+- Accept repeated upstream metadata headers, including separate Set-Cookie fields, on API and CONNECT responses. Keep native request headers and response framing/interpretation headers strict. Record fixed, bounded protocol diagnostics without credentials, cookies or upstream body text.
+- Project each N slot's request outcome into the Supervisor table, focus details, workspace error count and an errors filter. Share the same decision with the continuation gate: confirmed congestion remains retryable within its original budget; uncertain requests are shown as blocked instead of working. Current failures supersede the old submitted footer message.
+- Use a separate listener and owner directory for each immutable access runtime. Existing gateways, ports, native clients and journals remain in place when a new version starts. Original B/b, network modules, automatic pause and automatic Interrupt policy are unchanged.
+- Extend local native acceptance with repeated response headers, 25 HTTP and 25 SSE congestion rejections, actual CCC continuation, and both initial/final panel projections. This does not establish AnyRouter availability or a particular account charge.
+
 ## 0.2.24
 
 - Add a separate `N` / `--access-check` mode that retains 50 concurrent native slots while forwarding only a fixed, small Responses request. A complete assistant reply closes new admission inside the stream parser; in-flight requests finish naturally and automatic interruption remains OFF. Preserve original `B` and separate `b` until operator acceptance.

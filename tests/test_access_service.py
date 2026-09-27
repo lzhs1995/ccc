@@ -184,6 +184,52 @@ class AccessServiceBoundaryTests(unittest.TestCase):
 
 @unittest.skipUnless(__import__('sys').platform == 'darwin', 'exact process identity uses Darwin proc_pidinfo')
 class GatewayLifecycleTests(unittest.TestCase):
+    def test_two_runtime_generations_keep_the_original_listener_alive(self):
+        import importlib.util
+        import shutil
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp).resolve()
+            other_source = directory / 'other-runtime'
+            other_source.mkdir()
+            for source in Path(service.__file__).parent.glob('*.py'):
+                shutil.copy2(source, other_source / source.name)
+            other_file = other_source / 'ccc_access_service.py'
+            spec = importlib.util.spec_from_file_location('isolated_access_service', other_file)
+            alternate = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(alternate)
+            config = directory / 'config.json'
+            core.atomic_write_json(config, core.default_config())
+            owners = []
+            try:
+                first = service.ensure_gateway(config)
+                owners.append((service, first))
+                original_record = (service.root(config) / 'owner.json').read_bytes()
+                # The packaged entry and watcher's copied runtime have the
+                # same bytes at different paths. They must share one listener.
+                self.assertEqual(service.root(config), alternate.root(config))
+                self.assertEqual(alternate.ensure_gateway(config), first)
+                self.assertTrue(alternate.owner_alive(first, config))
+                with other_file.open('a') as handle:
+                    handle.write('\n# Distinct immutable runtime for listener coexistence acceptance.\n')
+                second = alternate.ensure_gateway(config)
+                owners.append((alternate, second))
+                self.assertNotEqual(service.root(config), alternate.root(config))
+                self.assertNotEqual(first['port'], second['port'])
+                self.assertNotEqual(first['pid'], second['pid'])
+                self.assertEqual((service.root(config) / 'owner.json').read_bytes(), original_record)
+                self.assertTrue(service.owner_alive(first, config))
+                self.assertTrue(service.ping(first))
+                self.assertTrue(alternate.owner_alive(second, config))
+                self.assertTrue(alternate.ping(second))
+                self.assertEqual(service.ensure_gateway(config), first)
+                self.assertEqual(alternate.ensure_gateway(config), second)
+                self.assertFalse(list(directory.glob('workspace-batches/*/access-journal.jsonl')))
+            finally:
+                for module, owner in reversed(owners):
+                    if module.owner_alive(owner, config):
+                        os.kill(owner['pid'], signal.SIGTERM)
+                    module._started_processes.pop(owner['pid']).wait(timeout=5)
+
     def test_repeated_starts_reuse_one_private_service_without_network_requests(self):
         with tempfile.TemporaryDirectory() as temp:
             config = Path(temp).resolve() / 'config.json'
