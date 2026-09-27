@@ -228,6 +228,16 @@ def continue_failed_batch(config_path, root, home, client, slots, owned, output,
         sys.setswitchinterval(previous_switch)
 
 
+def reset_reconnect_evidence_after_repair(probe, output):
+    """Keep original failure screenshots separate from repaired-native retries."""
+    archive = output / 'before-setup-repair'
+    archive.mkdir()
+    for path in output.glob('native-reconnect-*.json'):
+        path.rename(archive / path.name)
+    probe.reconnects.clear()
+    probe.last_sample = -100.0
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, required=True)
@@ -525,6 +535,7 @@ def main():
                 'same_native_sessions_resumed': 50, 'prior_http_requests': 0,
                 'original_port_retained': access_owner['port'] == desc['port'],
                 'original_instance_retained': access_owner['instance'] == desc['gateway_instance']}
+            reset_reconnect_evidence_after_repair(server.sustained_probe, output)
             # Also witness the repaired sessions exhausting normal native retry
             # and then the real watcher continuing them, not only our one input.
             complete_deadline = time.monotonic() + 180
