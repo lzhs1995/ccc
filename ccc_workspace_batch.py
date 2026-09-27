@@ -32,7 +32,7 @@ from ccc_inventory import SharedInventory
 from ccc_scheduling import SnapshotCache, SnapshotClient
 
 COUNT = 50
-WORKER_VERSION = 26
+WORKER_VERSION = 27
 LEGACY_PROMPT = "show me u power"
 PROMPT = "Reply only OK. Do not use tools. End the turn."
 EMPTY_CWD_POLICY = "private-empty-v1"
@@ -82,8 +82,27 @@ def job_prompt(job):
     return value
 
 
+def startup_mode(job, config_path=None):
+    from ccc_access_service import is_access_job
+    if is_access_job(config_path or job.get('config_path', core.DEFAULT_CONFIG_PATH), job):
+        return 'access_check'
+    return 'private_check' if job.get('cwd_policy') == EMPTY_CWD_POLICY else 'existing'
+
+
+def access_cohort_prepared(job):
+    slots = job.get('slots', [])
+    return (len(slots) == COUNT and {s.get('index') for s in slots} == set(range(COUNT))
+            and len({s.get('surface_id') for s in slots if s.get('surface_id')}) == COUNT
+            and all(s.get('access_ready_at') is not None
+                    and s.get('phase') in CONFIRMABLE | {'access_ready'} for s in slots))
+
+
 def allowed(config, job):
     from ccc_batch_guard import blocked
+    try:
+        startup_mode(job)
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
     rule = next((r for r in config["workspace_rules"] if r.get("workspace_id") == job["workspace_id"]), {})
     return (config.get("mode") == "armed" and not config.get("global_paused")
             and rule.get("enabled", True) and not rule.get("paused")
@@ -112,8 +131,11 @@ def snapshots(config_path, config, *, workspace_ids=None):
                 job = core.load_json(job_path(config_path, jid), {})
                 result[rule["workspace_id"]] = {
                     "id": jid, "status": job.get("status"),
-                    "startup_mode": "private_check" if job.get("cwd_policy") == EMPTY_CWD_POLICY else "existing",
+                    "startup_mode": startup_mode(job, config_path),
                     **counts(job)}
+                if result[rule['workspace_id']]['startup_mode'] == 'access_check':
+                    from ccc_access_service import status
+                    result[rule['workspace_id']]['access'] = status(config_path, jid)
                 if rule.get("batch_guard"):
                     from ccc_batch_guard import snapshot
                     result[rule["workspace_id"]]["protection"] = snapshot(config_path, rule["workspace_id"])
@@ -208,8 +230,9 @@ def settled_job(config_path, previous, config, client):
         return False
 
 
-def start(config_path, selector, *, client=None, launch=True, private_check=False):
-    if type(private_check) is not bool:
+def start(config_path, selector, *, client=None, launch=True, private_check=False,
+          access_check=False, _access_fixture=False):
+    if type(private_check) is not bool or type(access_check) is not bool or private_check and access_check:
         raise RuntimeError("B private-check mode must be explicitly selected")
     from ccc_batch_guard import AUTOMATIC_POOL_STOP
     guarded = launch and AUTOMATIC_POOL_STOP
@@ -230,6 +253,8 @@ def start(config_path, selector, *, client=None, launch=True, private_check=Fals
             resume_success = (state.get("phase") == "stopped" and trip.get("connected") is True
                               and trip.get("within_deadline") is True)
         if (rule.get("paused") and not resume_success) or not rule.get("enabled", True):
+            if access_check:
+                raise RuntimeError("本池的暂停和原会话已保留；请在新的 workspace 使用节费50，不要为试用恢复本池旧批次")
             raise RuntimeError("本池已暂停；请先按 W 恢复，再创建或补做")
         cancel_epoch = rule.get("batch_cancelled_at")
         previous = core.load_json(job_path(config_path, rule["last_batch_id"]), {}) if rule.get("last_batch_id") else {}
@@ -249,14 +274,19 @@ def start(config_path, selector, *, client=None, launch=True, private_check=Fals
                 and previous.get("created_at", 0) > rule.get("batch_success_at", 0)
                 and not settled_job(config_path, previous, config, client)))):
             job = previous  # Repeated clicks and retries reuse the same 50 slots.
+            if access_check and startup_mode(job, config_path) != 'access_check':
+                raise RuntimeError('本池尚有原 B 批次，已保留；节费50须在新批次使用，不能将旧任务静默改成检查')
         else:
             job = {"id": str(uuid.uuid4()), "workspace_id": wid,
                    "created_at": time.time(), "status": "pending",
                    "slots": [{"index": i, "phase": "pending"} for i in range(COUNT)]}
-            if private_check:
+            if private_check or access_check:
                 job.update(cwd_policy=EMPTY_CWD_POLICY, initial_prompt=PROMPT,
                            name_policy="before-first-turn-v1")
             job_locks.enter_context(core.FileLock(job_path(config_path, job["id"]).parent / "worker.lock", timeout_sec=0))
+            if access_check:
+                from ccc_access_service import prepare
+                job['access_policy'] = prepare(config_path, job, fixture=_access_fixture)
         if writable:
             job["config_path"] = str(Path(config_path).resolve())
             if guarded:
@@ -293,7 +323,7 @@ def start(config_path, selector, *, client=None, launch=True, private_check=Fals
         if launch:
             _launch(config_path, job)
         return {"job_id": job["id"], "workspace_id": wid,
-                "startup_mode": "private_check" if job.get("cwd_policy") == EMPTY_CWD_POLICY else "existing",
+                "startup_mode": startup_mode(job, config_path),
                 **counts(job)}
 
 
@@ -348,13 +378,18 @@ def workspace_launch_context(config_path, job, index):
 
 def native_launch_argv(config_path, job, index):
     """Resolve the exact native executable without putting long argv in a PTY."""
+    mode = startup_mode(job, config_path)
     from ccc_batch_guard import AUTOMATIC_POOL_STOP, native_binary
     if job.get("guard_version") == 1 and AUTOMATIC_POOL_STOP:
         return [sys.executable, "-B", str(Path(__file__).with_name("ccc_batch_guard.py")),
                 "launch", "--config", str(config_path), "--job", job["id"], "--index", str(index)]
     directory, context = workspace_launch_context(config_path, job, index)
-    return [native_binary(), *(["--cd", str(directory)] if directory else []), *context,
+    argv = [native_binary(), *(["--cd", str(directory)] if directory else []), *context,
             "-c", "sqlite_home=" + json.dumps(str(sqlite_home(config_path, job["id"], index).resolve()))]
+    if mode == 'access_check':
+        from ccc_access_service import launch_arguments
+        argv.extend(launch_arguments(config_path, job, index))
+    return argv
 
 
 def native_thread_name(target, native):
@@ -417,6 +452,9 @@ def launch_registered(config_path, job_id, index, launch_id):
     # exec retains the registered shell parent and original terminal. There is
     # no relay, alternate session, shell expansion, or global config write.
     argv = native_launch_argv(config_path, job, index)
+    if startup_mode(job, config_path) == 'access_check':
+        for name in ('NO_PROXY', 'no_proxy'):
+            os.environ[name] = ','.join(filter(None, (os.environ.get(name), '127.0.0.1', 'localhost')))
     os.execv(argv[0], argv)
 
 
@@ -479,6 +517,7 @@ def register(config_path, job_id, index, launch_id=""):
     """Runs in the newly created shell before Codex starts (without a prompt)."""
     path = job_path(config_path, job_id)
     job = core.load_json(path, {})
+    startup_mode(job, config_path)
     if not 0 <= index < len(job["slots"]):
         raise RuntimeError("invalid batch slot")
     if (job["slots"][index].get("launch_id") or "") != launch_id:
@@ -499,6 +538,8 @@ def register(config_path, job_id, index, launch_id=""):
                 raise RuntimeError("new surface was excluded by its operator")
             if previous and previous.get("job_id") != job_id:
                 raise RuntimeError("surface already belongs to another batch")
+            if startup_mode(job, config_path) == 'access_check':
+                rule.setdefault('access_check_slots', {})[sid] = {'job_id': job_id, 'index': index}
             # A late/repeated bootstrap cannot put a proven session on hold.
             if job["slots"][index].get("phase") != "confirmed":
                 rule.setdefault("batch_start_holds", {})[sid] = {
@@ -526,6 +567,7 @@ class BatchWorker:
         self.path = job_path(config_path, job_id)
         self.store = core.ConfigStore(self.config_path)
         self.job = core.load_json(self.path, {})
+        startup_mode(self.job, self.config_path)
         self.cache = SnapshotCache(workers=1)
         self.client = client or SnapshotClient(_client(self.store.load()), self.cache,
                                                SharedInventory(self.config_path.parent))
@@ -1168,8 +1210,11 @@ class BatchWorker:
             return
         if confirmation_only:
             return
-        if slot["phase"] not in {"created", "startup_wait", "restart_pending", "pty_wait"}:
+        if slot["phase"] not in {"created", "startup_wait", "restart_pending", "pty_wait", "access_ready"}:
             return
+        if slot['phase'] == 'access_ready' and (
+                not access_cohort_prepared(self.job) or not getattr(self, '_access_membership_ready', False)):
+            return  # Native startup can take minutes across many workspaces.
         if not receipt:
             slot["error"] = "等待新 shell 原始回执"
             if self.clock() - slot["created_at"] >= 3 and slot.get("surface_id"):
@@ -1229,6 +1274,16 @@ class BatchWorker:
             if (core.classify_grid(grid).kind != "idle" or core._composer_status(grid)[0] != "empty"
                     or self._native(target, slot) != native):
                 return
+            if startup_mode(self.job, self.config_path) == 'access_check' and slot['phase'] != 'access_ready':
+                from ccc_access_service import bind_slot
+                slot.update(pid=native['pid'], process_start=native.get('process_start'))
+                bind_slot(self.config_path, self.job, slot, target, native)
+                # Prepared sessions no longer occupy a cold-start permit. All
+                # fifty must be prepared before any prompt starts a local HTTP
+                # request or its much shorter connection/cohort deadline.
+                slot.update(phase='access_ready', access_ready_at=self.clock())
+                self.save()
+                return
             path = self._transcript(slot["surface_id"], native)
             uninitialized = native.get("kind") == "uninitialized"
             if not path and not uninitialized:
@@ -1246,6 +1301,9 @@ class BatchWorker:
                         transcript_offset=offset, pid=native["pid"],
                         process_start=native.get("process_start"), native_uninitialized=uninitialized)
             self.save()
+            if startup_mode(self.job, self.config_path) == 'access_check':
+                from ccc_access_service import bind_slot
+                bind_slot(self.config_path, self.job, slot, target, native)
             try:
                 self.client.send_text(target["workspace_id"], target["surface_id"], job_prompt(self.job))
                 slot["phase"] = "submitted"
@@ -1319,7 +1377,7 @@ class BatchWorker:
             workspace_present = any(w.get("id") == self.job["workspace_id"]
                                     for win in tree.get("windows", []) for w in win.get("workspaces", []))
             missing = any(s.get("surface_id") and s["surface_id"] not in present
-                          and s.get("phase") in INITIALIZING | {"startup_wait", "restart_pending", "pty_wait", "surface_closed"}
+                          and s.get("phase") in INITIALIZING | {"startup_wait", "restart_pending", "pty_wait", "surface_closed", "access_ready"}
                           and self.clock() - s.get("launched_at", s.get("created_at", self.clock())) >= 5
                           for s in self.job.get("slots", []))
             if not workspace_present or missing:
@@ -1352,7 +1410,29 @@ class BatchWorker:
             self.job["status"] = "running"
         return restored
 
+    def _access_ready_preflight(self, tree):
+        """Check the whole prepared batch before releasing its first prompt.
+
+        This startup-only read is outside input locks. Each eventual send still
+        repeats its own identity, composer and current authorization checks.
+        """
+        rows = {row['surface_id']: row for row in
+                core.workspace_surface_records(tree, self.job['workspace_id']).values()}
+        for slot in self.job['slots']:
+            target = rows.get(slot['surface_id'])
+            if target is None:
+                return False
+            native = self._native(target, slot)
+            if (not native or native.get('kind') not in {'unknown', 'uninitialized'}
+                    or any(native.get(key) != slot.get(key) for key in ('pid', 'process_start', 'session_id'))):
+                return False
+            grid = core.Grid.from_rpc(self.client.replay(target['workspace_id'], target['surface_id']), target['surface_id'])
+            if core.classify_grid(grid).kind != 'idle' or core._composer_status(grid)[0] != 'empty':
+                return False
+        return True
+
     def step(self):
+        self._access_membership_ready = False
         # Disk evidence is independent of cmux's process-table RPC and of B/P.
         # Releasing a proven hold does not override P or any manual exclusion.
         rule = next((r for r in self.store.load()["workspace_rules"]
@@ -1391,8 +1471,19 @@ class BatchWorker:
             self.job["error"] = str(exc)
         self.job["status"] = "running"
         present = {r["surface_id"] for r in core.workspace_surface_records(tree, self.job["workspace_id"]).values()}
+        if startup_mode(self.job, self.config_path) == 'access_check' and access_cohort_prepared(self.job):
+            self._access_membership_ready = all(s['surface_id'] in present for s in self.job['slots'])
+            if self._access_membership_ready and not any(s.get('submit_at') for s in self.job['slots']):
+                try:
+                    self._access_membership_ready = self._access_ready_preflight(tree)
+                except (OSError, ValueError, core.CmuxError, RuntimeError):
+                    self._access_membership_ready = False
+            if not self._access_membership_ready:
+                self.job.update(status='waiting', error='等待本池全部50个原会话和空输入框；未发送新的接入检查')
+                self.save()
+                return True
         for slot in self.job["slots"]:
-            if slot["phase"] not in INITIALIZING | {"startup_wait", "restart_pending", "pty_wait"} or self.clock() < slot.get("retry_at", 0):
+            if slot["phase"] not in INITIALIZING | {"startup_wait", "restart_pending", "pty_wait", "access_ready"} or self.clock() < slot.get("retry_at", 0):
                 continue
             if (slot.get("surface_id") and slot["surface_id"] not in present
                     and self.clock() - slot.get("launched_at", slot.get("created_at", self.clock())) >= 5):

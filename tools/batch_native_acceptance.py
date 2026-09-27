@@ -6,12 +6,15 @@ recorded fixture workspace. Existing Codex identities are checked, not signalled
 """
 import argparse
 from collections import Counter
+import ctypes
 import hashlib
-from http.server import ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
 import shlex
+import signal
+import statistics
 import tempfile
 import threading
 import time
@@ -33,10 +36,104 @@ import cmux_codex_watch as core
 from tools.idle_session_native_acceptance import ERROR, Handler
 
 
-def continue_failed_batch(config_path, root, home, client, slots, owned, output):
+class AccessHandler(BaseHTTPRequestHandler):
+    """Actual fifty-request cohort; all billing/model behavior is loopback."""
+    def log_message(self, *_):
+        pass
+
+    def do_POST(self):
+        raw = self.rfile.read(int(self.headers['Content-Length']))
+        body = json.loads(raw)
+        assert len(raw) < 1024 and body['input'] == 'Reply exactly OK.'
+        assert body['tools'] == [] and body['tool_choice'] == 'none' and body['max_output_tokens'] == 128
+        with self.server.condition:
+            number = len(self.server.requests)
+            failed = self.server.fail_first_by_session and number < 50
+            self.server.requests.append({'at': time.time(), 'monotonic': time.monotonic(),
+                'body': body, 'bytes': len(raw), 'failed': failed, 'native_title': False,
+                'rejection_transport': ('sse' if number % 2 else 'http') if failed else None,
+                'user_text': body['input'], 'thread_id': self.headers.get('thread-id')})
+            self.server.active += 1
+            self.server.peak = max(self.server.peak, self.server.active)
+            self.server.condition.notify_all()
+            ready = self.server.condition.wait_for(lambda: len(self.server.requests) >= 50, timeout=120)
+        try:
+            assert ready, 'native first cohort did not reach fifty actual HTTP requests'
+            if failed:
+                sse = bool(number % 2)
+                self.send_response(200 if sse else 500)
+                self.send_header('Content-Type', 'text/event-stream' if sse else 'application/json')
+                self.send_header('Connection', 'close')
+                self.end_headers()
+                if sse:
+                    failure = {'type': 'response.failed', 'response': {
+                        'id': 'resp_' + uuid.uuid4().hex, 'status': 'failed', 'output': [],
+                        'error': {'code': 'server_error', 'message': 'We are currently experiencing high demand.'}}}
+                    self.wfile.write(('data: ' + json.dumps(failure) + '\n\n').encode())
+                else:
+                    self.wfile.write(b'{"error":{"message":"fixture high demand"}}')
+            else:
+                response = {'id': 'resp_' + uuid.uuid4().hex, 'object': 'response', 'status': 'completed',
+                    'output': [{'id': 'msg_' + uuid.uuid4().hex, 'type': 'message', 'role': 'assistant',
+                                'status': 'completed', 'content': [{'type': 'output_text', 'text': 'OK'}]}],
+                    'usage': {'input_tokens': 12, 'output_tokens': 1, 'total_tokens': 13}}
+                raw = ('data: ' + json.dumps({'type': 'response.completed', 'response': response}) + '\n\n').encode()
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/event-stream')
+                self.send_header('Content-Length', str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+            self.wfile.flush()
+        finally:
+            with self.server.condition:
+                self.server.active -= 1
+
+
+class AccessHTTPServer(ThreadingHTTPServer):
+    request_queue_size = 256
+
+
+def workspace_surfaces_by_id(client, workspace_id):
+    # core's public map is keyed by display ref, not by immutable surface UUID.
+    return {row['surface_id']: row for row in
+            core.workspace_surface_records(client.tree(), workspace_id).values()}
+
+
+def close_fixture_surface(client, workspace_id, surface_id, originals):
+    assert surface_id not in originals, 'cleanup may not close an original surface'
+    current = workspace_surfaces_by_id(client, workspace_id)
+    assert surface_id in current, 'fixture surface is no longer in its pinned workspace'
+    # cmux resolves even UUIDs within a workspace context; the caller's active
+    # workspace is not the fixture's workspace.
+    client._run(['close-surface', '--workspace', workspace_id, '--surface', surface_id], timeout=10)
+
+
+def native_resources(owned):
+    """Darwin physical footprint, rather than adding shared RSS pages."""
+    class RusageV2(ctypes.Structure):
+        _fields_ = [('uuid', ctypes.c_ubyte * 16), ('values', ctypes.c_uint64 * 18)]
+    function = ctypes.CDLL('/usr/lib/libproc.dylib').proc_pid_rusage
+    function.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+    function.restype = ctypes.c_int
+    rows = []
+    for identity in owned:
+        sample = RusageV2()
+        assert scope.matches(identity)
+        if function(identity['pid'], 2, ctypes.byref(sample)) != 0:
+            raise RuntimeError('native physical footprint unavailable')
+        assert scope.matches(identity)
+        rows.append({'pid': identity['pid'], 'physical_footprint': sample.values[7], 'rss': sample.values[6]})
+    return {'samples': rows, 'native_cli_instances': len(rows),
+            'physical_footprint_total': sum(r['physical_footprint'] for r in rows),
+            'physical_footprint_median': statistics.median(r['physical_footprint'] for r in rows)}
+
+
+def continue_failed_batch(config_path, root, home, client, slots, owned, output, *, access_check=False, job_id=''):
     """Use the real scheduler, viewport gates and native identity checks."""
     failed = {s['surface_id']: native.task_snapshot(Path(s['transcript']), s['session_id']) for s in slots}
-    assert all(t and t['kind'] == 'task_complete' and ERROR in (t.get('error') or {}).get('message', '')
+    assert all(t and t['kind'] == 'task_complete' and
+               (('high demand' in (t.get('error') or {}).get('message', '').lower()) if access_check
+                else ERROR in (t.get('error') or {}).get('message', ''))
                for t in failed.values()), 'each original turn must actually fail first'
     core.atomic_write_json(output / 'failed-turns.json', failed)
     daemon = core.WatchDaemon(config_path, root / 'watch-state.json', client=client)
@@ -60,12 +157,17 @@ def continue_failed_batch(config_path, root, home, client, slots, owned, output)
             scheduler.wakeup.clear()
             targets = core.effective_targets(daemon.config, list(daemon.dynamic_targets.values()))
             assert all(t['workspace_id'] == slots[0]['fixture_workspace_id'] for t in targets)
+            assert {t['surface_id'] for t in targets} <= {s['surface_id'] for s in slots}, 'fixture discovery escaped its fifty surfaces'
             scheduler.tick(targets, generation=daemon._observation_policy.key)
             current = {s['surface_id']: native.task_snapshot(Path(s['transcript']), s['session_id']) for s in slots}
             completions = {sid: t for sid, t in current.items()
                            if t and t['kind'] == 'task_complete' and not t.get('error')
                            and t['turn_id'] != failed[sid]['turn_id']}
-            if len(completions) == len(slots):
+            enough = len(completions) == len(slots)
+            if access_check:
+                from ccc_access_service import status
+                enough = bool(completions and status(config_path, job_id).get('first_complete'))
+            if enough:
                 if completed_at is None:
                     completed_at = time.monotonic()
                 if time.monotonic() - completed_at >= 5:
@@ -75,7 +177,7 @@ def continue_failed_batch(config_path, root, home, client, slots, owned, output)
                                   'continued_original_sessions': len(completions), **scheduler.snapshot()}), flush=True)
                 last_report = elapsed
             scheduler.wakeup.wait(scheduler.wait_timeout())
-        assert len(completions) == len(slots), f'only {len(completions)}/{len(slots)} original sessions continued'
+        assert (bool(completions) if access_check else len(completions) == len(slots)), f'only {len(completions)}/{len(slots)} original sessions continued'
         assert all(scope.matches(row) for row in owned), 'original fixture process changed'
         return {'passed': True, 'seconds': time.monotonic() - started,
                 'original_failed_turns': failed, 'continued_turns': completions,
@@ -95,18 +197,22 @@ def continue_failed_batch(config_path, root, home, client, slots, owned, output)
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--mode', choices=('private-check', 'existing'), default='private-check',
+    parser.add_argument('--mode', choices=('private-check', 'existing', 'access-check'), default='private-check',
                         help='existing verifies default B including first-time folder trust')
+    parser.add_argument('--workspace', help='use an existing workspace; clean up only newly created fixture surfaces')
     parser.add_argument('--verify-continuation', action='store_true',
                         help='fail every original first turn; require real CCC continuation in all 50 sessions')
     args = parser.parse_args()
-    private_check = args.mode == 'private-check'
+    access_check = args.mode == 'access-check'
+    private_check = args.mode != 'existing'
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     assert not (output / 'result.json').exists(), 'keep previous acceptance evidence'
     assert not guard.AUTOMATIC_POOL_STOP and not guard.CONNECTION_CUT_ENABLED
     assert batch.COUNT == 50
-    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    server = (AccessHTTPServer if access_check else ThreadingHTTPServer)(
+        ('127.0.0.1', 0), AccessHandler if access_check else Handler)
+    server.condition, server.active, server.peak = threading.Condition(), 0, 0
     server.requests = []
     server.fail_first = False
     server.fail_first_by_session = args.verify_continuation
@@ -136,6 +242,11 @@ def main():
     core.atomic_write_json(config_path, config)
     client = migration.cmux_client(config_path)
     original = scope.scan()
+    original_surfaces = set()
+    if args.workspace:
+        uuid.UUID(args.workspace)
+        original_surfaces = set(workspace_surfaces_by_id(client, args.workspace))
+        assert original_surfaces, 'the specified real workspace must exist before acceptance'
     source_root = Path(__file__).resolve().parents[1]
     source_files = {name: hashlib.sha256((source_root / name).read_bytes()).hexdigest()
                     for name in (*core.RUNTIME_FILES, 'cmux_supervisor_tui.py',
@@ -145,7 +256,7 @@ def main():
               'source_files': source_files,
               'native_binary_sha256': hashlib.sha256(Path(guard.native_binary()).read_bytes()).hexdigest()}
     core.atomic_write_json(output / 'result.json', record)
-    cache, worker, wid = None, None, None
+    cache, worker, wid, access_owner = None, None, None, None
     captured_waits = set()
     input_calls = []
     original_env = dict(os.environ)
@@ -165,18 +276,21 @@ def main():
         os.environ.update(overrides)
         # Creation is one-shot. An uncertain acknowledgement is reconciled by
         # this unique title; it must never cause a second workspace creation.
-        try:
-            raw = client._run(command).stdout
-            (output / 'create-response.txt').write_text(raw)
-        except core.CmuxError as exc:
-            (output / 'create-response.txt').write_text(str(exc))
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            found = [w['id'] for win in client.tree().get('windows', []) for w in win.get('workspaces', []) if w.get('title') == name]
-            if len(found) == 1:
-                wid = found[0]
-                break
-            time.sleep(.2)
+        if args.workspace:
+            wid = args.workspace
+        else:
+            try:
+                raw = client._run(command).stdout
+                (output / 'create-response.txt').write_text(raw)
+            except core.CmuxError as exc:
+                (output / 'create-response.txt').write_text(str(exc))
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                found = [w['id'] for win in client.tree().get('windows', []) for w in win.get('workspaces', []) if w.get('title') == name]
+                if len(found) == 1:
+                    wid = found[0]
+                    break
+                time.sleep(.2)
         assert wid, 'created workspace could not be uniquely confirmed'
         record.update(phase='created_fixture_workspace', workspace_id=wid)
         core.atomic_write_json(output / 'result.json', record)
@@ -187,6 +301,7 @@ def main():
                 entry = {'at': time.time(), 'method': method, 'workspace_id': wid}
                 if surface_position is not None:
                     entry['surface_id'] = values[surface_position]
+                    assert entry['surface_id'] not in original_surfaces, 'fixture input reached a pre-existing surface'
                 input_calls.append(entry)
                 return original_method(*values, **options)
             setattr(client, method, checked)
@@ -196,8 +311,19 @@ def main():
         scoped_call('send', 0, 1)
         cache = SnapshotCache(workers=1)
         wrapped = SnapshotClient(client, cache)
-        options = {'private_check': True} if private_check else {}
+        if args.workspace:
+            # The private test daemon must never send to the user's existing
+            # surfaces, including the old B that remains explicitly held.
+            batch.authorize_workspace(config_path, wid, client=wrapped)
+            def exclude_original(value):
+                core.workspace_rule_by_id(value, wid)['excluded_surface_ids'] = sorted(original_surfaces)
+            core.ConfigStore(config_path).mutate(exclude_original)
+        options = ({'access_check': True, '_access_fixture': True} if access_check
+                   else {'private_check': True} if private_check else {})
         job = batch.start(config_path, wid, client=wrapped, launch=False, **options)
+        if access_check:
+            from ccc_access_service import read_private, root as gateway_root
+            access_owner = read_private(gateway_root(config_path) / 'owner.json')
         expected_prompt = batch.PROMPT if private_check else batch.LEGACY_PROMPT
         queue = native.QueueRecovery(root / 'ledger.json', root / 'missing-hooks', home / 'sessions', expected_prompt)
         worker = batch.BatchWorker(config_path, job['job_id'], client=wrapped, queue=queue)
@@ -243,7 +369,8 @@ def main():
         core.atomic_write_json(output / 'job.json', worker.job)
         assert worker.job['status'] == 'complete' and batch.counts(worker.job)['started'] == 50, batch.counts(worker.job)
         assert not core.workspace_rule_by_id(worker.store.load(), wid).get('batch_start_holds')
-        owned = [r for r in scope.scan() if r['environment_workspace_id'] == wid]
+        owned_ids = {s['surface_id'] for s in worker.job['slots']}
+        owned = [r for r in scope.scan() if r['environment_workspace_id'] == wid and r['surface_id'] in owned_ids]
         assert len(owned) == 50 and len({s['session_id'] for s in worker.job['slots']}) == 50
         assert {r['pid'] for r in owned} == {s['pid'] for s in worker.job['slots']}
         assert all(scope.arguments(r['pid'])[1].get('CODEX_HOME') == str(home) for r in owned)
@@ -293,9 +420,11 @@ def main():
                             and e.get('payload', {}).get('role') == 'user'
                             for part in e['payload'].get('content', [])]
                 pathless_contexts += any(c.startswith('# AGENTS.md instructions\n') for c in contexts)
-            assert pathless_contexts == 50, 'native global context format was not exercised in every session'
+            if not access_check:
+                assert pathless_contexts == 50, 'native global context format was not exercised in every session'
             continuation = continue_failed_batch(config_path, root, home, client,
-                [{**s, 'fixture_workspace_id': wid} for s in worker.job['slots']], owned, output)
+                [{**s, 'fixture_workspace_id': wid} for s in worker.job['slots']], owned, output,
+                access_check=access_check, job_id=job['job_id'])
             record.update(continuation=continuation, native_pathless_context_sessions=pathless_contexts)
         deadline = time.monotonic() + 10
         while sum(not r['native_title'] for r in server.requests) < 50 and time.monotonic() < deadline:
@@ -303,10 +432,31 @@ def main():
         time.sleep(1)
         primary = [r for r in server.requests if not r['native_title']]
         titles = [r for r in server.requests if r['native_title']]
+        successful_responses = sum(not r['failed'] for r in primary)
+        native_successes = (len(record.get('continuation', {}).get('continued_turns', {})) if args.verify_continuation
+                            else sum(bool(t and t['kind'] == 'task_complete' and not t.get('error')) for t in completions))
         record.update(started=50, local_requests=len(server.requests), primary_requests=len(primary),
-                      native_title_requests=len(titles), completed_responses=50,
+                      native_title_requests=len(titles), completed_responses=successful_responses,
+                      upstream_success_responses=successful_responses, native_successful_sessions=native_successes,
                       all_input_calls_scoped_to_fixture=all(call['workspace_id'] == wid for call in input_calls))
-        if args.verify_continuation:
+        if access_check:
+            from ccc_access_service import status as access_status, continuation_allowed
+            check = access_status(config_path, job['job_id'])
+            prepared_at = max(s['access_ready_at'] for s in worker.job['slots'])
+            first_submit = min(s['submit_at'] for s in worker.job['slots'])
+            assert first_submit >= prepared_at, 'HTTP submission began before all native sessions were prepared'
+            assert check.get('first_complete'), 'no complete real native API check'
+            assert not any(continuation_allowed(config_path, worker.store.load(),
+                {'workspace_id': wid, 'surface_id': s['surface_id']}) for s in worker.job['slots'])
+            assert server.peak == 50 and 50 <= len(primary) <= 100
+            assert all(r['bytes'] < 1024 and not r['native_title'] for r in primary)
+            record.update(access_status=check, actual_simultaneous_http=server.peak,
+                          all_native_prepared_before_first_submit=True,
+                          native_preparation_seconds=prepared_at - min(s['created_at'] for s in worker.job['slots']),
+                          first_submit_after_all_ready_seconds=first_submit - prepared_at,
+                          first_to_last_submit_seconds=max(s['submit_at'] for s in worker.job['slots']) - first_submit,
+                          ccc_continued_original_sessions=len(record.get('continuation', {}).get('continued_turns', {})))
+        elif args.verify_continuation:
             initial = [r for r in primary if r['user_text'] == expected_prompt and r['failed']]
             continued = [r for r in primary if r['user_text'] == core.MESSAGE and not r['failed']]
             sessions = {s['session_id'] for s in worker.job['slots']}
@@ -323,13 +473,15 @@ def main():
             assert len(titles) <= 50, 'unexpected repeated native title requests'
         record['original_identity_changes'] = [r for r in original if not scope.matches(r)]
         assert not record['original_identity_changes'], 'an existing identity changed during acceptance'
+        if access_check:
+            record['native_resources'] = native_resources(owned)
         assert all(hashlib.sha256((source_root / name).read_bytes()).hexdigest() == digest
                    for name, digest in source_files.items()), 'acceptance source changed during execution'
         record.update(phase='passed', seconds=time.monotonic() - started, started=50,
                       local_requests=len(server.requests), primary_requests=len(primary), native_title_requests=len(titles),
                       original_native_retained=len(original), native_owned=owned,
                       working_directories=working_roots, persistent_trust_config_unchanged=True,
-                      pretrusted_fixture_directory=False, completed_responses=50,
+                      pretrusted_fixture_directory=False, completed_responses=successful_responses,
                       named_before_model_request=private_check, legacy_prompt_preserved=not private_check)
         if private_check:
             record['distinct_empty_working_directories'] = working_roots
@@ -342,7 +494,35 @@ def main():
     finally:
         os.environ.clear()
         os.environ.update(original_env)
-        if wid:
+        if args.workspace and wid and worker:
+            try:
+                # Prevent a late fixture bootstrap from gaining authorization
+                # after cleanup starts. This modifies only the private config.
+                def close_fixture(value):
+                    core.workspace_rule_by_id(value, wid)['paused'] = True
+                worker.store.mutate(close_fixture)
+                actual = workspace_surfaces_by_id(client, wid)
+                created_ids = {s.get('surface_id') for s in worker.job['slots'] if s.get('surface_id')}
+                for slot in worker.job['slots']:
+                    receipt = core.load_json(worker.path.parent / f"surface-{slot['index']}.json", {})
+                    if (receipt.get('workspace_id') == wid and receipt.get('launch_id') == slot.get('launch_id')
+                            and receipt.get('surface_id')):
+                        created_ids.add(receipt['surface_id'])
+                assert not created_ids & original_surfaces
+                for sid in sorted(created_ids):
+                    if sid in actual:
+                        close_fixture_surface(client, wid, sid, original_surfaces)
+                remaining = set(workspace_surfaces_by_id(client, wid))
+                record['existing_workspace_retained'] = original_surfaces <= remaining
+                record['owned_fixture_surfaces_closed'] = not created_ids & remaining
+                record['pre_existing_surface_ids'] = sorted(original_surfaces)
+                record['fixture_surface_ids'] = sorted(created_ids)
+                record['remaining_surface_ids'] = sorted(remaining)
+                assert record['existing_workspace_retained'] and record['owned_fixture_surfaces_closed']
+            except (core.CmuxError, OSError, RuntimeError, AssertionError) as exc:
+                record['cleanup_error'] = str(exc)
+                record['phase'] = 'cleanup_failed'
+        elif wid and not args.workspace:
             try:
                 client._run(['close-workspace', '--workspace', wid], timeout=10)
                 deadline = time.monotonic() + 10
@@ -351,15 +531,29 @@ def main():
                 record['owned_workspace_closed'] = not any(r['environment_workspace_id'] == wid for r in scope.scan())
             except (core.CmuxError, OSError, RuntimeError) as exc:
                 record['cleanup_error'] = str(exc)
+        elif args.workspace and wid:
+            record['existing_workspace_cleanup_skipped'] = 'worker was never available; workspace is never closed'
         if worker:
             worker.cache.close()
         if cache:
             cache.close()
+        if access_owner:
+            from ccc_access_service import owner_alive, _started_processes
+            if owner_alive(access_owner, config_path):
+                os.kill(access_owner['pid'], signal.SIGTERM)
+                process = _started_processes.pop(access_owner['pid'], None)
+                if process:
+                    process.wait(timeout=10)
         server.shutdown()
         server.server_close()
+        record['original_identity_changes_after_cleanup'] = [r for r in original if not scope.matches(r)]
+        if record['original_identity_changes_after_cleanup']:
+            record['phase'] = 'original_identity_changed_during_cleanup'
         core.atomic_write_json(output / 'requests.json', server.requests)
         core.atomic_write_json(output / 'input-calls.json', input_calls)
         core.atomic_write_json(output / 'result.json', record)
+    if record.get('phase') != 'passed':
+        raise RuntimeError('native acceptance or cleanup did not pass; evidence retained')
     print(json.dumps({k: v for k, v in record.items() if k not in {'native_before', 'native_owned'}}, indent=2))
 
 
