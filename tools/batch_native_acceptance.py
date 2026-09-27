@@ -34,6 +34,7 @@ from ccc_scheduling import CoalescingWriter, SnapshotCache, SnapshotClient
 import ccc_workspace_batch as batch
 import cmux_codex_watch as core
 from tools.idle_session_native_acceptance import ERROR, Handler
+from tools.access_sustained_native_probe import SustainedNativeProbe
 
 
 class AccessHandler(BaseHTTPRequestHandler):
@@ -56,7 +57,8 @@ class AccessHandler(BaseHTTPRequestHandler):
         assert body['tools'] == [] and body['tool_choice'] == 'none' and body['max_output_tokens'] == 128
         with self.server.condition:
             number = len(self.server.requests)
-            failed = self.server.fail_first_by_session and number < 50
+            probe = getattr(self.server, 'sustained_probe', None)
+            failed = probe.reject() if probe else self.server.fail_first_by_session and number < 50
             self.server.requests.append({'at': time.time(), 'monotonic': time.monotonic(),
                 'body': body, 'bytes': len(raw), 'failed': failed, 'native_title': False,
                 'rejection_transport': ('sse' if number % 2 else 'http') if failed else None,
@@ -155,7 +157,8 @@ def access_panel_snapshot(config_path, client, slots):
         model.close()
 
 
-def continue_failed_batch(config_path, root, home, client, slots, owned, output, *, access_check=False, job_id=''):
+def continue_failed_batch(config_path, root, home, client, slots, owned, output, *, access_check=False, job_id='',
+                          sustained_probe=None, server=None):
     """Use the real scheduler, viewport gates and native identity checks."""
     failed = {s['surface_id']: native.task_snapshot(Path(s['transcript']), s['session_id']) for s in slots}
     assert all(t and t['kind'] == 'task_complete' and
@@ -177,7 +180,7 @@ def continue_failed_batch(config_path, root, home, client, slots, owned, output,
     try:
         daemon._native_process_index.start()
         notifier.start()
-        while time.monotonic() - started < 150:
+        while time.monotonic() - started < (600 if sustained_probe else 150):
             elapsed = time.monotonic() - started
             daemon._reload_config_if_changed()
             daemon._refresh_dynamic_targets(daemon._observation_client())
@@ -187,6 +190,9 @@ def continue_failed_batch(config_path, root, home, client, slots, owned, output,
             assert {t['surface_id'] for t in targets} <= {s['surface_id'] for s in slots}, 'fixture discovery escaped its fifty surfaces'
             scheduler.tick(targets, generation=daemon._observation_policy.key)
             current = {s['surface_id']: native.task_snapshot(Path(s['transcript']), s['session_id']) for s in slots}
+            if sustained_probe:
+                sustained_probe.sample(client, slots[0]['fixture_workspace_id'], slots)
+                sustained_probe.maybe_release(server, current, failed)
             completions = {sid: t for sid, t in current.items()
                            if t and t['kind'] == 'task_complete' and not t.get('error')
                            and t['turn_id'] != failed[sid]['turn_id']}
@@ -231,9 +237,12 @@ def main():
                         help='fail every original first turn; require real CCC continuation in all 50 sessions')
     parser.add_argument('--repeat-response-headers', action='store_true',
                         help='send legal repeated Cookie/Vary fields on every local API response (N only)')
+    parser.add_argument('--native-reconnect', action='store_true',
+                        help='N only: native retry defaults, 5/5 viewport proof, >1000 requests and >150s before success')
     args = parser.parse_args()
     access_check = args.mode == 'access-check'
     assert not args.repeat_response_headers or access_check
+    assert not args.native_reconnect or (access_check and args.verify_continuation)
     private_check = args.mode != 'existing'
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -247,6 +256,7 @@ def main():
     server.fail_first = False
     server.fail_first_by_session = args.verify_continuation
     server.repeat_response_headers = args.repeat_response_headers
+    server.sustained_probe = SustainedNativeProbe(output) if args.native_reconnect else None
     server.failed_sessions = set()
     server.failure_lock = threading.Lock()
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -264,7 +274,8 @@ def main():
         '[features]\nplugins = false\napps = false\nhooks = false\nskip_host_skill_discovery = true\n'
         '[model_providers.local_fixture]\nname = "Loopback fixture"\nwire_api = "responses"\n'
         f'base_url = "http://127.0.0.1:{server.server_port}/v1"\n'
-        'requires_openai_auth = false\nsupports_websockets = false\nrequest_max_retries = 0\nstream_max_retries = 0\n')
+        'requires_openai_auth = false\nsupports_websockets = false\n'
+        + ('' if args.native_reconnect else 'request_max_retries = 0\nstream_max_retries = 0\n'))
     original_native_config = (home / 'config.toml').read_bytes()
     config_path = root / 'ccc/config.json'
     config = core.default_config()
@@ -281,10 +292,12 @@ def main():
     source_root = Path(__file__).resolve().parents[1]
     source_files = {name: hashlib.sha256((source_root / name).read_bytes()).hexdigest()
                     for name in (*core.RUNTIME_FILES, 'cmux_supervisor_tui.py',
-                                 'tools/batch_native_acceptance.py', 'tools/idle_session_native_acceptance.py')}
+                                 'tools/batch_native_acceptance.py', 'tools/idle_session_native_acceptance.py',
+                                 'tools/access_sustained_native_probe.py')}
     record = {'phase': 'prepared', 'root': str(root), 'production_requests': 0,
               'automatic_pause': False, 'native_before': original, 'startup_mode': args.mode,
               'repeat_response_headers': args.repeat_response_headers,
+              'native_reconnect': args.native_reconnect,
               'source_files': source_files,
               'native_binary_sha256': hashlib.sha256(Path(guard.native_binary()).read_bytes()).hexdigest()}
     core.atomic_write_json(output / 'result.json', record)
@@ -371,6 +384,8 @@ def main():
             worker.save()
             while worker.step():
                 elapsed = time.monotonic() - started
+                if server.sustained_probe:
+                    server.sustained_probe.sample(client, wid, worker.job['slots'])
                 for slot in worker.job['slots']:
                     naming = slot.get('naming', {})
                     if (slot.get('surface_id') and slot.get('phase') != 'confirmed'
@@ -414,6 +429,9 @@ def main():
             assert not (worker.path.parent / 'work').exists()
             assert not any(call['method'] == 'draft_batch_session_name' for call in input_calls)
         native_arguments = {r['pid']: scope.arguments(r['pid'])[0] for r in owned}
+        if args.native_reconnect:
+            assert all(not any('request_max_retries' in arg or 'stream_max_retries' in arg for arg in argv)
+                       for argv in native_arguments.values()), 'native retry defaults were overridden'
         working_roots = []
         for slot in worker.job['slots']:
             expected = batch.working_directory(config_path, worker.job['id'], slot['index']) if private_check else root
@@ -434,9 +452,11 @@ def main():
             assert all(s.get('naming', {}).get('confirmed_name') for s in worker.job['slots'])
         else:
             assert not any(s.get('naming') for s in worker.job['slots'])
-        complete_deadline = time.monotonic() + 10
+        complete_deadline = time.monotonic() + (600 if args.native_reconnect else 10)
         completions = []
         while time.monotonic() < complete_deadline:
+            if server.sustained_probe:
+                server.sustained_probe.sample(client, wid, worker.job['slots'])
             completions = [native.task_snapshot(Path(s['transcript']), s['session_id']) for s in worker.job['slots']]
             if all(t and t['kind'] == 'task_complete'
                    and bool(t.get('error')) == args.verify_continuation for t in completions):
@@ -452,7 +472,10 @@ def main():
                     break
                 assert time.monotonic() < deadline, 'first-wave errors were not visible and retryable in the panel'
                 time.sleep(.25)
-            assert Counter(row['error'] for row in observed.values()) == {'HTTP500': 25, 'HTTP503': 25}
+            if args.native_reconnect:
+                assert {row['error'] for row in observed.values()} <= {'HTTP500', 'HTTP503'}
+            else:
+                assert Counter(row['error'] for row in observed.values()) == {'HTTP500': 25, 'HTTP503': 25}
             core.atomic_write_json(output / 'panel-after-cookie-rejections.json', observed)
             record['panel_initial_errors'] = len(observed)
         if args.verify_continuation:
@@ -467,7 +490,8 @@ def main():
                 assert pathless_contexts == 50, 'native global context format was not exercised in every session'
             continuation = continue_failed_batch(config_path, root, home, client,
                 [{**s, 'fixture_workspace_id': wid} for s in worker.job['slots']], owned, output,
-                access_check=access_check, job_id=job['job_id'])
+                access_check=access_check, job_id=job['job_id'],
+                sustained_probe=server.sustained_probe, server=server)
             record.update(continuation=continuation, native_pathless_context_sessions=pathless_contexts)
         deadline = time.monotonic() + 10
         while sum(not r['native_title'] for r in server.requests) < 50 and time.monotonic() < deadline:
@@ -491,7 +515,13 @@ def main():
             assert check.get('first_complete'), 'no complete real native API check'
             assert not any(continuation_allowed(config_path, worker.store.load(),
                 {'workspace_id': wid, 'surface_id': s['surface_id']}) for s in worker.job['slots'])
-            assert server.peak == 50 and 50 <= len(primary) <= 100
+            assert server.peak == 50
+            if args.native_reconnect:
+                assert len(primary) > 1000
+                record['sustained_native'] = server.sustained_probe.evidence()
+                assert all(r['failed'] for r in primary[:record['sustained_native']['http_before_success_enabled']])
+            else:
+                assert 50 <= len(primary) <= 100
             assert all(r['bytes'] < 1024 and not r['native_title'] for r in primary)
             record.update(access_status=check, actual_simultaneous_http=server.peak,
                           all_native_prepared_before_first_submit=True,

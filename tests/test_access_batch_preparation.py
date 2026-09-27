@@ -14,7 +14,8 @@ class AccessBatchPreparationTests(unittest.TestCase):
         fixtures.WorkspaceBatchTests.setUp(self)
         # Descriptor-only setup works on both supported test interpreters and
         # does not launch a gateway, native process or network connection.
-        policy = service.Policy(self.wid, self.worker.job['id'])
+        policy = service.Policy(self.wid, self.worker.job['id'],
+                                max_attempts=None, attempt_mode='sustained')
         descriptor = {'version': service.VERSION, 'mode': service.MODE,
             'config_path': str(self.config.resolve()), 'policy': service.asdict(policy)}
         service.create_private(self.worker.path.parent / 'access.json', descriptor)

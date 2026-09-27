@@ -26,18 +26,32 @@ class Policy:
     workspace_id: str
     job_id: str
     slots: int = 50
-    max_attempts: int = 1000
+    max_attempts: int | None = 1000
     max_output_tokens: int = 128
+    attempt_mode: str = 'finite'
 
     def __post_init__(self):
         for value in (self.workspace_id, self.job_id):
             uuid.UUID(value)
         if self.slots != 50 or type(self.slots) is not int:
             raise ValueError('access checks retain exactly 50 concurrent slots')
-        if type(self.max_attempts) is not int or not 50 <= self.max_attempts <= 10000:
-            raise ValueError('invalid finite attempt limit')
+        if self.attempt_mode == 'finite':
+            if type(self.max_attempts) is not int or not 50 <= self.max_attempts <= 10000:
+                raise ValueError('invalid finite attempt limit')
+        elif self.attempt_mode == 'sustained':
+            if self.max_attempts is not None:
+                raise ValueError('sustained access has no cumulative attempt cutoff')
+        else:
+            raise ValueError('unknown access attempt mode')
         if type(self.max_output_tokens) is not int or not 1 <= self.max_output_tokens <= 512:
             raise ValueError('invalid output limit')
+
+    def journal_header(self):
+        values = asdict(self)
+        version = 2 if self.attempt_mode == 'sustained' else 1
+        if version == 1:
+            values.pop('attempt_mode')  # Preserve the original finite journal byte contract.
+        return {'kind': 'policy', 'version': version, **values}
 
 
 @dataclass(frozen=True)
@@ -53,6 +67,7 @@ class AccessBudget:
     def __init__(self, path, policy, *, create=False):
         self.path, self.policy = Path(path), policy
         self._lock, self._storage_lock = threading.Lock(), threading.Lock()
+        self._reservation_lock = threading.Lock()
         self._active, self._blocked_slots, self._dispatched = {}, set(), set()
         self._active_slots, self._sessions = {}, {}
         self._known_success = {}
@@ -71,25 +86,32 @@ class AccessBudget:
                 raise ValueError('access journal must be private and owned')
             self._fd = fd
             if create:
-                self._append({'kind': 'policy', 'version': 1, **asdict(policy)})
+                self._append(policy.journal_header())
                 directory = os.open(self.path.parent, os.O_RDONLY)
                 try:
                     os.fsync(directory)
                 finally:
                     os.close(directory)
             else:
-                if not 0 < info.st_size <= 16 * 1024 * 1024:
+                if info.st_size <= 0 or (policy.attempt_mode == 'finite' and info.st_size > 16 * 1024 * 1024):
                     raise ValueError('access journal missing or oversized')
-                raw = os.pread(fd, info.st_size, 0)
-                if not raw.endswith(b'\n'):
-                    raise ValueError('unfinished access journal; no new requests authorized')
-                lines = [json.loads(line) for line in raw.splitlines()]
-                if lines[0] != {'kind': 'policy', 'version': 1, **asdict(policy)}:
-                    raise ValueError('access journal belongs to another job or policy')
-                for event in lines[1:]:
-                    self._replay(event)
-                if (self._attempts > policy.max_attempts
-                        or self._seen_numbers != set(range(1, self._attempts + 1))):
+                # Sustained checks can run for hours. Replay one bounded line at
+                # a time, not the complete history or an unbounded set of ids.
+                with os.fdopen(os.dup(fd), 'rb') as history:
+                    line = history.readline(65537)
+                    if not line.endswith(b'\n') or len(line) > 65536:
+                        raise ValueError('unfinished access journal; no new requests authorized')
+                    if json.loads(line) != policy.journal_header():
+                        raise ValueError('access journal belongs to another job or policy')
+                    while line := history.readline(65537):
+                        if not line.endswith(b'\n') or len(line) > 65536:
+                            raise ValueError('unfinished access journal; no new requests authorized')
+                        self._replay(json.loads(line))
+                after = os.fstat(fd)
+                if (info.st_size, info.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+                    raise ValueError('access journal changed during recovery')
+                if (policy.attempt_mode == 'finite' and (self._attempts > policy.max_attempts
+                        or self._seen_numbers != set(range(1, self._attempts + 1)))):
                     raise ValueError('access attempt history is incomplete')
                 # Completion may have closed the memory gate immediately before
                 # a crash, without a durable completion record. An unresolved
@@ -132,7 +154,11 @@ class AccessBudget:
                     or slot in self._active_slots
                     or slot in self._sessions and self._sessions[slot] != session_id):
                 raise ValueError('duplicate access reservation')
-            self._seen_numbers.add(number)
+            if self.policy.attempt_mode == 'sustained':
+                if number != self._attempts + 1:
+                    raise ValueError('sustained access reservation sequence is incomplete')
+            else:
+                self._seen_numbers.add(number)
             self._active[number] = Reservation(number, slot, session_id)
             self._active_slots[slot] = number
             self._sessions[slot] = session_id
@@ -155,6 +181,12 @@ class AccessBudget:
             raise ValueError('unknown access accounting event')
 
     def reserve(self, slot, session_id):
+        # Number allocation and its append have one order. This lock does not
+        # guard note_success or dispatch, so slow fsync cannot delay the gate.
+        with self._reservation_lock:
+            return self._reserve(slot, session_id)
+
+    def _reserve(self, slot, session_id):
         if type(slot) is not int or not 0 <= slot < self.policy.slots:
             raise ValueError('invalid access slot')
         if not isinstance(session_id, str) or not session_id or len(session_id) > 128:
@@ -188,7 +220,7 @@ class AccessBudget:
             return 'this batch has a completed API check; no new check requests'
         if slot in self._blocked_slots:
             return 'the previous request outcome is uncertain; this slot stays closed'
-        if self._attempts >= self.policy.max_attempts:
+        if self.policy.max_attempts is not None and self._attempts >= self.policy.max_attempts:
             return 'this batch reached its finite HTTP attempt limit'
         return ''
 
@@ -271,6 +303,7 @@ class AccessBudget:
         with self._lock:
             return {'workspace_id': self.policy.workspace_id, 'job_id': self.policy.job_id,
                     'attempts': self._attempts, 'max_attempts': self.policy.max_attempts,
+                    'attempt_mode': self.policy.attempt_mode,
                     'in_flight': len(self._active), 'blocked_slots': sorted(self._blocked_slots),
                     'first_complete': self._success, 'fault': self._fault,
                     'closed': self._closed,

@@ -448,6 +448,8 @@ class BatchChannel:
         self.metrics['active'] += 1
         self.metrics['peak_active'] = max(self.metrics['peak_active'], self.metrics['active'])
         self.metrics['dispatch_times'].append(time.monotonic())
+        if self.budget.policy.attempt_mode == 'sustained' and len(self.metrics['dispatch_times']) > 512:
+            del self.metrics['dispatch_times'][:-512]
         writer.write(wire)
         ready.set_result(None)
 

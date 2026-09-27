@@ -31,8 +31,9 @@ import uuid
 from ccc_access_budget import AccessBudget, AdmissionClosed, Policy
 from ccc_access_gateway import BatchChannel, Gateway, Upstream
 
-VERSION = 1
-MODE = 'finite-api-check-v1'
+VERSION = 2
+MODE = 'sustained-api-check-v2'
+LEGACY_MODE = 'finite-api-check-v1'
 AUTHORIZATION_LEASE = 1.0
 _started_processes = {}
 
@@ -90,12 +91,25 @@ def descriptor_sha(value):
 
 
 def verify_descriptor(descriptor, config_path, job):
-    policy = Policy(**descriptor['policy'])
+    record = descriptor.get('policy')
+    if not isinstance(record, dict):
+        raise ValueError('access descriptor has no explicit policy')
+    mode, version = descriptor.get('mode'), descriptor.get('version')
+    if mode == MODE and type(version) is int and version == VERSION:
+        if (set(record) != {'workspace_id', 'job_id', 'slots', 'max_attempts',
+                           'max_output_tokens', 'attempt_mode'}
+                or record.get('attempt_mode') != 'sustained' or record.get('max_attempts') is not None):
+            raise ValueError('sustained access requires an explicit unbounded-attempt policy')
+    elif mode == LEGACY_MODE and type(version) is int and version == 1:
+        if record.get('attempt_mode', 'finite') != 'finite':
+            raise ValueError('legacy finite access cannot become sustained')
+    else:
+        raise ValueError('unsupported access descriptor mode')
+    policy = Policy(**record)
     declared = job.get('access_policy')
-    expected = {'mode': MODE, 'version': VERSION, 'max_attempts': policy.max_attempts,
+    expected = {'mode': mode, 'version': version, 'max_attempts': policy.max_attempts,
                 'max_output_tokens': policy.max_output_tokens, 'descriptor_sha256': descriptor_sha(descriptor)}
-    if (descriptor.get('version') != VERSION or descriptor.get('mode') != MODE
-            or job.get('access_mode') != MODE or declared != expected
+    if (job.get('access_mode') != mode or declared != expected
             or descriptor.get('config_path') != str(Path(config_path).resolve())
             or policy.job_id != job['id'] or policy.workspace_id != job['workspace_id']
             or not isinstance(declared, dict)):
@@ -238,7 +252,7 @@ def prepare(config_path, job, *, fixture=False, owner=None):
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     spec = native_spec(fixture=fixture)
     owner = owner or ensure_gateway(config_path)
-    policy = Policy(job['workspace_id'], job['id'])
+    policy = Policy(job['workspace_id'], job['id'], max_attempts=None, attempt_mode='sustained')
     descriptor = {'version': VERSION, 'mode': MODE, 'config_path': str(Path(config_path).resolve()),
         'policy': asdict(policy), 'upstream': spec, 'gateway_instance': owner['instance'],
         'port': owner['port'], 'tokens': [secrets.token_urlsafe(32) for _ in range(50)]}
@@ -268,13 +282,16 @@ def launch_arguments(config_path, job, index):
     provider = 'model_providers.' + spec['provider']
     flags = {'model': spec['model'], 'model_provider': spec['provider'],
         provider + '.base_url': endpoint, provider + '.supports_websockets': False,
-        provider + '.request_max_retries': 0, provider + '.stream_max_retries': 0,
         'skills.include_instructions': False, 'agents.enabled': False,
         'features.multi_agent': False, 'features.multi_agent_v2': False,
         'features.plugins': False, 'features.apps': False, 'features.hooks': False,
         'features.skip_host_skill_discovery': True, 'project_doc_max_bytes': 0,
         'include_permissions_instructions': False, 'include_collaboration_mode_instructions': False,
         'include_apps_instructions': False}
+    if policy.attempt_mode == 'finite':
+        # Historical jobs retain their original contract. New N invocations
+        # inherit the provider's native HTTP and stream reconnect policy.
+        flags.update({provider + '.request_max_retries': 0, provider + '.stream_max_retries': 0})
     return [value for key, val in flags.items() for value in ('-c', key + '=' + json.dumps(val))]
 
 
@@ -359,9 +376,16 @@ def continuation_decision(binding, value, workspace_id, *, now=None):
             or value.get('job_id') != binding['job_id'] or value.get('workspace_id') != workspace_id):
         return result('invalid')
     attempts, maximum = value.get('attempts'), value.get('max_attempts')
+    attempt_mode = value.get('attempt_mode', 'finite')
+    valid_attempts = type(attempts) is int and attempts >= 0
+    if attempt_mode == 'sustained':
+        valid_attempts = valid_attempts and 'max_attempts' in value and maximum is None
+    elif attempt_mode == 'finite':
+        valid_attempts = valid_attempts and type(maximum) is int and 50 <= maximum <= 10000 and attempts <= maximum
+    else:
+        valid_attempts = False
     blocked = value.get('blocked_slots')
-    if (type(attempts) is not int or type(maximum) is not int or not 50 <= maximum <= 10000
-            or not 0 <= attempts <= maximum or not isinstance(blocked, list)
+    if (not valid_attempts or not isinstance(blocked, list)
             or any(type(slot) is not int or not 0 <= slot < 50 for slot in blocked)
             or len(blocked) != len(set(blocked))):
         return result('invalid')
@@ -397,7 +421,7 @@ def continuation_decision(binding, value, workspace_id, *, now=None):
     if value.get('first_complete'):
         return result('complete' if outcome == 'complete' else
                       'settling' if outcome == 'in_flight' else 'stopped')
-    if attempts >= maximum:
+    if maximum is not None and attempts >= maximum:
         return result('exhausted', detail=detail)
     if value.get('authorized') is not True:
         return result('paused', detail=detail)
@@ -451,7 +475,7 @@ async def serve(config_path):
         descriptor = read_private(path / 'access.json')
         job = load_json(path / 'job.json', {})
         policy = verify_descriptor(descriptor, config_path, job)
-        if (descriptor.get('version') != VERSION or policy.job_id != job_id
+        if (policy.job_id != job_id
                 or descriptor.get('config_path') != str(Path(config_path).resolve())
                 or descriptor.get('gateway_instance') != instance or descriptor.get('port') != owner['port']):
             raise AdmissionClosed('this job is not bound to the current access service')

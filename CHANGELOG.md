@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.27
+
+- Make new N batches explicitly sustained: retain all 50 slots, inherit the provider's native HTTP and stream retries, and continue confirmed retryable failures in the original sessions. Remove the cumulative 1000-attempt cutoff from new batches. Existing finite batches retain their limits, listeners and journals.
+- Stream sustained accounting history with bounded per-slot memory and serialize reservation numbers without delaying the immediate success gate behind disk writes. Retain durable counts, unresolved-restart protection and bounded recent dispatch diagnostics.
+- Keep the fixed short upstream request, tool/title exclusion, requested output limit and per-workspace success gate. After a complete reply, new checks stop and in-flight requests finish naturally. Original B/b and automatic pause/Interrupt behavior remain unchanged.
+- Add a native loopback acceptance path that preserves real retry defaults and requires an observed 5/5 reconnect, all fifty original-session continuations, more than 1000 real HTTP requests and sustained rejection before the fixture permits success. Protocol pressure and native CLI resource measurements remain separate evidence.
+
 ## 0.2.26
 
 - Add explicit `probe.validation_mode=reachability` for anonymous AnyRouter route checks. A fixed malformed request never loads API credentials or requests model generation. Structured API authentication, capacity and rate-limit replies establish reachability; explicit network blocks and uncertain HTML remain distinct. Existing configurations retain complete-response validation unless this mode is selected.
