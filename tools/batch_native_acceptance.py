@@ -5,6 +5,8 @@ Keeps automatic pause off, uses private native/CCC data, and closes only the
 recorded fixture workspace. Existing Codex identities are checked, not signalled.
 """
 import argparse
+from collections import Counter
+import hashlib
 from http.server import ThreadingHTTPServer
 import json
 import os
@@ -21,10 +23,69 @@ import ccc_batch_guard as guard
 import ccc_codex_queue as native
 import ccc_guard_scope as scope
 import ccc_guard_migration as migration
-from ccc_scheduling import SnapshotCache, SnapshotClient
+from ccc_scheduling import CoalescingWriter, SnapshotCache, SnapshotClient
 import ccc_workspace_batch as batch
 import cmux_codex_watch as core
-from tools.idle_session_native_acceptance import Handler
+from tools.idle_session_native_acceptance import ERROR, Handler
+
+
+def continue_failed_batch(config_path, root, home, client, slots, owned, output):
+    """Use the real scheduler, viewport gates and native identity checks."""
+    failed = {s['surface_id']: native.task_snapshot(Path(s['transcript']), s['session_id']) for s in slots}
+    assert all(t and t['kind'] == 'task_complete' and ERROR in (t.get('error') or {}).get('message', '')
+               for t in failed.values()), 'each original turn must actually fail first'
+    core.atomic_write_json(output / 'failed-turns.json', failed)
+    daemon = core.WatchDaemon(config_path, root / 'watch-state.json', client=client)
+    daemon.codex_queue_recovery.sessions_root = home / 'sessions'
+    daemon._state_writer = CoalescingWriter(daemon._save_now)
+    scheduler = daemon._start_scheduler()
+    notifier = native.NativeCompletionWatcher(daemon._native_wakeup_sources, scheduler.request_observation,
+                                               retry_needed=daemon._native_retry_needed)
+    scheduler.observation_interval = notifier.observation_interval
+    previous_switch = sys.getswitchinterval()
+    sys.setswitchinterval(min(previous_switch, .001))
+    started, last_report, completed_at = time.monotonic(), 0.0, None
+    completions = {}
+    try:
+        daemon._native_process_index.start()
+        notifier.start()
+        while time.monotonic() - started < 150:
+            elapsed = time.monotonic() - started
+            daemon._reload_config_if_changed()
+            daemon._refresh_dynamic_targets(daemon._observation_client())
+            scheduler.wakeup.clear()
+            targets = core.effective_targets(daemon.config, list(daemon.dynamic_targets.values()))
+            assert all(t['workspace_id'] == slots[0]['fixture_workspace_id'] for t in targets)
+            scheduler.tick(targets, generation=daemon._observation_policy.key)
+            current = {s['surface_id']: native.task_snapshot(Path(s['transcript']), s['session_id']) for s in slots}
+            completions = {sid: t for sid, t in current.items()
+                           if t and t['kind'] == 'task_complete' and not t.get('error')
+                           and t['turn_id'] != failed[sid]['turn_id']}
+            if len(completions) == len(slots):
+                if completed_at is None:
+                    completed_at = time.monotonic()
+                if time.monotonic() - completed_at >= 5:
+                    break
+            if elapsed - last_report >= 5:
+                print(json.dumps({'continuation_seconds': round(elapsed, 2), 'discovered': len(targets),
+                                  'continued_original_sessions': len(completions), **scheduler.snapshot()}), flush=True)
+                last_report = elapsed
+            scheduler.wakeup.wait(scheduler.wait_timeout())
+        assert len(completions) == len(slots), f'only {len(completions)}/{len(slots)} original sessions continued'
+        assert all(scope.matches(row) for row in owned), 'original fixture process changed'
+        return {'passed': True, 'seconds': time.monotonic() - started,
+                'original_failed_turns': failed, 'continued_turns': completions,
+                'surface_sessions': {s['surface_id']: s['session_id'] for s in slots},
+                'original_pid_birth_session_retained': len(slots), 'duplicate_detection_seconds': 5}
+    finally:
+        daemon.stop_requested = True
+        notifier.close()
+        scheduler.close()
+        daemon._native_process_index.close()
+        daemon._process_snapshots.close()
+        daemon._state_writer.close()
+        core.atomic_write_json(output / 'continuation-state.json', json.loads(daemon._serialize_state()))
+        sys.setswitchinterval(previous_switch)
 
 
 def main():
@@ -32,6 +93,8 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--mode', choices=('private-check', 'existing'), default='private-check',
                         help='existing verifies the default B after fixture-only folder trust')
+    parser.add_argument('--verify-continuation', action='store_true',
+                        help='fail every original first turn; require real CCC continuation in all 50 sessions')
     args = parser.parse_args()
     private_check = args.mode == 'private-check'
     output = args.output.resolve()
@@ -42,11 +105,16 @@ def main():
     server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
     server.requests = []
     server.fail_first = False
+    server.fail_first_by_session = args.verify_continuation
+    server.failed_sessions = set()
+    server.failure_lock = threading.Lock()
     threading.Thread(target=server.serve_forever, daemon=True).start()
     root = Path(tempfile.mkdtemp(prefix='ccc-b50-native-')).resolve()
     home = root / 'codex'
     home.mkdir()
     (home / 'sessions').mkdir()
+    if args.verify_continuation:
+        (home / 'AGENTS.md').write_text('Local loopback acceptance. Do not use tools.\n')
     (home / 'config.toml').write_text(
         'model = "gpt-6-astra"\nmodel_provider = "local_fixture"\n'
         'approval_policy = "never"\nsandbox_mode = "read-only"\ncheck_for_update_on_startup = false\n'
@@ -59,12 +127,19 @@ def main():
     original_native_config = (home / 'config.toml').read_bytes()
     config_path = root / 'ccc/config.json'
     config = core.default_config()
-    config.update(mode='armed', global_paused=False, targets=[], workspace_rules=[])
+    config.update(mode='armed', global_paused=False, claude_enabled=False,
+                  targets=[], workspace_rules=[], network_guard={'enabled': False})
     core.atomic_write_json(config_path, config)
     client = migration.cmux_client(config_path)
     original = scope.scan()
+    source_root = Path(__file__).resolve().parents[1]
+    source_files = {name: hashlib.sha256((source_root / name).read_bytes()).hexdigest()
+                    for name in (*core.RUNTIME_FILES, 'cmux_supervisor_tui.py',
+                                 'tools/batch_native_acceptance.py', 'tools/idle_session_native_acceptance.py')}
     record = {'phase': 'prepared', 'root': str(root), 'production_requests': 0,
-              'automatic_pause': False, 'native_before': original, 'startup_mode': args.mode}
+              'automatic_pause': False, 'native_before': original, 'startup_mode': args.mode,
+              'source_files': source_files,
+              'native_binary_sha256': hashlib.sha256(Path(guard.native_binary()).read_bytes()).hexdigest()}
     core.atomic_write_json(output / 'result.json', record)
     cache, worker, wid = None, None, None
     captured_waits = set()
@@ -114,6 +189,7 @@ def main():
         scoped_call('new_codex_surface', 1)
         for method in ('draft_batch_session_name', 'send_text', 'send_key'):
             scoped_call(method, 0, 1)
+        scoped_call('send', 0, 1)
         cache = SnapshotCache(workers=1)
         wrapped = SnapshotClient(client, cache)
         options = {'private_check': True} if private_check else {}
@@ -198,10 +274,24 @@ def main():
         completions = []
         while time.monotonic() < complete_deadline:
             completions = [native.task_snapshot(Path(s['transcript']), s['session_id']) for s in worker.job['slots']]
-            if all(t and t['kind'] == 'task_complete' and not t.get('error') for t in completions):
+            if all(t and t['kind'] == 'task_complete'
+                   and bool(t.get('error')) == args.verify_continuation for t in completions):
                 break
             time.sleep(.1)
-        assert all(t and t['kind'] == 'task_complete' and not t.get('error') for t in completions)
+        assert all(t and t['kind'] == 'task_complete'
+                   and bool(t.get('error')) == args.verify_continuation for t in completions)
+        if args.verify_continuation:
+            pathless_contexts = 0
+            for slot in worker.job['slots']:
+                events = [json.loads(line) for line in Path(slot['transcript']).read_text().splitlines() if line]
+                contexts = [part.get('text', '') for e in events if e.get('type') == 'response_item'
+                            and e.get('payload', {}).get('role') == 'user'
+                            for part in e['payload'].get('content', [])]
+                pathless_contexts += any(c.startswith('# AGENTS.md instructions\n') for c in contexts)
+            assert pathless_contexts == 50, 'native global context format was not exercised in every session'
+            continuation = continue_failed_batch(config_path, root, home, client,
+                [{**s, 'fixture_workspace_id': wid} for s in worker.job['slots']], owned, output)
+            record.update(continuation=continuation, native_pathless_context_sessions=pathless_contexts)
         deadline = time.monotonic() + 10
         while sum(not r['native_title'] for r in server.requests) < 50 and time.monotonic() < deadline:
             time.sleep(.1)
@@ -211,13 +301,25 @@ def main():
         record.update(started=50, local_requests=len(server.requests), primary_requests=len(primary),
                       native_title_requests=len(titles), completed_responses=50,
                       all_input_calls_scoped_to_fixture=all(call['workspace_id'] == wid for call in input_calls))
-        assert len(primary) == 50 and all(r['user_text'] == expected_prompt for r in primary), 'unexpected batch request'
+        if args.verify_continuation:
+            initial = [r for r in primary if r['user_text'] == expected_prompt and r['failed']]
+            continued = [r for r in primary if r['user_text'] == core.MESSAGE and not r['failed']]
+            sessions = {s['session_id'] for s in worker.job['slots']}
+            assert len(primary) == 100 and len(initial) == len(continued) == 50, 'unexpected or duplicated request'
+            assert {r['thread_id'] for r in initial} == {r['thread_id'] for r in continued} == sessions
+            sends = Counter(call['surface_id'] for call in input_calls if call['method'] == 'send')
+            assert sends == Counter({s['surface_id']: 1 for s in worker.job['slots']}), 'CCC did not send exactly once per surface'
+            record['ccc_continued_original_sessions'] = 50
+        else:
+            assert len(primary) == 50 and all(r['user_text'] == expected_prompt for r in primary), 'unexpected batch request'
         if private_check:
             assert not titles, 'the preassigned native name must avoid all hidden title requests'
         else:
             assert len(titles) <= 50, 'unexpected repeated native title requests'
         record['original_identity_changes'] = [r for r in original if not scope.matches(r)]
         assert not record['original_identity_changes'], 'an existing identity changed during acceptance'
+        assert all(hashlib.sha256((source_root / name).read_bytes()).hexdigest() == digest
+                   for name, digest in source_files.items()), 'acceptance source changed during execution'
         record.update(phase='passed', seconds=time.monotonic() - started, started=50,
                       local_requests=len(server.requests), primary_requests=len(primary), native_title_requests=len(titles),
                       original_native_retained=len(original), native_owned=owned,

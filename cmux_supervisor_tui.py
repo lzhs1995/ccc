@@ -2497,8 +2497,6 @@ class SupervisorModel:
     def refresh(self, *, force: bool = False) -> None:
         self.config = self.store.load()
         self.network_state = self.network.snapshot(self.config.get("network_guard", {}))
-        from ccc_workspace_batch import snapshots
-        self.batch_jobs = snapshots(self.config_path, self.config)
         self.runtime = core.load_json(self.config_path.parent / "state.json", {})
         self.hook_config = core.ClaudeHookSettingsManager().inspect()
         # Kicks off a background ctl read when the cached snapshot is due; it
@@ -2510,6 +2508,7 @@ class SupervisorModel:
         self.collab.maybe_refresh(force=force)
         now = time.monotonic()
         if not force and now - self.last_top_refresh < 5:
+            self._refresh_batch_snapshots()
             return
         self.last_top_refresh = now
         try:
@@ -2675,6 +2674,14 @@ class SupervisorModel:
         except (core.CmuxError, RuntimeError, OSError) as exc:
             self.online = False
             self.error = str(exc)
+        self._refresh_batch_snapshots()
+
+    def _refresh_batch_snapshots(self):
+        from ccc_workspace_batch import snapshots
+        # The panel displays live cmux rows, not the complete batch archive.
+        # Keep history on disk without rereading all of it every second.
+        self.batch_jobs = snapshots(self.config_path, self.config, workspace_ids={
+            str(row.record.get("workspace_id") or "") for row in self.candidates})
 
     def run_cli(self, args: list[str]) -> str:
         # Redirecting Python's global stdout on a worker would capture curses

@@ -42,8 +42,17 @@ class Handler(BaseHTTPRequestHandler):
         user_text = "\n".join(part.get("text", "") for part in (messages[-1].get("content", []) if messages else [])
                               if part.get("type") == "input_text")
         title = user_text.startswith("Generate a concise, single-line task title")
+        if getattr(self.server, "fail_first_by_session", False):
+            with self.server.failure_lock:
+                thread_id = self.headers.get("thread-id")
+                fail = not title and thread_id not in self.server.failed_sessions
+                if fail:
+                    self.server.failed_sessions.add(thread_id)
+        else:
+            fail = getattr(self.server, "fail_first", True) and not self.server.requests
         self.server.requests.append({"model": body.get("model"), "at": time.time(),
                                      "user_text": user_text, "native_title": title,
+                                     "failed": fail,
                                      "thread_id": self.headers.get("thread-id"),
                                      "body_sha256": hashlib.sha256(raw).hexdigest()})
         self.send_response(200)
@@ -51,7 +60,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         response = {"id": "resp_" + uuid.uuid4().hex, "object": "response", "status": "in_progress", "output": []}
         events = [{"type": "response.created", "response": response}]
-        if getattr(self.server, "fail_first", True) and len(self.server.requests) == 1:
+        if fail:
             events.append({"type": "response.failed", "response": {
                 **response, "status": "failed", "error": {"code": "server_error", "message": ERROR}}})
         else:

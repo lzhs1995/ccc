@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import ast
 import base64
+from collections import OrderedDict
 import contextlib
 import json
 import logging
@@ -31,7 +32,7 @@ from ccc_inventory import SharedInventory
 from ccc_scheduling import SnapshotCache, SnapshotClient
 
 COUNT = 50
-WORKER_VERSION = 24
+WORKER_VERSION = 25
 LEGACY_PROMPT = "show me u power"
 PROMPT = "Reply only OK. Do not use tools. End the turn."
 EMPTY_CWD_POLICY = "private-empty-v1"
@@ -41,6 +42,8 @@ STARTABLE = {"pending", "restart_pending", "pty_wait"}
 STARTUP_LEASE_SEC = 30
 CONFIRMABLE = {"submitted", "submitting", "uncertain", "confirmed"}
 CONFIRM_READ_BYTES = 1024 * 1024
+CONTEXT_PARSER_VERSION = 2
+RECONCILE_CACHE_LIMIT = 16
 
 
 def pty_available():
@@ -57,7 +60,10 @@ def pty_available():
 def _startup_context(message):
     message = message.strip()
     environment = r"<environment_context>[\s\S]*?</environment_context>"
-    instructions = r"# AGENTS\.md instructions for [^\n]+\n\s*<INSTRUCTIONS>[\s\S]*?</INSTRUCTIONS>"
+    # Native 0.156 also emits global instructions without a directory suffix.
+    # Only a complete response-item envelope is context; explicit user events
+    # and text appended outside the envelope still belong to the operator.
+    instructions = r"# AGENTS\.md instructions(?: for [^\r\n]+)?\r?\n\s*<INSTRUCTIONS>[\s\S]*?</INSTRUCTIONS>"
     return bool(re.fullmatch(environment, message) or
                 re.fullmatch(instructions + r"(?:\s*" + environment + r")?", message))
 
@@ -95,9 +101,11 @@ def counts(job):
             "total": len(slots)}
 
 
-def snapshots(config_path, config):
+def snapshots(config_path, config, *, workspace_ids=None):
     result = {}
     for rule in config.get("workspace_rules", []):
+        if workspace_ids is not None and rule.get("workspace_id") not in workspace_ids:
+            continue
         jid = rule.get("last_batch_id")
         if jid:
             try:
@@ -796,19 +804,25 @@ class BatchWorker:
         path = Path(slot.get("transcript") or "/nonexistent")
         try:
             stat = path.stat()
-            proof = slot.setdefault("confirmation", {"offset": slot["transcript_offset"], "session_id": slot["session_id"]})
+            proof = slot.setdefault("confirmation", {"offset": slot["transcript_offset"],
+                "session_id": slot["session_id"], "context_parser_version": CONTEXT_PARSER_VERSION})
             identity = [stat.st_dev, stat.st_ino]
             if proof.get("session_id", slot["session_id"]) != slot["session_id"]:
                 proof["blocked"] = "original session changed"
             if proof.get("identity", identity) != identity or stat.st_size < proof["offset"]:
                 proof["blocked"] = "original transcript changed or truncated"
             if proof.get("blocked"):
-                return False
+                return self._recheck_context_proof(slot, proof)
             if proof.get("confirmed"):
                 return True
+            proof["context_parser_version"] = CONTEXT_PARSER_VERSION
             if proof.get("identity") and stat.st_size == proof["offset"]:
                 return False
             with path.open("rb") as handle:
+                opened = os.fstat(handle.fileno())
+                if [opened.st_dev, opened.st_ino] != identity:
+                    proof["blocked"] = "original transcript changed while opening"
+                    return False
                 if not proof.get("identity"):
                     meta = json.loads(handle.readline())
                     if meta.get("type") != "session_meta" or meta.get("payload", {}).get("id") != slot.get("session_id"):
@@ -841,6 +855,9 @@ class BatchWorker:
                     return False
                 kind = payload.get("type") if event.get("type") == "event_msg" else ""
                 if kind == "task_started":
+                    if proof.get("expected_task_id") and payload.get("turn_id") != proof["expected_task_id"]:
+                        proof["blocked"] = "original task changed"
+                        return False
                     if epoch(event["timestamp"]) < slot["submit_at"] - .001 or proof.get("started"):
                         proof["blocked"] = "different task before batch prompt"
                         return False
@@ -865,11 +882,56 @@ class BatchWorker:
                         return False
                     proof["prompt"] = True
                 if proof.get("started") and proof.get("prompt"):
+                    current = path.stat()
+                    if [current.st_dev, current.st_ino] != identity or current.st_size < proof["offset"]:
+                        proof["blocked"] = "original transcript changed while confirming"
+                        return False
                     proof.update(confirmed=True, confirmed_at=self.clock())
                     proof.pop("partial", None)
                     return True
         except (OSError, ValueError, KeyError, TypeError):
             return False
+        return False
+
+    def _recheck_context_proof(self, slot, proof):
+        """Read an old rejected start again, without replaying any input.
+
+        The caller has already checked the saved session and file identity and
+        rejected truncation. Keep the old rejection while a bounded, restartable
+        cursor revalidates the original submitted task. Genuine operator input
+        remains blocked and is not rescanned forever.
+        """
+        if (proof.get("blocked") != "different user prompt" or not proof.get("identity")
+                or int(proof.get("context_parser_version") or 0) >= CONTEXT_PARSER_VERSION
+                or proof.get("context_rechecked_version") == CONTEXT_PARSER_VERSION):
+            return False
+        origin = {"session_id": slot["session_id"], "identity": proof["identity"],
+                  "transcript_offset": slot["transcript_offset"], "submit_at": slot["submit_at"],
+                  "task_id": proof.get("task_id")}
+        retry = proof.setdefault("context_recheck", {
+            "offset": slot["transcript_offset"], "session_id": slot["session_id"],
+            "identity": proof["identity"],
+            "context_parser_version": CONTEXT_PARSER_VERSION,
+            "expected_task_id": proof.get("task_id"), "origin": origin,
+        })
+        if (not isinstance(retry, dict) or retry.get("origin") != origin
+                or retry.get("session_id") != slot["session_id"]
+                or retry.get("context_parser_version") != CONTEXT_PARSER_VERSION
+                or retry.get("expected_task_id") != proof.get("task_id")
+                or type(retry.get("offset")) is not int
+                or retry["offset"] < slot["transcript_offset"]
+                or retry.get("identity", proof["identity"]) != proof["identity"]
+                or retry.get("confirmed")):
+            proof["context_recheck_error"] = "invalid original context recheck cursor"
+            return False
+        candidate = {**slot, "confirmation": retry}
+        if self._confirm(candidate):
+            previous = {key: value for key, value in proof.items() if key != "context_recheck"}
+            slot["confirmation"] = {**candidate["confirmation"], "legacy_context_revalidation": {
+                "parser_version": CONTEXT_PARSER_VERSION, "at": self.clock(), "previous": previous}}
+            return True
+        if retry.get("blocked"):
+            proof["context_rechecked_version"] = CONTEXT_PARSER_VERSION
         return False
 
     def _release(self, slot):
@@ -1393,8 +1455,39 @@ class BatchReconciler:
         self.path, self.client, self.launch = Path(config_path), client, launch
         self.store = core.ConfigStore(self.path)
         self.stop = threading.Event()
-        self.workers, self.launched = {}, {}
+        self.workers, self.launched = OrderedDict(), {}
+        self._config_cache = None
         self.thread = threading.Thread(target=self._run, name="ccc-batch-reconcile", daemon=True)
+
+    def _config(self):
+        """Reuse validation only while the exact file identity is unchanged.
+
+        Every authorization check still stats the file; a concurrent B/P/config
+        edit invalidates the cache. Actual worker input and config mutation keep
+        their existing locked, fresh authorization checks.
+        """
+        def stamp():
+            value = self.path.stat()
+            return value.st_dev, value.st_ino, value.st_mtime_ns, value.st_size
+        identity = stamp()
+        if self._config_cache is not None and self._config_cache[0] == identity:
+            return self._config_cache[1]
+        config = self.store.load()
+        self._config_cache = (identity, config) if stamp() == identity else None
+        return config
+
+    def _worker(self, jid):
+        worker = self.workers.pop(jid, None)
+        if worker is None:
+            worker = BatchWorker(self.path, jid, client=self.client)
+        self.workers[jid] = worker
+        # These are idle reconciliation adapters, never native session owners.
+        # Historical jobs must not retain an unbounded number of hook/process
+        # caches. Proof cursors already persist in each original job file.
+        while len(self.workers) > RECONCILE_CACHE_LIMIT:
+            _, old = self.workers.popitem(last=False)
+            old.cache.close()
+        return worker
 
     def start(self):
         self.thread.start()
@@ -1406,7 +1499,7 @@ class BatchReconciler:
             worker.cache.close()
 
     def cycle(self):
-        config = self.store.load()
+        config = self._config()
         ids = relevant_job_ids(self.path, config)
         membership = None
         for jid in ids:
@@ -1418,11 +1511,17 @@ class BatchReconciler:
                     job = core.load_json(path, {})
                     if not job:
                         continue
-                    worker = self.workers.get(jid)
-                    if worker is None:
-                        worker = self.workers[jid] = BatchWorker(self.path, jid, client=self.client)
+                    current_config = self._config()
+                    rule = next((r for r in current_config["workspace_rules"] if r.get("workspace_id") == job["workspace_id"]), {})
+                    if (job.get("status") == "complete"
+                            and all(s.get("phase") == "confirmed" for s in job.get("slots", []))
+                            and not any(core.batch_start_hold(rule, s.get("surface_id")) for s in job.get("slots", []))):
+                        old = self.workers.pop(jid, None)
+                        if old is not None:
+                            old.cache.close()
+                        continue
+                    worker = self._worker(jid)
                     worker.job = job
-                    current_config = self.store.load()
                     if allowed(current_config, job) and any(s.get("phase") == "surface_closed" for s in job.get("slots", [])):
                         if membership is None:
                             membership = self.client.fresh_tree() if isinstance(self.client, SnapshotClient) else self.client.tree()
@@ -1439,7 +1538,7 @@ class BatchReconciler:
                     if job.get("slots") and all(s["phase"] == "confirmed" for s in job["slots"]):
                         job["status"] = "complete"
                     worker.save()
-                    if (self.launch and allowed(self.store.load(), job)
+                    if (self.launch and allowed(self._config(), job)
                             and job.get("status") not in {"complete", "needs_attention", "workspace_closed"}
                             and time.monotonic() - self.launched.get(jid, 0) >= 10):
                         _launch(self.path, job)
@@ -1448,7 +1547,7 @@ class BatchReconciler:
                 # A running worker holds the lock; it owns both job and proof.
                 if "lock" in str(exc).lower() and self.launch:
                     job = core.load_json(path, {})
-                    if job and allowed(self.store.load(), job):
+                    if job and allowed(self._config(), job):
                         retire_old_worker(job, config_path=self.path)
                 else:
                     logging.getLogger(core.APP_NAME).warning("batch=%s reconciliation: %s", jid, exc)
