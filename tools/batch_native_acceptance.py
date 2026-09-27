@@ -15,7 +15,10 @@ import shlex
 import tempfile
 import threading
 import time
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:  # Optional acceptance dependency on Python 3.10.
+    import tomli as tomllib
 import sys
 import uuid
 

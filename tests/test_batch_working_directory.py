@@ -3,7 +3,10 @@ from pathlib import Path
 import shlex
 import stat
 import tempfile
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:  # Test-only parser for the supported Python 3.10 runner.
+    import tomli as tomllib
 import unittest
 import uuid
 from unittest.mock import Mock, patch
