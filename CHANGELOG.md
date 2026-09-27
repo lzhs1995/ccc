@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.26
+
+- Add explicit `probe.validation_mode=reachability` for anonymous AnyRouter route checks. A fixed malformed request never loads API credentials or requests model generation. Structured API authentication, capacity and rate-limit replies establish reachability; explicit network blocks and uncertain HTML remain distinct. Existing configurations retain complete-response validation unless this mode is selected.
+- Keep route reachability separate from model availability and expose selectable, reachable, blocked, failed, recovering and untested counts with check times. Refuse stale state from another validation mode. Keep manual selection independent of the automatic pool.
+- Match evidence freshness to the unchanged slow polling interval. Recheck a first transport failure, quarantine repeated failures, and require fresh recovery evidence after cooldown or configuration changes. Preserve existing model evidence, quarantine history and consumed probe reservations across the opt-in transition.
+- Preserve N protocol fixes, original B/b behavior and automatic pause/Interrupt settings. Local private routing changes and anonymous route results are separate deployment evidence; API reachability does not guarantee model capacity or account billing behavior.
+
 ## 0.2.25
 
 - Accept repeated upstream metadata headers, including separate Set-Cookie fields, on API and CONNECT responses. Keep native request headers and response framing/interpretation headers strict. Record fixed, bounded protocol diagnostics without credentials, cookies or upstream body text.
