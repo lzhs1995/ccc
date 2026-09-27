@@ -188,6 +188,11 @@ class NetworkClient:
                         raise ValueError("network status identity does not match")
                     if config.get("group") and any(value.get(k) != config.get(k) for k in ("group", "outer_group")):
                         raise ValueError("network status belongs to an obsolete selector configuration")
+                    probe = config.get("probe", {})
+                    if not isinstance(probe, dict):
+                        raise ValueError("invalid network probe configuration")
+                    if value.get("validation_mode", "response") != probe.get("validation_mode", "response"):
+                        raise ValueError("network status belongs to another validation mode")
                 except (OSError, ValueError, KeyError, TypeError):
                     value = {"phase": "observer_fault", "at": now}
                 self.cache = now, path, value
@@ -255,6 +260,16 @@ def summary(snapshot):
               "api_attention": "API 限流或配置异常", "observer_fault": "探测器异常",
               "manual": "手动路由", "inactive": "当前配置未启用自动路由",
               "observer_stale": "探测器心跳过期", "unmanaged_selection": "策略组待接入", "stopped": "已停止"}
+    automatic = snapshot.get("automatic", {})
+    if snapshot.get("validation_mode") == "reachability" and automatic.get("validation_mode") == "reachability":
+        selected = snapshot.get("effective_route", {}).get("selection") if phase in {"manual", "inactive"} else None
+        stamp = automatic.get("last_checked_at", 0)
+        checked = time.strftime("%H:%M:%S", time.localtime(stamp)) if isinstance(stamp, (int, float)) and stamp > 0 else "尚未检测"
+        prefix = f"AnyRouter {labels.get(phase, '启动中')}" + (f" · {selected}" if selected else "")
+        result = f"{prefix} · {automatic['summary']} · 最近 {checked}"
+        if not automatic.get("ready"):
+            result += " · " + automatic.get("reason", "等待可达性检测")
+        return result
     if phase in {"manual", "inactive"}:
         selected = snapshot.get("effective_route", {}).get("selection") or "—"
         return f"AnyRouter {labels[phase]} · {selected} · 自动候选 {snapshot.get('ready', 0)}/{len(snapshot.get('routes', []))}"

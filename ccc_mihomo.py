@@ -58,6 +58,10 @@ def probe_key(config):
     return probe_credential(config)[0]
 
 
+def reachability_mode(config):
+    return config.get("validation_mode", "response") == "reachability"
+
+
 def atomic_json(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -554,7 +558,43 @@ def _completed(response):
     return False
 
 
-def classify(status, content_type, body, *, deep=False):
+def classify_reachability(status, content_type, body, headers=None):
+    """Anonymous validator reachability, never model or account availability.
+
+    Explicit WAF evidence wins over an HTTP error code. Generic HTML/error
+    pages are uncertain, not proof of an IP ban or a working model backend.
+    """
+    text = body.decode("utf-8", "replace")
+    lower = text.lower()
+    headers = {str(k).lower(): str(v).lower() for k, v in (headers or {}).items()}
+    challenge = (headers.get("cf-mitigated") == "challenge" or any(marker in lower for marker in (
+        "cf-chl-", "/cdn-cgi/challenge-platform", "cf-browser-verification",
+        "cf-error-code\">1020", "sorry, you have been blocked", "attention required! | cloudflare",
+        "ip has been banned", "ip has been blocked",
+        "ip address is blocked", "ip address is banned", '"ip_blocked"', '"ip_banned"',
+        '"waf_blocked"', '"captcha_required"')))
+    if challenge:
+        return ProbeResult("blocked", status, detail="explicit WAF/IP blocking or browser challenge")
+    try:
+        value = json.loads(text)
+    except ValueError:
+        value = None
+    structured_error = (isinstance(value, dict) and (
+        isinstance(value.get("error"), (dict, str)) or
+        isinstance(value.get("message"), str) and ("code" in value or "status" in value)))
+    if structured_error and status in {400, 401, 403, 404, 405, 408, 413, 415, 422, 429, 500, 502, 503, 504}:
+        explanation = ("authentication required" if status == 401 else "account/model permission response" if status == 403
+                       else "API rate limit" if status == 429 else "API upstream error" if status >= 500
+                       else "API request validator reached")
+        return ProbeResult("accessible", status,
+                           detail=f"HTTP {status}: {explanation}; model generation not tested")
+    return ProbeResult("contract", status,
+                       detail=f"HTTP {status}: origin response uncertain; no explicit IP-block evidence")
+
+
+def classify(status, content_type, body, *, deep=False, validation_mode="response", headers=None):
+    if validation_mode == "reachability":
+        return classify_reachability(status, content_type, body, headers)
     text = body.decode("utf-8", "replace")
     lower = text.lower()
     try:
@@ -658,14 +698,16 @@ class ResponsesProbe:
         # Queue delay or an atomic auth/config replacement must not change the
         # account/model of a request after the guard bound its contract.
         self.config, self.ports = copy.deepcopy(config), ports
-        self._credential = credential
-        if credential is None:
+        self._credential = "" if reachability_mode(self.config) else credential
+        if self._credential is None:
             try:
                 self._credential = probe_key(self.config)
             except (OSError, ValueError):
                 pass
 
     def request_body(self):
+        if reachability_mode(self.config):
+            raise ValueError("reachability mode cannot create a model request")
         # Codex's wire contract, without starting a Codex session or writing
         # native completion events. Some Codex backends reject max_output_tokens.
         body = {
@@ -682,6 +724,10 @@ class ResponsesProbe:
 
     def run(self, item, deep=False):
         started = time.monotonic()
+        anonymous = reachability_mode(self.config)
+        if anonymous and deep:
+            return ProbeResult("observer_error", detail="model probes disabled in reachability mode",
+                               stage="validation_mode", deep=True)
         endpoint = urllib.parse.urlsplit(self.config["url"])
         if endpoint.scheme != "https" and not (endpoint.scheme == "http" and endpoint.hostname in {"127.0.0.1", "localhost"}):
             raise ValueError("probe endpoint must be HTTPS or a local test server")
@@ -705,7 +751,8 @@ class ResponsesProbe:
         headers = {"Content-Type": "application/json", "Accept": "text/event-stream" if deep else "application/json",
                    "User-Agent": self.config.get("user_agent", "codex_cli_rs/0.156.1"), "originator": "codex_cli_rs",
                    "Accept-Encoding": "identity", "session_id": str(uuid.uuid4())}
-        headers.update(self.config.get("headers", {}))
+        if not anonymous:
+            headers.update(self.config.get("headers", {}))
         if key:
             headers["Authorization"] = "Bearer " + key
         payload = self.request_body() if deep else None
@@ -748,7 +795,9 @@ class ResponsesProbe:
                     return ProbeResult("contract", response.status, detail="oversized response", deep=deep)
             if connection.expired.is_set():
                 raise TimeoutError("probe deadline")
-            result = classify(response.status, content_type, raw, deep=deep)
+            result = classify(response.status, content_type, raw, deep=deep,
+                              validation_mode=self.config.get("validation_mode", "response"),
+                              headers=dict(response.getheaders()))
         except (TimeoutError, socket.timeout):
             local = connection.stage in {"setup", "observer_connect"}
             result = ProbeResult("observer_error" if local else "timeout",
