@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.30 (unreleased)
+
+- Reduce repeated parsing under the shared batch startup lock with a bounded cache of unchanged jobs that cannot contribute startup capacity. Invalidate on file replacement or modification; retain four initialization permits, the 0.5-second interval, the 30-second lease and a fresh authorization check before reservation.
+- Keep the fixed short prompt for newly created b checks while the original native identity, first task, failed-turn history and durable CCC sends still prove that check. Ordinary user tasks and existing B/b/N policies retain their continuation semantics. Queue recovery pins each attempt's original message and rechecks short-check input after persisting its intent.
+- Show preparation waits, naming and first-task acceptance separately from model success. Retain the wait start time without repeated identical writes and remove stale wait messages when progress resumes.
+
 ## 0.2.29
 
 - Add explicit manual-route failover in anonymous reachability mode. Probe the actual selected fixed route, retain a healthy manual choice, and transfer the named service selector to its automatic child only after consecutive fresh failures and a newly verified replacement. Show actual manual protection before background candidate counts.

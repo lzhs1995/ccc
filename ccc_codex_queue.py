@@ -935,7 +935,10 @@ class QueueRecovery:
             return bool(self.attempts and any(r.get("surface_id") == sid and r.get("phase") in {"edited", "unconfirmed"}
                                              for r in self.attempts.values()))
 
-    def recover(self, target, runtime, *, read_view, edit_queued, enter, authorized):
+    def recover(self, target, runtime, *, read_view, edit_queued, enter, authorized, message=None):
+        # Each invocation owns its exact text. Never mutate the shared default
+        # while other B/b/N surfaces are recovering their own queued inputs.
+        message = self.message if message is None else message
         sid = target["surface_id"]
         with self.lock:
             if self.attempts is None or time.monotonic() < self.next_probe.get(sid, 0):
@@ -954,11 +957,13 @@ class QueueRecovery:
             with self.lock:
                 previous = self.attempts.get(key)
             if previous:
+                if previous.get("message", self.message) != message:
+                    return "queue_recovery_unconfirmed"
                 # An acknowledged edit with no Enter attempted can be finished
                 # from its exact draft. A lost Enter acknowledgement cannot.
                 if previous["phase"] in {"edited", "unconfirmed"}:
                     view = read_view()
-                    if (not view.get("busy") and not view.get("queued") and view.get("draft") == self.message
+                    if (not view.get("busy") and not view.get("queued") and view.get("draft") == message
                             and authorized() and self.evidence(target) == evidence):
                         record = previous
                         self.write_attempt(key, {**record, "phase": "submitting"})
@@ -968,18 +973,18 @@ class QueueRecovery:
                 return "queue_recovery_unconfirmed" if previous["phase"] != "submitted" else ""
             view = read_view()
             if (not view.get("empty") or view.get("busy") or not view.get("editable")
-                    or view.get("queued") != [self.message] or not authorized()):
+                    or view.get("queued") != [message] or not authorized()):
                 return ""
             if self.evidence(target) != evidence:
                 return ""
             record = {"surface_id": sid, "workspace_id": target["workspace_id"],
-                      **evidence, "phase": "editing", "at": time.time()}
+                      **evidence, "message": message, "phase": "editing", "at": time.time()}
             self.write_attempt(key, record)
             edit_queued()
             self.write_attempt(key, {**record, "phase": "edited"})
             time.sleep(0.15)
             view = read_view()
-            if (view.get("busy") or view.get("queued") or view.get("draft") != self.message
+            if (view.get("busy") or view.get("queued") or view.get("draft") != message
                     or not authorized() or self.evidence(target) != evidence):
                 self.write_attempt(key, {**record, "phase": "unconfirmed"})
                 return "queue_recovery_unconfirmed"

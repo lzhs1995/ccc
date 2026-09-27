@@ -4492,9 +4492,7 @@ def _draw(
     elif status:
         _safe_addnstr(stdscr, at["message"], 0, status, clip, attr("error"))
     elif focus and (batch := getattr(model, "batch_jobs", {}).get(focus.workspace_id)):
-        mode = {'private_check': '空目录短答50', 'access_check': '节费50'}.get(batch.get('startup_mode'), '原B50')
-        progress = (f"{mode} {batch['status']} | 创建 {batch['created']}/50 | 就绪 {batch['ready']} | "
-                    f"已提交 {batch['submitted']} | 已启动 {batch['started']} | 未完成 {50 - batch['started']} | 异常 {batch['failed']}")
+        progress = batch_preparation_progress(batch)
         if batch.get("protection"):
             progress = batch_guard_label(batch["protection"])
         if batch.get('startup_mode') == 'access_check' and (check := batch.get('access')):
@@ -4504,6 +4502,28 @@ def _draw(
     _safe_addnstr(stdscr, at["keys1"], 0, GLOBAL_KEYS_1, clip, attr("dim"))
     _safe_addnstr(stdscr, at["keys2"], 0, GLOBAL_KEYS_2, clip, attr("dim"))
     stdscr.refresh()
+
+
+def batch_preparation_progress(batch, *, now=None):
+    mode = {'private_check': '空目录短答50', 'access_check': '节费50'}.get(batch.get('startup_mode'), '原B50')
+    wait = batch.get('wait') if isinstance(batch.get('wait'), dict) else {}
+    phase = wait.get('message') or {
+        'complete': '首任务已全数启动', 'running': '准备中', 'waiting': '等待准备',
+        'workspace_closed': '工作区已关闭', 'cancelled': '已取消',
+        'needs_attention': '部分原会话待处理',
+    }.get(batch.get('status'), batch.get('status') or '状态未知')
+    total = batch.get('total', 50)
+    named = batch.get('named')
+    result = (f"{mode} | {phase} | 创建 {batch.get('created', 0)}/{total}"
+              + (f" 命名 {named}/{total}" if named is not None else '')
+              + f" 首任务 {batch.get('started', 0)}/{total}")
+    if batch.get('failed'):
+        result += f" | 待处理 {batch['failed']}"
+    at = batch.get('last_progress_at')
+    if type(at) in {int, float} and 0 < at < float('inf'):
+        age = max(0, int((time.time() if now is None else now) - at))
+        result += f" | 最近进展 {age}秒前"
+    return result
 
 
 def next_status_after_key(key: int, status: str) -> str:
