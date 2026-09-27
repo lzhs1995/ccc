@@ -266,6 +266,8 @@ ACCESS_LABELS = {
 def access_detail(value):
     text = ACCESS_LABELS.get(value.get('phase'), ACCESS_LABELS['invalid'])[2]
     error = value.get('error') or {}
+    if value.get('phase') == 'retryable' and error.get('stage') in {'upstream_connect', 'cohort_dispatch'}:
+        text = '连接准备暂时失败，请求尚未发出；等待原生重连，结束后守卫器继续原会话'
     reason = error.get('reason')
     if reason:
         translations = {
@@ -275,8 +277,12 @@ def access_detail(value):
             'upstream stream ended before a full response': '上游连接在完整答复前结束',
             'operation timed out': '等待连接或答复超时',
             'connection or local storage operation failed': '连接或本地存储操作失败',
+            'waiting for fifty live connections; no request was sent': '等待全50路连接就绪，随后继续尝试',
+            'upstream TLS certificate verification failed': '上游TLS证书验证失败',
         }
         text += '；' + translations.get(reason, reason)
+    if error.get('errno_name'):
+        text += '（' + str(error['errno_name']) + '）'
     return text
 
 
@@ -285,6 +291,8 @@ def access_error_label(value):
     if label == '—':
         return label
     error = value.get('error') or {}
+    if value.get('phase') == 'retryable' and error.get('stage') in {'upstream_connect', 'cohort_dispatch'}:
+        return '连接重试'
     if error.get('type') == 'ProtocolFault':
         return '协议异常'
     if error.get('http_status'):
