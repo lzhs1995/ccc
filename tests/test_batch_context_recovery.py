@@ -157,6 +157,26 @@ class BatchContextRecoveryTests(unittest.TestCase):
         self.assertFalse(worker._confirm(slot))
         self.assertIn('transcript', slot['confirmation']['blocked'])
 
+    def test_legacy_recheck_retains_identity_between_parent_and_cursor_read(self):
+        slot = self.submitted()
+        self.append(slot, self.rows(slot, CONTEXT))
+        self.legacy_block(slot)
+        worker, slot = self.restored()
+        path = Path(slot['transcript'])
+        data = path.read_bytes()
+        stat, calls = Path.stat, []
+        def swap_before_nested_read(value, *args, **kwargs):
+            if value == path:
+                calls.append(True)
+                if len(calls) == 2:
+                    path.rename(path.with_suffix('.old'))
+                    path.write_bytes(data)
+            return stat(value, *args, **kwargs)
+        with patch.object(Path, 'stat', swap_before_nested_read):
+            self.assertFalse(worker._confirm(slot))
+        self.assertTrue(core.batch_start_hold(self.store.load()['workspace_rules'][0], slot['surface_id']))
+        self.assertEqual(self.client.sent, [])
+
     def test_old_block_never_rechecks_a_truncated_transcript(self):
         slot = self.submitted()
         self.append(slot, self.rows(slot, CONTEXT))
@@ -165,6 +185,41 @@ class BatchContextRecoveryTests(unittest.TestCase):
         worker, slot = self.restored()
         self.assertFalse(worker._confirm(slot))
         self.assertIn('truncated', slot['confirmation']['blocked'])
+
+    def test_file_replaced_after_stat_before_open_never_confirms(self):
+        slot = self.submitted()
+        self.append(slot, self.rows(slot, CONTEXT))
+        path = Path(slot['transcript'])
+        data = path.read_bytes()
+        opened, swapped = Path.open, []
+        def replace_at_open(value, *args, **kwargs):
+            if value == path and args == ('rb',) and not swapped:
+                swapped.append(True)
+                path.rename(path.with_suffix('.old'))
+                path.write_bytes(data)
+                swapped.append(True)
+            return opened(value, *args, **kwargs)
+        with patch.object(Path, 'open', replace_at_open):
+            self.assertFalse(self.worker._confirm(slot))
+        self.assertIn('while opening', slot['confirmation']['blocked'])
+        self.assertTrue(core.batch_start_hold(self.store.load()['workspace_rules'][0], slot['surface_id']))
+
+    def test_file_replaced_during_context_parse_never_confirms(self):
+        slot = self.submitted()
+        self.append(slot, self.rows(slot, CONTEXT))
+        path = Path(slot['transcript'])
+        data = path.read_bytes()
+        check = batch._startup_context
+        def replace_during_parse(message):
+            result = check(message)
+            if result:
+                path.rename(path.with_suffix('.old'))
+                path.write_bytes(data)
+            return result
+        with patch.object(batch, '_startup_context', side_effect=replace_during_parse):
+            self.assertFalse(self.worker._confirm(slot))
+        self.assertIn('while confirming', slot['confirmation']['blocked'])
+        self.assertTrue(core.batch_start_hold(self.store.load()['workspace_rules'][0], slot['surface_id']))
 
     def test_old_block_never_grants_a_different_original_session(self):
         slot = self.submitted()

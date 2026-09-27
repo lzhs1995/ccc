@@ -819,6 +819,10 @@ class BatchWorker:
             if proof.get("identity") and stat.st_size == proof["offset"]:
                 return False
             with path.open("rb") as handle:
+                opened = os.fstat(handle.fileno())
+                if [opened.st_dev, opened.st_ino] != identity:
+                    proof["blocked"] = "original transcript changed while opening"
+                    return False
                 if not proof.get("identity"):
                     meta = json.loads(handle.readline())
                     if meta.get("type") != "session_meta" or meta.get("payload", {}).get("id") != slot.get("session_id"):
@@ -878,6 +882,10 @@ class BatchWorker:
                         return False
                     proof["prompt"] = True
                 if proof.get("started") and proof.get("prompt"):
+                    current = path.stat()
+                    if [current.st_dev, current.st_ino] != identity or current.st_size < proof["offset"]:
+                        proof["blocked"] = "original transcript changed while confirming"
+                        return False
                     proof.update(confirmed=True, confirmed_at=self.clock())
                     proof.pop("partial", None)
                     return True
@@ -902,6 +910,7 @@ class BatchWorker:
                   "task_id": proof.get("task_id")}
         retry = proof.setdefault("context_recheck", {
             "offset": slot["transcript_offset"], "session_id": slot["session_id"],
+            "identity": proof["identity"],
             "context_parser_version": CONTEXT_PARSER_VERSION,
             "expected_task_id": proof.get("task_id"), "origin": origin,
         })
