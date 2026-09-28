@@ -1,5 +1,6 @@
 """Exercise 50 durable slots without creating real terminals or model calls."""
 import copy
+from concurrent.futures import Future
 from datetime import datetime, timezone
 import json
 import os
@@ -14,6 +15,23 @@ from unittest.mock import Mock, patch
 import ccc_workspace_batch as batch
 import cmux_codex_watch as core
 from tests.test_watch import grid_payload, span
+
+
+class InlineExecutor:
+    """Keep single-slot policy fixtures deterministic; concurrency is separate."""
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def submit(self, function, *args, **kwargs):
+        future = Future()
+        try:
+            future.set_result(function(*args, **kwargs))
+        except BaseException as exc:
+            future.set_exception(exc)
+        return future
+
+    def shutdown(self, **kwargs):
+        pass
 
 
 class BatchFixture:
@@ -119,6 +137,9 @@ class BatchFixture:
 
 class WorkspaceBatchTests(unittest.TestCase):
     def setUp(self):
+        executor = patch.object(batch, 'ThreadPoolExecutor', InlineExecutor)
+        executor.start()
+        self.addCleanup(executor.stop)
         native = patch('ccc_batch_guard.native_binary', return_value='/test/native/codex')
         native.start()
         self.addCleanup(native.stop)
@@ -130,8 +151,12 @@ class WorkspaceBatchTests(unittest.TestCase):
         pty = patch.object(batch, 'pty_available', return_value=True)
         pty.start()
         self.addCleanup(pty.stop)
-        seed = patch.object(batch, 'prepare_sqlite_home', side_effect=lambda config, jid:
-                            batch.sqlite_home(config, jid, 0).mkdir(parents=True, exist_ok=True))
+        def empty_metadata(config, jid):
+            directory = batch.sqlite_seed_home(config, jid)
+            directory.mkdir(parents=True, exist_ok=True)
+            if not (directory / 'seed.json').exists():
+                core.atomic_write_json(directory / 'seed.json', {'metadata': []})
+        seed = patch.object(batch, 'prepare_sqlite_home', side_effect=empty_metadata)
         seed.start()
         self.addCleanup(seed.stop)
         self.tmp = tempfile.TemporaryDirectory()
@@ -151,7 +176,7 @@ class WorkspaceBatchTests(unittest.TestCase):
         self.now = time.time()
         self.worker = batch.BatchWorker(self.config, self.job['job_id'], client=self.client, queue=self.client,
                                         clock=lambda: self.now, pty_probe=lambda: True)
-        self.addCleanup(self.worker.cache.close)
+        self.addCleanup(self.worker.close)
         self.worker.job['status'] = 'running'
 
     def finish(self):
@@ -196,7 +221,7 @@ class WorkspaceBatchTests(unittest.TestCase):
     def test_restart_after_submit_uses_transcript_instead_of_repeating_prompt(self):
         self.worker.step()
         self.worker.step()
-        self.assertEqual(len(self.client.sent), 1)
+        self.assertEqual(len(self.client.sent), 50)
         self.worker = batch.BatchWorker(self.config, self.job['job_id'], client=self.client, queue=self.client)
         self.assertEqual(self.finish()['started'], 50)
         self.assertEqual(len(self.client.sent), 50)
@@ -208,7 +233,7 @@ class WorkspaceBatchTests(unittest.TestCase):
         self.store.mutate(lambda c: c['workspace_rules'][0].update(paused=False))
         self.assertFalse(self.worker.step())
         self.assertEqual(self.worker.job['status'], 'cancelled')
-        self.assertEqual(len(self.client.calls), 1)
+        self.assertEqual(len(self.client.calls), 50)
         self.assertEqual(self.client.sent, [])
 
     def test_drafts_menus_and_existing_tasks_are_not_overwritten(self):
@@ -231,7 +256,7 @@ class WorkspaceBatchTests(unittest.TestCase):
         self.worker.step()
         self.assertEqual(slot['phase'], 'create_unknown')
         self.assertNotIn('surface_id', slot)
-        self.assertEqual(len(self.client.calls), 1)  # Only the next untouched slot.
+        self.assertEqual(len(self.client.calls), 49)  # Every other original untouched slot.
 
     def test_authorization_and_user_exclusions_are_preserved(self):
         self.store.mutate(lambda c: c['workspace_rules'][0].update(

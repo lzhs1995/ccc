@@ -10,7 +10,11 @@ import argparse
 import ast
 import base64
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 import contextlib
+import copy
+import ctypes
+import errno
 import json
 import logging
 import os
@@ -18,6 +22,7 @@ from pathlib import Path
 import re
 import shlex
 import signal
+import shutil
 import sqlite3
 import stat
 import subprocess
@@ -32,19 +37,20 @@ from ccc_inventory import SharedInventory
 from ccc_scheduling import SnapshotCache, SnapshotClient
 
 COUNT = 50
-WORKER_VERSION = 27
+WORKER_VERSION = 28
 LEGACY_PROMPT = "show me u power"
 PROMPT = "Reply only OK. Do not use tools. End the turn."
 EMPTY_CWD_POLICY = "private-empty-v1"
 INITIALIZING = {"creating", "create_unknown", "created", "restarting", "restart_unknown",
                 "submitted", "submitting", "uncertain"}
 STARTABLE = {"pending", "restart_pending", "pty_wait"}
-STARTUP_LEASE_SEC = 30
+STARTUP_POLL_SEC = 0.025
+IMMEDIATE_START_POLICY = "parallel-native-v1"
+NATIVE_ACCESS_POLICY = "direct-native-v1"
 CONFIRMABLE = {"submitted", "submitting", "uncertain", "confirmed"}
 CONFIRM_READ_BYTES = 1024 * 1024
 CONTEXT_PARSER_VERSION = 2
 RECONCILE_CACHE_LIMIT = 16
-CAPACITY_HISTORY_LIMIT = 1024
 
 
 def _file_generation(path):
@@ -52,43 +58,6 @@ def _file_generation(path):
     return (value.st_dev, value.st_ino, value.st_size,
             value.st_mtime_ns, value.st_ctime_ns)
 
-
-class CapacityHistory:
-    """Remember only unchanged jobs that contribute no startup capacity.
-
-    This is not an authorization cache. Current jobs, initializing slots and
-    possible future reservations still take the original fresh-read path.
-    Store file generations, not hundreds of complete historical job objects.
-    """
-    def __init__(self, limit=CAPACITY_HISTORY_LIMIT):
-        self.limit = limit
-        self.neutral = OrderedDict()
-
-    def read(self, path):
-        try:
-            before = _file_generation(path)
-        except FileNotFoundError:
-            self.neutral.pop(path, None)
-            return core.load_json(path, {})
-        previous = self.neutral.pop(path, None)
-        if previous == before and _file_generation(path) == before:
-            self.neutral[path] = before
-            return {}
-        job = core.load_json(path, {})
-        # Never label parsed old bytes with a replacement file's generation.
-        # Defer the reservation if a writer changed the file while reading it.
-        if _file_generation(path) != before:
-            raise RuntimeError("批次状态正在更新；等待下一次启动容量核验")
-        slots = job.get("slots") if isinstance(job, dict) else None
-        if (isinstance(job, dict) and job.get("status") in {"cancelled", "workspace_closed"}) or (
-                isinstance(slots, list) and slots
-                and all(isinstance(s, dict) and s.get("phase") is not None
-                        and s.get("phase") not in INITIALIZING | STARTABLE for s in slots)):
-            self.neutral[path] = before
-            while len(self.neutral) > self.limit:
-                self.neutral.popitem(last=False)
-            return {}
-        return job
 
 
 def pty_available():
@@ -129,7 +98,14 @@ def job_prompt(job):
 
 def startup_mode(job, config_path=None):
     from ccc_access_service import is_access_job
-    if is_access_job(config_path or job.get('config_path', core.DEFAULT_CONFIG_PATH), job):
+    access = is_access_job(config_path or job.get('config_path', core.DEFAULT_CONFIG_PATH), job)
+    if "native_access_policy" in job:
+        from ccc_private_check import POLICY
+        if (job["native_access_policy"] != NATIVE_ACCESS_POLICY or access
+                or job.get("cwd_policy") != EMPTY_CWD_POLICY or job.get("initial_prompt") != PROMPT
+                or job.get("check_retry_policy") != POLICY):
+            raise ValueError("invalid direct native check policy")
+    if access:
         return 'access_check'
     return 'private_check' if job.get('cwd_policy') == EMPTY_CWD_POLICY else 'existing'
 
@@ -208,6 +184,7 @@ def snapshots(config_path, config, *, workspace_ids=None):
                 result[rule["workspace_id"]] = {
                     "id": jid, "status": job.get("status"),
                     "startup_mode": startup_mode(job, config_path),
+                    "native_access_policy": job.get("native_access_policy"),
                     **counts(job), **preparation_progress(job)}
                 if result[rule['workspace_id']]['startup_mode'] == 'access_check':
                     from ccc_access_service import status
@@ -307,8 +284,9 @@ def settled_job(config_path, previous, config, client):
 
 
 def start(config_path, selector, *, client=None, launch=True, private_check=False,
-          access_check=False, _access_fixture=False):
-    if type(private_check) is not bool or type(access_check) is not bool or private_check and access_check:
+          access_check=False, native_access=False, _access_fixture=False):
+    if (any(type(mode) is not bool for mode in (private_check, access_check, native_access))
+            or sum((private_check, access_check, native_access)) > 1):
         raise RuntimeError("B private-check mode must be explicitly selected")
     from ccc_batch_guard import AUTOMATIC_POOL_STOP
     guarded = launch and AUTOMATIC_POOL_STOP
@@ -350,18 +328,27 @@ def start(config_path, selector, *, client=None, launch=True, private_check=Fals
                 and previous.get("created_at", 0) > rule.get("batch_success_at", 0)
                 and not settled_job(config_path, previous, config, client)))):
             job = previous  # Repeated clicks and retries reuse the same 50 slots.
-            if access_check and startup_mode(job, config_path) != 'access_check':
+            if (native_access and job.get("native_access_policy") != NATIVE_ACCESS_POLICY
+                    or access_check and startup_mode(job, config_path) != 'access_check'):
                 raise RuntimeError('本池尚有原 B 批次，已保留；节费50须在新批次使用，不能将旧任务静默改成检查')
         else:
             job = {"id": str(uuid.uuid4()), "workspace_id": wid,
                    "created_at": time.time(), "status": "pending",
+                   "startup_policy": IMMEDIATE_START_POLICY,
                    "slots": [{"index": i, "phase": "pending"} for i in range(COUNT)]}
-            if private_check or access_check:
-                job.update(cwd_policy=EMPTY_CWD_POLICY, initial_prompt=PROMPT,
-                           name_policy="before-first-turn-v1")
-            if private_check:
+            if private_check or access_check or native_access:
+                job.update(cwd_policy=EMPTY_CWD_POLICY, initial_prompt=PROMPT)
+            if access_check:
+                # Only the legacy gateway contract retains its title-cost
+                # preparation. New native b/N starts its first check directly.
+                job["name_policy"] = "before-first-turn-v1"
+            if private_check or native_access:
                 from ccc_private_check import POLICY
                 job["check_retry_policy"] = POLICY
+            if native_access:
+                # Explicit new native N. Do not reuse the legacy gateway
+                # marker names or reinterpret any existing N descriptor.
+                job["native_access_policy"] = NATIVE_ACCESS_POLICY
             job_locks.enter_context(core.FileLock(job_path(config_path, job["id"]).parent / "worker.lock", timeout_sec=0))
             if access_check:
                 from ccc_access_service import prepare
@@ -409,7 +396,61 @@ def start(config_path, selector, *, client=None, launch=True, private_check=Fals
 def sqlite_home(config_path, job_id, index):
     # Keep CODEX_HOME, transcripts, hooks and credentials in their normal
     # locations. Only the native SQLite writers of this new CLI are isolated.
-    return job_path(config_path, job_id).parent / "native-db"
+    if type(index) is not int or not 0 <= index < COUNT:
+        raise RuntimeError("invalid batch SQLite index")
+    return job_path(config_path, job_id).parent / "native-db" / "slots" / str(index)
+
+
+def sqlite_seed_home(config_path, job_id):
+    # Old native processes may still own native-db/*.sqlite. They retain their
+    # exact argv and files; only future processes use the new per-slot copies.
+    return job_path(config_path, job_id).parent / "native-db" / "template"
+
+
+def _copy_seed(source, target):
+    """APFS copy-on-write copy, never a shared writable inode."""
+    if sys.platform == "darwin":
+        clone = ctypes.CDLL(None, use_errno=True).clonefile
+        clone.argtypes, clone.restype = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int], ctypes.c_int
+        if clone(os.fsencode(source), os.fsencode(target), 0) == 0:
+            return
+        code = ctypes.get_errno()
+        if code not in {errno.ENOTSUP, errno.EOPNOTSUPP, errno.EXDEV, errno.EINVAL}:
+            raise OSError(code, os.strerror(code), str(target))
+    shutil.copyfile(source, target)
+
+
+def prepare_slot_sqlite_home(config_path, job_id, index):
+    prepare_sqlite_home(config_path, job_id)
+    directory = sqlite_home(config_path, job_id, index)
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    marker = directory / "seed.json"
+    if marker.exists():
+        return directory
+    with core.FileLock(directory / "seed.lock", timeout_sec=5):
+        if marker.exists():
+            return directory
+        source = sqlite_seed_home(config_path, job_id)
+        metadata = core.load_json(source / "seed.json", {}).get("metadata", [])
+        for name in metadata:
+            if not isinstance(name, str) or not re.fullmatch(r"(?:state|goals|memories|queue)_\d+\.sqlite", name):
+                raise RuntimeError("invalid original native metadata seed")
+            target = directory / name
+            if target.exists():
+                continue  # A native process may already have opened this copy.
+            temporary = directory / ("." + name + ".seed")
+            with contextlib.suppress(FileNotFoundError):
+                temporary.unlink()
+            try:
+                _copy_seed(source / name, temporary)
+                temporary.chmod(0o600)
+                temporary.replace(target)
+            finally:
+                with contextlib.suppress(FileNotFoundError):
+                    temporary.unlink()
+        core.atomic_write_json(marker, {"at": time.time(), "metadata": metadata,
+                                       "source": str(source), "layout": "per-slot-v1"})
+    return directory
 
 
 def working_directory(config_path, job_id, index):
@@ -542,9 +583,9 @@ def prepare_sqlite_home(config_path, job_id):
 
     An empty state DB makes Codex synchronously reindex every old rollout.
     SQLite backup preserves the real completed backfill and selected rollouts;
-    no native status is fabricated. One batch shares this new runtime.
+    no native status is fabricated. Each native gets its own writable copy.
     """
-    directory = sqlite_home(config_path, job_id, 0)
+    directory = sqlite_seed_home(config_path, job_id)
     directory.mkdir(parents=True, exist_ok=True)
     marker = directory / "seed.json"
     if marker.exists():
@@ -631,7 +672,7 @@ def register(config_path, job_id, index, launch_id=""):
             if old and old.get("surface_id") != sid:
                 raise RuntimeError("batch slot already belongs to another surface")
             store.mutate(protect)
-            prepare_sqlite_home(config_path, job_id)
+            prepare_slot_sqlite_home(config_path, job_id, index)
             directory = prepare_working_directory(config_path, job, index)
             core.atomic_write_json(receipt, {"surface_id": sid, "workspace_id": wid,
                                             "launch_id": launch_id, "registered_at": time.time(),
@@ -664,8 +705,31 @@ class BatchWorker:
         self._top_due = 0.0
         self._saved = self._serialized_job()
         self._shell_hints = {}
-        self._capacity_history = CapacityHistory()
         self._wait_observed = False
+        self._state_lock = threading.RLock()
+        self._slot_parent = None
+        self._slot_index = None
+        self._slot_pool = None
+        self._inflight = {}
+        self._slot_due = {}
+        self._release_pending = set()
+        self._wakeup = threading.Event()
+        self._closed = False
+        self._config_read_lock = threading.RLock()
+        self._config_snapshot = None
+
+    def _configuration(self):
+        owner = self._slot_parent or self
+        with owner._config_read_lock:
+            before = _file_generation(owner.config_path)
+            cached = owner._config_snapshot
+            if cached is not None and cached[0] == before and _file_generation(owner.config_path) == before:
+                return cached[1]
+            value = owner.store.load()
+            if _file_generation(owner.config_path) != before:
+                raise RuntimeError("批次授权正在更新；等待原文件代际稳定")
+            owner._config_snapshot = (before, value)
+            return value
 
     def _wait(self, reason, message):
         previous = self.job.get("preparation_wait", {})
@@ -725,12 +789,113 @@ class BatchWorker:
         return json.dumps(value, sort_keys=True)
 
     def save(self):
-        serialized = self._serialized_job()
-        if serialized == self._saved:
+        if self._slot_parent is not None:
+            parent = self._slot_parent
+            # Each task owns a private slot snapshot. Only its slot is merged;
+            # an older view cannot overwrite another slot's durable intent.
+            with parent._state_lock:
+                current = parent.job["slots"][self._slot_index]
+                current.clear()
+                current.update(copy.deepcopy(self.job["slots"][self._slot_index]))
+                for key in ("window_id", "pane_id"):
+                    if key in self.job:
+                        parent.job[key] = self.job[key]
+                if self._wait_observed:
+                    parent._wait_observed = True
+                    parent.job["preparation_wait"] = copy.deepcopy(self.job["preparation_wait"])
+                    parent.job["error"] = self.job["error"]
+                parent.save()
             return
-        self.job["updated_at"] = self.clock()
-        core.atomic_write_json(self.path, self.job)
-        self._saved = serialized
+        with self._state_lock:
+            serialized = self._serialized_job()
+            if serialized == self._saved:
+                return
+            self.job["updated_at"] = self.clock()
+            core.atomic_write_json(self.path, self.job)
+            self._saved = serialized
+
+    def _slot_action(self, index, *, confirmation_only=False):
+        with self._state_lock:
+            view = copy.copy(self)
+            view.job = dict(self.job)
+            # Other slots are read only for the legacy N cohort gate. Do not
+            # duplicate fifty growing transcript cursors for each slot poll.
+            view.job["slots"] = [{key: slot.get(key) for key in
+                                   ("index", "phase", "surface_id", "access_ready_at")}
+                                  for slot in self.job["slots"]]
+            view.job["slots"][index] = copy.deepcopy(self.job["slots"][index])
+            view._slot_parent, view._slot_index = self, index
+            view._wait_observed = False
+        slot = view.job["slots"][index]
+        previous_phase = slot["phase"]
+        try:
+            if slot["phase"] == "pending" and not confirmation_only:
+                view._create(slot)
+            else:
+                view._advance(slot, confirmation_only=confirmation_only)
+            if slot["phase"] == "creating":
+                slot.update(phase="create_unknown", error="等待原创建回执；不会重复创建")
+        except (OSError, ValueError, core.CmuxError, RuntimeError) as exc:
+            slot["error"] = str(exc)
+            if previous_phase == "pending":
+                view._wait("create_preflight", "等待启动前核验：" + str(exc))
+        finally:
+            # A native/menu wait affects only this original slot. It never
+            # withholds launch capacity or schedules the other 49 behind it.
+            delay = 0 if slot["phase"] != previous_phase else STARTUP_POLL_SEC
+            view.save()
+            with self._state_lock:
+                self._slot_due[index] = view.clock() + delay
+
+    def _dispatch_slots(self, indices, *, confirmation_only=False):
+        if self._closed:
+            return
+        if self._slot_pool is None:
+            self._slot_pool = ThreadPoolExecutor(COUNT, thread_name_prefix="ccc-batch-slot")
+        for index in indices:
+            if index in self._inflight:
+                continue
+            future = self._slot_pool.submit(self._slot_action, index, confirmation_only=confirmation_only)
+            self._inflight[index] = future
+            future.add_done_callback(lambda _: self._wakeup.set())
+
+    def _collect_slots(self):
+        for index, future in list(self._inflight.items()):
+            if not future.done():
+                continue
+            # A failed durable write must not be treated as a completed
+            # dispatch. Propagate it, preserving the original disk receipt.
+            future.result()
+            self._inflight.pop(index)
+        self._flush_releases()
+
+    def _flush_releases(self):
+        with self._state_lock:
+            ready = [index for index in self._release_pending if index not in self._inflight]
+            slots = [copy.deepcopy(self.job["slots"][index]) for index in ready]
+            slots = [s for s in slots if s.get("phase") == "confirmed" and s.get("confirmation", {}).get("confirmed")]
+        if not slots:
+            return
+        # Do not hold the job mutex over config I/O: another slot's launch
+        # reservation must not wait for a different pool's config writer.
+        self._release_many(slots)
+        with self._state_lock:
+            for saved in slots:
+                slot = self.job["slots"][saved["index"]]
+                if all(slot.get(key) == saved.get(key) for key in ("surface_id", "session_id", "launch_id")):
+                    slot["hold_released_at"] = saved["hold_released_at"]
+            self._release_pending.difference_update(s["index"] for s in slots)
+            self.save()
+
+    def close(self):
+        self._closed = True
+        if self._slot_pool is not None:
+            self._slot_pool.shutdown(wait=True, cancel_futures=False)
+            self._collect_slots()
+        self.cache.close()
+
+    def _stopping(self):
+        return self._closed or (self._slot_parent is not None and self._slot_parent._closed)
 
     def _target(self, slot, *, fresh=False):
         tree = (self.client.fresh_tree() if fresh and isinstance(self.client, SnapshotClient)
@@ -741,16 +906,16 @@ class BatchWorker:
         return target
 
     def _create(self, slot):
-        if self.clock() < slot.get("retry_at", 0):
+        if self._stopping() or slot.get("phase") != "pending" or self.clock() < slot.get("retry_at", 0):
             return
         wid = self.job["workspace_id"]
         with core.workspace_input_lock(self.config_path, wid, shared=True):
-            if not allowed(self.store.load(), self.job):
+            if self._stopping() or not allowed(self._configuration(), self.job):
                 return
             if not self.pty_probe():
                 self._wait("pty", "系统 PTY 名额已满；保留剩余名额，空位释放后自动继续")
                 return
-            prepare_sqlite_home(self.config_path, self.job["id"])
+            prepare_slot_sqlite_home(self.config_path, self.job["id"], slot["index"])
             prepare_working_directory(self.config_path, self.job, slot["index"])
             tree = self.client.tree()
             panes = [(win, p) for win in tree.get("windows", []) for w in win.get("workspaces", [])
@@ -766,11 +931,21 @@ class BatchWorker:
             # Persist BEFORE creating; an uncertain reply is reconciled from
             # the bootstrap receipt and must never cause a replacement tab.
             command = self._launch_command(slot)
+            if self._stopping() or not allowed(self._configuration(), self.job):
+                # The reservation is durable, but the RPC has not been
+                # entered. Cancellation must not create a fresh terminal.
+                slot.update(phase="pending", create_not_sent_at=self.clock())
+                self.save()
+                return
             try:
+                slot["create_dispatched_at"] = self.clock()
                 slot["surface_id"] = self.client.new_codex_surface(
                     self.job["window_id"], wid, self.job["pane_id"], command)
                 slot["phase"] = "created"
-                self._protect_created(slot)
+                slot["create_acknowledged_at"] = self.clock()
+                # register() installs the hold before exec. Writing the same
+                # full config again for each create acknowledgement serialized
+                # all 50 launches and could race bootstrap's own protection.
             except core.CmuxRequestRejected as exc:
                 self._defer_rejected_start(slot, str(exc))
             except (core.CmuxError, RuntimeError) as exc:
@@ -877,7 +1052,7 @@ class BatchWorker:
         if self.clock() < slot.get("retry_at", 0):
             return
         with core.workspace_input_lock(self.config_path, self.job["workspace_id"], shared=True):
-            config = self.store.load()
+            config = self._configuration()
             if not allowed(config, self.job) or not self._protected(config, slot):
                 return
             if slot.get("session_id") or slot.get("native_seen_session_id") or slot.get("submit_at"):
@@ -902,7 +1077,7 @@ class BatchWorker:
                 return
             if not ((self._pty_failure(grid) if no_pty else self._startup_failure(grid)) or guard_refusal):
                 return
-            prepare_sqlite_home(self.config_path, self.job["id"])
+            prepare_slot_sqlite_home(self.config_path, self.job["id"], slot["index"])
             prepare_working_directory(self.config_path, self.job, slot["index"])
             if not self._reserve_start(slot, restarting=True):
                 return
@@ -1085,17 +1260,26 @@ class BatchWorker:
     def _release(self, slot):
         if slot.get("phase") != "confirmed" or not slot.get("confirmation", {}).get("confirmed"):
             return
+        if self._slot_parent is not None:
+            with self._slot_parent._state_lock:
+                self._slot_parent._release_pending.add(slot["index"])
+            return
+        self._release_many([slot])
+
+    def _release_many(self, slots):
         def release(config):
             rule = next((r for r in config["workspace_rules"] if r.get("workspace_id") == self.job["workspace_id"]), {})
             reasons = rule.get("excluded_surface_reasons", {})
-            sid = slot["surface_id"]
-            if reasons.get(sid) == f"batch:{self.job['id']}:initial":
-                reasons.pop(sid)
-                rule["excluded_surface_ids"] = [s for s in rule.get("excluded_surface_ids", []) if s != sid]
-            if rule.get("batch_start_holds", {}).get(sid, {}).get("job_id") == self.job["id"]:
-                rule["batch_start_holds"].pop(sid)
+            for slot in slots:
+                sid = slot["surface_id"]
+                if reasons.get(sid) == f"batch:{self.job['id']}:initial":
+                    reasons.pop(sid)
+                    rule["excluded_surface_ids"] = [s for s in rule.get("excluded_surface_ids", []) if s != sid]
+                if rule.get("batch_start_holds", {}).get(sid, {}).get("job_id") == self.job["id"]:
+                    rule["batch_start_holds"].pop(sid)
         self.store.mutate(release)
-        slot["hold_released_at"] = self.clock()
+        for slot in slots:
+            slot["hold_released_at"] = self.clock()
 
     def _protected(self, config, slot):
         rule = core.workspace_rule_by_id(config, self.job["workspace_id"])
@@ -1158,7 +1342,7 @@ class BatchWorker:
         if slot.get("enter_attempt_at") or self.clock() - slot.get("submit_at", self.clock()) < .2:
             return
         with core.workspace_input_lock(self.config_path, self.job["workspace_id"], shared=True):
-            config = self.store.load()
+            config = self._configuration()
             if not allowed(config, self.job):
                 return
             if not self._protected(config, slot):
@@ -1173,10 +1357,32 @@ class BatchWorker:
                 return
             slot["enter_attempt_at"] = self.clock()
             self.save()  # A missing Enter acknowledgement is never retried.
+            if not self._initial_input_ready(slot, target, native, draft=job_prompt(self.job)):
+                slot.pop("enter_attempt_at", None)
+                slot["enter_not_sent_at"] = self.clock()
+                self.save()
+                return
             try:
                 self.client.send_key(target["workspace_id"], target["surface_id"], "enter")
             except (core.CmuxError, RuntimeError) as exc:
                 slot.update(phase="uncertain", error=str(exc))
+
+    def _initial_input_ready(self, slot, target, native, *, draft=None):
+        """Recheck after durable intent, immediately before actual input."""
+        try:
+            config = self._configuration()
+            if self._stopping() or not allowed(config, self.job) or not self._protected(config, slot):
+                return False
+            if self._target(slot, fresh=True) != target or self._native(target, slot) != native:
+                return False
+            grid = core.Grid.from_rpc(self.client.replay(target["workspace_id"], target["surface_id"]), target["surface_id"])
+            empty = core.classify_grid(grid).kind == "idle" and core._composer_status(grid)[0] == "empty"
+            if not (empty if draft is None else self._own_prompt_draft(grid, draft)):
+                return False
+            config = self._configuration()
+            return not self._stopping() and allowed(config, self.job) and self._protected(config, slot)
+        except (OSError, ValueError, core.CmuxError, RuntimeError):
+            return False
 
     def _send_name_input(self, slot, target, native, field, send):
         naming = slot["naming"]
@@ -1186,12 +1392,15 @@ class BatchWorker:
         # called we KNOW no input was attempted. Keep that distinction on disk
         # so an ordinary observation race cannot strand the slot forever.
         try:
-            config = self.store.load()
+            config = self._configuration()
             ready = (allowed(config, self.job) and self._protected(config, slot)
                      and self._native(target, slot) == native)
             if ready and naming.get("birth"):
                 from ccc_guard_scope import birth
                 ready = birth(native["pid"], codex=True) == naming["birth"]
+            if ready:
+                ready = self._initial_input_ready(slot, target, native,
+                    draft=naming["command"] if field == "enter_at" else None)
         except (OSError, ValueError, core.CmuxError, RuntimeError):
             ready = False
         if not ready:
@@ -1232,7 +1441,7 @@ class BatchWorker:
             slot["error"] = "原命名 session 已改变；未发送批量任务"
             return False
         with core.workspace_input_lock(self.config_path, self.job["workspace_id"], shared=True):
-            config = self.store.load()
+            config = self._configuration()
             if not allowed(config, self.job) or not self._protected(config, slot):
                 return False
             target = self._target(slot, fresh=True)
@@ -1296,7 +1505,7 @@ class BatchWorker:
                 if self.job.get("check_retry_policy"):
                     from ccc_private_check import record_origin
                     record_origin(self.config_path, self.job, slot)
-                rule = next((r for r in self.store.load()["workspace_rules"]
+                rule = next((r for r in self._configuration()["workspace_rules"]
                              if r.get("workspace_id") == self.job["workspace_id"]), {})
                 if core.batch_start_hold(rule, slot["surface_id"]):
                     self._release(slot)
@@ -1321,7 +1530,7 @@ class BatchWorker:
                     slot.update(phase="pty_wait", error="系统 PTY 名额已满；等待空位后在原 surface 补做")
                     self._restart_failed(slot, no_pty=True)
             return
-        if not self._protected(self.store.load(), slot):
+        if not self._protected(self._configuration(), slot):
             slot.update(phase="blocked", error="此路授权已被修改，未发送 prompt")
             return
         target = self._target(slot)
@@ -1359,7 +1568,7 @@ class BatchWorker:
             slot.update(phase="blocked", error="此 session 已有任务，未发送批量 prompt")
             return
         with core.workspace_input_lock(self.config_path, self.job["workspace_id"], shared=True):
-            config = self.store.load()
+            config = self._configuration()
             if not allowed(config, self.job):
                 return
             if not self._protected(config, slot):
@@ -1393,6 +1602,7 @@ class BatchWorker:
                 if not uninitialized:
                     raise
                 offset = 0
+            unsent = copy.deepcopy(slot)
             slot.update(phase="submitting", submit_at=self.clock(), transcript=path,
                         transcript_offset=offset, pid=native["pid"],
                         process_start=native.get("process_start"), native_uninitialized=uninitialized)
@@ -1400,7 +1610,17 @@ class BatchWorker:
             if startup_mode(self.job, self.config_path) == 'access_check':
                 from ccc_access_service import bind_slot
                 bind_slot(self.config_path, self.job, slot, target, native)
+            if not self._initial_input_ready(slot, target, native):
+                # No transport entry occurred. Preserve that distinction so a
+                # pause or late user draft cannot become an automatic retry of
+                # uncertain I/O, or strand a still-unsent authorized session.
+                slot.clear()
+                slot.update(unsent, submit_not_sent_at=self.clock(),
+                            submit_not_sent_count=unsent.get("submit_not_sent_count", 0) + 1)
+                self.save()
+                return
             try:
+                slot["send_dispatched_at"] = self.clock()
                 self.client.send_text(target["workspace_id"], target["surface_id"], job_prompt(self.job))
                 slot["phase"] = "submitted"
             except (core.CmuxError, RuntimeError) as exc:
@@ -1408,69 +1628,24 @@ class BatchWorker:
             self.save()
 
     def _reserve_start(self, slot, *, restarting=False):
-        try:
-            return self._reserve_capacity(slot, restarting=restarting)
-        except RuntimeError as exc:
-            lock_path = self.config_path.parent / "batch-capacity.lock"
-            if str(exc) != f"timed out waiting for lock: {lock_path}":
-                raise
-            self._wait("capacity_lock", "共享启动锁繁忙；保留原名额，自动排队")
+        # Per-slot single flight and the job's worker lock replace the old
+        # global four-permit/rate/round-robin budget. No historical job scan
+        # or other pool's startup/naming latency belongs on this path.
+        expected = {"restart_pending", "pty_wait", "created"} if restarting else {"pending"}
+        if slot.get("phase") not in expected:
             return False
-
-    def _reserve_capacity(self, slot, *, restarting=False):
-        # All batch processes share the same capacity and rate limit. Save the
-        # reservation before releasing the lock, without holding it over RPC.
-        with core.FileLock(self.config_path.parent / "batch-capacity.lock", timeout_sec=2):
-            path = self.config_path.parent / "batch-capacity.json"
-            budget = core.load_json(path, {})
-            now = self.clock()
-            if now - budget.get("last_start", 0) < .5:
-                self._wait("start_spacing", "等待共享启动间隔（0.5秒）")
-                return False
-            config = self.store.load()
-            ids = sorted({r["active_batch_id"] for r in config["workspace_rules"] if r.get("active_batch_id")})
-            active = 0
-            pending_jobs = []
-            for jid in ids:
-                job = self.job if jid == self.job["id"] else self._capacity_history.read(job_path(self.config_path, jid))
-                if not job or job.get("status") in {"cancelled", "workspace_closed"} or not allowed(config, job):
-                    continue
-                # An ambiguous RPC remains durable, but cannot monopolize a
-                # startup permit forever. It is still reconciled, never replayed.
-                # Native initialization still consumes capacity after cmux
-                # creates the tab. Bound its lease so a stalled startup cannot
-                # monopolize every pool, but do not flood 50 cold SQLite writers.
-                active += sum(s.get("phase") in INITIALIZING and
-                              now - s.get("launched_at", s.get("created_at", now)) < STARTUP_LEASE_SEC
-                              for s in job.get("slots", []))
-                if any(s.get("phase") in STARTABLE for s in job.get("slots", [])):
-                    pending_jobs.append(jid)
-            if active >= 4 or now - budget.get("last_start", 0) < .5:
-                self._wait("capacity", "等待共享启动名额（最多4路同时初始化）")
-                return False
-            # A busy first pool cannot consume every available startup slot.
-            last = budget.get("last_job", "")
-            if not pending_jobs:
-                self._wait("authorization", "等待可启动的原批次授权")
-                return False
-            next_job = next((jid for jid in pending_jobs if jid > last), pending_jobs[0])
-            if next_job != self.job["id"] and now - budget.get("last_start", 0) < 1.5:
-                self._wait("rotation", "等待其他批次轮转启动")
-                return False
-            # A history scan may have waited for disk I/O. The caller's
-            # authorization must still be current before reserving a launch.
-            if not allowed(self.store.load(), self.job):
-                self._wait("authorization", "批次授权已变化；未预约新的启动")
-                return False
-            self._clear_wait()
-            self._wait_observed = False
-            self.job["status"] = "running"
-            slot.update(phase="restarting" if restarting else "creating", launched_at=now,
-                        launch_id=str(uuid.uuid4()))
-            slot.setdefault("created_at", now)
-            self.save()
-            core.atomic_write_json(path, {"last_start": now, "last_job": self.job["id"]})
-            return True
+        if not allowed(self._configuration(), self.job):
+            self._wait("authorization", "批次授权已变化；未预约新的启动")
+            return False
+        now = self.clock()
+        self._clear_wait()
+        self._wait_observed = False
+        self.job["status"] = "running"
+        slot.update(phase="restarting" if restarting else "creating", launched_at=now,
+                    launch_id=str(uuid.uuid4()))
+        slot.setdefault("created_at", now)
+        self.save()
+        return True
 
     def _refresh_processes(self):
         if isinstance(self.client, SnapshotClient):
@@ -1512,6 +1687,8 @@ class BatchWorker:
         present = {r["surface_id"] for r in core.workspace_surface_records(tree, self.job["workspace_id"]).values()}
         restored = False
         for slot in self.job.get("slots", []):
+            if slot["index"] in self._inflight:
+                continue
             if slot.get("phase") != "surface_closed" or slot.get("surface_id") not in present:
                 continue
             receipt = core.load_json(self.path.parent / f"surface-{slot['index']}.json", {})
@@ -1550,49 +1727,65 @@ class BatchWorker:
         return True
 
     def step(self):
+        self._collect_slots()
         self._access_membership_ready = False
         self._wait_observed = False
-        # Disk evidence is independent of cmux's process-table RPC and of B/P.
-        # Releasing a proven hold does not override P or any manual exclusion.
-        rule = next((r for r in self.store.load()["workspace_rules"]
+        try:
+            config = self._configuration()
+        except (OSError, ValueError, RuntimeError) as exc:
+            # Parallel shell registrations can replace the config during a
+            # read. Keep this worker and every in-flight slot; retry the
+            # authorization read, never a possibly delivered command.
+            with self._state_lock:
+                self._wait("authorization", "等待当前授权核验：" + str(exc))
+                self.save()
+            return True
+        rule = next((r for r in config["workspace_rules"]
                      if r.get("workspace_id") == self.job["workspace_id"]), {})
-        for slot in self.job["slots"]:
-            if slot.get("phase") == "confirmed" and not core.batch_start_hold(rule, slot.get("surface_id")):
-                continue
-            if slot.get("phase") in CONFIRMABLE:
-                try:
-                    self._advance(slot, confirmation_only=True)
-                except (OSError, ValueError, core.CmuxError, RuntimeError) as exc:
-                    slot["error"] = str(exc)
-        if not allowed(self.store.load(), self.job):
+        with self._state_lock:
+            confirmations = [s["index"] for s in self.job["slots"]
+                             if s["phase"] in CONFIRMABLE and s["index"] not in self._inflight
+                             and not (s["phase"] == "confirmed" and not core.batch_start_hold(rule, s.get("surface_id")))
+                             and self.clock() >= max(s.get("retry_at", 0), self._slot_due.get(s["index"], 0))]
+        if not allowed(config, self.job):
+            # Read-only original transcript confirmation remains possible after
+            # pause. No newly created slot or initial input is scheduled.
+            self._dispatch_slots(confirmations, confirmation_only=True)
             from ccc_batch_guard import snapshot
             guard = snapshot(self.config_path, self.job["workspace_id"])
-            self.job["status"] = "stopped_success" if (guard.get("trip") or {}).get("connected") else "cancelled"
-            self._clear_wait()
-            self.save()
+            with self._state_lock:
+                self.job["status"] = "stopped_success" if (guard.get("trip") or {}).get("connected") else "cancelled"
+                self._clear_wait()
+                self.save()
             return False
         try:
             tree = self._membership_tree()
             workspaces = [w.get("id") for win in tree.get("windows", []) for w in win.get("workspaces", [])]
             if self.job["workspace_id"] not in workspaces:
-                # Only a successful, fresh inventory proves a closed pool.
-                self.job["status"] = "workspace_closed"
-                self._clear_wait()
-                self.save()
+                self._dispatch_slots(confirmations, confirmation_only=True)
+                with self._state_lock:
+                    self.job["status"] = "workspace_closed"
+                    self._clear_wait()
+                    self.save()
                 return False
         except (core.CmuxError, RuntimeError) as exc:
-            self._wait("topology", "等待工作区拓扑：" + str(exc))
-            self.save()
+            self._dispatch_slots(confirmations, confirmation_only=True)
+            with self._state_lock:
+                self._wait("topology", "等待工作区拓扑：" + str(exc))
+                self.save()
             return True
-        self._restore_present_slots(tree)
+        with self._state_lock:
+            self._restore_present_slots(tree)
         try:
             self._refresh_processes()
         except (core.CmuxError, RuntimeError) as exc:
             self.processes = {}
-            self._wait("process_inventory", "等待原进程核验：" + str(exc))
-        self.job["status"] = "running"
+            with self._state_lock:
+                self._wait("process_inventory", "等待原进程核验：" + str(exc))
         present = {r["surface_id"] for r in core.workspace_surface_records(tree, self.job["workspace_id"]).values()}
-        if startup_mode(self.job, self.config_path) == 'access_check' and access_cohort_prepared(self.job):
+        with self._state_lock:
+            access_ready = startup_mode(self.job, self.config_path) == 'access_check' and access_cohort_prepared(self.job)
+        if access_ready:
             self._access_membership_ready = all(s['surface_id'] in present for s in self.job['slots'])
             if self._access_membership_ready and not any(s.get('submit_at') for s in self.job['slots']):
                 try:
@@ -1600,64 +1793,71 @@ class BatchWorker:
                 except (OSError, ValueError, core.CmuxError, RuntimeError):
                     self._access_membership_ready = False
             if not self._access_membership_ready:
-                self._wait('access_cohort', '等待本池全部50个原会话和空输入框；未发送新的接入检查')
-                self.save()
+                self._dispatch_slots(confirmations, confirmation_only=True)
+                with self._state_lock:
+                    self._wait('access_cohort', '等待本池全部50个原会话和空输入框；未发送新的接入检查')
+                    self.save()
                 return True
-        for slot in self.job["slots"]:
-            if slot["phase"] not in INITIALIZING | {"startup_wait", "restart_pending", "pty_wait", "access_ready"} or self.clock() < slot.get("retry_at", 0):
-                continue
-            if (slot.get("surface_id") and slot["surface_id"] not in present
-                    and self.clock() - slot.get("launched_at", slot.get("created_at", self.clock())) >= 5):
-                slot.update(phase="surface_closed", error="原 surface 已关闭或移出本池；不补建替代会话")
-                continue
-            try:
-                self._advance(slot)
-            except (OSError, ValueError, core.CmuxError, RuntimeError) as exc:
-                slot["error"] = str(exc)
-            # Recoverable waits have no abandonment deadline. Slow startup,
-            # partial logs and timeouts do not create replacement sessions.
-            slot["retry_at"] = max(slot.get("retry_at", 0),
-                self.clock() + (5 if slot["phase"] in {"startup_wait", "pty_wait"} else 1))
-            if slot["phase"] == "creating":
-                slot.update(phase="create_unknown", error="等待原创建回执；不会重复创建")
-        pending = next((s for s in self.job["slots"]
-                        if s["phase"] == "pending" and self.clock() >= s.get("retry_at", 0)), None)
-        if pending is not None:
-            try:
-                self._create(pending)
-            except (OSError, ValueError, core.CmuxError, RuntimeError) as exc:
-                self._wait("create_preflight", "等待启动前核验：" + str(exc))
-        if all(s["phase"] == "confirmed" for s in self.job["slots"]):
-            self.job["status"] = "complete"
-            self._clear_wait()
-        elif all(s["phase"] in {"confirmed", "blocked", "surface_closed"} for s in self.job["slots"]):
-            self.job["status"] = "needs_attention"
-            self._clear_wait()
-        elif self._wait_observed:
-            self.job["status"] = "waiting"
-        else:
-            self._clear_wait()
-        self.save()
-        return self.job["status"] not in {"complete", "needs_attention", "cancelled", "workspace_closed"}
+        ready = []
+        with self._state_lock:
+            for slot in self.job["slots"]:
+                if (slot["index"] in self._inflight
+                        or self.clock() < max(slot.get("retry_at", 0), self._slot_due.get(slot["index"], 0))):
+                    continue
+                if slot["phase"] == "confirmed":
+                    if slot["index"] in confirmations:
+                        ready.append(slot["index"])
+                    continue
+                if slot["phase"] not in INITIALIZING | {"pending", "startup_wait", "restart_pending", "pty_wait", "access_ready"}:
+                    continue
+                if (slot.get("surface_id") and slot["surface_id"] not in present
+                        and self.clock() - slot.get("launched_at", slot.get("created_at", self.clock())) >= 5):
+                    slot.update(phase="surface_closed", error="原 surface 已关闭或移出本池；不补建替代会话")
+                    continue
+                ready.append(slot["index"])
+        # Submit the entire ready set. A slow/uncertain RPC retains exactly its
+        # own slot future and cannot stall another slot's next startup phase.
+        self._dispatch_slots(ready)
+        self._collect_slots()
+        with self._state_lock:
+            if not self._inflight and all(s["phase"] == "confirmed" for s in self.job["slots"]):
+                self.job["status"] = "complete"
+                self._clear_wait()
+            elif not self._inflight and all(s["phase"] in {"confirmed", "blocked", "surface_closed"} for s in self.job["slots"]):
+                self.job["status"] = "needs_attention"
+                self._clear_wait()
+            elif self._wait_observed:
+                self.job["status"] = "waiting"
+            else:
+                self.job["status"] = "running"
+                self._clear_wait()
+            self.save()
+            return self.job["status"] not in {"complete", "needs_attention", "cancelled", "workspace_closed"}
 
     def run(self):
         from ccc_guard_scope import birth
         try:
             with core.FileLock(self.path.parent / "worker.lock", timeout_sec=0):
-                self.job = core.load_json(self.path, {})
-                self.job.update(status="running", worker_pid=os.getpid(),
-                                worker_birth=birth(os.getpid()), worker_version=WORKER_VERSION)
-                for slot in self.job["slots"]:
-                    # v0.2.12 marked slow starts blocked at 25 s. Explicit
-                    # operator-task/authorization vetoes remain blocked.
-                    if (slot["phase"] == "blocked" and not slot.get("submit_at")
-                            and slot.get("error") not in {"此 session 已有任务，未发送批量 prompt", "此路授权已被修改，未发送 prompt"}):
-                        slot["phase"] = "created"
-                self.save()
-                while self.step():
-                    time.sleep(.5)
+                try:
+                    self.job = core.load_json(self.path, {})
+                    self.job.update(status="running", worker_pid=os.getpid(),
+                                    worker_birth=birth(os.getpid()), worker_version=WORKER_VERSION)
+                    for slot in self.job["slots"]:
+                        # v0.2.12 marked slow starts blocked at 25 s. Explicit
+                        # operator-task/authorization vetoes remain blocked.
+                        if (slot["phase"] == "blocked" and not slot.get("submit_at")
+                                and slot.get("error") not in {"此 session 已有任务，未发送批量 prompt", "此路授权已被修改，未发送 prompt"}):
+                            slot["phase"] = "created"
+                    self.save()
+                    while True:
+                        self._wakeup.clear()
+                        if not self.step():
+                            break
+                        self._wakeup.wait(STARTUP_POLL_SEC)
+                finally:
+                    self.close()
         finally:
-            self.cache.close()
+            self.close()
 
 
 def relevant_job_ids(config_path, config):

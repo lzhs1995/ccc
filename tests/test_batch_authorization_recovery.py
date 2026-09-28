@@ -19,6 +19,8 @@ class BatchAuthorizationTests(unittest.TestCase):
     finish = fixtures.WorkspaceBatchTests.finish
 
     def submitted(self):
+        self.worker.job['slots'] = self.worker.job['slots'][:1]
+        self.worker.save()
         self.worker.step()
         slot = self.worker.job['slots'][0]
         with patch.object(self.client, 'send_text'):
@@ -169,7 +171,7 @@ class BatchAuthorizationTests(unittest.TestCase):
         with patch.object(self.client, 'tree', return_value={'windows': []}):
             self.assertFalse(self.worker.step())
         self.assertEqual(self.worker.job['status'], 'workspace_closed')
-        self.assertEqual(len(self.client.calls), 1)
+        self.assertEqual(len(self.client.calls), 50)
 
     def test_completed_B_appends_another_50(self):
         self.assertEqual(self.finish()['started'], 50)
@@ -182,7 +184,7 @@ class BatchAuthorizationTests(unittest.TestCase):
         self.assertEqual(len(self.client.calls), 100)
         self.assertEqual(len(self.client.sent), 100)
 
-    def test_three_pools_share_four_initializing_slots_and_two_starts_per_second(self):
+    def test_three_pools_launch_all_fifty_without_shared_permits_or_spacing(self):
         workers = [self.worker]
         for _ in range(2):
             context = SimpleNamespace(config=self.config, root=self.root, store=self.store,
@@ -196,19 +198,14 @@ class BatchAuthorizationTests(unittest.TestCase):
             workers.append(worker)
         for worker in workers:
             worker.client.frame_options = {'working': True}
-        starts = []
-        previous = 0
-        for _ in range(100):
-            for worker in workers:
-                worker.step()
-            total = sum(len(w.client.calls) for w in workers)
-            starts.extend([self.now] * (total - previous))
-            previous = total
-            self.assertLessEqual(total, 4)
-            self.now += .1
-        self.assertEqual(previous, 4)
-        self.assertTrue(all(w.client.calls for w in workers), 'each concurrent pool must get a startup slot')
-        self.assertTrue(all(b - a >= .5 - 1e-6 for a, b in zip(starts, starts[1:])))
+        for worker in workers:
+            worker.step()
+        self.assertEqual([len(w.client.calls) for w in workers], [50, 50, 50])
+        self.assertEqual({s['launched_at'] for w in workers for s in w.job['slots']}, {self.now})
+        self.now += .1
+        for worker in workers:
+            worker.step()
+        self.assertTrue(all(not w.client.sent for w in workers))
         self.assertTrue(all(s['phase'] != 'blocked' for w in workers for s in w.job['slots']))
 
     def test_panel_start_hold_is_pool_monitoring_not_pause_even_before_top_classifies_codex(self):
@@ -218,10 +215,10 @@ class BatchAuthorizationTests(unittest.TestCase):
         sessions = SimpleNamespace(maybe_refresh=lambda *args, **kwargs: None, snapshot=lambda: {})
         panel = SupervisorModel(self.config, client=self.client, janitor=idle, stack=idle, collab=idle, sessions=sessions)
         panel.refresh(force=True)
-        self.assertEqual(len(panel.candidates), 1)
+        self.assertEqual(len(panel.candidates), 50)
         self.assertEqual(watch_label(panel.candidates[0]), '整池／启动中')
         self.assertEqual(panel.counts()['paused'], 0)
-        self.assertEqual(panel.counts()['watching'], 1)
+        self.assertEqual(panel.counts()['watching'], 50)
         panel.close()
 
     def test_start_hold_vetoes_even_an_explicit_registration_at_input_boundary(self):

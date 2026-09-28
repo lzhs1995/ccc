@@ -10,7 +10,12 @@ from tests import test_workspace_batch as fixtures
 
 
 class BatchMembershipTests(unittest.TestCase):
-    setUp = fixtures.WorkspaceBatchTests.setUp
+    def setUp(self):
+        fixtures.WorkspaceBatchTests.setUp(self)
+        # Membership/replay scenarios operate on one original slot; the
+        # immediate-start suite separately exercises the full fifty.
+        self.worker.job['slots'] = self.worker.job['slots'][:1]
+        self.worker.save()
 
     def cached_client(self, tree):
         cache = SnapshotCache()

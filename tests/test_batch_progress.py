@@ -15,28 +15,27 @@ class BatchProgressTests(unittest.TestCase):
         self.worker.save()
         return batch.snapshots(self.config, self.store.load())[self.wid]
 
-    def test_capacity_wait_is_visible_even_when_failed_count_is_zero(self):
-        for slot in self.worker.job["slots"][1:5]:
-            slot.update(phase="created", launched_at=self.now)
-        self.assertFalse(self.worker._reserve_start(self.worker.job["slots"][0]))
+    def test_actual_pty_wait_is_visible_even_when_failed_count_is_zero(self):
+        self.worker.pty_probe = lambda: False
+        self.worker.step()
         value = self.snapshot()
         self.assertEqual(value["failed"], 0)
-        self.assertEqual(value["wait"]["reason"], "capacity")
-        self.assertIn("共享启动名额", tui.batch_preparation_progress(value, now=self.now))
+        self.assertEqual(value["wait"]["reason"], "pty")
+        self.assertIn("PTY", tui.batch_preparation_progress(value, now=self.now))
 
     def test_lock_timeout_has_a_specific_recoverable_wait(self):
         enter = core.FileLock.__enter__
         def acquire(lock):
-            if lock.path.name == "batch-capacity.lock":
+            if lock.path.name == "seed.lock":
                 raise RuntimeError(f"timed out waiting for lock: {lock.path}")
             return enter(lock)
         with patch.object(core.FileLock, "__enter__", acquire):
             self.worker.step()
-        self.assertEqual(self.snapshot()["wait"]["reason"], "capacity_lock")
+        self.assertEqual(self.snapshot()["wait"]["reason"], "create_preflight")
         self.assertEqual(self.client.calls, [])
         self.now += 3
         self.worker.step()
-        self.assertEqual(len(self.client.calls), 1)
+        self.assertEqual(len(self.client.calls), 50)
         self.assertNotIn("preparation_wait", self.worker.job)
         self.assertNotIn("error", self.worker.job)
 
@@ -84,9 +83,10 @@ class BatchProgressTests(unittest.TestCase):
         self.now += 1
         self.worker.step()
         self.assertNotIn("preparation_wait", self.worker.job)
-        self.assertEqual(len(self.client.calls), 1)
+        self.assertEqual(len(self.client.calls), 50)
 
     def test_last_progress_ignores_retry_heartbeat_and_old_error(self):
+        self.worker.job["name_policy"] = "before-first-turn-v1"
         self.worker.job["created_at"] = 1
         self.worker.job["updated_at"] = 999
         self.worker.job["slots"][0].update(
