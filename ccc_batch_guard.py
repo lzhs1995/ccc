@@ -130,11 +130,11 @@ def provenance(config_path, workspace_id, config=None):
     return rule
 
 
-def blocked(config_path, workspace_id):
+def blocked(config_path, workspace_id, *, marker_path=None):
     # A tiny per-workspace marker, including on the last send boundary. Ordinary
     # workspaces have no marker and never acquire global pause semantics.
     try:
-        return (pool_dir(config_path, workspace_id) / "STOP.json").exists()
+        return (marker_path if marker_path is not None else pool_dir(config_path, workspace_id) / "STOP.json").exists()
     except (ValueError, OSError):
         return False
 

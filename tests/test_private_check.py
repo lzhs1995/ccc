@@ -457,7 +457,7 @@ class PrivateCheckDeliveryTests(CheckFixture, unittest.TestCase):
             return value
         def ledger(*args, **kwargs):
             value = original_ledger(*args, **kwargs)
-            if phase["ready"] and phase["view"] and not phase["injected"]:
+            if phase["ready"] and not phase["injected"]:
                 change()
                 phase["injected"] = True
             return value
@@ -501,13 +501,13 @@ class PrivateCheckDeliveryTests(CheckFixture, unittest.TestCase):
             value = original_view(*args, **kwargs)
             if phase["ready"]:
                 phase["views"] += 1
-                if phase["views"] == 2:
+                if phase["views"] == 1:
                     change()
             return value
         with patch.object(self.daemon, "_private_check_ready", side_effect=ready), \
                 patch.object(self.client, "replay", side_effect=view):
             self.send()
-        self.assertEqual(phase["views"], 2)
+        self.assertEqual(phase["views"], 1)
         self.assertEqual(self.client.sent, [])
 
     def test_source_change_during_last_composer_read_prevents_short_input(self):

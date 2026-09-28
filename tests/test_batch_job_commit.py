@@ -1,5 +1,5 @@
 """Actual job-file commits and failure/authorization boundaries; no native I/O."""
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 import copy
 import tempfile
 from pathlib import Path
@@ -87,6 +87,50 @@ class JobCommitTests(unittest.TestCase):
 
 class BatchCommitBoundaryTests(unittest.TestCase):
     setUp = fixtures.WorkspaceBatchTests.setUp
+
+    def slot_view(self):
+        with self.worker._state_lock:
+            commit = self.worker._queue_job_commit()
+        self.worker._wait_job_commit(commit)
+        view = copy.copy(self.worker)
+        view.job = copy.deepcopy(self.worker.job)
+        view._slot_parent, view._slot_index = self.worker, 0
+        view._wait_observed = False
+        return view
+
+    def test_unchanged_poll_skips_serialization_but_waits_for_pending_commit(self):
+        view = self.slot_view()
+        pending, entered = Future(), threading.Event()
+        self.worker._queued_commit = pending
+        original = self.worker._wait_job_commit
+        def wait(commit):
+            entered.set()
+            return original(commit)
+        with patch.object(self.worker, '_wait_job_commit', side_effect=wait), \
+             patch.object(self.worker, '_serialized_job', side_effect=AssertionError('unchanged job serialized')), \
+             ThreadPoolExecutor(1) as pool:
+            result = pool.submit(view.save)
+            try:
+                self.assertTrue(entered.wait(1))
+                self.assertFalse(result.done())
+            finally:
+                pending.set_result(None)
+            result.result(1)
+
+    def test_unchanged_poll_propagates_original_commit_failure(self):
+        view = self.slot_view()
+        pending = Future()
+        pending.set_exception(OSError('original commit failed'))
+        self.worker._queued_commit = pending
+        with self.assertRaisesRegex(OSError, 'original commit failed'):
+            view.save()
+
+    def test_same_memory_slot_without_matching_queued_snapshot_is_persisted(self):
+        view = self.slot_view()
+        self.worker.job['slots'][0]['error'] = 'not yet committed'
+        view.job['slots'][0]['error'] = 'not yet committed'
+        view.save()
+        self.assertEqual(core.load_json(self.worker.path, {})['slots'][0]['error'], 'not yet committed')
 
     def test_pause_during_group_commit_prevents_all_original_creations(self):
         self.worker._slot_pool = ThreadPoolExecutor(50)

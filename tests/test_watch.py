@@ -680,7 +680,8 @@ class WatchTests(unittest.TestCase):
         CmuxClient("/opt/homebrew/bin/cmux", runner=runner).send("workspace-uuid", "surface-uuid", "任务请继续")
         self.assertEqual(
             calls,
-            [["/opt/homebrew/bin/cmux", "send", "--workspace", "workspace-uuid", "--surface", "surface-uuid", "任务请继续\n"]],
+            [["/opt/homebrew/bin/cmux", "send", "--workspace", "workspace-uuid", "--surface", "surface-uuid", "任务请继续"],
+             ["/opt/homebrew/bin/cmux", "send-key", "--workspace", "workspace-uuid", "--surface", "surface-uuid", "enter"]],
         )
 
     def test_plan_body_keywords_without_error_marker_are_not_live_error(self):
@@ -4124,13 +4125,15 @@ class WatchTests(unittest.TestCase):
         client = CmuxClient(runner=runner)
         client.send("ws", "sf", "任务请继续")
         client.send("ws", "sf", CLAUDE_MESSAGE)
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 4)
+        self.assertEqual([c[1] for c in calls], ['send', 'send-key', 'send', 'send-key'])
+        self.assertEqual([c[-1] for c in calls[1::2]], ['enter', 'enter'])
 
         for forbidden in ("/compact", "/clear", "/exit", "/quit", "  /clear  ", "/CLEAR",
                           "/compact\n/clear", "/model opus"):
             with self.assertRaises(RuntimeError, msg=forbidden):
                 client.send("ws", "sf", forbidden)
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 4)
 
     def test_send_still_allows_prose_that_merely_mentions_a_command(self):
         # Our own nudge quotes "usage: /context", and an assistant sentence can
@@ -4145,7 +4148,7 @@ class WatchTests(unittest.TestCase):
         client = CmuxClient(runner=runner)
         client.send("ws", "sf", "别用 /clear，历史会没了")
         client.send("ws", "sf", "完成，建议检查 usage: /context")
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 4)
 
     def test_context_parser_matches_live_footer_not_recap_prose(self):
         payload = claude_grid_payload(lines=[

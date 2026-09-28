@@ -202,7 +202,40 @@ class PrivateChecks:
     def __init__(self, config_path, sessions_root):
         self.config_path, self.sessions_root = Path(config_path), Path(sessions_root).resolve()
         self.cache = OrderedDict()
+        self.cache_bytes = 0
+        self.documents = OrderedDict()
+        self.document_bytes = 0
         self.lock = threading.Lock()
+
+    def _document(self, path, limit, generations):
+        # Cache parsed bytes, never permission. Every use checks the complete
+        # file generation, and select rechecks all generations after the sends
+        # ledger read. Fifty slots can share a job parse without sharing their
+        # native identity, turn proof or mutable sends ledger.
+        before = _generation(path)
+        if before[2] > limit:
+            raise ValueError("private check evidence exceeds read limit")
+        with self.lock:
+            cached = self.documents.get(path)
+            if cached and cached[0] == before:
+                self.documents.move_to_end(path)
+                generations[path] = before
+                return cached[1]
+        data, signature = _read(path, limit)
+        value = json.loads(data)
+        if not isinstance(value, dict):
+            raise ValueError("private check evidence is not an object")
+        with self.lock:
+            old = self.documents.pop(path, None)
+            if old:
+                self.document_bytes -= old[0][2]
+            self.documents[path] = (signature, value)
+            self.document_bytes += signature[2]
+            while len(self.documents) > 4096 or self.document_bytes > 32 * 1024 * 1024:
+                _, removed = self.documents.popitem(last=False)
+                self.document_bytes -= removed[0][2]
+        generations[path] = signature
+        return value
 
     def _ledger_path(self, target):
         return _directory(self.config_path, target["surface_id"]) / "sends.json"
@@ -228,12 +261,19 @@ class PrivateChecks:
             if cached and cached[0] == before and cached[1] == session_id:
                 self.cache[path] = cached
                 return cached[2], before
+            if cached:
+                self.cache_bytes -= cached[0][2]
         data, signature = _read(path, HISTORY_BYTES)
         turns = _turns(data, session_id, message)
         with self.lock:
+            previous = self.cache.pop(path, None)
+            if previous:
+                self.cache_bytes -= previous[0][2]
             self.cache[path] = (signature, session_id, turns)
-            while len(self.cache) > 128:
-                self.cache.popitem(last=False)
+            self.cache_bytes += signature[2]
+            while len(self.cache) > 2048 or self.cache_bytes > 32 * 1024 * 1024:
+                _, removed = self.cache.popitem(last=False)
+                self.cache_bytes -= removed[0][2]
         return turns, signature
 
     def select(self, target, read_turn, *, snapshot=None):
@@ -241,13 +281,13 @@ class PrivateChecks:
         try:
             generations = {}
             directory = _directory(self.config_path, target["surface_id"])
-            origin = _json(directory / "origin.json", 16384, generations=generations)
+            origin = self._document(directory / "origin.json", 16384, generations)
             if (origin.get("workspace_id") != target["workspace_id"]
                     or origin.get("surface_id") != target["surface_id"]):
                 return None
             from ccc_workspace_batch import job_path, PROMPT
             path = job_path(self.config_path, origin["job_id"])
-            job = _json(path, 2 * 1024 * 1024, generations=generations)
+            job = self._document(path, 2 * 1024 * 1024, generations)
             slots = [s for s in job.get("slots", []) if s.get("surface_id") == target["surface_id"]]
             if len(slots) != 1 or _identity(self.config_path, job, slots[0]) != origin:
                 return None
@@ -255,7 +295,7 @@ class PrivateChecks:
             if descriptor.exists():
                 return None
             generations[descriptor] = None
-            receipt = _json(path.parent / f"surface-{origin['index']}.json", 16384, generations=generations)
+            receipt = self._document(path.parent / f"surface-{origin['index']}.json", 16384, generations)
             if any(receipt.get(key) != origin[key] for key in ("workspace_id", "surface_id", "launch_id")):
                 return None
             turn = read_turn()
@@ -275,8 +315,15 @@ class PrivateChecks:
                 return None
             generations[path] = generation
             sends = self._ledger(target, generations=generations)
+            # Index this freshly read ledger only; never cache authorization.
+            # Preserve all attempts for a turn so duplicates still veto input.
+            sends_by_turn = {}
+            for record in sends.values():
+                failed_id = record.get("failed_turn_id")
+                if isinstance(failed_id, str):
+                    sends_by_turn.setdefault(failed_id, []).append(record)
             for previous, following in zip(turns, turns[1:]):
-                matched = [r for r in sends.values() if r.get("origin") == origin
+                matched = [r for r in sends_by_turn.get(previous["id"], ()) if r.get("origin") == origin
                            and r.get("failed_turn_id") == previous["id"] and r.get("failed_at") == previous["at"]
                            and r.get("message") == PROMPT and r.get("phase") == "accepted"
                            and type(r.get("io_started_at")) in {int, float}

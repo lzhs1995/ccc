@@ -48,6 +48,8 @@ STARTABLE = {"pending", "restart_pending", "pty_wait"}
 STARTUP_POLL_SEC = 0.025
 IMMEDIATE_START_POLICY = "parallel-native-v1"
 NATIVE_ACCESS_POLICY = "direct-native-v1"
+ARGV_INITIAL_POLICY = "native-argv-first-task-v1"
+NATIVE_RUNTIME_POLICY = "tokio-workers-2-v1"
 CONFIRMABLE = {"submitted", "submitting", "uncertain", "confirmed"}
 CONFIRM_READ_BYTES = 1024 * 1024
 CONTEXT_PARSER_VERSION = 2
@@ -109,6 +111,20 @@ def startup_mode(job, config_path=None):
     if access:
         return 'access_check'
     return 'private_check' if job.get('cwd_policy') == EMPTY_CWD_POLICY else 'existing'
+
+
+def argv_initial(job, config_path=None):
+    if "initial_prompt_policy" not in job:
+        return False
+    from ccc_private_check import POLICY
+    if (job["initial_prompt_policy"] != ARGV_INITIAL_POLICY
+            or startup_mode(job, config_path) != "private_check"
+            or job.get("check_retry_policy") != POLICY
+            or job.get("initial_prompt") != PROMPT
+            or job.get("name_policy") is not None
+            or job.get("guard_version") is not None):
+        raise RuntimeError("invalid native argv initial prompt policy")
+    return True
 
 
 def access_cohort_prepared(job):
@@ -203,6 +219,46 @@ def _client(config):
     client = core.CmuxClient(config.get("cmux_path", core.DEFAULT_CMUX), viewport_socket=transport)
     transport.configure(client.capabilities())
     return client
+
+
+def _bootstrap_endpoint(client, config):
+    """Carry batch discovery, not input authorization, into its bootstraps."""
+    base = client.client if isinstance(client, SnapshotClient) else client
+    if not isinstance(base, core.CmuxClient):
+        return None
+    transport = base.viewport_socket
+    if transport is None or not transport.path or "system.tree" not in transport.control_methods:
+        return None
+    info = os.stat(transport.path)
+    if not stat.S_ISSOCK(info.st_mode):
+        raise RuntimeError("bootstrap controller is not a socket")
+    return {"path": transport.path, "device": info.st_dev, "inode": info.st_ino,
+            "binary": config.get("cmux_path", core.DEFAULT_CMUX)}
+
+
+def _bootstrap_endpoint_current(endpoint, config):
+    try:
+        info = os.stat(endpoint["path"])
+        return (stat.S_ISSOCK(info.st_mode) and (info.st_dev, info.st_ino) ==
+                (endpoint["device"], endpoint["inode"])
+                and endpoint["binary"] == config.get("cmux_path", core.DEFAULT_CMUX))
+    except (OSError, KeyError, TypeError):
+        return False
+
+
+def _bootstrap_client(config, job):
+    endpoint = job.get("bootstrap_endpoint")
+    if endpoint is None:
+        return _client(config)
+    if not _bootstrap_endpoint_current(endpoint, config):
+        raise RuntimeError("original bootstrap controller identity changed")
+    transport = core.CmuxViewportSocket()
+    transport.configure({"protocol": "cmux-socket", "version": 2,
+                         "socket_path": endpoint["path"], "access_mode": "automation",
+                         "methods": ["system.tree"]})
+    def no_fallback(*args, **kwargs):
+        raise RuntimeError("original bootstrap controller unavailable; no CLI fallback")
+    return core.CmuxClient(endpoint["binary"], runner=no_fallback, viewport_socket=transport)
 
 
 def _launch(config_path, job):
@@ -346,6 +402,12 @@ def start(config_path, selector, *, client=None, launch=True, private_check=Fals
             if private_check or native_access:
                 from ccc_private_check import POLICY
                 job["check_retry_policy"] = POLICY
+                if not guarded:
+                    job["initial_prompt_policy"] = ARGV_INITIAL_POLICY
+                    job["native_runtime_policy"] = NATIVE_RUNTIME_POLICY
+                    endpoint = _bootstrap_endpoint(client if client is not None else _client(config), config)
+                    if endpoint is not None:
+                        job["bootstrap_endpoint"] = endpoint
             if native_access:
                 # Explicit new native N. Do not reuse the legacy gateway
                 # marker names or reinterpret any existing N descriptor.
@@ -510,7 +572,196 @@ def native_launch_argv(config_path, job, index):
     if mode == 'access_check':
         from ccc_access_service import launch_arguments
         argv.extend(launch_arguments(config_path, job, index))
+    if argv_initial(job, config_path):
+        # Native's skill_search is a shadow ranking experiment, not skill
+        # discovery or actual skill selection. Avoid running its catalog-wide
+        # algorithms on every short-check turn in explicit new native jobs.
+        argv.extend(["--disable", "skill_search"])
+        hook = shlex.join([sys.executable, "-B", str(Path(__file__).resolve()), "bind-initial",
+                           "--config", str(config_path), "--job", job["id"],
+                           "--index", str(index), "--launch-id", job["slots"][index]["launch_id"]])
+        # Native 0.156's normalized hook identity uses sorted JSON via
+        # version_for_toml; trust only this session-flags handler, not other hooks.
+        normalized = {"event_name": "session_start", "matcher": "startup", "hooks": [
+            {"type": "command", "command": hook, "timeout": 5, "async": False}]}
+        trust = "sha256:" + hashlib.sha256(json.dumps(
+            normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+        key = "/<session-flags>/config.toml:session_start:0:0"
+        argv.extend(["--enable", "hooks", "-c", 'hooks.SessionStart=[{matcher="startup",hooks=[{type="command",command='
+                     + json.dumps(hook) + ',timeout=5}]}]', "-c",
+                     "hooks.state={" + json.dumps(key) + '={enabled=true,trusted_hash=' + json.dumps(trust) + '}}'])
+        argv.append(PROMPT)
     return argv
+
+
+def _claim_argv_initial(config_path, job_id, index, record):
+    """Permanently consume one slot before any initial-prompt exec.
+
+    A partial file is deliberately a consumed claim. Neither a different
+    launch ID nor a process restart can turn uncertain execution into retry.
+    This primitive does not authorize an exec or enable the new job protocol.
+    """
+    if type(index) is not int or not 0 <= index < COUNT:
+        raise RuntimeError("invalid initial prompt slot")
+    if (record.get("job_id") != job_id or record.get("index") != index
+            or record.get("policy") != ARGV_INITIAL_POLICY):
+        raise RuntimeError("initial prompt claim identity mismatch")
+    path = job_path(config_path, job_id).parent / f"initial-argv-{index}.json"
+    return _write_once_json(path, record)
+
+
+def _write_once_json(path, record):
+    payload = (json.dumps(record, ensure_ascii=False, sort_keys=True,
+                          separators=(",", ":")) + "\n").encode("utf-8")
+    # No replace/rename: all competing bootstraps contend on the permanent
+    # slot name, including a bootstrap with a newer launch_id.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except BaseException:
+        # Even an empty claim is evidence of uncertainty, never unlink it.
+        raise
+    return path, payload
+
+
+def _initial_event_prefix(claim, *, require_turn=False):
+    path = Path(claim["tui_log"])
+    st = path.stat()
+    if [st.st_dev, st.st_ino] != claim["tui_log_identity"]:
+        raise RuntimeError("initial native event file identity changed")
+    with path.open("rb") as handle:
+        opened = os.fstat(handle.fileno())
+        if [opened.st_dev, opened.st_ino] != claim["tui_log_identity"]:
+            raise RuntimeError("initial event file changed while opening")
+        data = handle.read(2 * 1024 * 1024 + 1)
+        after = os.fstat(handle.fileno())
+    current = path.stat()
+    if (after.st_size < opened.st_size or current.st_size < after.st_size
+            or [current.st_dev, current.st_ino] != claim["tui_log_identity"]):
+        raise RuntimeError("initial event file replaced or truncated")
+    if len(data) > 2 * 1024 * 1024:
+        raise RuntimeError("initial native event prefix exceeded bound")
+    # A concurrent write may have emitted JSON but not its terminating newline.
+    data = data[:data.rfind(b"\n") + 1]
+    events = [json.loads(line) for line in data.splitlines()]
+    if (not events or events[0].get("dir") != "meta" or events[0].get("kind") != "session_start"
+            or Path(events[0]["cwd"]).resolve() != Path(claim["cwd"]).resolve()
+            or epoch(events[0]["ts"]) < claim["at"] - .001):
+        raise RuntimeError("initial native event header missing")
+    switches = {"ResumeSessionByIdOrName", "ResumeSession", "ForkCurrentSession",
+                "NewAgentsOverviewSession", "SelectAgentThread", "SelectAgentsOverviewThread",
+                "ClearUiAndSubmitUserMessage"}
+    starts = 0
+    first_turn = False
+    end = len(data.splitlines(keepends=True)[0])
+    for event, line in zip(events[1:], data.splitlines(keepends=True)[1:]):
+        end += len(line)
+        if (event.get("kind") in {"new_session", "clear_ui", "session_end", "session_start"}
+                or event.get("variant") in switches):
+            raise RuntimeError("native session changed before the initial task")
+        if event.get("variant") == "StartupThreadStarted":
+            starts += 1
+        if event.get("dir") == "from_tui" and event.get("kind") == "op":
+            payload = event.get("payload")
+            if (isinstance(payload, dict) and set(payload) == {"ListSkills"}
+                    and payload["ListSkills"].get("cwds") == [claim["cwd"]]):
+                continue  # Native startup lists skills before submitting argv.
+            user = event.get("payload", {}).get("UserTurn") if isinstance(event.get("payload"), dict) else None
+            if (not user or len(user.get("items", [])) != 1
+                    or user["items"][0].get("type") != "text"
+                    or user["items"][0].get("text") != PROMPT
+                    or starts != 1 or first_turn):
+                raise RuntimeError("native first outbound task is not the fixed initial task")
+            first_turn = True
+            if require_turn:
+                return data, True
+    if starts > 1:
+        raise RuntimeError("multiple native startup events before hook binding")
+    return data, first_turn
+
+
+def bind_initial_session(config_path, job_id, index, launch_id, payload):
+    """Synchronous native startup hook; later clear/resume can never replace it."""
+    from ccc_guard_scope import process, birth
+    jobfile = job_path(config_path, job_id)
+    job = core.load_json(jobfile, {})
+    if not argv_initial(job, config_path):
+        raise RuntimeError("initial hook requires explicit argv protocol")
+    raw = (jobfile.parent / f"initial-argv-{index}.json").read_bytes()
+    claim = json.loads(raw)
+    if (claim.get("launch_id") != launch_id or claim.get("job_id") != job_id
+            or claim.get("index") != index or claim.get("state") != "exec_intent"
+            or payload.get("hook_event_name") != "SessionStart" or payload.get("source") != "startup"):
+        raise RuntimeError("not the original native startup hook")
+    # Consume even a failed first callback. A later /new must not repair an
+    # identity failure by presenting another session with source=startup.
+    _write_once_json(jobfile.parent / f"initial-hook-attempt-{index}.json", {
+        "claim_sha256": hashlib.sha256(raw).hexdigest(), "at": time.time()})
+    session = str(uuid.UUID(payload["session_id"]))
+    native = process(claim["bootstrap_pid"], launch=True)
+    if (not native or native["birth"] != claim["bootstrap_birth"]
+            or native["surface_id"].upper() != claim["surface_id"].upper()
+            or native["environment_workspace_id"].upper() != claim["workspace_id"].upper()
+            or native["argv"] != claim["argv"]
+            or Path(payload["cwd"]).resolve() != Path(claim["cwd"]).resolve()):
+        raise RuntimeError("initial hook original native identity changed")
+    from ccc_codex_queue import process_writable_files
+    tui = Path(claim["tui_log"])
+    st = tui.stat()
+    fd = process_writable_files(native["pid"], identities=True).get(tui.resolve(), {})
+    if ([st.st_dev, st.st_ino] != claim["tui_log_identity"]
+            or [fd.get("device"), fd.get("inode")] != claim["tui_log_identity"]):
+        raise RuntimeError("initial hook original native event writer missing")
+    data, _ = _initial_event_prefix(claim)
+    root = (Path(native["environment"].get("CODEX_HOME") or Path.home() / ".codex") / "sessions").resolve()
+    transcript = payload.get("transcript_path")
+    if transcript:
+        transcript = str(Path(transcript).resolve())
+        if not Path(transcript).is_relative_to(root):
+            raise RuntimeError("initial hook transcript outside original sessions")
+    record = {"claim_sha256": hashlib.sha256(raw).hexdigest(), "session_id": session,
+              "pid": native["pid"], "birth": native["birth"], "surface_id": claim["surface_id"],
+              "workspace_id": claim["workspace_id"], "sessions_root": str(root),
+              "transcript": transcript, "source": "startup", "at": time.time()}
+    record.update(tui_prefix_bytes=len(data), tui_prefix_sha256=hashlib.sha256(data).hexdigest())
+    if (birth(native["pid"], codex=True) != native["birth"]
+            or (jobfile.parent / f"initial-argv-{index}.json").read_bytes() != raw):
+        raise RuntimeError("initial hook identity changed before persistence")
+    _write_once_json(jobfile.parent / f"initial-session-{index}.json", record)
+
+
+def _exec_claimed_argv(config_path, job_id, index, record, argv, final_guard, final_authorized=None):
+    """Consume the slot, then validate after persistence and just before exec.
+
+    final_guard owns live authorization, original bootstrap identity, current
+    main-area membership and the bound receipt/cwd/argv evidence. An exec error
+    leaves the same claim consumed. Callers must only observe it thereafter.
+    """
+    if (not isinstance(argv, list) or not argv
+            or any(not isinstance(value, str) or "\0" in value for value in argv)
+            or not Path(argv[0]).is_absolute() or record.get("argv") != argv):
+        raise RuntimeError("initial prompt argv identity mismatch")
+    argv = list(argv)  # Caller/guard mutation cannot alter the consumed payload.
+    path, payload = _claim_argv_initial(config_path, job_id, index, record)
+    generation = _file_generation(path)
+    if not final_guard():
+        raise RuntimeError("initial prompt authorization changed before exec")
+    # The final guard may perform I/O. Reject a replaced or truncated claim
+    # after it returns without granting another attempt.
+    if (path.is_symlink() or _file_generation(path) != generation
+            or path.read_bytes() != payload or _file_generation(path) != generation):
+        raise RuntimeError("initial prompt claim changed before exec")
+    if not (final_authorized or final_guard)():
+        raise RuntimeError("initial prompt authorization changed at exec boundary")
+    os.execv(argv[0], argv)
 
 
 def native_thread_name(target, native):
@@ -573,10 +824,112 @@ def launch_registered(config_path, job_id, index, launch_id):
     # exec retains the registered shell parent and original terminal. There is
     # no relay, alternate session, shell expansion, or global config write.
     argv = native_launch_argv(config_path, job, index)
+    if argv_initial(job, config_path):
+        return _launch_initial_registered(config_path, job, index, launch_id, argv)
     if startup_mode(job, config_path) == 'access_check':
         for name in ('NO_PROXY', 'no_proxy'):
             os.environ[name] = ','.join(filter(None, (os.environ.get(name), '127.0.0.1', 'localhost')))
     os.execv(argv[0], argv)
+
+
+def native_launch_environment(job):
+    policy = job.get("native_runtime_policy")
+    if policy is None:
+        return {}  # Historical jobs keep their original runtime environment.
+    if policy != NATIVE_RUNTIME_POLICY or job.get("initial_prompt_policy") != ARGV_INITIAL_POLICY:
+        raise RuntimeError("unknown native runtime policy")
+    return {"TOKIO_WORKER_THREADS": "2"}
+
+
+def _launch_initial_registered(config_path, job, index, launch_id, argv):
+    """The original registered bootstrap becomes the initial native writer."""
+    from ccc_guard_scope import birth
+    requested_environment = native_launch_environment(job)
+    os.environ.update(requested_environment)
+    path = job_path(config_path, job["id"])
+    receipt_path = path.parent / f"surface-{index}.json"
+    raw = receipt_path.read_bytes()
+    receipt = json.loads(raw)
+    receipt_generation = _file_generation(receipt_path)
+    sid, wid = os.environ.get("CMUX_SURFACE_ID"), os.environ.get("CMUX_WORKSPACE_ID")
+    if (receipt.get("surface_id") != sid or receipt.get("workspace_id") != wid
+            or wid != job["workspace_id"] or receipt.get("launch_id") != launch_id):
+        raise RuntimeError("initial prompt registration identity changed")
+    pid = os.getpid()
+    identity = birth(pid)
+    if not identity:
+        raise RuntimeError("initial prompt bootstrap birth unavailable")
+    cwd = working_directory(config_path, job["id"], index)
+    cwd_generation = _file_generation(cwd)
+    executable = Path(argv[0]).resolve(strict=True)
+    executable_generation = _file_generation(executable)
+    client = _bootstrap_client(core.ConfigStore(Path(config_path)).load(), job)
+    tui_log = path.parent / f"initial-native-events-{index}.jsonl"
+    with os.fdopen(os.open(tui_log, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as handle:
+        os.fsync(handle.fileno())
+    tui_stat = tui_log.stat()
+    os.environ["CODEX_TUI_RECORD_SESSION"] = "1"
+    os.environ["CODEX_TUI_SESSION_LOG_PATH"] = str(tui_log)
+    record = {"policy": ARGV_INITIAL_POLICY, "job_id": job["id"], "index": index,
+              "workspace_id": wid, "surface_id": sid, "launch_id": launch_id,
+              "bootstrap_pid": pid, "bootstrap_birth": identity,
+              "receipt_sha256": hashlib.sha256(raw).hexdigest(),
+              "cwd": str(cwd), "cwd_generation": list(cwd_generation),
+              "argv": argv, "executable": str(executable),
+              "executable_generation": list(executable_generation),
+              "at": time.time(), "state": "exec_intent"}
+    record.update(tui_log=str(tui_log), tui_log_identity=[tui_stat.st_dev, tui_stat.st_ino])
+    # Native dotenv can override this request. This records exec input, not a
+    # claim about the eventual number of native or blocking-pool threads.
+    record["requested_environment"] = requested_environment
+
+    def permission_current():
+        if (receipt_path.is_symlink() or _file_generation(receipt_path) != receipt_generation
+                or cwd.is_symlink() or _file_generation(cwd) != cwd_generation
+                or Path(argv[0]).resolve(strict=True) != executable
+                or _file_generation(executable) != executable_generation):
+            return False
+        current = core.load_json(path, {})
+        if (native_launch_environment(current) != requested_environment
+                or any(os.environ.get(key) != value for key, value in requested_environment.items())):
+            return False
+        if (not argv_initial(current, config_path) or current.get("workspace_id") != wid
+                or current["slots"][index].get("launch_id") != launch_id
+                or current["slots"][index].get("surface_id") not in {None, sid}):
+            return False
+        config = core.ConfigStore(Path(config_path)).load()
+        if job.get("bootstrap_endpoint") is not None and not _bootstrap_endpoint_current(job["bootstrap_endpoint"], config):
+            return False
+        rule = core.workspace_rule_by_id(config, wid)
+        hold = core.batch_start_hold(rule, sid)
+        return (allowed(config, current) and hold.get("job_id") == job["id"]
+                and hold.get("index") == index
+                and not (sid in rule.get("excluded_surface_ids", [])
+                         and rule.get("excluded_surface_reasons", {}).get(sid)
+                         != f"batch:{job['id']}:initial")
+                and not any(t.get("surface_id") == sid
+                            and (t.get("paused") or not t.get("enabled", True))
+                            for t in config["targets"]) and birth(pid) == identity)
+
+    def authorized():
+        current = core.load_json(path, {})
+        if (not argv_initial(current, config_path) or current.get("workspace_id") != wid
+                or current["slots"][index].get("launch_id") != launch_id
+                or current["slots"][index].get("surface_id") not in {None, sid}
+                or receipt_path.read_bytes() != raw
+                or birth(pid) != identity
+                or Path(argv[0]).resolve(strict=True) != executable
+                or _file_generation(executable) != executable_generation
+                or _file_generation(cwd) != cwd_generation or any(cwd.iterdir())):
+            return False
+        tree = client.workspace_tree(wid)
+        target = core.find_main_surface(tree, sid)
+        if target.get("workspace_id") != wid:
+            return False
+        return permission_current()
+
+    with core.workspace_input_lock(config_path, wid, shared=True):
+        _exec_claimed_argv(config_path, job["id"], index, record, argv, authorized, permission_current)
 
 
 def prepare_sqlite_home(config_path, job_id):
@@ -1027,16 +1380,30 @@ class BatchWorker:
             # an older view cannot overwrite another slot's durable intent.
             with parent._state_lock:
                 current = parent.job["slots"][self._slot_index]
-                current.clear()
-                current.update(copy.deepcopy(self.job["slots"][self._slot_index]))
-                for key in ("window_id", "pane_id"):
-                    if key in self.job:
-                        parent.job[key] = self.job[key]
-                if self._wait_observed:
-                    parent._wait_observed = True
-                    parent.job["preparation_wait"] = copy.deepcopy(self.job["preparation_wait"])
-                    parent.job["error"] = self.job["error"]
-                commit = parent._queue_job_commit()
+                snapshot = self.job["slots"][self._slot_index]
+                queued = getattr(parent, "_queued_job_snapshot", None)
+                unchanged = (parent._queued_commit is not None
+                             and queued is not None
+                             and queued["slots"][self._slot_index] == snapshot
+                             and current == snapshot and not self._wait_observed
+                             and all(key not in self.job or parent.job.get(key) == self.job[key]
+                                     and queued.get(key) == self.job[key]
+                                     for key in ("window_id", "pane_id")))
+                if unchanged:
+                    # Repeated startup polls must still await an outstanding
+                    # commit, but need not serialize the whole job again.
+                    commit = parent._queued_commit
+                else:
+                    current.clear()
+                    current.update(copy.deepcopy(snapshot))
+                    for key in ("window_id", "pane_id"):
+                        if key in self.job:
+                            parent.job[key] = self.job[key]
+                    if self._wait_observed:
+                        parent._wait_observed = True
+                        parent.job["preparation_wait"] = copy.deepcopy(self.job["preparation_wait"])
+                        parent.job["error"] = self.job["error"]
+                    commit = parent._queue_job_commit()
             # Other slots can publish their own intents into this commit while
             # this slot waits. No slot reaches I/O before its snapshot is saved.
             parent._wait_job_commit(commit)
@@ -1062,7 +1429,9 @@ class BatchWorker:
         if self._job_committer is None:
             self._job_committer = _JobCommitter(self.path)
         self.job["updated_at"] = self.clock()
-        commit = self._job_committer.submit(copy.deepcopy(self.job))
+        snapshot = copy.deepcopy(self.job)
+        commit = self._job_committer.submit(snapshot)
+        self._queued_job_snapshot = snapshot
         self._queued_serialized, self._queued_commit = serialized, commit
         return commit
 
@@ -1205,6 +1574,10 @@ class BatchWorker:
         return target
 
     def _create(self, slot):
+        if argv_initial(self.job, self.config_path) and os.path.lexists(
+                self.path.parent / f"initial-argv-{slot['index']}.json"):
+            slot.update(phase="uncertain", error="首发启动已有永久记录；仅核对原会话，不重建")
+            return
         if self._stopping() or slot.get("phase") != "pending" or self.clock() < slot.get("retry_at", 0):
             return
         wid = self.job["workspace_id"]
@@ -1238,13 +1611,20 @@ class BatchWorker:
                 return
             try:
                 slot["create_dispatched_at"] = self.clock()
-                slot["surface_id"] = self.client.new_codex_surface(
-                    self.job["window_id"], wid, self.job["pane_id"], command)
+                shell_options = {"clean_shell": True} if argv_initial(self.job, self.config_path) else {}
+                base = self.client.client if isinstance(self.client, SnapshotClient) else self.client
+                guard = (base.input_guard(lambda: not self._stopping() and allowed(self._configuration(), self.job))
+                         if isinstance(base, core.CmuxClient) else contextlib.nullcontext())
+                with guard:
+                    slot["surface_id"] = self.client.new_codex_surface(
+                        self.job["window_id"], wid, self.job["pane_id"], command, **shell_options)
                 slot["phase"] = "created"
                 slot["create_acknowledged_at"] = self.clock()
                 # register() installs the hold before exec. Writing the same
                 # full config again for each create acknowledgement serialized
                 # all 50 launches and could race bootstrap's own protection.
+            except core.InputNotSentError as exc:
+                slot.update(phase="pending", create_not_sent_at=self.clock(), error=str(exc))
             except core.CmuxRequestRejected as exc:
                 self._defer_rejected_start(slot, str(exc))
             except (core.CmuxError, RuntimeError) as exc:
@@ -1346,6 +1726,8 @@ class BatchWorker:
                 or "surface is not currently inside its authorized B workspace" in before)
 
     def _restart_failed(self, slot, *, no_pty=False):
+        if argv_initial(self.job, self.config_path):
+            return  # This protocol never respawns or supplements an argv task.
         # Only pre-session startup failures owned by this batch may be
         # relaunched, in the same terminal. Never replace an existing session.
         if self.clock() < slot.get("retry_at", 0):
@@ -1368,7 +1750,7 @@ class BatchWorker:
                     return
             if (self._native(target, slot) or {}).get("session_id"):
                 return
-            grid = core.Grid.from_rpc(self.client.replay(target["workspace_id"], target["surface_id"]), target["surface_id"])
+            grid = core.Grid.from_rpc(self._replay(target["workspace_id"], target["surface_id"]), target["surface_id"])
             guard_refusal = False if no_pty else self._guard_refusal(grid)
             if slot.get("restart_attempt_at"):
                 return
@@ -1638,6 +2020,8 @@ class BatchWorker:
         return "".join(cells[2:]).rstrip() == prompt
 
     def _finish_submission(self, slot):
+        if argv_initial(self.job, self.config_path):
+            return
         if slot.get("enter_attempt_at") or self.clock() - slot.get("submit_at", self.clock()) < .2:
             return
         with core.workspace_input_lock(self.config_path, self.job["workspace_id"], shared=True):
@@ -1651,7 +2035,7 @@ class BatchWorker:
             if (not native or native.get("kind") not in {"unknown", "uninitialized"}
                     or any(native.get(k) != slot.get(k) for k in ("session_id", "pid", "process_start"))):
                 return
-            grid = core.Grid.from_rpc(self.client.replay(target["workspace_id"], target["surface_id"]), target["surface_id"])
+            grid = core.Grid.from_rpc(self._replay(target["workspace_id"], target["surface_id"]), target["surface_id"])
             if not self._own_prompt_draft(grid, job_prompt(self.job)) or self._native(target, slot) != native:
                 return
             slot["enter_attempt_at"] = self.clock()
@@ -1662,24 +2046,44 @@ class BatchWorker:
                 self.save()
                 return
             try:
-                self.client.send_key(target["workspace_id"], target["surface_id"], "enter")
+                with self._initial_connected_guard(slot, target, native, draft=job_prompt(self.job)):
+                    self.client.send_key(target["workspace_id"], target["surface_id"], "enter")
+            except core.InputNotSentError as exc:
+                slot.pop("enter_attempt_at", None)
+                slot.update(enter_not_sent_at=self.clock(), error=str(exc))
+                self.save()
             except (core.CmuxError, RuntimeError) as exc:
                 slot.update(phase="uncertain", error=str(exc))
 
-    def _initial_input_ready(self, slot, target, native, *, draft=None):
+    def _initial_connected_guard(self, slot, target, native, *, draft=None):
+        client = self.client.client if isinstance(self.client, SnapshotClient) else self.client
+        if isinstance(client, core.CmuxClient):
+            return client.input_guard(lambda: self._initial_input_ready(
+                slot, target, native, draft=draft, connected_client=client))
+        return contextlib.nullcontext()
+
+    def _initial_input_ready(self, slot, target, native, *, draft=None, connected_client=None):
         """Recheck after durable intent, immediately before actual input."""
         try:
             config = self._configuration()
             if self._stopping() or not allowed(config, self.job) or not self._protected(config, slot):
                 return False
-            if self._target(slot, fresh=True) != target or self._native(target, slot) != native:
+            current = (core.find_main_surface(connected_client.workspace_tree(target["workspace_id"]),
+                                             target["surface_id"]) if connected_client
+                       else self._target(slot, fresh=True))
+            if (any(current.get(key) != target.get(key) for key in
+                    ("surface_id", "workspace_id", "pane_id", "window_id"))
+                    or self._native(target, slot) != native):
                 return False
-            grid = core.Grid.from_rpc(self.client.replay(target["workspace_id"], target["surface_id"]), target["surface_id"])
+            replay = (connected_client.replay(target["workspace_id"], target["surface_id"], live=True)
+                      if connected_client else self._replay(target["workspace_id"], target["surface_id"]))
+            grid = core.Grid.from_rpc(replay, target["surface_id"])
             empty = core.classify_grid(grid).kind == "idle" and core._composer_status(grid)[0] == "empty"
             if not (empty if draft is None else self._own_prompt_draft(grid, draft)):
                 return False
             config = self._configuration()
-            return not self._stopping() and allowed(config, self.job) and self._protected(config, slot)
+            return (not self._stopping() and allowed(config, self.job) and self._protected(config, slot)
+                    and self._native(target, slot) == native)
         except (OSError, ValueError, core.CmuxError, RuntimeError):
             return False
 
@@ -1709,7 +2113,13 @@ class BatchWorker:
             self.save()
             return False
         try:
-            send()
+            with self._initial_connected_guard(slot, target, native,
+                    draft=naming["command"] if field == "enter_at" else None):
+                send()
+        except core.InputNotSentError as exc:
+            naming.pop(field, None)
+            naming.update(deferred_at=self.clock(), deferred_stage=field)
+            slot["error"] = "命名前最终连接检查未通过；零输入：" + str(exc)
         except (core.CmuxError, RuntimeError) as exc:
             # The transport was entered: do not reset or replay this attempt.
             slot["error"] = "原生命名输入待核验：" + str(exc)
@@ -1762,7 +2172,7 @@ class BatchWorker:
                                   "confirmed_at": self.clock()}
                 self.save()
                 return True
-            grid = core.Grid.from_rpc(self.client.replay(target["workspace_id"], target["surface_id"]), target["surface_id"])
+            grid = core.Grid.from_rpc(self._replay(target["workspace_id"], target["surface_id"]), target["surface_id"])
             if naming and naming.get("submitted_at"):
                 if naming.get("enter_at") or self.clock() - naming["submitted_at"] < .2:
                     return False
@@ -1780,9 +2190,77 @@ class BatchWorker:
                 self.client.draft_batch_session_name(target["workspace_id"], target["surface_id"],
                                                      self.job["id"], slot["index"]))
 
+    def _observe_argv_initial(self, slot, receipt):
+        """Read the immutable first startup hook, including after native exit."""
+        path = self.path.parent / f"initial-argv-{slot['index']}.json"
+        try:
+            raw = path.read_bytes()
+            claim = json.loads(raw)
+            digest = hashlib.sha256(raw).hexdigest()
+            expected = {"policy": ARGV_INITIAL_POLICY, "job_id": self.job["id"],
+                        "index": slot["index"], "workspace_id": self.job["workspace_id"],
+                        "surface_id": slot.get("surface_id"), "launch_id": slot.get("launch_id")}
+            if (any(claim.get(k) != v for k, v in expected.items())
+                    or claim.get("state") != "exec_intent"
+                    or claim.get("argv", [])[-1:] != [PROMPT]
+                    or slot.get("argv_claim_sha256", digest) != digest):
+                raise ValueError("initial prompt claim identity changed")
+            receipt_raw = (self.path.parent / f"surface-{slot['index']}.json").read_bytes()
+            if (hashlib.sha256(receipt_raw).hexdigest() != claim.get("receipt_sha256")
+                    or json.loads(receipt_raw) != receipt):
+                raise ValueError("initial prompt registration changed")
+            if slot.get("argv_claim_sha256"):
+                return True
+            identity = claim["bootstrap_birth"]
+            if not isinstance(identity, list) or len(identity) != 2:
+                raise ValueError("initial bootstrap birth missing")
+            first_path = self.path.parent / f"initial-session-{slot['index']}.json"
+            first_raw = first_path.read_bytes()
+            first = json.loads(first_raw)
+            if (first.get("claim_sha256") != digest or first.get("pid") != claim["bootstrap_pid"]
+                    or first.get("birth") != identity or first.get("source") != "startup"
+                    or first.get("surface_id") != slot["surface_id"]
+                    or first.get("workspace_id") != self.job["workspace_id"]):
+                raise ValueError("original startup hook identity changed")
+            event_data, sent = _initial_event_prefix(claim, require_turn=True)
+            if (len(event_data) < first["tui_prefix_bytes"] or hashlib.sha256(
+                    event_data[:first["tui_prefix_bytes"]]).hexdigest() != first["tui_prefix_sha256"]):
+                raise ValueError("original startup event prefix changed")
+            if not sent:
+                return False
+            session = str(uuid.UUID(first["session_id"]))
+            root = Path(first["sessions_root"])
+            if root != self.queue.sessions_root.resolve():
+                raise ValueError("initial hook sessions root changed")
+            if first.get("transcript"):
+                transcript = Path(first["transcript"])
+            else:
+                paths = list(root.rglob(f"*{session}.jsonl"))
+                if len(paths) != 1:
+                    return False
+                transcript = paths[0]
+            if transcript.resolve() != transcript or not transcript.is_relative_to(root):
+                raise ValueError("initial transcript outside original sessions")
+            if first_path.read_bytes() != first_raw:
+                raise ValueError("original startup hook changed while reading")
+            slot.update(argv_claim_sha256=digest, session_id=session,
+                        argv_first_hook_sha256=hashlib.sha256(first_raw).hexdigest(),
+                        argv_initial_event_sha256=hashlib.sha256(event_data).hexdigest(),
+                        pid=claim["bootstrap_pid"], process_start=identity[0],
+                        native_birth=identity, transcript=str(transcript), transcript_offset=0,
+                        submit_at=claim["at"], phase="submitted")
+            self.save()
+            return True
+        except FileNotFoundError:
+            slot["error"] = "等待首发永久记录或原生首会话；不发送界面输入"
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            slot["error"] = "首发证据尚不可确认：" + str(exc)
+        return False
+
     def _advance(self, slot, *, confirmation_only=False):
         receipt = core.load_json(self.path.parent / f"surface-{slot['index']}.json", {})
-        if not confirmation_only and self._recover_rejected_start(slot, receipt):
+        initial = argv_initial(self.job, self.config_path)
+        if not initial and not confirmation_only and self._recover_rejected_start(slot, receipt):
             return
         if receipt and receipt.get("workspace_id") == self.job["workspace_id"]:
             if slot.get("surface_id") not in {None, receipt["surface_id"]}:
@@ -1794,6 +2272,8 @@ class BatchWorker:
                 if receipt.get("launch_id") != slot.get("launch_id"):
                     return
                 slot.update(phase="created", launched_at=receipt["registered_at"])
+        if initial and not self._observe_argv_initial(slot, receipt):
+            return
         if slot["phase"] in CONFIRMABLE:
             if self._confirm(slot):
                 slot["phase"] = "confirmed"
@@ -1809,7 +2289,7 @@ class BatchWorker:
                 if core.batch_start_hold(rule, slot["surface_id"]):
                     self._release(slot)
                     self.save()
-            elif not confirmation_only:
+            elif not confirmation_only and not initial:
                 self._finish_submission(slot)
             return
         if confirmation_only:
@@ -1823,7 +2303,7 @@ class BatchWorker:
             slot["error"] = "等待新 shell 原始回执"
             if self.clock() - slot["created_at"] >= 3 and slot.get("surface_id"):
                 target = self._target(slot)
-                grid = core.Grid.from_rpc(self.client.replay(target["workspace_id"], target["surface_id"]), target["surface_id"])
+                grid = core.Grid.from_rpc(self._replay(target["workspace_id"], target["surface_id"]), target["surface_id"])
                 if self._pty_failure(grid):
                     self._protect_created(slot)
                     slot.update(phase="pty_wait", error="系统 PTY 名额已满；等待空位后在原 surface 补做")
@@ -1842,7 +2322,7 @@ class BatchWorker:
         if (self.job.get("name_policy") is not None and native and native.get("session_id") and native.get("pid")
                 and not self._prepare_name(slot, target, native)):
             return
-        grid = core.Grid.from_rpc(self.client.replay(target["workspace_id"], target["surface_id"]), target["surface_id"])
+        grid = core.Grid.from_rpc(self._replay(target["workspace_id"], target["surface_id"]), target["surface_id"])
         if core.classify_grid(grid).kind != "idle" or core._composer_status(grid)[0] != "empty":
             if not (native or {}).get("session_id") and (self._startup_failure(grid) or self._guard_refusal(grid)):
                 slot.update(phase="restart_pending", error=(
@@ -1874,7 +2354,7 @@ class BatchWorker:
                 slot.update(phase="blocked", error="此路授权已被修改，未发送 prompt")
                 return
             target = self._target(slot, fresh=True)
-            grid = core.Grid.from_rpc(self.client.replay(target["workspace_id"], target["surface_id"]), target["surface_id"])
+            grid = core.Grid.from_rpc(self._replay(target["workspace_id"], target["surface_id"]), target["surface_id"])
             if (core.classify_grid(grid).kind != "idle" or core._composer_status(grid)[0] != "empty"
                     or self._native(target, slot) != native):
                 return
@@ -1920,8 +2400,13 @@ class BatchWorker:
                 return
             try:
                 slot["send_dispatched_at"] = self.clock()
-                self.client.send_text(target["workspace_id"], target["surface_id"], job_prompt(self.job))
+                with self._initial_connected_guard(slot, target, native):
+                    self.client.send_text(target["workspace_id"], target["surface_id"], job_prompt(self.job))
                 slot["phase"] = "submitted"
+            except core.InputNotSentError as exc:
+                slot.pop("submit_at", None)
+                slot.pop("send_dispatched_at", None)
+                slot.update(phase="created", input_not_sent_at=self.clock(), error=str(exc))
             except (core.CmuxError, RuntimeError) as exc:
                 slot.update(phase="uncertain", error=str(exc))
             self.save()
@@ -1946,7 +2431,22 @@ class BatchWorker:
         self.save()
         return True
 
+    def _replay(self, workspace_id, surface_id):
+        # Startup is tied to the live native composer, never a scrolled-back
+        # historical viewport. Keep this per-call so shared observers retain
+        # their original read mode.
+        client = self.client.client if isinstance(self.client, SnapshotClient) else self.client
+        if isinstance(client, core.CmuxClient):
+            return client.replay(workspace_id, surface_id, live=True)
+        return self.client.replay(workspace_id, surface_id)
+
     def _refresh_processes(self):
+        if argv_initial(self.job, self.config_path):
+            # This protocol only observes its pinned claim/hook/transcript.
+            # It never enters _native() or the legacy UI startup path that
+            # consumes these labels. Avoid a global process RPC per batch;
+            # bootstrap authorization and original-session proof stay fresh.
+            return
         if isinstance(self.client, SnapshotClient):
             labels = self.client.process_labels(self.job["workspace_id"], core.classify_surface_processes, wait=False)
             self.processes = labels or {}
@@ -2020,7 +2520,7 @@ class BatchWorker:
             if (not native or native.get('kind') not in {'unknown', 'uninitialized'}
                     or any(native.get(key) != slot.get(key) for key in ('pid', 'process_start', 'session_id'))):
                 return False
-            grid = core.Grid.from_rpc(self.client.replay(target['workspace_id'], target['surface_id']), target['surface_id'])
+            grid = core.Grid.from_rpc(self._replay(target['workspace_id'], target['surface_id']), target['surface_id'])
             if core.classify_grid(grid).kind != 'idle' or core._composer_status(grid)[0] != 'empty':
                 return False
         return True
@@ -2341,14 +2841,26 @@ def retire_old_worker(job, *, config_path=None):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=("run", "register"))
+    parser.add_argument("action", choices=("run", "register", "bind-initial"))
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--job", required=True)
     parser.add_argument("--index", type=int, default=0)
     parser.add_argument("--launch-id", default="")
     parser.add_argument("--launch-native", action="store_true")
     args = parser.parse_args()
-    if args.action == "register":
+    if args.action == "bind-initial":
+        raw = sys.stdin.buffer.read(65537)
+        if len(raw) > 65536:
+            raise RuntimeError("initial hook payload too large")
+        try:
+            bind_initial_session(args.config, args.job, args.index, args.launch_id, json.loads(raw))
+        except Exception as exc:
+            error_path = job_path(args.config, args.job).parent / f"initial-hook-error-{args.index}.json"
+            with contextlib.suppress(FileExistsError):
+                _write_once_json(error_path, {"at": time.time(), "error_type": type(exc).__name__,
+                                              "error": str(exc)})
+            raise
+    elif args.action == "register":
         if args.launch_native:
             launch_registered(args.config, args.job, args.index, args.launch_id)
         else:

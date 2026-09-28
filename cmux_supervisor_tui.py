@@ -2399,8 +2399,8 @@ def private_batch_prompt(pool: str) -> str:
 
 
 def access_batch_prompt(pool: str) -> str:
-    return (f"在 {pool} 新开节费50？50路持续尝试，保留Codex原生重连，不设累计HTTP次数或运行时长上限；每次只发短问、请求上限128输出token。"
-            "一条完整回复后停止新增检查，在途请求自行结束；不自动Interrupt。原B保留，不能用检查页执行实际任务。")
+    return (f"在 {pool} 新开N原生50？50路并行启动，每路独立空目录、直接使用Codex原生连接，只请求回复OK；失败自动续跑。"
+            "节费限制暂缓：不等齐50路、不设累计HTTP次数、运行时长或输出token上限，不承诺接通后整池自动止损。")
 
 
 def confirm_prompt(action: str, candidate: Candidate, *, live_codex: int | None = None) -> str:
@@ -2889,7 +2889,7 @@ class SupervisorModel:
         elif action == "private_batch_workspace":
             self.run_cli(["batch-workspace", candidate.record["workspace_id"], "--private-check"])
         elif action == "access_batch_workspace":
-            self.run_cli(["batch-workspace", candidate.record["workspace_id"], "--access-check"])
+            self.run_cli(["batch-workspace", candidate.record["workspace_id"], "--native-access"])
         elif action == "pause":
             if candidate.source in {"workspace_rule", "workspace_starting", "workspace_excluded"}:
                 self.run_cli(["exclude", surface_id])
@@ -2931,7 +2931,7 @@ class SupervisorModel:
         elif action == "private_batch_workspace":
             self.run_cli(["batch-workspace", row.workspace_id, "--private-check"])
         elif action == "access_batch_workspace":
-            self.run_cli(["batch-workspace", row.workspace_id, "--access-check"])
+            self.run_cli(["batch-workspace", row.workspace_id, "--native-access"])
         else:
             raise RuntimeError("组头只支持 w 授权整池 · u 取消整池 · Tab 折叠")
 
@@ -4240,14 +4240,14 @@ def view_row_attr(row: ViewRow) -> int:
 
 
 GLOBAL_KEYS_1 = "↑↓ jk 移动  Tab 折/展  z/Z 全折/展  [ ] 跳 workspace  / 查找  c 清除  y 复制ID（也可点击ID）"
-GLOBAL_KEYS_2 = "N 节费50  b 空目录50  f 筛选 R 刷新 G 存储 v 三件套 e 配置 A 开启发 S 停发 d 观察 q 退出"
+GLOBAL_KEYS_2 = "N 原生50·节费暂缓  b 空目录50  f 筛选 R 刷新 G 存储 v 三件套 e 配置 A 开启发 S 停发 d 观察 q 退出"
 
 
 def workspace_buttons():
     column = 0
     result = []
     for key, label in (("w", "整池授权"), ("P", "暂停+Interrupt"),
-                       ("B", "新开50+授权"), ("W", "恢复整池"), ("N", "节费50"), ("b", "空目录50")):
+                       ("B", "新开50+授权"), ("W", "恢复整池"), ("N", "原生50·节费暂缓"), ("b", "空目录50")):
         text = f"[{key} {label}]"
         result.append((ord(key), column, column + display_width(text), text))
         column += display_width(text) + 2
@@ -4505,7 +4505,8 @@ def _draw(
 
 
 def batch_preparation_progress(batch, *, now=None):
-    mode = {'private_check': '空目录短答50', 'access_check': '节费50'}.get(batch.get('startup_mode'), '原B50')
+    mode = ('N原生50·节费暂缓' if batch.get('native_access_policy') == 'direct-native-v1' else
+            {'private_check': '空目录短答50', 'access_check': '旧节费50'}.get(batch.get('startup_mode'), '原B50'))
     wait = batch.get('wait') if isinstance(batch.get('wait'), dict) else {}
     phase = wait.get('message') or {
         'complete': '首任务已全数启动', 'running': '准备中', 'waiting': '等待准备',
@@ -5183,7 +5184,7 @@ def _run(stdscr: Any, model: SupervisorModel) -> None:
                 elif action == "private_batch_workspace":
                     success = f"{row.workspace_ref} 批次已提交；新批次用空目录短答，未完成旧批次保留原模式；P 可停止"
                 elif action == "access_batch_workspace":
-                    success = f"{row.workspace_ref} 节费50已提交；接通后不再新增检查，原B保留"
+                    success = f"{row.workspace_ref} N原生50已提交；并行启动、原生连接，节费限制暂缓"
                 status = model.start_action(lambda row=row, action=action: model.mutate_workspace(row, action), success,
                                             priority=action == "pause_workspace")
             except Exception as exc:
@@ -5233,7 +5234,7 @@ def _run(stdscr: Any, model: SupervisorModel) -> None:
                 "resume_workspace": f"{candidate.workspace_ref} 已恢复整池监控",
                 "batch_workspace": f"{candidate.workspace_ref} 批量任务已提交；创建50路并整池授权，P 可停止",
                 "private_batch_workspace": f"{candidate.workspace_ref} 批次已提交；新批次用空目录短答，未完成旧批次保留原模式；P 可停止",
-                "access_batch_workspace": f"{candidate.workspace_ref} 节费50已提交；接通后不再新增检查，原B保留",
+                "access_batch_workspace": f"{candidate.workspace_ref} N原生50已提交；并行启动、原生连接，节费限制暂缓",
             }.get(action, f"已处理 {where}")
             status = model.start_action(lambda candidate=candidate, action=action: model.mutate_selected(candidate, action), success,
                                         priority=action == "pause_workspace")

@@ -247,8 +247,8 @@ class ViewportSocketTests(unittest.TestCase):
         client = core.CmuxClient(runner=runner, viewport_socket=transport)
         with mock.patch.object(transport, "request", side_effect=AssertionError("input on read transport")):
             client.send("workspace", "surface", "任务请继续")
-        self.assertEqual(runner.call_count, 1)
-        self.assertEqual(runner.call_args.args[0][-1], "任务请继续\n")
+        self.assertEqual(runner.call_count, 2)
+        self.assertEqual([call.args[0][-1] for call in runner.call_args_list], ["任务请继续", "enter"])
 
     def test_changing_configured_binary_invalidates_the_discovered_socket(self):
         with tempfile.TemporaryDirectory() as directory:

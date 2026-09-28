@@ -26,6 +26,7 @@ import shutil
 import shlex
 import signal
 import socket
+import stat
 import statistics
 import subprocess
 import sys
@@ -43,7 +44,8 @@ import ccc_observation as observation_health
 import ccc_network_client as network_health
 from ccc_codex_queue import NativeCompletionWatcher, QueueRecovery
 from ccc_native_processes import NativeProcessIndex
-from ccc_scheduling import CoalescingWriter, SnapshotCache, SnapshotClient, SurfaceScheduler
+from ccc_scheduling import CoalescingWriter, SnapshotCache, SnapshotClient, SurfaceScheduler, TreeSnapshot
+from ccc_delivery import DeliveryStore
 
 
 APP_NAME = "cmux-codex-continue"
@@ -61,7 +63,7 @@ DEFAULT_LABEL = f"{LABEL_PREFIX}.{APP_NAME}"
 PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_APP_DIR = Path.home() / "Library" / "Application Support" / APP_NAME
 DEFAULT_RUNTIME_ROOT = DEFAULT_APP_DIR / "runtime"
-RUNTIME_FILES = ("cmux_codex_watch.py", "claude_ccc_protocol.py", "claude_ccc_event_hook.py", "ccc_observation.py", "ccc_scheduling.py", "ccc_codex_queue.py", "ccc_codex_goal.py", "ccc_workspace_batch.py", "ccc_private_check.py", "ccc_inventory.py", "ccc_batch_guard.py", "ccc_guard_transport.py", "ccc_guard_watchdog.py", "ccc_guard_scope.py", "ccc_guard_migration.py", "ccc_codex_launcher.py", "ccc_network_client.py", "ccc_network_guard.py", "ccc_mihomo.py", "ccc_native_processes.py", "ccc_access_budget.py", "ccc_access_gateway.py", "ccc_access_service.py")
+RUNTIME_FILES = ("cmux_codex_watch.py", "claude_ccc_protocol.py", "claude_ccc_event_hook.py", "ccc_observation.py", "ccc_scheduling.py", "ccc_native_lanes.py", "ccc_delivery.py", "ccc_codex_queue.py", "ccc_codex_goal.py", "ccc_workspace_batch.py", "ccc_private_check.py", "ccc_inventory.py", "ccc_batch_guard.py", "ccc_guard_transport.py", "ccc_guard_watchdog.py", "ccc_guard_scope.py", "ccc_guard_migration.py", "ccc_codex_launcher.py", "ccc_network_client.py", "ccc_network_guard.py", "ccc_mihomo.py", "ccc_native_processes.py", "ccc_access_budget.py", "ccc_access_gateway.py", "ccc_access_service.py")
 DEFAULT_LOG_DIR = Path.home() / "Library" / "Logs" / APP_NAME
 DEFAULT_CONFIG_PATH = DEFAULT_APP_DIR / "config.json"
 DEFAULT_STATE_PATH = DEFAULT_APP_DIR / "state.json"
@@ -177,6 +179,10 @@ PROVIDER_REPEAT_ERROR_TYPES = frozenset({
 # the 1s repeat instead of waiting for a serial pass of every UUID.
 OBSERVE_WORKERS = 32
 SEND_WORKERS = 8
+IMMEDIATE_SCAN_SEC = 0.1
+IMMEDIATE_DISCOVERY_SEC = 0.25
+IMMEDIATE_WORKERS = 50
+NATIVE_EVENT_WORKERS = 1024
 MAINTENANCE_WORKERS = 2
 HEALTHY_REVISIT_SEC = 1.0
 HEALTHY_SKIP_STATES = frozenset({
@@ -379,6 +385,10 @@ class UncertainDeliveryError(CmuxError):
     """Input may have reached cmux; never retry via another transport."""
 
 
+class InputNotSentError(CmuxError):
+    """A connected guard refused before any input request bytes were written."""
+
+
 class IncompatibleError(CmuxError):
     """The connected cmux does not expose the required protocol shape."""
 
@@ -551,12 +561,18 @@ class TargetRuntime:
     send_duration_ms: float = 0.0
     detection_to_send_ms: float = 0.0
     delivery_status: str = ""
+    delivery_revision: int = 0
+    native_failure_at: float = 0.0
+    native_failure_turn_key: str = ""
+    native_complete_to_send_ms: float = 0.0
+    native_send_deadline_missed: bool = False
     delivery_confirmed_at: float = 0.0
     send_attempt_id: str = ""
     send_attempt_evidence: str | None = None
     codex_observed_turn_key: str = ""
     codex_sent_turn_key: str = ""
     codex_goal_resume: bool = False
+    codex_input_phase: str = ""
     codex_private_check: dict[str, Any] = dataclasses.field(default_factory=dict)
     codex_absent_probe: str = ""
     codex_absent_since: float = 0.0
@@ -3460,6 +3476,93 @@ class ClaudeEventWorkerPool:
             thread.join(timeout=1)
 
 
+def _connect_local_socket(connection, path, remaining):
+    """Retry local accept-queue pressure before any request bytes exist.
+
+    Darwin may return ECONNREFUSED while a live Unix listener's backlog is
+    full. Pin the socket inode and keep a short budget; replacement/missing
+    paths fail immediately. Never retry a control request or its response.
+    """
+    end, identity = None, None
+    while True:
+        if identity is not None:
+            info = os.stat(path)
+            if (info.st_dev, info.st_ino) != identity:
+                raise ConnectionRefusedError(errno.ECONNREFUSED, "local socket replaced during connect")
+        connection.settimeout(remaining())
+        try:
+            connection.connect(path)
+            if identity is not None:
+                info = os.stat(path)
+                if (info.st_dev, info.st_ino) != identity:
+                    raise ConnectionRefusedError(errno.ECONNREFUSED, "local socket replaced during connect")
+            return
+        except OSError as exc:
+            if exc.errno not in {errno.EAGAIN, errno.EWOULDBLOCK, errno.ECONNREFUSED, errno.ENOBUFS}:
+                raise
+            try:
+                info = os.stat(path)
+            except OSError:
+                raise exc
+            if not stat.S_ISSOCK(info.st_mode):
+                raise
+            current = (info.st_dev, info.st_ino)
+            if identity is None:
+                identity, end = current, time.monotonic() + min(.1, remaining())
+            if current != identity or time.monotonic() >= end:
+                raise
+            time.sleep(min(.001, max(0, end - time.monotonic())))
+
+
+@contextlib.contextmanager
+def controller_admission(path, deadline, *, capacity=24):
+    """Bound CCC connections across processes; kernel releases crash leases.
+
+    cmux has 32 active connection workers. Leave eight for other clients.
+    This is admission before connect/write, not permission to retry any input.
+    """
+    if not path:
+        yield
+        return
+    endpoint = os.stat(path)
+    if not stat.S_ISSOCK(endpoint.st_mode):
+        raise CmuxError('controller endpoint is not a socket')
+    root = Path('/tmp') / f'ccc-cmux-admission-{os.getuid()}'
+    root.mkdir(mode=0o700, exist_ok=True)
+    info = root.lstat()
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077):
+        raise CmuxError('controller admission directory is not private')
+    key = hashlib.sha256(f'{endpoint.st_dev}:{endpoint.st_ino}'.encode()).hexdigest()[:24]
+    first = (os.getpid() + threading.get_ident()) % capacity
+    while time.monotonic() < deadline:
+        for offset in range(capacity):
+            entry = root / f'{key}-{(first + offset) % capacity}.lock'
+            fd = os.open(entry, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+            try:
+                current = os.fstat(fd)
+                if (not stat.S_ISREG(current.st_mode) or current.st_uid != os.getuid()
+                        or current.st_mode & 0o077 or current.st_nlink != 1):
+                    raise CmuxError('controller admission lease is not private')
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    continue
+                try:
+                    latest = os.stat(path)
+                    if (latest.st_dev, latest.st_ino) != (endpoint.st_dev, endpoint.st_ino):
+                        raise CmuxError('controller endpoint changed during admission')
+                    if time.monotonic() >= deadline:
+                        raise InputNotSentError('controller admission deadline exceeded before request')
+                    yield
+                    return
+                finally:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+        time.sleep(min(.002, max(0, deadline-time.monotonic())))
+    raise InputNotSentError('controller admission deadline exceeded before request')
+
+
 class CmuxViewportSocket:
     """Read-only v2 viewport transport, discovered by the configured CLI.
 
@@ -3470,10 +3573,28 @@ class CmuxViewportSocket:
 
     MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 
-    def __init__(self):
+    def __init__(self, *, max_connections=16):
         self.path: str | None = None
         self.retry_at = 0.0
         self.control_methods: frozenset[str] = frozenset()
+        self._connection_slots = threading.BoundedSemaphore(max_connections) if max_connections else None
+        self._connection_local = threading.local()
+
+    @contextlib.contextmanager
+    def connection_window(self, timeout):
+        started = time.monotonic()
+        slots = self._connection_slots
+        if slots is not None and not slots.acquire(timeout=max(0, timeout)):
+            raise InputNotSentError("local controller connection deadline exceeded before request")
+        try:
+            with controller_admission(self.path, started + timeout):
+                remaining = timeout - (time.monotonic() - started)
+                if remaining <= 0:
+                    raise InputNotSentError("local controller connection deadline exceeded before request")
+                yield remaining
+        finally:
+            if slots is not None:
+                slots.release()
 
     def configure(self, capabilities: Mapping[str, Any]) -> None:
         path = capabilities.get("socket_path")
@@ -3484,17 +3605,29 @@ class CmuxViewportSocket:
             self.path, self.retry_at = path, 0.0
             if capabilities.get("access_mode") == "automation":
                 self.control_methods = frozenset(capabilities.get("methods", ())) & {
-                    "system.tree", "system.top", "surface.send_text", "surface.send_key",
+                    "system.tree", "system.top", "surface.send_text", "surface.send_key", "surface.create", "terminal.paste",
                 }
 
     def request(self, method: str, params: Mapping[str, Any], *, timeout: float) -> Mapping[str, Any] | None:
+        if getattr(self._connection_local, 'read_rpc', None) is not None:
+            return self._request(method, params, timeout=timeout)
+        with self.connection_window(timeout) as remaining:
+            return self._request(method, params, timeout=remaining)
+
+    def _request(self, method: str, params: Mapping[str, Any], *, timeout: float) -> Mapping[str, Any] | None:
         if method not in {"surface.read_text", "terminal.replay"}:
             raise ValueError("viewport transport only permits read methods")
         if not params.get("workspace_id") or not params.get("surface_id"):
             raise ValueError("viewport transport requires explicit workspace and surface UUIDs")
+        live_screen = (params.get("anchor") == "screen"
+                       and type(params.get("max_scrollback_rows")) is int
+                       and params["max_scrollback_rows"] == 0)
         if (method == "surface.read_text" and params.get("scrollback") is not False
-                or method == "terminal.replay" and params.get("anchor") != "viewport"):
+                or method == "terminal.replay" and params.get("anchor") != "viewport" and not live_screen):
             raise ValueError("viewport transport must not request history")
+        borrowed = getattr(self._connection_local, 'read_rpc', None)
+        if borrowed is not None:
+            return borrowed(method, params)
         path = self.path
         if path is None or time.monotonic() < self.retry_at:
             return None
@@ -3508,7 +3641,7 @@ class CmuxViewportSocket:
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
                 connection.settimeout(remaining())
-                connection.connect(path)
+                _connect_local_socket(connection, path, remaining)
                 connection.settimeout(remaining())
                 connection.sendall((json.dumps({"id": request_id, "method": method, "params": params}) + "\n").encode())
                 data = bytearray()
@@ -3544,6 +3677,23 @@ class CmuxViewportSocket:
 
 
 class CmuxClient:
+    _input_guard_local = threading.local()
+
+    @contextlib.contextmanager
+    def input_guard(self, check):
+        guards = getattr(self._input_guard_local, 'guards', None)
+        if guards is None:
+            guards = self._input_guard_local.guards = {}
+        previous = guards.get(id(self))
+        guards[id(self)] = check
+        try:
+            yield
+        finally:
+            if previous is None:
+                guards.pop(id(self), None)
+            else:
+                guards[id(self)] = previous
+
     def __init__(self, binary: str = DEFAULT_CMUX, runner: Any = subprocess.run,
                  *, viewport_socket: CmuxViewportSocket | None = None):
         self.binary = binary
@@ -3551,6 +3701,16 @@ class CmuxClient:
         self.viewport_socket = viewport_socket
 
     def _control_rpc(self, method: str, params: Mapping[str, Any], *, timeout: float = 8):
+        transport = self.viewport_socket
+        if transport is None:
+            return None
+        borrowed = getattr(transport._connection_local, 'read_rpc', None)
+        if borrowed is not None and method in {'system.tree', 'system.top'}:
+            return borrowed(method, params)
+        with transport.connection_window(timeout) as remaining:
+            return self._control_rpc_once(method, params, timeout=remaining)
+
+    def _control_rpc_once(self, method: str, params: Mapping[str, Any], *, timeout: float = 8):
         """Use the advertised endpoint without CLI selector-resolution RPCs.
 
         Input has one attempt and no transport fallback. A missing or malformed
@@ -3560,9 +3720,17 @@ class CmuxClient:
         if (transport is None or not transport.path
                 or method not in getattr(transport, "control_methods", ())):
             return None
-        is_input = method in {"surface.send_text", "surface.send_key"}
+        is_input = method in {"surface.send_text", "surface.send_key", "terminal.paste"}
+        is_create = method == "surface.create"
         if is_input and (not params.get("workspace_id") or not params.get("surface_id")):
             raise ValueError("input requires explicit workspace and surface UUIDs")
+        if method == "terminal.paste" and any(
+                not isinstance(params.get(key), str)
+                or str(uuid.UUID(params[key])).lower() != params[key].lower()
+                for key in ("workspace_id", "surface_id")):
+            raise ValueError("paste requires explicit canonical workspace and surface UUIDs")
+        if is_create and not all(params.get(key) for key in ("window_id", "workspace_id", "pane_id")):
+            raise ValueError("creation requires explicit window, workspace and pane UUIDs")
         request_id = uuid.uuid4().hex
         deadline, attempted = time.monotonic() + timeout, False
         def remaining():
@@ -3573,7 +3741,46 @@ class CmuxClient:
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
                 connection.settimeout(remaining())
-                connection.connect(transport.path)
+                _connect_local_socket(connection, transport.path, remaining)
+                connection.settimeout(remaining())
+                if is_input or is_create:
+                    check = getattr(self._input_guard_local, 'guards', {}).get(id(self))
+                    if check is not None:
+                        def read_rpc(read_method, read_params):
+                            if read_method not in {'system.tree', 'system.top', 'terminal.replay', 'surface.read_text'}:
+                                raise CmuxError('connected guard only permits read RPC')
+                            rid = uuid.uuid4().hex
+                            connection.settimeout(remaining())
+                            connection.sendall((json.dumps({'id': rid, 'method': read_method,
+                                'params': read_params}) + '\n').encode())
+                            response = bytearray()
+                            while b'\n' not in response:
+                                connection.settimeout(remaining())
+                                chunk = connection.recv(min(65536, transport.MAX_RESPONSE_BYTES + 1 - len(response)))
+                                if not chunk:
+                                    raise CmuxError('connected guard response incomplete')
+                                response.extend(chunk)
+                                if len(response) > transport.MAX_RESPONSE_BYTES:
+                                    raise CmuxError('connected guard response oversized')
+                            reply = json.loads(response.split(b'\n', 1)[0])
+                            if (not isinstance(reply, Mapping) or reply.get('id') != rid
+                                    or reply.get('ok') is not True or not isinstance(reply.get('result'), Mapping)):
+                                raise CmuxError('connected guard response invalid')
+                            value = reply['result']
+                            if read_method in {'terminal.replay', 'surface.read_text'}:
+                                if any(value.get(k) != read_params.get(k) for k in ('workspace_id', 'surface_id')):
+                                    raise CmuxError('connected guard identity mismatch')
+                            elif not isinstance(value.get('windows'), list):
+                                raise CmuxError('connected guard topology missing')
+                            if read_method == 'system.top' and value.get('include_processes') is not True:
+                                raise CmuxError('connected guard process evidence missing')
+                            return value
+                        transport._connection_local.read_rpc = read_rpc
+                        try:
+                            if not check():
+                                raise InputNotSentError('input authorization changed after controller admission')
+                        finally:
+                            transport._connection_local.read_rpc = None
                 connection.settimeout(remaining())
                 attempted = True
                 connection.sendall((json.dumps({"id": request_id, "method": method, "params": params}) + "\n").encode())
@@ -3593,15 +3800,29 @@ class CmuxClient:
             result = reply["result"]
             if is_input:
                 for key in ("workspace_id", "surface_id"):
+                    if method == "terminal.paste" and result.get(key) != params[key]:
+                        raise ValueError("paste acknowledgement identity missing or changed")
                     if key in result and result[key] != params[key]:
                         raise ValueError("control acknowledgement identity mismatch")
+                if method == "terminal.paste" and (("delivery" in result and result["delivery"] not in {"delivered", "queued"})
+                        or result.get("submitted") is not True or result.get("submit_error")):
+                    raise ValueError("paste accepted without confirmed submit; no replay permitted")
+            elif is_create:
+                sid = result.get("surface_id")
+                if not isinstance(sid, str) or str(uuid.UUID(sid)).lower() != sid.lower():
+                    raise ValueError("create acknowledgement missing surface UUID")
+                if result.get("workspace_id") != params["workspace_id"] or result.get("dock_surface_id"):
+                    raise ValueError("create acknowledgement workspace mismatch")
+                for key in ("window_id", "pane_id"):
+                    if key in result and result[key] != params[key]:
+                        raise ValueError("create acknowledgement placement mismatch")
             elif not isinstance(result.get("windows"), list):
                 raise ValueError("control snapshot missing windows")
             if method == "system.top" and result.get("include_processes") is not True:
                 raise ValueError("control snapshot omitted requested processes")
             return result
         except (OSError, ValueError) as exc:
-            if is_input and attempted:
+            if (is_input or is_create) and attempted:
                 raise UncertainDeliveryError(f"{method} acknowledgement uncertain: {exc}") from exc
             raise CmuxError(f"{method} control request failed: {exc}") from exc
 
@@ -3716,11 +3937,26 @@ class CmuxClient:
             raise CmuxError("new Dock surface response missing dock_surface_id")
         return surface_id
 
-    def new_codex_surface(self, window_id: str, workspace_id: str, pane_id: str, command: str) -> str:
+    def new_codex_surface(self, window_id: str, workspace_id: str, pane_id: str, command: str,
+                          *, clean_shell: bool = False) -> str:
         if not all((window_id, workspace_id, pane_id, command)):
             raise CmuxError("batch creation requires a pinned window, workspace and pane")
         # The startup command registers this exact new tab, then starts an
         # empty Codex. First-prompt delivery has its own durable guard.
+        params = {
+            "window_id": window_id, "workspace_id": workspace_id, "pane_id": pane_id,
+            "type": "terminal", "placement": "workspace", "focus": False,
+            "initial_input": command + "\r",
+        }
+        if clean_shell:
+            # Keep an interactive parent after Codex exits, without rerunning
+            # user login/plugin setup for every explicitly isolated native tab.
+            params['initial_command'] = '/bin/zsh -f -i'
+        value = self._control_rpc("surface.create", params)
+        if value is not None:
+            return value["surface_id"]
+        if clean_shell:
+            raise CmuxError('clean native shell requires advertised surface.create; no CLI fallback')
         result = self._run(["--json", "--id-format", "both", "new-surface",
             "--type", "terminal", "--placement", "workspace", "--window", window_id,
             "--workspace", workspace_id, "--pane", pane_id, "--focus", "false", "--command", command])
@@ -3835,7 +4071,8 @@ class CmuxClient:
         also retain that prefilter so Working/menu/Claude routing stays intact.
         Identity errors and timeouts from replay must not fall back to text.
         """
-        if not structured or self.viewport_socket is None or self.viewport_socket.path is None:
+        live = bool(getattr(self.viewport_socket, "live_native_frames", False))
+        if (not structured and not live) or self.viewport_socket is None or self.viewport_socket.path is None:
             return self.read_screen(workspace_id, surface_id), None
         payload = self.replay(workspace_id, surface_id)
         try:
@@ -3845,10 +4082,16 @@ class CmuxClient:
         self.last_viewport_source = "terminal.replay"
         return "\n".join(grid.lines), grid
 
-    def replay(self, workspace_id: str, surface_id: str) -> Mapping[str, Any]:
+    def replay(self, workspace_id: str, surface_id: str, *, live: bool | None = None) -> Mapping[str, Any]:
         if not workspace_id or not surface_id:
             raise IncompatibleError("terminal.replay requires workspace_id and surface_id")
         params = {"workspace_id": workspace_id, "surface_id": surface_id, "anchor": "viewport"}
+        if live is None:
+            live = bool(getattr(self.viewport_socket, "live_native_frames", False))
+        if live:
+            # Native lanes follow the live terminal, not the user's scrollback
+            # viewport. No history rows are needed to prove its current input.
+            params.update(anchor="screen", max_scrollback_rows=0)
         value = (self.viewport_socket.request("terminal.replay", params, timeout=12)
                  if self.viewport_socket is not None else None)
         if value is None:
@@ -3870,7 +4113,21 @@ class CmuxClient:
                 render_grid = render_grid.get("result", render_grid)
                 if isinstance(render_grid, Mapping) and render_grid.get("surface_id") and render_grid["surface_id"] != surface_id:
                     raise IncompatibleError("render grid surface identity mismatch")
+                if live and (not isinstance(render_grid, Mapping) or render_grid.get("anchor") != "screen"):
+                    raise IncompatibleError("native live frame did not confirm screen anchoring")
         return value
+
+    def workspace_tree(self, workspace_id: str) -> Mapping[str, Any]:
+        transport = getattr(self, 'viewport_socket', None)
+        if transport is None or 'system.tree' not in transport.control_methods:
+            return self.tree()
+        tree = self._control_rpc('system.tree', {'workspace_id': workspace_id, 'all_windows': True})
+        if not isinstance(tree, Mapping):
+            raise IncompatibleError('workspace tree unavailable')
+        workspaces = [w for win in tree.get('windows', []) for w in win.get('workspaces', [])]
+        if len(workspaces) != 1 or workspaces[0].get('id') != workspace_id:
+            raise IncompatibleError('workspace tree scope mismatch')
+        return tree
 
     def terminal_diagnostics(self) -> Mapping[str, Any]:
         result = self._run(["--json", "rpc", "debug.terminals", "{}"], timeout=8)
@@ -3883,14 +4140,10 @@ class CmuxClient:
         return value
 
     def send(self, workspace_id: str, surface_id: str, message: str) -> None:
-        # Keep the newline in the argv value. cmux maps it to Enter without
-        # requiring focus or a separate send-key operation.
-        self._reject_unapproved_command(message)
-        if self._control_rpc("surface.send_text", {
-            "workspace_id": workspace_id, "surface_id": surface_id, "text": f"{message}\n",
-        }) is not None:
-            return
-        self._run(["send", "--workspace", workspace_id, "--surface", surface_id, f"{message}\n"], timeout=8)
+        # Bracket-paste treats both LF and CR inside text as draft content in
+        # current Codex. Submission is an explicit ordered key, not text.
+        self.send_text(workspace_id, surface_id, message)
+        self.send_key(workspace_id, surface_id, "enter")
 
     def send_text(self, workspace_id: str, surface_id: str, message: str) -> None:
         """Write text only; do not rely on a newline being interpreted as Enter."""
@@ -3898,6 +4151,10 @@ class CmuxClient:
         if not workspace_id or not surface_id:
             raise CmuxError("send_text requires explicit workspace and surface UUIDs")
         self._reject_unapproved_command(message)
+        if self._control_rpc("surface.send_text", {
+            "workspace_id": workspace_id, "surface_id": surface_id, "text": message,
+        }) is not None:
+            return
         self._run(["send", "--workspace", workspace_id, "--surface", surface_id, message], timeout=8)
 
     def resume_codex_goal(self, workspace_id: str, surface_id: str) -> None:
@@ -3949,6 +4206,10 @@ class CmuxClient:
             raise CmuxError("send_key requires explicit workspace and surface UUIDs")
         if key != "enter":
             raise RuntimeError(f"Claude submit only permits Enter, got {key!r}")
+        if self._control_rpc("surface.send_key", {
+            "workspace_id": workspace_id, "surface_id": surface_id, "key": key,
+        }) is not None:
+            return
         self._run([
             "send-key", "--workspace", workspace_id, "--surface", surface_id, key,
         ], timeout=8)
@@ -3966,6 +4227,10 @@ class CmuxClient:
         """Use Codex's displayed Alt+Up binding; caller verifies queue and draft."""
         if not workspace_id or not surface_id:
             raise CmuxError("queued edit requires explicit workspace and surface UUIDs")
+        if self._control_rpc("surface.send_key", {
+            "workspace_id": workspace_id, "surface_id": surface_id, "key": "alt+up",
+        }) is not None:
+            return
         self._run(["send-key", "--workspace", workspace_id, "--surface", surface_id, "alt+up"], timeout=8)
 
     @staticmethod
@@ -4137,6 +4402,11 @@ def main_surface_records(
 
 
 def find_main_surface(tree: Mapping[str, Any], selector: str) -> dict[str, str]:
+    if isinstance(tree, TreeSnapshot):
+        record = tree.main_surfaces.get(selector)
+        if record is not None:
+            return dict(record)
+        raise CmuxError(f"main-area surface not found: {selector}")
     for record in main_surface_records(tree):
         if selector in {record["surface_id"], record["ref"]} or record["ref"] == f"surface:{selector}":
             return record
@@ -4180,6 +4450,8 @@ def dock_surface_records(tree: Mapping[str, Any]) -> list[dict[str, str]]:
 
 
 def is_dock_surface(tree: Mapping[str, Any], surface_id: str) -> bool:
+    if isinstance(tree, TreeSnapshot):
+        return surface_id in tree.dock_surface_ids
     return any(record["surface_id"] == surface_id for record in dock_surface_records(tree))
 
 
@@ -4887,18 +5159,33 @@ class ObservationPolicy:
     """
 
     def __init__(self, config):
+        self.config = config
+        self.target_list = config.get("targets", [])
+        self.rule_list = config.get("workspace_rules", [])
+        self.target_count, self.rule_count = len(self.target_list), len(self.rule_list)
+        self.target_records = {}
+        self.rule_records = {}
+        for target in self.target_list:
+            self.target_records.setdefault(str(target.get("surface_id") or ""), target)
+        for rule in self.rule_list:
+            self.rule_records.setdefault(str(rule.get("workspace_id") or ""), []).append(rule)
         self.common = json.dumps({k: v for k, v in config.items()
                                   if k not in {"targets", "workspace_rules", "schema_version"}},
                                  sort_keys=True, separators=(",", ":"))
         self.targets = {str(t["surface_id"]): json.dumps(t, sort_keys=True, separators=(",", ":"))
                         for t in config.get("targets", [])}
         self.rules = {}
+        self.access = {}
         for rule in config.get("workspace_rules", []):
             excluded = frozenset(rule.get("excluded_surface_ids", []))
             held = frozenset(sid for sid in set(rule.get("batch_start_holds", {})) | set(excluded)
                              if batch_start_hold(rule, sid))
             self.rules[str(rule.get("workspace_id"))] = (
                 rule.get("enabled", True), rule.get("paused", False), excluded, held)
+            bindings = rule.get("access_check_slots", {})
+            for sid, binding in (bindings.items() if isinstance(bindings, Mapping) else ()):
+                self.access[(str(rule.get("workspace_id")), str(sid))] = json.dumps(
+                    binding, sort_keys=True, separators=(",", ":"))
         self.panes = frozenset((t.get("workspace_id"), t.get("pane_id")) for t in config.get("targets", [])
                                if t.get("enabled", True) and not t.get("paused", False))
 
@@ -4907,7 +5194,7 @@ class ObservationPolicy:
         rule = self.rules.get(wid)
         own_rule = (rule[0], rule[1], sid in rule[2], sid in rule[3]) if rule else None
         pane = (wid, target.get("pane_id")) in self.panes if target.get("source") == "pane_follow" else None
-        return self.common, self.targets.get(sid), own_rule, pane
+        return self.common, self.targets.get(sid), own_rule, pane, self.access.get((wid, sid))
 
 
 class WatchDaemon:
@@ -4920,6 +5207,7 @@ class WatchDaemon:
     ):
         self.config_path = config_path
         self.state_path = state_path
+        self._delivery_store = DeliveryStore(config_path.parent / "codex-delivery")
         self.config_store = ConfigStore(config_path)
         native_home = Path.home() if config_path == DEFAULT_CONFIG_PATH else config_path.parent
         self.codex_queue_recovery = QueueRecovery(
@@ -4959,13 +5247,17 @@ class WatchDaemon:
         self._targets_lock = threading.RLock()
         self._process_cache_lock = threading.RLock()
         self._config_reload_lock = threading.RLock()
+        self._guard_path_generation = None
+        self._guard_root_path = None
+        self._guard_stop_paths = {}
         self._process_snapshots = SnapshotCache(workers=MAINTENANCE_WORKERS)
-        self._native_process_index = NativeProcessIndex()
+        self._native_process_index = NativeProcessIndex(interval=IMMEDIATE_DISCOVERY_SEC)
         from ccc_inventory import SharedInventory
         self._shared_inventory = SharedInventory(config_path.parent, owner=True)
         self.codex_queue_recovery.process_lookup = lambda target: self._candidate_process_label(target, self._observation_client())
         self._viewport_socket = CmuxViewportSocket()
         self._scheduler: SurfaceScheduler | None = None
+        self._native_dispatch = None
         self._discovery_future: Any = None
         self._observation_metadata: dict[str, Any] = {}
         self._metadata_lock = threading.Lock()
@@ -4979,6 +5271,7 @@ class WatchDaemon:
         self._process_inspection_cache: dict[int, tuple[float, dict[str, Any]]] = {}
         self._event_worker_pool: ClaudeEventWorkerPool | None = None
         self._diagnostics_pool: ThreadPoolExecutor | None = None
+        self._discovery_pool: ThreadPoolExecutor | None = None
         self._diagnostics_future: Any = None
         self._diagnostics_next_at = 0.0
         self._registration_futures: dict[str, Any] = {}
@@ -5295,8 +5588,10 @@ class WatchDaemon:
     def _load_runtime(self) -> dict[str, TargetRuntime]:
         value = load_json(self.state_path, {})
         if not isinstance(value, Mapping):
-            return {}
-        return {str(key): TargetRuntime.from_dict(item) for key, item in value.items() if isinstance(item, Mapping)}
+            value = {}
+        runtimes = {str(key): TargetRuntime.from_dict(item) for key, item in value.items() if isinstance(item, Mapping)}
+        self._delivery_store.restore(runtimes, TargetRuntime)
+        return runtimes
 
     def _config_mtime(self) -> int | None:
         return self.config_store.mtime_ns()
@@ -5451,13 +5746,11 @@ class WatchDaemon:
             return self._observation_client() if self._scheduler is not None else (
                 self.client or CmuxClient(str(self.config.get("cmux_path", DEFAULT_CMUX))))
         def occupied():
-            return (len(self._registration_futures) + int(self._diagnostics_future is not None)
-                    + int(self._discovery_future is not None))
+            return len(self._registration_futures) + int(self._diagnostics_future is not None)
         if (self._scheduler is not None and self._discovery_future is None
-                and occupied() < MAINTENANCE_WORKERS
                 and time.monotonic() - self._last_workspace_discovery_at >=
-                float(self.config.get("workspace_discovery_interval_sec", 5))):
-            self._discovery_future = pool.submit(self._refresh_dynamic_targets, client())
+                min(IMMEDIATE_DISCOVERY_SEC, float(self.config.get("workspace_discovery_interval_sec", 5)))):
+            self._discovery_future = (self._discovery_pool or pool).submit(self._refresh_dynamic_targets, client())
         if (self._diagnostics_future is None and now >= self._diagnostics_next_at
                 and occupied() < MAINTENANCE_WORKERS):
             self._diagnostics_future = pool.submit(self._refresh_observation_health, client())
@@ -5612,8 +5905,7 @@ class WatchDaemon:
                         targets, state, now=now, poll_interval=float(config.get("poll_interval_sec", 1)),
                         observations=rows),
                     "claude_hook_coverage": hooks, "hook_coverage_at": metadata_at,
-                    "scheduler": {**self._scheduler.snapshot(), "thread_switch_interval_sec": sys.getswitchinterval()}
-                    if self._scheduler else {}}
+                    "scheduler": self._scheduler_metrics()}
         atomic_write_json(self.observation_health_path, snapshot)
 
     def _registration_events(self) -> list[dict[str, Any]]:
@@ -6211,6 +6503,19 @@ class WatchDaemon:
         else:
             self._save_now()
 
+    def _save_delivery(self, surface_id, runtime, codex, *, wait=True):
+        if not codex:
+            return self.save(wait=wait)
+        # Only this input record must reach disk before this surface proceeds.
+        # A full-fleet JSON snapshot is for observers, never a send barrier.
+        self._delivery_store.persist(surface_id, runtime)
+        if self._state_writer is None:
+            # Synchronous compatibility callers have no publishing heartbeat.
+            self.save(wait=False)
+        # The production loop publishes the full snapshot once per second.
+        # Re-requesting it on every input spends O(fleet) CPU at O(inputs)
+        # frequency even with an asynchronous coalescing writer.
+
     def _save_now(self) -> None:
         with self._state_save_lock:
             state_serialized = self._serialize_state()
@@ -6233,20 +6538,66 @@ class WatchDaemon:
     def _start_scheduler(self) -> SurfaceScheduler:
         self._scheduler = SurfaceScheduler(
             self._scheduled_observe, self._scheduled_send,
-            interval=float(self.config.get("poll_interval_sec", 1)),
-            observe_workers=int(self.config.get("observe_workers", OBSERVE_WORKERS)),
-            send_workers=int(self.config.get("send_workers", SEND_WORKERS)),
+            interval=min(IMMEDIATE_SCAN_SEC, float(self.config.get("poll_interval_sec", 1))),
+            observe_workers=max(IMMEDIATE_WORKERS, int(self.config.get("observe_workers", OBSERVE_WORKERS))),
+            send_workers=max(IMMEDIATE_WORKERS, int(self.config.get("send_workers", SEND_WORKERS))),
+            event_workers=NATIVE_EVENT_WORKERS,
+            event_handler=self._scheduled_native, supersede_reads=True,
             on_dispatch=self._record_dispatch, on_error=self._scheduled_error,
         )
         return self._scheduler
 
+    def _scheduling_targets(self):
+        """Reuse one immutable effective-target publication between discoveries."""
+        while True:
+            with self._targets_lock:
+                config, dynamic, policy = self.config, self.dynamic_targets, self._observation_policy
+                cached = getattr(self, "_scheduling_publication", None)
+                if (cached is not None and cached[0] is config and cached[1] is dynamic
+                        and cached[2] is policy):
+                    return cached[3], cached[4]
+            # Merging a large native publication cannot hold the live target
+            # authorization lock. Publish only if the source references match.
+            targets = effective_targets(config, list(dynamic.values()))
+            with self._targets_lock:
+                if (config is not self.config or dynamic is not self.dynamic_targets
+                        or policy is not self._observation_policy):
+                    continue
+                token = object()
+                self._scheduling_publication = (config, dynamic, policy, targets, token)
+                return targets, token
+
     def _native_wakeup_sources(self):
-        with self._targets_lock:
-            config, dynamic = self.config, list(self.dynamic_targets.values())
-        targets = effective_targets(config, dynamic)
+        targets, _ = self._scheduling_targets()
+        if self._native_dispatch is not None:
+            targets = [t for t in targets if not self._native_dispatch.owns(t["surface_id"])]
+        if not targets:
+            return []
         return self.codex_queue_recovery.wakeup_sources(targets)
 
+    def _scheduler_metrics(self):
+        if self._scheduler is None:
+            return {}
+        result = self._scheduler.snapshot()
+        if self._native_dispatch is not None:
+            for key, value in self._native_dispatch.metrics().items():
+                result[key] = result.get(key, 0) + value
+        result["thread_switch_interval_sec"] = sys.getswitchinterval()
+        return result
+
+    def _native_failed(self, sid, wid, session, turn, at):
+        if self._native_dispatch is not None and self._native_dispatch.owns(sid):
+            return
+        if not isinstance(at, (int, float)) or at <= 0:
+            return
+        with self._runtime_lock:
+            runtime = self.runtime.setdefault(sid, TargetRuntime())
+        runtime.native_failure_at = at
+        runtime.native_failure_turn_key = f"{session}:{turn}:{at}"
+
     def _native_retry_needed(self, sid, wid, failed_at):
+        if self._native_dispatch is not None and self._native_dispatch.owns(sid):
+            return False
         if self.config.get("global_paused") or self.config.get("mode") != "armed":
             return False
         target = self._event_target(sid)
@@ -6270,7 +6621,7 @@ class WatchDaemon:
         if phase == "observe":
             runtime.scheduler_lag_ms = round(delay * 1000, 3)
             runtime.observation_started_at = time.time()
-            interval = float(self.config.get("poll_interval_sec", 1))
+            interval = min(IMMEDIATE_SCAN_SEC, float(self.config.get("poll_interval_sec", 1)))
             cadence = self._scheduler.observation_interval if self._scheduler else None
             runtime.observation_cadence_sec = cadence(target, interval) if cadence else interval
         else:
@@ -6300,7 +6651,7 @@ class WatchDaemon:
                 target, self._observation_client(), None, "",
                 defer_send=True,
                 is_current=lambda: is_current() and policy_key == self._observation_policy.key(target),
-                authorization_current=lambda: generation == self._config_mtime_ns,
+                authorization_current=lambda: generation == self._config_mtime(),
             )
         finally:
             now = time.time()
@@ -6308,43 +6659,73 @@ class WatchDaemon:
             runtime.observation_completed_at = now
             runtime.observation_interval_ms = round(max(0, now - previous) * 1000, 3) if previous else 0
 
+    def _scheduled_native(self, target, is_current):
+        """One current observation and input transaction for a native failure.
+
+        A superseded periodic read may finish, but its generation has no input
+        authority. The per-surface lock still serializes every actual input.
+        """
+        sid = str(target["surface_id"])
+        policy_key = self._observation_policy.key(target)
+        current = lambda: is_current() and policy_key == self._observation_policy.key(target)
+        with self._surface_lock(sid):
+            active = self._active_send_target(target, current)
+            if active is None:
+                return
+            client = self._observation_client()
+            with self._runtime_lock:
+                runtime = self.runtime.setdefault(sid, TargetRuntime())
+            generation = self._config_mtime_ns
+            started = time.monotonic()
+            try:
+                tree = client.tree()
+                if not current():
+                    return
+                self._process_one_target(active, client, tree, "", is_current=current,
+                    authorization_current=lambda: generation == self._config_mtime())
+            finally:
+                runtime.read_duration_ms = round((time.monotonic() - started) * 1000, 3)
+                runtime.observation_completed_at = time.time()
+
     def _active_send_target(self, target, is_current=None):
         if self.stop_requested or (is_current is not None and not is_current()):
             return None
-        from ccc_batch_guard import blocked
-        if blocked(self.config_path, target.get("workspace_id")):
+        if self._native_dispatch is not None and self._native_dispatch.owns(target["surface_id"]):
+            return None
+        if self._delivery_store.blocked(str(target["surface_id"])):
             return None
         self._reload_config_if_changed()
+        if self._workspace_stop_marked(target.get("workspace_id")):
+            return None
+        policy = self._target_policy()
         current = self._event_target(str(target["surface_id"]))
         if (current is None or not current.get("enabled", True) or current.get("paused", False)
                 or str(current.get("workspace_id")) != str(target.get("workspace_id"))
                 or str(target["surface_id"]) in self._local_paused_surface_ids):
             return None
         from ccc_access_service import continuation_allowed
-        if not continuation_allowed(self.config_path, self.config, current):
+        rules = policy.rule_records.get(str(current.get("workspace_id")), ())
+        if not continuation_allowed(self.config_path, {"workspace_rules": rules}, current):
             return None
         sid = str(target["surface_id"])
         if sid == str(self.config.get("manager_surface_id") or ""):
             return None
         if any(r.get("workspace_id") == current.get("workspace_id") and batch_start_hold(r, sid)
-               for r in self.config.get("workspace_rules", [])):
+               for r in rules):
             return None
-        explicit = any(str(t.get("surface_id")) == sid for t in self.config.get("targets", []))
+        explicit = sid in policy.target_records
         if not explicit:
             if any(str(r.get("workspace_id")) == str(current.get("workspace_id"))
                    and sid in r.get("excluded_surface_ids", [])
-                   for r in self.config.get("workspace_rules", [])):
+                   for r in rules):
                 return None
             if current.get("source") == "workspace_rule":
                 allowed = any(r.get("enabled", True)
                               and str(r.get("workspace_id")) == str(current.get("source_workspace_id"))
                               and sid not in r.get("excluded_surface_ids", [])
-                              for r in self.config.get("workspace_rules", []))
+                              for r in policy.rule_records.get(str(current.get("source_workspace_id")), ()))
             elif current.get("source") == "pane_follow":
-                allowed = any(t.get("enabled", True) and not t.get("paused", False)
-                              and t.get("pane_id") == current.get("pane_id")
-                              and t.get("workspace_id") == current.get("workspace_id")
-                              for t in self.config.get("targets", []))
+                allowed = (current.get("workspace_id"), current.get("pane_id")) in policy.panes
             else:
                 allowed = False
             if not allowed:
@@ -6354,9 +6735,9 @@ class WatchDaemon:
     def _scheduled_send(self, target, candidate, is_current):
         sid = str(target["surface_id"])
         client = self._observation_client()
-        generation = self._config_mtime_ns
+        generation = self._observation_policy.key(target)
         scheduler_current = is_current
-        is_current = lambda: scheduler_current() and generation == self._config_mtime_ns
+        is_current = lambda: scheduler_current() and generation == self._observation_policy.key(target)
         # A waiting candidate is not input authorization. Re-read only when a
         # send slot is available, then check registration again at the boundary.
         with self._surface_lock(sid):
@@ -6426,14 +6807,18 @@ class WatchDaemon:
         )
         self._event_worker_pool.start()
         self._diagnostics_pool = ThreadPoolExecutor(max_workers=MAINTENANCE_WORKERS, thread_name_prefix="ccc-maintenance")
+        self._discovery_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ccc-discovery")
         self._state_writer = CoalescingWriter(
             self._save_now, on_error=lambda exc: self.logger.error("state persistence failed: %s", exc))
         self._health_writer = CoalescingWriter(
             self._publish_runtime_health, name="ccc-health", delay=0,
             on_error=lambda exc: self.logger.error("health publication failed: %s", exc))
+        self._delivery_store.start()
         scheduler = self._start_scheduler()
         native_wakeup = NativeCompletionWatcher(self._native_wakeup_sources, scheduler.request_observation,
-                                                retry_needed=self._native_retry_needed)
+                                                interval=0.05, retry_interval=0.1,
+                                                retry_needed=self._native_retry_needed,
+                                                on_failure=self._native_failed)
         scheduler.observation_interval = native_wakeup.observation_interval
         self._native_process_index.start()
         native_wakeup.start()
@@ -6463,6 +6848,9 @@ class WatchDaemon:
                         if self.client is None:
                             self._viewport_socket.configure(capabilities)
                         capabilities_ok = True
+                        if sys.version_info >= (3, 14) and capabilities.get("access_mode") == "automation":
+                            from ccc_native_lanes import NativeDispatcher
+                            self._native_dispatch = NativeDispatcher(self, capabilities)
                     except (CmuxError, IncompatibleError) as exc:
                         self.logger.error("incompatible cmux: %s", exc)
                         self._mark_global_incompatible(TargetRuntime(), str(exc))
@@ -6473,12 +6861,13 @@ class WatchDaemon:
                 if self.client is None:
                     self._shared_inventory.heartbeat()
                 self._schedule_diagnostics()
-                with self._targets_lock:
-                    config, dynamic = self.config, list(self.dynamic_targets.values())
-                targets = effective_targets(config, dynamic)
+                targets, publication = self._scheduling_targets()
+                if self._native_dispatch is not None:
+                    self._native_dispatch.refresh(targets)
+                    targets, publication = self._native_dispatch.filter(targets, publication)
                 scheduler.tick(
-                    targets, generation=self._observation_policy.key,
-                    interval=float(self.config.get("poll_interval_sec", 1)),
+                    targets, generation=self._observation_policy.key, publication=publication,
+                    interval=min(IMMEDIATE_SCAN_SEC, float(self.config.get("poll_interval_sec", 1))),
                 )
                 now = time.monotonic()
                 if now - last_publish >= observation_health.HEALTH_PUBLISH_INTERVAL_SEC:
@@ -6492,9 +6881,13 @@ class WatchDaemon:
             batch_reconciler.close()
             native_wakeup.close()
             self._native_process_index.close()
+            if self._native_dispatch is not None:
+                self._native_dispatch.close()
             scheduler.close()
             if self._diagnostics_pool is not None:
                 self._diagnostics_pool.shutdown(wait=True, cancel_futures=True)
+            if self._discovery_pool is not None:
+                self._discovery_pool.shutdown(wait=True, cancel_futures=True)
             if self._event_worker_pool is not None:
                 self._event_worker_pool.close()
             self.claude_event_inbox.close()
@@ -6503,6 +6896,7 @@ class WatchDaemon:
             self._health_writer = None
             self._state_writer.close()
             self._state_writer = None
+            self._delivery_store.close()
             self.save()
 
     def _observation_due(self, runtime: TargetRuntime, now: float) -> bool:
@@ -6544,6 +6938,77 @@ class WatchDaemon:
             self._process_one_target(target, client, send_guard_tree, send_guard_error)
         self.save()
 
+    def _argv_startup_observation_held(self, target):
+        """Briefly leave a proven argv startup to its original batch worker.
+
+        This suppresses only redundant viewport reads, never discovery or
+        native events. Missing/expired evidence restores normal observation.
+        Cached job contents are invalidated by every file generation change.
+        """
+        self._reload_config_if_changed()
+        sid, wid = str(target['surface_id']), str(target['workspace_id'])
+        rule = next((r for r in self.config.get('workspace_rules', [])
+                     if r.get('workspace_id') == wid), {})
+        hold = batch_start_hold(rule, sid)
+        if not hold or hold.get('legacy') or type(hold.get('index')) is not int:
+            return False
+        try:
+            def file_stamp(file):
+                st = file.stat()
+                return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns
+            config_generation = file_stamp(self.config_path)
+            if config_generation[3] != self._config_mtime_ns:
+                return False
+            age = time.time() - float(hold['created_at'])
+            if not 0 <= age < 30:
+                return False
+            from ccc_workspace_batch import argv_initial, job_path
+            jid = str(uuid.UUID(hold['job_id']))
+            path = job_path(self.config_path, jid)
+            def stamp():
+                return file_stamp(path)
+            generation = stamp()
+            with self._runtime_lock:
+                cache = getattr(self, '_argv_observation_jobs', None)
+                if cache is None:
+                    cache = self._argv_observation_jobs = {}
+                entry = cache.get(jid)
+                if entry is None or entry[0] != generation:
+                    job = json.loads(path.read_bytes())
+                    if stamp() != generation:
+                        return False
+                    if len(cache) >= 32:
+                        cache.clear()
+                    cache[jid] = (generation, job)
+                else:
+                    job = entry[1]
+            index = hold['index']
+            if (not isinstance(job, dict) or not isinstance(job.get('slots'), list)
+                    or not 0 <= index < len(job['slots'])):
+                return False
+            slot = job['slots'][index]
+            receipt_path = path.parent / f'surface-{index}.json'
+            receipt_generation = file_stamp(receipt_path)
+            receipt = load_json(receipt_path, {})
+            if not isinstance(slot, dict) or not isinstance(receipt, dict):
+                return False
+            return (job.get('id') == jid and job.get('workspace_id') == wid
+                    and job.get('status') in {'running', 'waiting'}
+                    and rule.get('active_batch_id') == jid
+                    and argv_initial(job, self.config_path)
+                    and slot.get('index') == index and slot.get('surface_id') == sid
+                    and bool(slot.get('launch_id'))
+                    and all(receipt.get(key) == value for key, value in {
+                        'job_id': jid, 'index': index, 'surface_id': sid,
+                        'workspace_id': wid, 'launch_id': slot['launch_id']}.items())
+                    and slot.get('phase') in {'creating', 'created', 'submitted'}
+                    and stamp() == generation
+                    and file_stamp(receipt_path) == receipt_generation
+                    and file_stamp(self.config_path) == config_generation
+                    and 0 <= time.time() - float(hold['created_at']) < 30)
+        except (OSError, ValueError, TypeError, KeyError, RuntimeError):
+            return False
+
     def _process_one_target(
         self,
         target: Mapping[str, Any],
@@ -6566,6 +7031,8 @@ class WatchDaemon:
             return is_current()
 
         if not current():
+            return None
+        if self._argv_startup_observation_held(target):
             return None
         if client is None:
             client = CmuxClient(str(self.config.get("cmux_path", DEFAULT_CMUX)))
@@ -6789,18 +7256,50 @@ class WatchDaemon:
                 is_current=is_current,
             )
 
+    def _target_policy(self):
+        policy, config = self._observation_policy, self.config
+        if (policy.config is not config or policy.target_list is not config.get("targets")
+                or policy.rule_list is not config.get("workspace_rules")
+                or policy.target_count != len(config.get("targets", []))
+                or policy.rule_count != len(config.get("workspace_rules", []))):
+            # Normal publications replace the config and index together. This
+            # also handles synchronous callers replacing registration lists.
+            with self._config_reload_lock:
+                policy = self._observation_policy = ObservationPolicy(self.config)
+        return policy
+
+    def _workspace_stop_marked(self, workspace_id):
+        # Resolve the config path once per publication, not at every input
+        # guard. The STOP marker itself is always read at the live boundary.
+        generation = self._config_mtime_ns
+        if generation != self._guard_path_generation or self._guard_root_path is None:
+            with self._config_reload_lock:
+                if generation != self._guard_path_generation or self._guard_root_path is None:
+                    self._guard_root_path = self.config_path.resolve().parent / "batch-guards"
+                    self._guard_stop_paths = {}
+                    self._guard_path_generation = generation
+        key = str(workspace_id)
+        if key not in self._guard_stop_paths:
+            try:
+                self._guard_stop_paths[key] = self._guard_root_path / str(uuid.UUID(key)).upper() / "STOP.json"
+            except (ValueError, TypeError):
+                self._guard_stop_paths[key] = None
+        path = self._guard_stop_paths[key]
+        from ccc_batch_guard import blocked
+        return blocked(self.config_path, workspace_id, marker_path=path)
+
     def _event_target(self, surface_id: str) -> dict[str, Any] | None:
+        policy = self._target_policy()
         with self._targets_lock:
-            explicit = self.config.get("targets", [])
             dynamic = self.dynamic_targets.get(surface_id)
-        # Explicit registrations win without sorting the whole fleet for
-        # every authorization check or doing that work under a shared lock.
-        for target in explicit:
-            if str(target.get("surface_id") or "") == surface_id:
-                return dict(apply_workspace_pause(self.config, target))
-        if dynamic is not None:
-            return dict(apply_workspace_pause(self.config, dynamic))
-        return None
+        target = policy.target_records.get(surface_id, dynamic)
+        if target is None:
+            return None
+        result = dict(target)
+        if any(r.get("workspace_id") == target.get("workspace_id") and r.get("paused")
+               for r in policy.rule_records.get(str(target.get("workspace_id")), ())):
+            result.update(paused=True, paused_reason="workspace interrupt pause")
+        return result
 
     def _foreign_claude_session_owner(self, surface_id: str, session_id: str) -> str:
         with self._runtime_lock:
@@ -6864,7 +7363,7 @@ class WatchDaemon:
         def authorized():
             # poll_once has no scheduler callback: current(fresh=True) alone
             # cannot authorize a private check's Edit/Enter after disk I/O.
-            if private_check and self._active_send_target(target) is None:
+            if self._active_send_target(target) is None:
                 return False
             generation = self._config_mtime_ns
             allowed = (self.config.get("mode") == "armed" and not self.config.get("global_paused")
@@ -6903,7 +7402,27 @@ class WatchDaemon:
                             or self._active_send_target(target) is None or generation != self._config_mtime_ns
                             or not self.private_checks.snapshot_current(private_snapshot)):
                         raise CmuxError("原短检查来源、位置或草稿已改变；未发送按键")
-                send()
+                base = client.client if isinstance(client, SnapshotClient) else client
+                original_turn = self.codex_queue_recovery.current_turn(target)
+                def connected_check():
+                    if not authorized() or self.codex_queue_recovery.current_turn(target) != original_turn:
+                        return False
+                    generation = self._config_mtime_ns
+                    tree = base.workspace_tree(target['workspace_id'])
+                    located = find_main_surface(tree, target['surface_id'])
+                    if (located.get('workspace_id') != target['workspace_id']
+                            or is_dock_surface(tree, target['surface_id']) or not own_view()):
+                        return False
+                    return (self.codex_queue_recovery.current_turn(target) == original_turn
+                            and self._active_send_target(target) is not None and current(fresh=True)
+                            and generation == self._config_mtime_ns
+                            and self.config.get('mode') == 'armed' and not self.config.get('global_paused')
+                            and (not private_check or self.private_checks.snapshot_current(private_snapshot)))
+                if isinstance(base, CmuxClient):
+                    with base.input_guard(connected_check):
+                        send()
+                else:
+                    send()
 
         outcome = self.codex_queue_recovery.recover(
             target, runtime, read_view=view,
@@ -8360,7 +8879,7 @@ class WatchDaemon:
 
     def _refresh_dynamic_targets(self, client: CmuxClient, *, force: bool = False) -> None:
         now = time.monotonic()
-        interval = float(self.config.get("workspace_discovery_interval_sec", 5))
+        interval = min(IMMEDIATE_DISCOVERY_SEC, float(self.config.get("workspace_discovery_interval_sec", 5)))
         if not force and now - self._last_workspace_discovery_at < interval:
             return
         self._last_workspace_discovery_at = now
@@ -8535,6 +9054,7 @@ class WatchDaemon:
     def _record_state(self, surface_id: str, runtime: TargetRuntime, state: ScreenState) -> None:
         self._record_observation(surface_id, runtime, state)
         runtime.state = state.kind
+
         if state.kind != "recoverable_error":
             runtime.awaiting = False
 
@@ -9108,33 +9628,56 @@ class WatchDaemon:
             return str(self.config.get("message") or MESSAGE)
         raise RuntimeError(f"send-eligible state lacks a message route: {state.kind}")
 
-    def _private_check_ready(self, proof, target, runtime, state, client, is_current):
+    @staticmethod
+    def _codex_draft_matches(grid, message):
+        from ccc_workspace_batch import BatchWorker
+        if message.isascii():
+            return BatchWorker._own_prompt_draft(grid, message)
+        if (not message or any(ch in message for ch in '\r\n\t') or not grid.cursor.visible
+                or _menu_present(grid.lines) or _working_present(grid.lines)
+                or _queued_followup_present(grid.lines, grid.cursor.row)):
+            return False
+        row = grid.cursor.row
+        if (grid.lines[row].rstrip() != '› ' + message
+                or grid.cursor.column != 2 + _audit_display_width(message)):
+            return False
+        return all(not (grid.style(s.style_id).get('faint') or grid.style(s.style_id).get('invisible'))
+                   for s in grid.spans if s.row == row and s.text.strip())
+
+    def _private_check_ready(self, proof, target, runtime, state, client, is_current, *, draft=None):
         read_turn = lambda: self.codex_queue_recovery.current_turn(target)
         snapshot = {}
         def empty_view():
             grid = Grid.from_rpc(client.replay(target["workspace_id"], target["surface_id"]), target["surface_id"])
+            if draft is not None:
+                deadline = time.monotonic() + .25
+                while not self._codex_draft_matches(grid, draft):
+                    if (_composer_status(grid)[0] != 'empty' or time.monotonic() >= deadline
+                            or self._active_send_target(target, is_current) is None):
+                        return False
+                    time.sleep(.005)
+                    grid = Grid.from_rpc(client.replay(target["workspace_id"], target["surface_id"]), target["surface_id"])
+                return True
             fresh = classify_grid(grid)
             return (_composer_status(grid)[0] == "empty" and fresh.kind in SEND_ELIGIBLE_STATES
                     and fresh.message_kind == "codex" and fresh.error_type == state.error_type
                     and not fresh.native_goal_stalled)
 
-        if not self.private_checks.valid(proof, target, read_turn):
+        if not self.private_checks.valid(proof, target, read_turn, snapshot=snapshot):
             return False
         # Source reads and the write-ahead send record can wait for disk. Read
         # placement and the empty composer after them, then recheck native and
         # authorization at the actual short-check input boundary.
-        tree = client.fresh_tree() if isinstance(client, SnapshotClient) else client.tree()
-        current = find_main_surface(tree, target["surface_id"])
-        if current.get("workspace_id") != target["workspace_id"] or is_dock_surface(tree, target["surface_id"]):
-            return False
-        if not empty_view() or not self.private_checks.valid(proof, target, read_turn, snapshot=snapshot):
-            return False
         if (self._active_send_target(target, is_current) is None
                 or self.config.get("mode") != "armed" or self.config.get("global_paused")
                 or not self._codex_turn_ready(target, runtime, state, reserved=True)):
             return False
         generation = self._config_mtime_ns
-        tree = client.fresh_tree() if isinstance(client, SnapshotClient) else client.tree()
+        # The entire provenance read precedes the final placement/composer
+        # read. Afterwards only immutable-proof/generation checks remain;
+        # repeating full UI/source reads adds no newer evidence at the exit.
+        tree = (client.workspace_tree(target['workspace_id']) if isinstance(client, CmuxClient)
+                else client.fresh_tree() if isinstance(client, SnapshotClient) else client.tree())
         current = find_main_surface(tree, target["surface_id"])
         if (current.get("workspace_id") != target["workspace_id"] or is_dock_surface(tree, target["surface_id"])
                 or not empty_view() or not self.private_checks.matches_turn(proof, read_turn())):
@@ -9143,6 +9686,114 @@ class WatchDaemon:
                 and generation == self._config_mtime_ns
                 and self.config.get("mode") == "armed" and not self.config.get("global_paused")
                 and self.private_checks.snapshot_current(snapshot))
+
+    @staticmethod
+    def _connected_native_input(client):
+        base = client.client if isinstance(client, SnapshotClient) else client
+        transport = getattr(base, 'viewport_socket', None)
+        return (isinstance(base, CmuxClient) and transport is not None and transport.path
+                and {'surface.send_text', 'surface.send_key'} <= transport.control_methods)
+
+    def _native_input_ready(self, target, runtime, state, client, proof, is_current, *, draft=None):
+        if proof:
+            return self._private_check_ready(proof, target, runtime, state, client, is_current, draft=draft)
+        if (self._active_send_target(target, is_current) is None
+                or self.config.get('mode') != 'armed' or self.config.get('global_paused')
+                or not self._codex_turn_ready(target, runtime, state, reserved=True)):
+            return False
+        generation = self._config_mtime_ns
+        turn = self.codex_queue_recovery.current_turn(target)
+        tree = (client.workspace_tree(target['workspace_id']) if isinstance(client, CmuxClient)
+                else client.fresh_tree() if isinstance(client, SnapshotClient) else client.tree())
+        sid, wid = target['surface_id'], target['workspace_id']
+        if find_main_surface(tree, sid).get('workspace_id') != wid or is_dock_surface(tree, sid):
+            return False
+        grid = Grid.from_rpc(client.replay(wid, sid), sid)
+        ready = (self._codex_draft_matches(grid, draft) if draft is not None else
+                 _composer_status(grid)[0] == 'empty' and classify_grid(grid).kind in SEND_ELIGIBLE_STATES)
+        return (ready and self.codex_queue_recovery.current_turn(target) == turn
+                and self._active_send_target(target, is_current) is not None
+                and generation == self._config_mtime_ns and self.config.get('mode') == 'armed'
+                and not self.config.get('global_paused'))
+
+    def _submit_native_draft(self, target, runtime, state, client, message, proof, is_current,
+                             *, persisted_input_phase=None):
+        """Persist Enter intent, then repeat ownership/draft guards after I/O."""
+        sid, wid = str(target['surface_id']), str(target['workspace_id'])
+        base = client.client if isinstance(client, SnapshotClient) else client
+        transport = getattr(base, 'viewport_socket', None)
+        if (self._connected_native_input(client) and 'terminal.paste' in transport.control_methods):
+            runtime.codex_input_phase = 'paste_submit_pending'
+            # The caller can persist this exact intent with the original
+            # attempt. Standalone callers still require their own durable gate.
+            if persisted_input_phase != 'paste_submit_pending':
+                self._save_delivery(sid, runtime, True)
+            with base.input_guard(lambda: self._native_input_ready(
+                    target, runtime, state, base, proof, is_current)):
+                result = base._control_rpc('terminal.paste', {'workspace_id': wid, 'surface_id': sid,
+                    'text': message, 'submit_key': 'enter'})
+                if result is None:
+                    raise CmuxError('paste capability unavailable; no fallback attempted')
+            runtime.codex_input_phase = 'paste_submit_acknowledged'
+            return
+        check_text = lambda: self._native_input_ready(target, runtime, state, base, proof, is_current)
+        with base.input_guard(check_text):
+            client.send_text(wid, sid, message)
+        runtime.codex_input_phase = 'enter_pending'
+        key_attempted = False
+        try:
+            self._save_delivery(sid, runtime, True)
+            connected = self._connected_native_input(client)
+            if not proof and not connected:
+                deadline = time.monotonic() + .25
+                while True:
+                    grid = Grid.from_rpc(client.replay(wid, sid), sid)
+                    if self._codex_draft_matches(grid, message):
+                        break
+                    if (_composer_status(grid)[0] != 'empty' or time.monotonic() >= deadline
+                            or self._active_send_target(target, is_current) is None
+                            or not self._codex_turn_ready(target, runtime, state, reserved=True)):
+                        raise UncertainDeliveryError('native draft is not the exact text written; Enter withheld')
+                    time.sleep(.005)
+            if connected:
+                # The connected transport performs the final full check after
+                # all admission/connect waits, on its own ordered read channel.
+                ready = True
+            elif proof:
+                ready = self._private_check_ready(proof, target, runtime, state, client, is_current, draft=message)
+            else:
+                generation = self._config_mtime_ns
+                tree = (client.workspace_tree(target['workspace_id']) if isinstance(client, CmuxClient)
+                else client.fresh_tree() if isinstance(client, SnapshotClient) else client.tree())
+                located = find_main_surface(tree, sid)
+                turn = self.codex_queue_recovery.current_turn(target)
+                ready = (located.get('workspace_id') == wid and not is_dock_surface(tree, sid)
+                    and self._codex_turn_ready(target, runtime, state, reserved=True))
+                grid = Grid.from_rpc(client.replay(wid, sid), sid)
+                ready = (ready and self._codex_draft_matches(grid, message)
+                    and self.codex_queue_recovery.current_turn(target) == turn
+                    and self._active_send_target(target, is_current) is not None
+                    and generation == self._config_mtime_ns)
+            if (not ready or self._active_send_target(target, is_current) is None
+                    or self.config.get('mode') != 'armed' or self.config.get('global_paused')):
+                raise UncertainDeliveryError('native draft retained; Enter authorization changed')
+            runtime.send_io_started_at = time.time()
+            if (runtime.native_failure_turn_key == runtime.codex_sent_turn_key
+                    and 0 < runtime.native_failure_at <= runtime.send_io_started_at):
+                runtime.native_complete_to_send_ms = round((runtime.send_io_started_at-runtime.native_failure_at)*1000,3)
+                runtime.native_send_deadline_missed = runtime.native_complete_to_send_ms >= 1000
+            key_attempted = True
+            check_enter = lambda: self._native_input_ready(
+                target, runtime, state, base, proof, is_current, draft=message)
+            with base.input_guard(check_enter):
+                client.send_key(wid, sid, 'enter')
+            runtime.codex_input_phase = 'enter_acknowledged'
+        except (OSError, CmuxError, RuntimeError) as exc:
+            # Text has already been delivered. Never classify a guard/key
+            # error as permission to paste another copy on the same turn.
+            if not key_attempted:
+                runtime.codex_input_phase = 'text_retained'
+            raise UncertainDeliveryError('native draft/Enter outcome retained: '+str(exc)) from exc
 
     @staticmethod
     def _claude_candidate_key(state: ScreenState) -> str:
@@ -9284,6 +9935,27 @@ class WatchDaemon:
             runtime.last_send_error = ""
             return False
         if runtime.delivery_status in {"sending", "unknown"}:
+            if runtime.codex_input_phase:
+                target = self._event_target(surface_id)
+                turn = self.codex_queue_recovery.current_turn(target) if target else None
+                key = (f"{turn.get('session_id')}:{turn.get('turn_id')}:{turn.get('at')}"
+                       if turn else "")
+                if (runtime.codex_input_phase != 'text_retained'
+                        and turn and turn.get('signature') and turn.get('turn_id')
+                        and turn.get('session_id') == runtime.codex_sent_turn_key.split(':', 1)[0]
+                        and key != runtime.codex_sent_turn_key
+                        and float(turn.get('at') or 0) >= runtime.send_started_at):
+                    runtime.delivery_status = 'confirmed'
+                    runtime.delivery_confirmed_at = time.time()
+                    runtime.last_send_error = ''
+                    return False
+                # An empty composer cannot disprove input still queued in the
+                # controller/native process after a lost ACK. Only subsequent
+                # lifecycle evidence permits another turn; never replay this one.
+                self._record_observation(surface_id, runtime, state)
+                runtime.delivery_status = 'unknown'
+                runtime.state = 'delivery_unknown'
+                return True
             if (state.kind == "recoverable_error" and state.content_fingerprint
                     and runtime.send_attempt_evidence
                     and state.content_fingerprint != runtime.send_attempt_evidence):
@@ -9341,6 +10013,8 @@ class WatchDaemon:
         if state.kind not in SEND_ELIGIBLE_STATES:
             self._record_state(surface_id, runtime, state)
             return
+        if state.message_kind == "codex" and not self._codex_turn_ready(target, runtime, state):
+            return
         if state.message_kind == "claude":
             state, send_guard_tree = self._prepare_claude_send(
                 target,
@@ -9380,6 +10054,11 @@ class WatchDaemon:
                 runtime.episode_started_at = now
         runtime.state = state.kind
 
+        # A distinct completed native turn is a new attempt. The lifecycle
+        # and duplicate-input gates below still run at the actual send boundary.
+        new_native_turn = bool(state.message_kind == "codex"
+                               and runtime.codex_observed_turn_key
+                               and runtime.codex_observed_turn_key != runtime.codex_sent_turn_key)
         if state.message_kind == "claude":
             # Claude stop events are single-shot.  The runtime guard converts
             # every unchanged subsequent frame to claude_pending_input, so no
@@ -9394,6 +10073,9 @@ class WatchDaemon:
                 max(0.0, float(configured_repeat)),
             )
             first_send_immediate = bool(self.config.get("first_send_immediate", True))
+        if runtime.awaiting and new_native_turn:
+            runtime.awaiting = False
+            runtime.awaiting_suppressed = 0
         if runtime.awaiting:
             if state.screen_signature != runtime.sent_screen_signature:
                 runtime.awaiting = False
@@ -9422,9 +10104,9 @@ class WatchDaemon:
                 started_at = runtime.episode_started_at
                 if started_at <= 0 or now - started_at < interval:
                     return
-        elif now - runtime.last_send_at < repeat_delay:
+        elif not new_native_turn and now - runtime.last_send_at < repeat_delay:
             return
-        if (state.message_kind == "codex" and runtime.delivery_status in {"failed", "retryable"}
+        if (not new_native_turn and state.message_kind == "codex" and runtime.delivery_status in {"failed", "retryable"}
                 and runtime.send_started_at > 0
                 and now - runtime.send_started_at < repeat_delay):
             return
@@ -9500,10 +10182,17 @@ class WatchDaemon:
         runtime.send_attempt_evidence = state.content_fingerprint
         runtime.codex_sent_turn_key = runtime.codex_observed_turn_key
         runtime.delivery_status = "sending"
+        runtime.codex_input_phase = "text_pending" if state.message_kind == "codex" else ""
+        base = client.client if isinstance(client, SnapshotClient) else client
+        if (state.message_kind == 'codex' and not runtime.codex_goal_resume
+                and self._connected_native_input(client)
+                and 'terminal.paste' in base.viewport_socket.control_methods):
+            runtime.codex_input_phase = 'paste_submit_pending'
+        initial_input_phase = runtime.codex_input_phase
         runtime.last_send_error = ""
         persisted_at = time.monotonic()
         try:
-            self.save()
+            self._save_delivery(surface_id, runtime, state.message_kind == "codex")
         except (OSError, RuntimeError) as exc:
             runtime.delivery_status = "failed"
             runtime.state = "send_failed"
@@ -9516,11 +10205,11 @@ class WatchDaemon:
         if (self._active_send_target(target, is_current) is None
                 or self.config.get("mode") != "armed" or self.config.get("global_paused", False)):
             runtime.delivery_status = "cancelled"
-            self.save(wait=False)
+            self._save_delivery(surface_id, runtime, state.message_kind == "codex", wait=False)
             return
         if not self._codex_turn_ready(target, runtime, state, reserved=True):
             runtime.delivery_status = "cancelled"
-            self.save(wait=False)
+            self._save_delivery(surface_id, runtime, state.message_kind == "codex", wait=False)
             return
         runtime.send_io_started_at = time.time()
         runtime.detection_to_send_ms = round(max(0, runtime.send_io_started_at -
@@ -9529,28 +10218,40 @@ class WatchDaemon:
         private_reserved = input_attempted = False
         try:
             with workspace_input_lock(self.config_path, target["workspace_id"], shared=True):
-                if self._active_send_target(target, is_current) is None:
+                if (self._active_send_target(target, is_current) is None
+                        or self.config.get('mode') != 'armed' or self.config.get('global_paused')):
                     runtime.delivery_status = "cancelled"
-                    self.save(wait=False)
+                    self._save_delivery(surface_id, runtime, state.message_kind == "codex", wait=False)
                     return
                 if not self._codex_turn_ready(target, runtime, state, reserved=True):
                     runtime.delivery_status = "cancelled"
-                    self.save(wait=False)
+                    self._save_delivery(surface_id, runtime, state.message_kind == "codex", wait=False)
                     return
                 if private_check:
                     self.private_checks.reserve(private_check, runtime.send_attempt_id)
                     private_reserved = True
-                    if not self._private_check_ready(private_check, target, runtime, state, client, is_current):
+                    if (not self._connected_native_input(client)
+                            and not self._private_check_ready(private_check, target, runtime, state, client, is_current)):
                         raise CmuxError("原 b 检查来源、任务或输入授权已变化；本次未发送")
                 runtime.send_io_started_at = time.time()
                 runtime.detection_to_send_ms = round(max(0, runtime.send_io_started_at -
                     (runtime.candidate_observed_at or runtime.observed_at)) * 1000, 3)
+                if (runtime.native_failure_turn_key == runtime.codex_sent_turn_key
+                        and 0 < runtime.native_failure_at <= runtime.send_io_started_at):
+                    runtime.native_complete_to_send_ms = round(
+                        (runtime.send_io_started_at - runtime.native_failure_at) * 1000, 3)
+                    runtime.native_send_deadline_missed = runtime.native_complete_to_send_ms >= 1000
                 if runtime.codex_goal_resume:
                     client.resume_codex_goal(str(target["workspace_id"]), surface_id)
                 else:
                     input_attempted = True
-                    client.send(str(target["workspace_id"]), surface_id,
-                                outgoing_message if private_check else self._outgoing_message(state))
+                    message = outgoing_message if private_check else self._outgoing_message(state)
+                    base = client.client if isinstance(client, SnapshotClient) else client
+                    if state.message_kind == "codex" and isinstance(base, CmuxClient):
+                        self._submit_native_draft(target, runtime, state, client, message, private_check, is_current,
+                                                  persisted_input_phase=initial_input_phase)
+                    else:
+                        client.send(str(target["workspace_id"]), surface_id, message)
         except (OSError, CmuxError, RuntimeError) as exc:
             runtime.send_completed_at = time.time()
             runtime.send_duration_ms = round((time.monotonic() - send_started) * 1000, 3)
@@ -9564,7 +10265,7 @@ class WatchDaemon:
             runtime.delivery_status = "unknown" if uncertain else "failed"
             runtime.state = "delivery_unknown" if uncertain else "send_failed"
             self.logger.error("surface=%s send failed: %s", surface_id[:8], exc)
-            self.save()
+            self._save_delivery(surface_id, runtime, state.message_kind == "codex")
             return
         if private_reserved:
             try:
@@ -9592,10 +10293,12 @@ class WatchDaemon:
         runtime.state = "claude_pending_input" if state.message_kind == "claude" else "awaiting_transition"
         if state.message_kind == "claude":
             runtime.awaiting = False
-        self.logger.info("surface=%s sent=%s count=%d scheduler_lag_ms=%.1f detect_to_send_ms=%.1f send_ms=%.1f",
+        self.logger.info("surface=%s sent=%s count=%d scheduler_lag_ms=%.1f detect_to_send_ms=%.1f send_ms=%.1f native_complete_to_send_ms=%.3f native_deadline_missed=%s attempt=%s",
                          surface_id[:8], state.error_type, runtime.send_count, runtime.scheduler_lag_ms,
-                         runtime.detection_to_send_ms, runtime.send_duration_ms)
-        self.save()
+                         runtime.detection_to_send_ms, runtime.send_duration_ms,
+                         runtime.native_complete_to_send_ms, runtime.native_send_deadline_missed,
+                         runtime.send_attempt_id)
+        self._save_delivery(surface_id, runtime, state.message_kind == "codex")
 
 
     def _network_turn_ready(self, target, runtime, turn):
@@ -10646,7 +11349,9 @@ def build_parser() -> argparse.ArgumentParser:
             choices.add_argument("--private-check", action="store_true",
                               help="opt in to empty private directories and short named checks; default keeps existing B behavior")
             choices.add_argument("--access-check", action="store_true",
-                              help="opt in to 50 concurrent finite API checks; stop new checks after a complete answer")
+                              help="legacy gateway checks; retain existing descriptors and budget policy")
+            choices.add_argument("--native-access", action="store_true",
+                              help="N: launch 50 direct native short checks concurrently; savings restrictions suspended")
     discover = sub.add_parser("discover")
     discover.add_argument("workspace")
     exclude = sub.add_parser("exclude")
@@ -10899,7 +11604,7 @@ def cli(argv: Sequence[str] | None = None) -> int:
     if args.command == "batch-workspace":
         from ccc_workspace_batch import start
         print(json.dumps(start(config_path, args.workspace, private_check=args.private_check,
-                               access_check=args.access_check), ensure_ascii=False, indent=2))
+                               access_check=args.access_check, native_access=args.native_access), ensure_ascii=False, indent=2))
         return 0
     if args.command == "resume-workspace":
         def resume_pool(latest):

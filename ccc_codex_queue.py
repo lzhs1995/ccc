@@ -7,7 +7,10 @@ proves the turn ended. Every key is write-ahead recorded; ambiguity stops here.
 from __future__ import annotations
 
 from datetime import datetime
+from collections import OrderedDict
+import copy
 import ctypes
+import fcntl
 import hashlib
 import json
 import os
@@ -39,41 +42,71 @@ def writable_open_files(output):
     return paths
 
 
+_task_snapshots = OrderedDict()
+_task_snapshot_lock = threading.Lock()
+
+
+def _task_stamp(info):
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+
 def task_snapshot(path, session_id):
     """Read the original thread's latest lifecycle event, with a stable file."""
     path = Path(path)
     before = path.stat()
+    key, signature = (str(path), session_id), _task_stamp(before)
+    with _task_snapshot_lock:
+        cached = _task_snapshots.get(key)
+        if cached and cached[0] == signature:
+            _task_snapshots.move_to_end(key)
+    if cached and cached[0] == signature:
+        return copy.deepcopy(cached[1]) if _task_stamp(path.stat()) == signature else None
     with path.open("rb") as handle:
         first = json.loads(handle.readline())
         if first.get("type") != "session_meta" or first.get("payload", {}).get("id") != session_id:
             return None
-        handle.seek(max(0, before.st_size - 1024 * 1024))
-        tail = handle.read().decode("utf-8", errors="replace")
-    latest = None
-    for line in reversed(tail.splitlines()):
-        try:
-            event = json.loads(line)
-        except ValueError:
-            continue
-        payload = event.get("payload", {})
-        if event.get("type") == "event_msg" and payload.get("type") in {
-            "task_started", "task_complete", "turn_aborted", "user_message",
-        }:
-            latest = event
-            break
+        if _task_stamp(os.fstat(handle.fileno())) != signature:
+            return None
+        latest, limit = None, min(before.st_size, 16384)
+        while latest is None:
+            offset = max(0, before.st_size - limit)
+            handle.seek(offset)
+            lines = handle.read(limit).splitlines()
+            if offset:
+                lines = lines[1:]
+            for line in reversed(lines):
+                try:
+                    event = json.loads(line)
+                except (ValueError, UnicodeError):
+                    continue
+                payload = event.get("payload", {})
+                if event.get("type") == "event_msg" and payload.get("type") in {
+                    "task_started", "task_complete", "turn_aborted", "user_message",
+                }:
+                    latest = event
+                    break
+            if limit >= min(before.st_size, 1024 * 1024):
+                break
+            limit = min(before.st_size, 1024 * 1024, max(1, limit * 4))
     if not latest:
         return None
     after = path.stat()
-    if (after.st_ino, after.st_size, after.st_mtime_ns) != (before.st_ino, before.st_size, before.st_mtime_ns):
+    if _task_stamp(after) != signature:
         return None
     try:
         at = epoch(latest.get("timestamp"))
     except (TypeError, ValueError):
         return None
-    return {**({"model_provider": first["payload"]["model_provider"]} if first["payload"].get("model_provider") else {}),
+    snapshot = {**({"model_provider": first["payload"]["model_provider"]} if first["payload"].get("model_provider") else {}),
             "kind": latest["payload"]["type"], "at": at,
             "turn_id": latest["payload"].get("turn_id"), "error": latest["payload"].get("error"),
             "signature": [after.st_ino, after.st_size, after.st_mtime_ns]}
+    with _task_snapshot_lock:
+        _task_snapshots[key] = (signature, snapshot)
+        _task_snapshots.move_to_end(key)
+        if len(_task_snapshots) > 8192:
+            _task_snapshots.popitem(last=False)
+    return copy.deepcopy(snapshot)
 
 
 def _retryable_completed_message(message):
@@ -365,7 +398,9 @@ def process_placement_start(pid, target):
         if length.value > len(buffer):
             return None
         try:
-            placement = _process_placement_args(buffer.raw[:length.value])
+            # Copy only bytes returned by sysctl. buffer.raw first copies the
+            # full ARG_MAX allocation (1 MiB here) on every identity check.
+            placement = _process_placement_args(ctypes.string_at(buffer, length.value))
         except UnicodeError:
             return None
         if placement is None or any(placement.get(name) != str(target[key]) for name, key in (
@@ -390,11 +425,14 @@ class NativeCompletionWatcher:
     This watcher has no terminal-input operation.
     """
     def __init__(self, sources, wake, *, interval=0.25, tail_bytes=16384,
-                 retry_needed=None, clock=time.monotonic):
+                 retry_needed=None, clock=time.monotonic, retry_interval=1.0,
+                 on_failure=None, daemon_threads=True):
         self.sources, self.wake = sources, wake
         self.interval, self.tail_bytes = interval, tail_bytes
         self.signatures, self.seen_turns = {}, {}
         self.pending, self.retry_needed, self.clock = {}, retry_needed, clock
+        self.retry_interval, self.on_failure = retry_interval, on_failure
+        self.daemon_threads = daemon_threads
         self.lifecycle, self.coverage = {}, {}
         self.scan_seconds = 0.0
         self.coverage_seconds = max(1, 3 * interval)
@@ -422,7 +460,7 @@ class NativeCompletionWatcher:
                     if pending and self.retry_needed and self.clock() >= pending[1]:
                         if self.retry_needed(key[0], key[1], pending[0]):
                             self.wake(key[0], key[1])
-                        self.pending[key] = (pending[0], self.clock() + 1)
+                        self.pending[key] = (pending[0], self.clock() + self.retry_interval)
                     continue
                 with path.open("rb") as handle:
                     offset = max(0, before.st_size - self.tail_bytes)
@@ -447,13 +485,26 @@ class NativeCompletionWatcher:
                     }:
                         latest = event
                         break
+                if latest is None:
+                    # New native builds append large world/turn context after
+                    # task_started. A fixed tail may contain no lifecycle even
+                    # though the original task is working. Use the existing
+                    # bounded, session-checked snapshot reader in that case.
+                    snapshot = task_snapshot(path, source["session_id"])
+                    if snapshot and snapshot.get("signature") == [after.st_ino, after.st_size, after.st_mtime_ns]:
+                        latest = {"timestamp":datetime.fromtimestamp(snapshot["at"]).astimezone().isoformat(),
+                            "payload":{"type":snapshot["kind"], "turn_id":snapshot.get("turn_id"),
+                                       "error":snapshot.get("error")}}
                 if latest and latest["payload"].get("type") == "task_complete" and latest["payload"].get("error"):
                     turn = (latest["payload"].get("turn_id"), latest.get("timestamp"))
                     if self.seen_turns.get(key) != turn:
+                        failed_at = epoch(latest.get("timestamp"))
+                        if self.on_failure is not None:
+                            self.on_failure(key[0], key[1], key[2], turn[0], failed_at)
                         if not self.wake(key[0], key[1]):
                             continue  # The scheduler may still be discovering this UUID.
                         self.seen_turns[key] = turn
-                        self.pending[key] = (epoch(latest.get("timestamp")), self.clock() + 1)
+                        self.pending[key] = (failed_at, self.clock() + self.retry_interval)
                 elif latest:
                     self.pending.pop(key, None)
                 if latest:
@@ -496,12 +547,13 @@ class NativeCompletionWatcher:
     def start(self):
         def run():
             while not self.stop.is_set():
+                started = self.clock()
                 try:
                     self.scan()
                 except (OSError, ValueError, TypeError, AttributeError, KeyError):
                     pass  # A hint failure cannot disable regular viewport scans.
-                self.stop.wait(self.interval)
-        self.thread = threading.Thread(target=run, name="ccc-native-wakeup", daemon=True)
+                self.stop.wait(max(0, self.interval - (self.clock() - started)))
+        self.thread = threading.Thread(target=run, name="ccc-native-wakeup", daemon=self.daemon_threads)
         self.thread.start()
 
     def close(self):
@@ -598,6 +650,7 @@ class QueueRecovery:
         self.wakeup_process_cache = (0.0, frozenset(), {})
         self.wakeup_root_cache = (None, None)
         self.wakeup_path_cache = {}
+        self._ledger_seen = self.ledger.exists()
         try:
             self.attempts = json.loads(self.ledger.read_text())
         except FileNotFoundError:
@@ -925,13 +978,38 @@ class QueueRecovery:
         with self.lock:
             if self.attempts is None:
                 raise RuntimeError("queue recovery ledger unreadable")
-            self.attempts[key] = record
-            temp = self.ledger.with_name(f".{self.ledger.name}.{os.getpid()}.tmp")
-            temp.write_text(json.dumps(self.attempts) + "\n")
-            temp.replace(self.ledger)
+            # Separate native lanes share this historical ledger. Merge the
+            # current file under an OS lock, never overwrite another lane's
+            # input intent with an old in-memory snapshot.
+            self.ledger.parent.mkdir(parents=True, exist_ok=True)
+            with self.ledger.with_name(self.ledger.name + ".lock").open("a+b") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                try:
+                    self._refresh_attempts()
+                    if self.attempts is None:
+                        raise RuntimeError("queue recovery ledger unreadable")
+                    updated = {**self.attempts, key: record}
+                    from cmux_codex_watch import atomic_write_json
+                    atomic_write_json(self.ledger, updated)
+                    self.attempts, self._ledger_seen = updated, True
+                finally:
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+
+    def _refresh_attempts(self):
+        try:
+            value = json.loads(self.ledger.read_bytes())
+            if not isinstance(value, dict) or any(not isinstance(r, dict) for r in value.values()):
+                raise ValueError("invalid queue recovery ledger")
+            self.attempts, self._ledger_seen = value, True
+        except FileNotFoundError:
+            if self._ledger_seen:
+                self.attempts = None
+        except (OSError, ValueError, TypeError):
+            self.attempts = None
 
     def has_pending_draft(self, sid):
         with self.lock:
+            self._refresh_attempts()
             return bool(self.attempts and any(r.get("surface_id") == sid and r.get("phase") in {"edited", "unconfirmed"}
                                              for r in self.attempts.values()))
 
@@ -941,6 +1019,7 @@ class QueueRecovery:
         message = self.message if message is None else message
         sid = target["surface_id"]
         with self.lock:
+            self._refresh_attempts()
             if self.attempts is None or time.monotonic() < self.next_probe.get(sid, 0):
                 return ""
             self.next_probe[sid] = time.monotonic() + 5

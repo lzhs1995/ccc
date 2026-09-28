@@ -84,6 +84,30 @@ class NativeWakeupTests(unittest.TestCase):
         self.watcher.scan()
         self.assertEqual(self.watcher.signatures, {})
 
+    def test_large_context_after_native_start_retains_verified_monitor_coverage(self):
+        self.path.write_text(json.dumps({'type':'session_meta','payload':{'id':'session'}})+'\n')
+        self.event('task_started',error=False)
+        with self.path.open('a') as f:
+            f.write(json.dumps({'type':'world_state','payload':{'text':'x'*80000}})+'\n')
+        self.sources[0]['identity_current']=True
+        self.watcher.scan()
+        self.assertEqual(self.watcher.observation_interval({'surface_id':'surface','workspace_id':'workspace'},1),10)
+        self.assertEqual(self.woken,[])
+        with patch.object(Path,'open',side_effect=AssertionError('unchanged context reread')):
+            self.watcher.scan()
+        self.event()
+        self.watcher.scan()
+        self.assertEqual(self.woken,[('surface','workspace')])
+
+    def test_bounded_context_fallback_requires_original_session_metadata(self):
+        self.path.write_text(json.dumps({'type':'session_meta','payload':{'id':'replacement'}})+'\n')
+        self.event('task_started',error=False)
+        with self.path.open('a') as f:
+            f.write(json.dumps({'type':'world_state','payload':{'text':'x'*80000}})+'\n')
+        self.sources[0]['identity_current']=True
+        self.watcher.scan()
+        self.assertEqual(self.watcher.coverage,{})
+
     def test_sources_use_enabled_workspace_uuid_and_latest_known_process(self):
         queue = QueueRecovery(self.root / "ledger", self.root / "bindings", self.root, "continue")
         queue.open_file_sources["surface"] = {**self.sources[0], "process_start": 20}

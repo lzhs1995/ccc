@@ -60,7 +60,7 @@ class BatchFixture:
     def top(self, wid):
         return self.top_all()
 
-    def new_codex_surface(self, window, wid, pane, command):
+    def new_codex_surface(self, window, wid, pane, command, *, clean_shell=False):
         self.test.assertEqual((window, wid, pane), (self.test.window, self.test.wid, self.test.pane))
         self.test.assertNotIn(batch.PROMPT, command)  # First prompt waits for readiness.
         tokens = shlex.split(command)
@@ -173,6 +173,13 @@ class WorkspaceBatchTests(unittest.TestCase):
         self.addCleanup(names.stop)
         self.job = batch.start(self.config, self.wid, client=self.client, launch=False,
                                private_check=getattr(self, 'private_check', True))
+        # This shared fixture models historical jobs whose first prompt is
+        # delivered through the UI. New argv bootstrap tests exercise their
+        # own permanent claim and native hook records separately.
+        path = batch.job_path(self.config, self.job['job_id'])
+        legacy = core.load_json(path, {})
+        legacy.pop('initial_prompt_policy', None)
+        core.atomic_write_json(path, legacy)
         self.now = time.time()
         self.worker = batch.BatchWorker(self.config, self.job['job_id'], client=self.client, queue=self.client,
                                         clock=lambda: self.now, pty_probe=lambda: True)

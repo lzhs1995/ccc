@@ -155,6 +155,8 @@ class ImmediateBatchTests(unittest.TestCase):
         self.assertNotIn('name_policy', job)
         self.assertFalse(any(key.startswith('access_') for key in job))
         self.assertFalse((batch.job_path(self.config, job['id']).parent / 'access.json').exists())
+        # argv construction follows the slot's durable creation intent.
+        job['slots'][0]['launch_id'] = str(uuid.uuid4())
         args = batch.native_launch_argv(self.config, job, 0)
         self.assertEqual(args[0], '/test/native/codex')
         self.assertFalse(any('127.0.0.1' in arg for arg in args))
