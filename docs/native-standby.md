@@ -7,13 +7,33 @@ no model requests until activation. Cold run99 remains a startup failure at
 
 The current candidate implements the lifecycle ledger, original writer/session
 observation, guarded atomic socket paste and a separate no-prompt launcher with
-postactivation Hook binding. The launcher supports b/N only. Its caller must
-provide a current effective configuration generation; that provider and the
-preparation manager are still outstanding. The normal start/worker/recovery
+postactivation Hook binding. The launcher supports b/N only. A separate manager
+now collects complete readiness observations and attempts one activation; it
+never upgrades identity-only observations to readiness. A generation checker
+pins a declared dependency graph, including symbolic-link targets and optional
+missing files. The real adapter must still discover the complete effective
+configuration graph and prove native readiness. The normal start/worker/recovery
 entrypoints reject or skip standby descriptors so they cannot submit a task
 while the dedicated manager is unconnected. There is no standby UI entrypoint
-or running cohort yet. Tests use synthetic process evidence and isolated local
-Unix sockets; they do not establish zero-model readiness or performance.
+or running cohort yet. Tests use synthetic process evidence, temporary-file
+Darwin events and isolated local Unix sockets; they do not establish zero-model
+readiness or performance.
+
+The optional generation event mode arms kernel vnode watches over declared
+content, links, and ancestor path identities, then rescans and checks pending
+events. An event, registration/read error, fork or close permanently invalidates
+the pin. It never accepts an empty queue after consuming a change. Activation
+checks use nonblocking event reads plus effective-setting hashes instead of
+rescanning every skill file for every slot. Ancestors outside the declared graph
+watch identity changes rather than unrelated child writes. Missing dependencies
+conservatively watch their nearest existing parent for child changes. The
+descriptor cap fails closed; no polling fallback silently certifies readiness.
+
+Manager cancellation uses a short status lock separate from the operation lock
+held while waiting for callbacks. Late ACKs remain recorded delivery facts and
+cannot overwrite invalidation. Failed invalidation persistence still clears
+in-memory readiness; close always shuts down the executor. ACK counts are not
+native task-start counts or startup acceptance.
 
 ## Ownership and preparation
 
@@ -46,10 +66,21 @@ UserTurn. After activation that first Hook must agree with the pinned standby
 session, and cannot introduce a replacement. The same live PID/birth/argv and
 workspace membership must still hold. Native startup and
 initial skills discovery must have completed, the composer must be empty and
-idle, and no task, user input, queued prompt, pending approval, model request or
+idle, and no task, user prompt, queued prompt, pending approval, model request or
 automatic title request may have occurred. Readiness must be invalidated when
 these conditions change. A private loopback provider will prove zero requests
 through a bounded idle interval before any real-provider standby is used.
+
+A candidate local `/pwd` preparation command is under consideration. The
+reference source records the original `from_tui/op/ListSkills` after the main
+loop has dequeued it and then awaits refresh inline. A later, newly rendered
+`/pwd` response can therefore prove that this wait returned. It does not prove
+refresh success; preserve native skill configuration and native error/warning
+behavior, without adding a new requirement that all skills be warning-free.
+The command must be separately consumed and counted as preparation control
+input, never as a task. Its actual zero-model behavior, empty pending queue and
+composer, original identity and final generation checks still need the native
+adapter and single-process verification. No control input has been sent yet.
 
 ## Activation
 
