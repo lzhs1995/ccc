@@ -15,6 +15,7 @@ import contextlib
 import copy
 import ctypes
 import errno
+import hashlib
 import json
 import logging
 import os
@@ -653,60 +654,101 @@ def _registration_outcome(directory, request):
     return None
 
 
-def _commit_registration_requests(config_path, job_id):
-    """One bootstrap commits every already-ready request in its original batch.
+def _publish_registration(config_path, request):
+    """Keep the original request and publish one short-lived readiness entry."""
+    directory = job_path(config_path, request['job_id']).parent
+    source = directory / f"registration-{request['index']}.json"
+    core.atomic_write_json(source, request)
+    ready = Path(config_path).parent / 'batch-registration-ready'
+    ready.mkdir(mode=0o700, exist_ok=True)
+    info = ready.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+        raise RuntimeError('batch registration queue is not an owned directory')
+    core.atomic_write_json(ready / f"{request['request_id']}.json", {
+        'job_id': request['job_id'], 'index': request['index'], 'request_id': request['request_id'],
+        'sha256': hashlib.sha256(source.read_bytes()).hexdigest()})
 
-    There is no wait for a cohort. The per-batch lock elects a writer while the
-    other bootstraps await their own durable receipt. Each native still waits
-    for its hold and repeats current authorization before exec.
+
+def _commit_registration_requests(config_path, job_id):
+    """One bootstrap commits all already-ready requests across active batches.
+
+    The queue contains pending bootstrap requests, never historical jobs. No
+    cohort wait is added. Each native awaits its own durable hold/receipt and
+    repeats current authorization before exec.
     """
     path = job_path(config_path, job_id)
     store = core.ConfigStore(Path(config_path))
     try:
-        with core.FileLock(path.parent / "registration-group.lock", timeout_sec=0,
+        with core.FileLock(Path(config_path).parent / "batch-registration.lock", timeout_sec=0,
                            purpose="batch registration group"):
             requests = []
-            for index in range(COUNT):
-                source = path.parent / f"registration-{index}.json"
+            ready = Path(config_path).parent / 'batch-registration-ready'
+            for marker in ready.glob('*.json'):
                 try:
+                    marker_data = marker.read_bytes()
+                    entry = json.loads(marker_data)
+                    uuid.UUID(entry['job_id'])
+                    uuid.UUID(entry['request_id'])
+                    index = entry['index']
+                    if (type(index) is not int or not 0 <= index < COUNT
+                            or marker.stem != entry['request_id']):
+                        raise ValueError('invalid registration queue identity')
+                    source = job_path(config_path, entry['job_id']).parent / f'registration-{index}.json'
                     data = source.read_bytes()
+                    request = json.loads(data)
+                    if (hashlib.sha256(data).hexdigest() != entry['sha256']
+                            or any(request.get(key) != entry[key] for key in ('job_id', 'index', 'request_id'))):
+                        marker.rename(marker.with_suffix('.stale'))
+                        continue
                 except FileNotFoundError:
                     continue
-                request = json.loads(data)
-                if (not isinstance(request, dict) or type(request.get("index")) is not int
-                        or request.get("index") != index
-                        or request.get("job_id") != job_id
-                        or not isinstance(request.get("request_id"), str)):
-                    raise RuntimeError("invalid batch registration request")
+                except (ValueError, KeyError, TypeError, AttributeError):
+                    marker.rename(marker.with_suffix('.invalid'))
+                    continue
                 try:
-                    if _registration_outcome(path.parent, request):
+                    if _registration_outcome(source.parent, request):
+                        marker.unlink()
                         continue
                 except RuntimeError:
+                    marker.unlink()
                     continue  # This exact request already has a durable veto.
-                requests.append((source, data, request))
+                requests.append((marker, marker_data, source, data, request))
             if not requests:
                 return True
             accepted, rejected = [], []
             def protect(latest):
                 # Atomic job replacements may happen while other slots reserve
                 # their launch IDs. Bind every request to the current slot.
-                job = core.load_json(path, {})
-                mode = startup_mode(job, config_path)
-                rule = core.workspace_rule_by_id(latest, job["workspace_id"])
+                jobs, job_errors = {}, {}
                 changed = False
-                for source, data, request in requests:
-                    index, sid = request["index"], request["surface_id"]
+                for marker, marker_data, source, data, request in requests:
+                    job_id = request['job_id']
                     try:
+                        index, sid = request["index"], request["surface_id"]
                         uuid.UUID(sid)
-                        if not allowed(latest, job):
-                            raise RuntimeError("batch paused or cancelled before launch")
+                        if type(request.get('requested_at')) not in (int, float):
+                            raise ValueError('invalid registration time')
+                        if job_id in job_errors:
+                            raise RuntimeError(job_errors[job_id])
+                        if job_id not in jobs:
+                            try:
+                                job = core.load_json(job_path(config_path, job_id), {})
+                                mode = startup_mode(job, config_path)
+                                if job.get('id') != job_id or not allowed(latest, job):
+                                    raise RuntimeError('batch paused or cancelled before launch')
+                                rule = core.workspace_rule_by_id(latest, job['workspace_id'])
+                            except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+                                job_errors[job_id] = str(exc)
+                                raise
+                            jobs[job_id] = job, mode, rule
+                        job, rule_mode, rule = jobs[job_id]
                         if (request["workspace_id"] != job["workspace_id"]
                                 or index >= len(job["slots"])
                                 or job["slots"][index].get("launch_id", "") != request["launch_id"]):
                             raise RuntimeError("stale batch launch")
                         if job["slots"][index].get("surface_id") not in (None, sid):
                             raise RuntimeError("batch slot already has its original surface")
-                        old = core.load_json(path.parent / f"surface-{index}.json", {})
+                        old = core.load_json(source.parent / f"surface-{index}.json", {})
                         if old and old.get("surface_id") != sid:
                             raise RuntimeError("batch slot already belongs to another surface")
                         previous = core.batch_start_hold(rule, sid)
@@ -720,7 +762,7 @@ def _commit_registration_requests(config_path, job_id):
                                and hold.get("job_id") == job_id and hold.get("index") == index
                                for other, hold in rule.get("batch_start_holds", {}).items()):
                             raise RuntimeError("batch slot already protects its original surface")
-                        if mode == "access_check":
+                        if rule_mode == "access_check":
                             record = {"job_id": job_id, "index": index}
                             slots = rule.setdefault("access_check_slots", {})
                             if slots.get(sid) != record:
@@ -730,9 +772,9 @@ def _commit_registration_requests(config_path, job_id):
                             rule.setdefault("batch_start_holds", {})[sid] = {
                                 "job_id": job_id, "index": index, "created_at": request["requested_at"]}
                             changed = True
-                        accepted.append((source, data, request))
+                        accepted.append((marker, marker_data, source, data, request))
                     except (KeyError, TypeError, ValueError, RuntimeError) as exc:
-                        rejected.append((source, data, request, str(exc)))
+                        rejected.append((marker, marker_data, source, data, request, str(exc)))
                 if not changed:
                     # Skip a full config rewrite when a late bootstrap already
                     # has its exact hold or all requests were vetoed.
@@ -743,15 +785,19 @@ def _commit_registration_requests(config_path, job_id):
                 pass
             # No receipt is visible before the entire config commit succeeds.
             # A subsequent attempt reconciles an interrupted receipt write.
-            for source, data, request in accepted:
+            for marker, marker_data, source, data, request in accepted:
                 if source.read_bytes() != data:
                     continue
-                core.atomic_write_json(path.parent / f"surface-{request['index']}.json",
+                core.atomic_write_json(source.parent / f"surface-{request['index']}.json",
                     {**request, "registered_at": time.time(), "registration_policy": "coalesced-v1"})
-            for source, data, request, error in rejected:
+                if marker.read_bytes() == marker_data:
+                    marker.unlink()
+            for marker, marker_data, source, data, request, error in rejected:
                 if source.read_bytes() == data:
-                    core.atomic_write_json(path.parent / f"registration-result-{request['index']}.json",
+                    core.atomic_write_json(source.parent / f"registration-result-{request['index']}.json",
                         {"request_id": request["request_id"], "error": error, "at": time.time()})
+                    if marker.read_bytes() == marker_data:
+                        marker.unlink()
             return True
     except RuntimeError as exc:
         if _lock_busy(exc):
@@ -788,7 +834,7 @@ def register(config_path, job_id, index, launch_id=""):
                        "requested_at": time.time(), "shell_pid": os.getppid(),
                        "shell_start": batch_shell_identity(os.getppid()),
                        **({"working_directory": str(directory)} if directory else {})}
-            core.atomic_write_json(path.parent / f"registration-{index}.json", request)
+            _publish_registration(config_path, request)
             next_check = time.monotonic() + .25
             while not _registration_outcome(path.parent, request):
                 _commit_registration_requests(config_path, job_id)

@@ -22,13 +22,35 @@ class BatchRegistrationTests(unittest.TestCase):
                            request_id=str(uuid.uuid4()), surface_id=str(uuid.uuid4()),
                            workspace_id=self.wid, launch_id=slot['launch_id'],
                            requested_at=self.now, shell_pid=123, shell_start='original-shell')
-            core.atomic_write_json(self.worker.path.parent / f"registration-{slot['index']}.json", request)
+            batch._publish_registration(self.config, request)
             result.append(request)
         self.worker.save()
         return result
 
     def commit(self):
         return batch._commit_registration_requests(self.config, self.worker.job['id'])
+
+    def another_batch(self):
+        wid, jid = str(uuid.uuid4()), str(uuid.uuid4())
+        job = dict(id=jid, workspace_id=wid, config_path=str(self.config), created_at=self.now,
+                   status='running', slots=[])
+        requests = []
+        for index in range(50):
+            launch_id = str(uuid.uuid4())
+            job['slots'].append(dict(index=index, phase='creating', launch_id=launch_id))
+            request = dict(job_id=jid, index=index, request_id=str(uuid.uuid4()),
+                           surface_id=str(uuid.uuid4()), workspace_id=wid, launch_id=launch_id,
+                           requested_at=self.now, shell_pid=123, shell_start='other-original-shell')
+            batch._publish_registration(self.config, request)
+            requests.append(request)
+        path = batch.job_path(self.config, jid)
+        core.atomic_write_json(path, job)
+        def authorize(config):
+            rule = core._workspace_rule_from_record(dict(workspace_id=wid, ref='', title='other fixture'))
+            rule.update(active_batch_id=jid, last_batch_id=jid)
+            config['workspace_rules'].append(rule)
+        self.store.mutate(authorize)
+        return path, requests
 
     def test_fifty_ready_requests_share_one_real_config_commit(self):
         requests = self.requests()
@@ -153,6 +175,49 @@ class BatchRegistrationTests(unittest.TestCase):
         for request in requests:
             with self.assertRaisesRegex(RuntimeError, 'original surface'):
                 batch._registration_outcome(self.worker.path.parent, request)
+
+    def test_two_active_batches_share_one_config_commit(self):
+        first = self.requests()
+        path, second = self.another_batch()
+        original, writes = core.atomic_write_json, []
+        def write(target, value):
+            if target == self.config:
+                writes.append(1)
+            return original(target, value)
+        with patch.object(core, 'atomic_write_json', side_effect=write):
+            self.commit()
+        self.assertEqual(writes, [1])
+        for directory, requests in ((self.worker.path.parent, first), (path.parent, second)):
+            self.assertTrue(all(batch._registration_outcome(directory, request) for request in requests))
+            self.assertTrue(all((directory / f"registration-{request['index']}.json").exists() for request in requests))
+        self.assertEqual(list((self.config.parent / 'batch-registration-ready').glob('*.json')), [])
+
+    def test_paused_pool_does_not_prevent_other_pool_receipts(self):
+        first = self.requests()
+        path, second = self.another_batch()
+        self.store.mutate(lambda config: config['workspace_rules'][0].update(paused=True))
+        self.commit()
+        for request in first:
+            with self.assertRaisesRegex(RuntimeError, 'paused or cancelled'):
+                batch._registration_outcome(self.worker.path.parent, request)
+        self.assertTrue(all(batch._registration_outcome(path.parent, request) for request in second))
+
+    def test_changed_request_snapshot_is_retained_without_a_native_receipt(self):
+        requests = self.requests()
+        changed = {**requests[0], 'surface_id': str(uuid.uuid4())}
+        core.atomic_write_json(self.worker.path.parent / 'registration-0.json', changed)
+        self.commit()
+        self.assertIsNone(batch._registration_outcome(self.worker.path.parent, requests[0]))
+        self.assertTrue(all(batch._registration_outcome(self.worker.path.parent, request) for request in requests[1:]))
+        self.assertTrue((self.config.parent / 'batch-registration-ready' / f"{requests[0]['request_id']}.stale").exists())
+
+    def test_invalid_queue_record_cannot_block_valid_bootstraps(self):
+        requests = self.requests()
+        bad = self.config.parent / 'batch-registration-ready' / 'invalid.json'
+        bad.write_text('{')
+        self.commit()
+        self.assertTrue(bad.with_suffix('.invalid').exists())
+        self.assertTrue(all(batch._registration_outcome(self.worker.path.parent, request) for request in requests))
 
 
 if __name__ == '__main__':
