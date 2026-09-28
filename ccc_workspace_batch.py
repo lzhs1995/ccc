@@ -341,7 +341,7 @@ def settled_job(config_path, previous, config, client):
 
 
 def start(config_path, selector, *, client=None, launch=True, private_check=False,
-          access_check=False, native_access=False, _access_fixture=False):
+          access_check=False, native_access=False, _access_fixture=False, ui_trace=None):
     if (any(type(mode) is not bool for mode in (private_check, access_check, native_access))
             or sum((private_check, access_check, native_access)) > 1):
         raise RuntimeError("B private-check mode must be explicitly selected")
@@ -351,6 +351,17 @@ def start(config_path, selector, *, client=None, launch=True, private_check=Fals
     config = store.load()
     workspace = workspace_record(config_path, selector, config, client)
     wid = workspace["workspace_id"]
+    if ui_trace is not None:
+        from ccc_batch_timing import validate
+        try:
+            validate(ui_trace)
+            if (ui_trace['workspace_id'] != wid
+                    or ui_trace['mode'] != ('N' if native_access else 'b' if private_check else 'B')
+                    or access_check):
+                raise ValueError('UI timing workspace or mode mismatch')
+        except (ValueError, TypeError):
+            ui_trace = None  # Timing metadata never changes the selected batch operation.
+    new_job = False
     with core.FileLock(Path(config_path).parent / f"batch-start-{wid}.lock", timeout_sec=5), contextlib.ExitStack() as job_locks:
         config = store.load()
         rule = next((r for r in config["workspace_rules"] if r.get("workspace_id") == wid), {})
@@ -389,10 +400,13 @@ def start(config_path, selector, *, client=None, launch=True, private_check=Fals
                     or access_check and startup_mode(job, config_path) != 'access_check'):
                 raise RuntimeError('本池尚有原 B 批次，已保留；节费50须在新批次使用，不能将旧任务静默改成检查')
         else:
+            new_job = True
             job = {"id": str(uuid.uuid4()), "workspace_id": wid,
                    "created_at": time.time(), "status": "pending",
                    "startup_policy": IMMEDIATE_START_POLICY,
                    "slots": [{"index": i, "phase": "pending"} for i in range(COUNT)]}
+            if ui_trace is not None:
+                job['ui_timing_origin'] = copy.deepcopy(ui_trace)
             if private_check or access_check or native_access:
                 job.update(cwd_policy=EMPTY_CWD_POLICY, initial_prompt=PROMPT)
             if access_check:
@@ -449,6 +463,11 @@ def start(config_path, selector, *, client=None, launch=True, private_check=Fals
         # Neither the old reconciler nor the new helper may run until the
         # authorization commit above is durable. Release before spawning.
         job_locks.close()
+        if ui_trace is not None:
+            from ccc_batch_timing import record
+            with contextlib.suppress(OSError):
+                record(config_path, ui_trace, 'job_created' if new_job else 'job_reused',
+                       job_id=job['id'], new_job=new_job)
         if launch:
             _launch(config_path, job)
         return {"job_id": job["id"], "workspace_id": wid,
@@ -1866,6 +1885,18 @@ class BatchWorker:
                         proof["blocked"] = "different task before batch prompt"
                         return False
                     proof.update(started=True, task_id=payload.get("turn_id"), task_at=event["timestamp"])
+                    if self.job.get('ui_timing_origin'):
+                        from ccc_batch_timing import stamp
+                        from ccc_guard_scope import birth
+                        proof['first_task_observed'] = stamp()
+                        observed_birth = None
+                        with contextlib.suppress(OSError, ValueError, RuntimeError):
+                            observed_birth = birth(slot.get('pid'))
+                        proof['first_task_observed_identity'] = {
+                            'surface_id': slot.get('surface_id'), 'workspace_id': self.job['workspace_id'],
+                            'session_id': slot.get('session_id'), 'turn_id': payload.get('turn_id'),
+                            'pid': slot.get('pid'), 'birth': observed_birth,
+                            'verified': bool(observed_birth and observed_birth == slot.get('native_birth'))}
                 if kind in {"task_complete", "task_aborted"} and not proof.get("prompt"):
                     proof["blocked"] = "task ended before batch prompt"
                     return False
@@ -2249,6 +2280,10 @@ class BatchWorker:
                         pid=claim["bootstrap_pid"], process_start=identity[0],
                         native_birth=identity, transcript=str(transcript), transcript_offset=0,
                         submit_at=claim["at"], phase="submitted")
+            if self.job.get('ui_timing_origin'):
+                slot.setdefault('ui_original_identity', {
+                    'surface_id':slot['surface_id'], 'workspace_id':self.job['workspace_id'],
+                    'session_id':session, 'pid':claim['bootstrap_pid'], 'birth':identity})
             self.save()
             return True
         except FileNotFoundError:
@@ -2385,6 +2420,15 @@ class BatchWorker:
             slot.update(phase="submitting", submit_at=self.clock(), transcript=path,
                         transcript_offset=offset, pid=native["pid"],
                         process_start=native.get("process_start"), native_uninitialized=uninitialized)
+            if self.job.get('ui_timing_origin'):
+                from ccc_guard_scope import birth
+                born = None
+                with contextlib.suppress(OSError, ValueError, RuntimeError):
+                    born = birth(native['pid'])
+                slot['native_birth'] = born if born and born[0] == native.get('process_start') else None
+                slot.setdefault('ui_original_identity', {
+                    'surface_id':slot['surface_id'], 'workspace_id':self.job['workspace_id'],
+                    'session_id':slot['session_id'], 'pid':native['pid'], 'birth':slot['native_birth']})
             self.save()
             if startup_mode(self.job, self.config_path) == 'access_check':
                 from ccc_access_service import bind_slot

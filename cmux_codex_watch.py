@@ -64,7 +64,7 @@ DEFAULT_LABEL = f"{LABEL_PREFIX}.{APP_NAME}"
 PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_APP_DIR = Path.home() / "Library" / "Application Support" / APP_NAME
 DEFAULT_RUNTIME_ROOT = DEFAULT_APP_DIR / "runtime"
-RUNTIME_FILES = ("cmux_codex_watch.py", "claude_ccc_protocol.py", "claude_ccc_event_hook.py", "ccc_observation.py", "ccc_scheduling.py", "ccc_native_lanes.py", "ccc_delivery.py", "ccc_codex_queue.py", "ccc_codex_goal.py", "ccc_workspace_batch.py", "ccc_private_check.py", "ccc_inventory.py", "ccc_batch_guard.py", "ccc_guard_transport.py", "ccc_guard_watchdog.py", "ccc_guard_scope.py", "ccc_guard_migration.py", "ccc_codex_launcher.py", "ccc_network_client.py", "ccc_network_guard.py", "ccc_mihomo.py", "ccc_native_processes.py", "ccc_access_budget.py", "ccc_access_gateway.py", "ccc_access_service.py")
+RUNTIME_FILES = ("cmux_codex_watch.py", "claude_ccc_protocol.py", "claude_ccc_event_hook.py", "ccc_observation.py", "ccc_scheduling.py", "ccc_native_lanes.py", "ccc_delivery.py", "ccc_codex_queue.py", "ccc_codex_goal.py", "ccc_workspace_batch.py", "ccc_private_check.py", "ccc_inventory.py", "ccc_batch_guard.py", "ccc_guard_transport.py", "ccc_guard_watchdog.py", "ccc_guard_scope.py", "ccc_guard_migration.py", "ccc_codex_launcher.py", "ccc_network_client.py", "ccc_network_guard.py", "ccc_mihomo.py", "ccc_native_processes.py", "ccc_access_budget.py", "ccc_access_gateway.py", "ccc_access_service.py", "ccc_batch_timing.py")
 DEFAULT_LOG_DIR = Path.home() / "Library" / "Logs" / APP_NAME
 DEFAULT_CONFIG_PATH = DEFAULT_APP_DIR / "config.json"
 DEFAULT_STATE_PATH = DEFAULT_APP_DIR / "state.json"
@@ -11437,6 +11437,7 @@ def build_parser() -> argparse.ArgumentParser:
         item = sub.add_parser(command)
         item.add_argument("workspace")
         if command == "batch-workspace":
+            item.add_argument('--ui-action-id', help=argparse.SUPPRESS)
             choices = item.add_mutually_exclusive_group()
             choices.add_argument("--private-check", action="store_true",
                               help="opt in to empty private directories and short named checks; default keeps existing B behavior")
@@ -11558,6 +11559,15 @@ def _discover_workspace(client: CmuxClient, tree: Mapping[str, Any], selector: s
 def cli(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     config_path: Path = args.config
+    ui_trace = None
+    if args.command == 'batch-workspace' and args.ui_action_id:
+        import ccc_batch_timing as batch_timing
+        try:
+            ui_trace = batch_timing.read(config_path, args.ui_action_id)
+            batch_timing.record(config_path, ui_trace, 'cli_received')
+        except (OSError, ValueError, TypeError):
+            logging.getLogger(__name__).warning('UI timing origin unavailable; batch authorization remains mandatory')
+            ui_trace = None
     if not args.command or args.command == "howto":
         # Bare `ccc` / no subcommand inside a cmux surface opens the TUI.
         # Outside cmux, keep printing the short howto so a normal Terminal
@@ -11695,8 +11705,15 @@ def cli(argv: Sequence[str] | None = None) -> int:
         return 1 if result["failed"] else 0
     if args.command == "batch-workspace":
         from ccc_workspace_batch import start
-        print(json.dumps(start(config_path, args.workspace, private_check=args.private_check,
-                               access_check=args.access_check, native_access=args.native_access), ensure_ascii=False, indent=2))
+        try:
+            result = start(config_path, args.workspace, private_check=args.private_check,
+                           access_check=args.access_check, native_access=args.native_access,
+                           ui_trace=ui_trace)
+        except Exception as exc:
+            if ui_trace is not None:
+                batch_timing.record(config_path, ui_trace, 'cli_failed', error_type=type(exc).__name__)
+            raise
+        print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     if args.command == "resume-workspace":
         def resume_pool(latest):

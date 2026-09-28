@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
 import cmux_codex_watch as core
+import ccc_batch_timing as batch_timing
 
 
 SOURCE_LABELS = {
@@ -2552,17 +2553,22 @@ class SupervisorModel:
         self._action_thread = None
         self._action_result = None
         self._action_generation = 0
+        self._action_context = threading.local()
 
-    def start_action(self, operation, success: str, *, priority: bool = False) -> str:
+    def start_action(self, operation, success: str, *, priority: bool = False, ui_trace=None) -> str:
         """Keep CLI mutations and pool interrupts off the keyboard thread."""
         with self._action_lock:
             if not priority and self._action_thread is not None and self._action_thread.is_alive():
+                batch_timing.record(self.config_path, ui_trace, 'rejected_busy')
                 return "上一操作仍在处理，可继续浏览"
             self._action_result = None
             self._action_generation += 1
             generation = self._action_generation
+            batch_timing.mark(ui_trace, 'action_enqueued')
             def work():
                 try:
+                    self._action_context.ui_trace = ui_trace
+                    batch_timing.record(self.config_path, ui_trace, 'action_started')
                     result = operation()
                     message = success
                     if isinstance(result, str):
@@ -2572,6 +2578,12 @@ class SupervisorModel:
                                 message = f"已整池停发；已向 {len(details['interrupt_requested'])} 路请求 Interrupt"
                 except Exception as exc:
                     message = f"失败: {exc}"
+                finally:
+                    self._action_context.ui_trace = None
+                    if ui_trace is not None:
+                        with contextlib.suppress(OSError, ValueError):
+                            latest = batch_timing.read(self.config_path, ui_trace['action_id'])
+                            batch_timing.record(self.config_path, latest, 'action_finished')
                 with self._action_lock:
                     if generation == self._action_generation:
                         self._action_result = message
@@ -2857,6 +2869,9 @@ class SupervisorModel:
     def run_cli(self, args: list[str]) -> str:
         # Redirecting Python's global stdout on a worker would capture curses
         # output. Give each action its own bounded CLI process instead.
+        trace = getattr(self._action_context, 'ui_trace', None)
+        if trace is not None and args[0] == 'batch-workspace':
+            args = [*args, '--ui-action-id', trace['action_id']]
         result = subprocess.run([sys.executable, "-B", str(Path(core.__file__).resolve()),
                                  "--config", str(self.config_path), *args],
                                 capture_output=True, text=True, timeout=180 if args[0] in {
@@ -5022,6 +5037,8 @@ def _run(stdscr: Any, model: SupervisorModel) -> None:
             cursor_key = rows[index].key
         _draw(stdscr, model, rows, index, view, query, status)
         key = stdscr.getch()
+        input_stamp = batch_timing.stamp()
+        input_kind = 'mouse' if key == curses.KEY_MOUSE else 'keyboard'
         if key == curses.KEY_MOUSE:
             try:
                 _, mx, my, _, buttons = curses.getmouse()
@@ -5164,15 +5181,20 @@ def _run(stdscr: Any, model: SupervisorModel) -> None:
             ord("N"): "access_batch_workspace",
         }[key]
         row = rows[index]
+        ui_trace = batch_timing.new(action, row.workspace_id, input_kind,
+                                    'group' if row.kind == 'group' else 'candidate', input_stamp)
         if row.kind == "group":
             refusal = group_action_error(row, action)
             if refusal:
+                batch_timing.record(model.config_path, ui_trace, 'rejected_selection')
                 status = refusal
                 continue
             live = row.counts.get("all", 0) or None
             if not _confirm(stdscr, workspace_confirm_prompt(row, action, live_codex=live)):
+                batch_timing.record(model.config_path, ui_trace, 'cancelled')
                 status = "已取消"
                 continue
+            batch_timing.mark(ui_trace, 'confirmation_accepted')
             try:
                 success = (f"已授权整个 {row.workspace_ref}" if action == "workspace"
                           else f"已取消整个 {row.workspace_ref} 授权")
@@ -5186,7 +5208,7 @@ def _run(stdscr: Any, model: SupervisorModel) -> None:
                 elif action == "access_batch_workspace":
                     success = f"{row.workspace_ref} N原生50已提交；并行启动、原生连接，节费限制暂缓"
                 status = model.start_action(lambda row=row, action=action: model.mutate_workspace(row, action), success,
-                                            priority=action == "pause_workspace")
+                                            priority=action == "pause_workspace", ui_trace=ui_trace)
             except Exception as exc:
                 status = f"失败: {exc}"
             continue
@@ -5219,8 +5241,10 @@ def _run(stdscr: Any, model: SupervisorModel) -> None:
         if action in {"pause", "remove", "add", "workspace", "untrack_workspace", "pause_workspace", "resume_workspace", "batch_workspace", "private_batch_workspace", "access_batch_workspace"} and not _confirm(
             stdscr, confirm_prompt(action, candidate, live_codex=live_codex)
         ):
+            batch_timing.record(model.config_path, ui_trace, 'cancelled')
             status = "已取消"
             continue
+        batch_timing.mark(ui_trace, 'confirmation_accepted')
         try:
             where = f"{candidate.workspace_ref}/{candidate.ref}"
             success = {
@@ -5237,7 +5261,7 @@ def _run(stdscr: Any, model: SupervisorModel) -> None:
                 "access_batch_workspace": f"{candidate.workspace_ref} N原生50已提交；并行启动、原生连接，节费限制暂缓",
             }.get(action, f"已处理 {where}")
             status = model.start_action(lambda candidate=candidate, action=action: model.mutate_selected(candidate, action), success,
-                                        priority=action == "pause_workspace")
+                                        priority=action == "pause_workspace", ui_trace=ui_trace)
         except Exception as exc:
             status = f"失败: {exc}"
 
