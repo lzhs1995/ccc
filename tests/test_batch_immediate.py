@@ -145,7 +145,10 @@ class ImmediateBatchTests(unittest.TestCase):
                 self.assertIn('submit_not_sent_at', slot)
 
     def test_native_access_is_explicit_short_check_without_gateway_or_name_wait(self):
-        result = batch.start(self.config, str(uuid.uuid4()), launch=False, native_access=True)
+        # A new fixture workspace avoids reinterpreting the existing B job.
+        self.wid = str(uuid.uuid4())
+        result = batch.start(self.config, self.wid, launch=False,
+                             native_access=True, client=self.client)
         job = core.load_json(batch.job_path(self.config, result['job_id']), {})
         self.assertEqual(job['native_access_policy'], 'direct-native-v1')
         self.assertEqual(job['check_retry_policy'], 'fixed-check-v1')
