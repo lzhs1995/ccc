@@ -162,6 +162,9 @@ class RealCookieGatewayTests(unittest.IsolatedAsyncioTestCase):
     async def test_real_html_failure_is_diagnosable_and_does_not_replay(self):
         self.fixture.mode = 'html'
         results = await self.wave()
+        # Error responses close the socket before durable budget finalization.
+        # Observe the ledger only after every accepted handler has finished.
+        await asyncio.wait_for(asyncio.gather(*tuple(self.gateway.tasks)), 15)
         self.assertEqual([code for code, _ in results], [502] * 50)
         detail = self.channel.snapshot()['last_error']
         self.assertEqual(detail['stage'], 'upstream_response')
