@@ -10,7 +10,7 @@ import argparse
 import ast
 import base64
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 import contextlib
 import copy
 import ctypes
@@ -849,6 +849,63 @@ def register(config_path, job_id, index, launch_id=""):
                 time.sleep(.005)
 
 
+class _JobCommitter:
+    """Commit a group of immutable job snapshots before releasing its senders.
+
+    Snapshots are submitted under the worker state lock, so the last snapshot
+    includes every earlier slot mutation. The writer never acquires that lock.
+    No new receipt format or asynchronous permission to create/send is added.
+    """
+    def __init__(self, path):
+        self.path = path
+        self.condition = threading.Condition()
+        self.pending = []
+        self.closed = False
+        self.error = None
+        self.thread = threading.Thread(target=self._run, name="ccc-batch-commit", daemon=True)
+        self.thread.start()
+
+    def submit(self, snapshot):
+        with self.condition:
+            if self.closed or self.error is not None:
+                raise RuntimeError("batch persistence is unavailable") from self.error
+            future = Future()
+            self.pending.append((snapshot, future))
+            self.condition.notify()
+            return future
+
+    def _run(self):
+        while True:
+            with self.condition:
+                self.condition.wait_for(lambda: self.pending or self.closed)
+                if not self.pending:
+                    return
+                end = time.monotonic() + .002
+                while not self.closed and time.monotonic() < end:
+                    self.condition.wait(max(0, end - time.monotonic()))
+                batch, self.pending = self.pending, []
+            try:
+                core.atomic_write_json(self.path, batch[-1][0])
+            except BaseException as exc:
+                with self.condition:
+                    self.error, self.closed = exc, True
+                    batch.extend(self.pending)
+                    self.pending = []
+                for _, future in batch:
+                    if not future.done():
+                        future.set_exception(exc)
+                return
+            for _, future in batch:
+                if not future.done():
+                    future.set_result(None)
+
+    def close(self):
+        with self.condition:
+            self.closed = True
+            self.condition.notify_all()
+        self.thread.join()
+
+
 class BatchWorker:
     def __init__(self, config_path, job_id, *, client=None, queue=None, clock=time.time, pty_probe=None):
         self.config_path = Path(config_path)
@@ -872,6 +929,9 @@ class BatchWorker:
         self.name_lookup = native_thread_name
         self._top_due = 0.0
         self._saved = self._serialized_job()
+        self._job_committer = None
+        self._queued_serialized = self._saved
+        self._queued_commit = None
         self._shell_hints = {}
         self._wait_observed = False
         self._state_lock = threading.RLock()
@@ -976,15 +1036,43 @@ class BatchWorker:
                     parent._wait_observed = True
                     parent.job["preparation_wait"] = copy.deepcopy(self.job["preparation_wait"])
                     parent.job["error"] = self.job["error"]
-                parent.save()
+                commit = parent._queue_job_commit()
+            # Other slots can publish their own intents into this commit while
+            # this slot waits. No slot reaches I/O before its snapshot is saved.
+            parent._wait_job_commit(commit)
             return
         with self._state_lock:
-            serialized = self._serialized_job()
-            if serialized == self._saved:
+            if self._job_committer is not None:
+                commit = self._queue_job_commit()
+            else:
+                serialized = self._serialized_job()
+                if serialized == self._saved:
+                    return
+                self.job["updated_at"] = self.clock()
+                core.atomic_write_json(self.path, self.job)
+                self._saved = self._queued_serialized = serialized
                 return
-            self.job["updated_at"] = self.clock()
-            core.atomic_write_json(self.path, self.job)
-            self._saved = serialized
+        self._wait_job_commit(commit)
+
+    def _queue_job_commit(self):
+        """Called under the original worker's state lock, in mutation order."""
+        serialized = self._serialized_job()
+        if serialized == self._queued_serialized:
+            return self._queued_commit
+        if self._job_committer is None:
+            self._job_committer = _JobCommitter(self.path)
+        self.job["updated_at"] = self.clock()
+        commit = self._job_committer.submit(copy.deepcopy(self.job))
+        self._queued_serialized, self._queued_commit = serialized, commit
+        return commit
+
+    def _wait_job_commit(self, commit):
+        if commit is None:
+            return
+        commit.result()
+        with self._state_lock:
+            if commit is self._queued_commit:
+                self._saved = self._queued_serialized
 
     def _slot_action(self, index, *, confirmation_only=False):
         with self._state_lock:
@@ -1098,8 +1186,12 @@ class BatchWorker:
                     self._release_pool.shutdown(wait=True, cancel_futures=False)
                     self._flush_releases(schedule=False)
             finally:
-                self.cache.close()
-                self._close_done = True
+                try:
+                    if self._job_committer is not None:
+                        self._job_committer.close()
+                finally:
+                    self.cache.close()
+                    self._close_done = True
 
     def _stopping(self):
         return self._closed or (self._slot_parent is not None and self._slot_parent._closed)
