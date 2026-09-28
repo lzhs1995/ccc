@@ -50,6 +50,7 @@ IMMEDIATE_START_POLICY = "parallel-native-v1"
 NATIVE_ACCESS_POLICY = "direct-native-v1"
 ARGV_INITIAL_POLICY = "native-argv-first-task-v1"
 NATIVE_RUNTIME_POLICY = "tokio-workers-2-v1"
+NATIVE_TRACE_POLICY = "per-launch-log-v1"
 CONFIRMABLE = {"submitted", "submitting", "uncertain", "confirmed"}
 CONFIRM_READ_BYTES = 1024 * 1024
 CONTEXT_PARSER_VERSION = 2
@@ -341,12 +342,16 @@ def settled_job(config_path, previous, config, client):
 
 
 def start(config_path, selector, *, client=None, launch=True, private_check=False,
-          access_check=False, native_access=False, _access_fixture=False, ui_trace=None):
+          access_check=False, native_access=False, _access_fixture=False, ui_trace=None,
+          _native_trace=False):
     if (any(type(mode) is not bool for mode in (private_check, access_check, native_access))
             or sum((private_check, access_check, native_access)) > 1):
         raise RuntimeError("B private-check mode must be explicitly selected")
     from ccc_batch_guard import AUTOMATIC_POOL_STOP
     guarded = launch and AUTOMATIC_POOL_STOP
+    if (type(_native_trace) is not bool or
+            (_native_trace and (guarded or not (private_check or native_access)))):
+        raise RuntimeError('native trace requires an explicit new unguarded native check')
     store = core.ConfigStore(Path(config_path))
     config = store.load()
     workspace = workspace_record(config_path, selector, config, client)
@@ -396,6 +401,8 @@ def start(config_path, selector, *, client=None, launch=True, private_check=Fals
                 and previous.get("created_at", 0) > rule.get("batch_success_at", 0)
                 and not settled_job(config_path, previous, config, client)))):
             job = previous  # Repeated clicks and retries reuse the same 50 slots.
+            if _native_trace and job.get('native_trace_policy') != NATIVE_TRACE_POLICY:
+                raise RuntimeError('existing batch has no native trace policy; original batch preserved')
             if (native_access and job.get("native_access_policy") != NATIVE_ACCESS_POLICY
                     or access_check and startup_mode(job, config_path) != 'access_check'):
                 raise RuntimeError('本池尚有原 B 批次，已保留；节费50须在新批次使用，不能将旧任务静默改成检查')
@@ -426,6 +433,8 @@ def start(config_path, selector, *, client=None, launch=True, private_check=Fals
                 # Explicit new native N. Do not reuse the legacy gateway
                 # marker names or reinterpret any existing N descriptor.
                 job["native_access_policy"] = NATIVE_ACCESS_POLICY
+            if _native_trace:
+                job['native_trace_policy'] = NATIVE_TRACE_POLICY
             job_locks.enter_context(core.FileLock(job_path(config_path, job["id"]).parent / "worker.lock", timeout_sec=0))
             if access_check:
                 from ccc_access_service import prepare
@@ -578,6 +587,42 @@ def workspace_launch_context(config_path, job, index):
     return directory, ["-c", trust]
 
 
+def native_trace_directory(config_path, job, index):
+    """An opt-in log destination bound to the original job/slot/launch."""
+    if 'native_trace_policy' not in job:
+        return None
+    if job['native_trace_policy'] != NATIVE_TRACE_POLICY or not argv_initial(job, config_path):
+        raise RuntimeError('invalid native trace policy')
+    if type(index) is not int or not 0 <= index < len(job['slots']):
+        raise RuntimeError('invalid native trace slot')
+    launch_id = job['slots'][index].get('launch_id')
+    if not isinstance(launch_id, str) or str(uuid.UUID(launch_id)) != launch_id:
+        raise RuntimeError('invalid native trace launch identity')
+    root = job_path(Path(config_path).resolve(), job['id']).parent
+    directory = root / 'native-trace' / str(index) / launch_id
+    if directory.resolve() != directory:
+        raise RuntimeError('native trace directory identity changed')
+    return directory
+
+
+def native_trace_identity(config_path, job, index, *, prepare=False):
+    directory = native_trace_directory(config_path, job, index)
+    if directory is None:
+        return None
+    identities = {}
+    for path in (directory.parent.parent, directory.parent, directory):
+        if prepare:
+            path.mkdir(mode=0o700, exist_ok=True)
+        value = path.lstat()
+        if (not stat.S_ISDIR(value.st_mode) or value.st_uid != os.geteuid()
+                or stat.S_IMODE(value.st_mode) & 0o077):
+            raise RuntimeError('native trace directory must be owned and private')
+        identities[str(path)] = [value.st_dev, value.st_ino]
+    if any(directory.iterdir()):
+        raise RuntimeError('native trace directory is not empty before exec')
+    return identities
+
+
 def native_launch_argv(config_path, job, index):
     """Resolve the exact native executable without putting long argv in a PTY."""
     mode = startup_mode(job, config_path)
@@ -588,6 +633,9 @@ def native_launch_argv(config_path, job, index):
     directory, context = workspace_launch_context(config_path, job, index)
     argv = [native_binary(), *(["--cd", str(directory)] if directory else []), *context,
             "-c", "sqlite_home=" + json.dumps(str(sqlite_home(config_path, job["id"], index).resolve()))]
+    trace_directory = native_trace_directory(config_path, job, index)
+    if trace_directory is not None:
+        argv.extend(['-c', 'log_dir=' + json.dumps(str(trace_directory))])
     if mode == 'access_check':
         from ccc_access_service import launch_arguments
         argv.extend(launch_arguments(config_path, job, index))
@@ -882,6 +930,14 @@ def _launch_initial_registered(config_path, job, index, launch_id, argv):
     cwd_generation = _file_generation(cwd)
     executable = Path(argv[0]).resolve(strict=True)
     executable_generation = _file_generation(executable)
+    trace_directory = native_trace_directory(config_path, job, index)
+    trace_identity = None
+    trace_argv = None
+    if trace_directory is not None:
+        trace_argv = tuple(native_launch_argv(config_path, job, index))
+        if tuple(argv) != trace_argv:
+            raise RuntimeError('native trace argv differs from original launch policy')
+        trace_identity = native_trace_identity(config_path, job, index, prepare=True)
     client = _bootstrap_client(core.ConfigStore(Path(config_path)).load(), job)
     tui_log = path.parent / f"initial-native-events-{index}.jsonl"
     with os.fdopen(os.open(tui_log, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as handle:
@@ -901,6 +957,9 @@ def _launch_initial_registered(config_path, job, index, launch_id, argv):
     # Native dotenv can override this request. This records exec input, not a
     # claim about the eventual number of native or blocking-pool threads.
     record["requested_environment"] = requested_environment
+    if trace_directory is not None:
+        record.update(native_trace_policy=NATIVE_TRACE_POLICY,
+                      native_trace_directory=str(trace_directory), native_trace_identity=trace_identity)
 
     def permission_current():
         if (receipt_path.is_symlink() or _file_generation(receipt_path) != receipt_generation
@@ -909,6 +968,18 @@ def _launch_initial_registered(config_path, job, index, launch_id, argv):
                 or _file_generation(executable) != executable_generation):
             return False
         current = core.load_json(path, {})
+        if current.get('native_trace_policy') != job.get('native_trace_policy'):
+            return False
+        if trace_directory is not None:
+            try:
+                if native_trace_directory(config_path, current, index) != trace_directory:
+                    return False
+                if tuple(native_launch_argv(config_path, current, index)) != trace_argv:
+                    return False
+                if native_trace_identity(config_path, current, index) != trace_identity:
+                    return False
+            except (OSError, ValueError, RuntimeError, KeyError, TypeError):
+                return False
         if (native_launch_environment(current) != requested_environment
                 or any(os.environ.get(key) != value for key, value in requested_environment.items())):
             return False
