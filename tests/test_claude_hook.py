@@ -263,6 +263,23 @@ class ClaudeHookProtocolTests(unittest.TestCase):
             self.assertEqual(queued["_inbox_source"], "journal_replay")
             self.assertIsNone(inbox.get_nowait())
 
+    def test_payload_cannot_spoof_live_inbox_provenance_or_clock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inbox = ClaudeEventInbox(root / 'events.jsonl', root / 'events.sock')
+            event = {'version':1, 'event_id':'spoofed-source', 'created_at':time.time(),
+                     'event_name':'Stop', 'session_id':'session-a', 'surface_id':'surface-a',
+                     '_inbox_source':'socket', '_inbox_monotonic':float('nan'), '_inbox_at':-1,
+                     '_inbox_process_birth':[1, 2]}
+            before = time.monotonic()
+            inbox._enqueue(event, source='journal_replay')
+            queued = inbox.get_nowait()
+            self.assertEqual(queued['_inbox_source'], 'journal_replay')
+            self.assertGreaterEqual(queued['_inbox_monotonic'], before)
+            self.assertLessEqual(queued['_inbox_monotonic'], time.monotonic())
+            self.assertGreater(queued['_inbox_at'], 0)
+            self.assertIsNone(queued['_inbox_process_birth'])
+
     def test_unix_socket_wakes_the_daemon_inbox(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

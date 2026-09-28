@@ -18,6 +18,7 @@ import fcntl
 import hashlib
 import json
 import logging
+import math
 import os
 import plistlib
 import queue
@@ -3280,8 +3281,16 @@ class ClaudeEventInbox:
                 return
             self._queued_ids.add(event_id)
         queued = dict(event)
-        queued.setdefault("_inbox_at", time.time())
-        queued.setdefault("_inbox_source", source)
+        queued["_inbox_at"] = time.time()
+        queued["_inbox_source"] = source
+        queued["_inbox_monotonic"] = time.monotonic()
+        queued["_inbox_process_birth"] = None
+        if source == "socket" and type(event.get("agent_pid")) is int:
+            try:
+                from ccc_guard_scope import birth
+                queued["_inbox_process_birth"] = birth(event["agent_pid"])
+            except (OSError, ValueError, RuntimeError):
+                pass
         self.items.put(queued)
         self.wakeup.set()
 
@@ -5264,6 +5273,7 @@ class WatchDaemon:
         self.config = self._load_config_at_startup()
         self._observation_policy = ObservationPolicy(self.config)
         self.runtime: dict[str, TargetRuntime] = self._load_runtime()
+        self._live_claude_hook_epoch = object()
         self._clear_stale_runtime_pause_reasons()
         self.dynamic_targets: dict[str, dict[str, Any]] = {}
         self._local_paused_surface_ids: set[str] = set()
@@ -6087,7 +6097,72 @@ class WatchDaemon:
         pid = int(label.get("agent_pid") or 0)
         inspected = self._inspect_process_cached(pid)
         inspected["agent_kind"] = "claude"
+        inspected["surface_id"] = target.get("surface_id")
+        inspected["workspace_id"] = target.get("workspace_id")
         return inspected
+
+    def _live_claude_hook_identity_matches(self, runtime, observation) -> bool:
+        # This receipt is deliberately not a TargetRuntime dataclass field:
+        # loading state.json or replaying a journal cannot restore it.
+        receipt = getattr(runtime, "_live_claude_hook_identity", None)
+        if not receipt or runtime.claude_hook_provenance != "live_event":
+            return False
+        pid, born, generation, session, accepted, surface, workspace, epoch = receipt
+        now = time.monotonic()
+        if (pid != observation.get("pid") or pid != runtime.claude_process_pid
+                or epoch is not self._live_claude_hook_epoch
+                or surface != observation.get("surface_id")
+                or workspace != observation.get("workspace_id")
+                or self.runtime.get(surface) is not runtime
+                or not generation or generation != observation.get("generation")
+                or generation != runtime.claude_process_generation
+                or not session or session != runtime.claude_session_id
+                or not math.isfinite(accepted) or not math.isfinite(now) or now < accepted):
+            runtime.__dict__.pop("_live_claude_hook_identity", None)
+            return False
+        from ccc_guard_scope import birth
+        try:
+            if birth(pid) == born:
+                return True
+        except (OSError, ValueError, RuntimeError):
+            pass
+        runtime.__dict__.pop("_live_claude_hook_identity", None)
+        return False
+
+    def _record_live_claude_hook_identity(self, runtime, event, target) -> None:
+        if (event.get("_inbox_source") != "socket"
+                or not target.get("surface_id") or not target.get("workspace_id")
+                or event.get("surface_id") != target["surface_id"]
+                or event.get("workspace_id") != target["workspace_id"]
+                or self.runtime.get(target["surface_id"]) is not runtime
+                or not isinstance(event.get("_inbox_monotonic"), (int, float))
+                or not math.isfinite(event["_inbox_monotonic"])
+                or not 0 <= event["_inbox_monotonic"] <= time.monotonic()
+                or event.get("synthetic_fallback")
+                or not runtime.claude_session_id
+                or event.get("agent_pid") != runtime.claude_process_pid):
+            return
+        try:
+            started = dt.datetime.fromisoformat(runtime.claude_process_started_at or "").timestamp()
+            if runtime.claude_last_hook_at >= started:
+                return  # Ordinary wall-clock ordering needs no extra inspection.
+            from ccc_guard_scope import birth
+            pid = runtime.claude_process_pid
+            before = birth(pid)
+            if not before or before != event.get("_inbox_process_birth"):
+                return  # Never bind an older queued event to a reused PID.
+            inspected = inspect_claude_process(pid)
+            if (not before or before != birth(pid)
+                    or not runtime.claude_process_generation
+                    or inspected.get("generation") != runtime.claude_process_generation
+                    or inspected.get("started_epoch", 0) <= 0):
+                return
+            runtime._live_claude_hook_identity = (
+                pid, before, runtime.claude_process_generation,
+                runtime.claude_session_id, time.monotonic(),
+                target["surface_id"], target["workspace_id"], self._live_claude_hook_epoch)
+        except (OSError, ValueError, TypeError, OverflowError, RuntimeError):
+            return  # Missing identity evidence preserves the existing closed gate.
 
     def _apply_claude_process_observation(
         self,
@@ -6101,6 +6176,7 @@ class WatchDaemon:
         generation = str(observation.get("generation") or "")
         started_epoch = float(observation.get("started_epoch") or 0.0)
         generation_changed = bool(generation and generation != runtime.claude_process_generation)
+        live_identity_matches = self._live_claude_hook_identity_matches(runtime, observation)
         # Older state files predate ``claude_hook_process_generation``.  A
         # daemon-only restart must not discard a real Hook from the exact same
         # still-running Claude process merely because that new provenance field
@@ -6123,9 +6199,11 @@ class WatchDaemon:
         hook_belongs_to_process = bool(
             runtime.claude_last_hook_at > 0
             and runtime.claude_hook_process_generation == generation
-            and (started_epoch <= 0 or runtime.claude_last_hook_at >= started_epoch)
+            and (started_epoch <= 0 or runtime.claude_last_hook_at >= started_epoch
+                 or live_identity_matches)
         )
         if generation_changed:
+            runtime.__dict__.pop("_live_claude_hook_identity", None)
             runtime.claude_process_pid = pid
             runtime.claude_process_started_at = str(observation.get("started_at") or "") or None
             runtime.claude_process_generation = generation
@@ -8717,8 +8795,12 @@ class WatchDaemon:
             return
 
         if event_pid > 0 and process_kind == "claude":
+            if runtime.claude_process_pid != event_pid:
+                runtime.__dict__.pop("_live_claude_hook_identity", None)
             runtime.claude_process_pid = event_pid
         if event_name == "SessionStart":
+            if runtime.claude_session_id != session_id:
+                runtime.__dict__.pop("_live_claude_hook_identity", None)
             runtime.claude_hook_health = "healthy"
             runtime.claude_hook_provenance = "live_event"
             runtime.claude_hook_unverified_since = 0.0
@@ -8727,6 +8809,7 @@ class WatchDaemon:
             runtime.claude_hook_process_generation = runtime.claude_process_generation or event_generation or None
             runtime.state = "claude_hook_waiting"
             self._mark_claude_event(event, runtime, "session_started")
+            self._record_live_claude_hook_identity(runtime, event, target)
             self.logger.info(
                 "surface=%s state=claude_hook_healthy source=session_start",
                 surface_id[:8],
@@ -8767,6 +8850,8 @@ class WatchDaemon:
             # supersedes any synthetic gap retry budget from an older missing
             # Hook and makes the next stopped turn eligible again.
             self._clear_claude_fallback_episode(runtime)
+        if runtime.claude_session_id != session_id:
+            runtime.__dict__.pop("_live_claude_hook_identity", None)
         runtime.claude_session_id = session_id
         if not synthetic_fallback:
             runtime.claude_hook_health = "healthy"
@@ -8774,6 +8859,7 @@ class WatchDaemon:
             runtime.claude_hook_unverified_since = 0.0
             runtime.claude_hook_process_generation = runtime.claude_process_generation or event_generation or None
             runtime.claude_last_hook_at = float(event.get("created_at") or time.time())
+            self._record_live_claude_hook_identity(runtime, event, target)
 
         if event_name == "UserPromptSubmit":
             self._clear_claude_fallback_episode(runtime)
@@ -10976,6 +11062,10 @@ def claude_hook_coverage_from_inventory(state, records, labels, targets, inspect
                         and runtime.get("claude_hook_provenance") != "journal_identity"
                         and runtime.get("claude_session_id")
                         and float(runtime.get("claude_last_hook_at") or 0) >= inspection["started_epoch"])
+        if health == "healthy" and not verified:
+            # File-based reports cannot reconstruct a daemon's private live
+            # receipt. Keep their verdict conservative under clock rollback.
+            health = "unverified"
         disposition = (
             "paused" if target.get("paused") or not target.get("enabled", True) else
             "completed" if same_process and runtime.get("claude_completed_latched") else
@@ -11045,6 +11135,8 @@ def audit_claude_surfaces(
             hook_health = "legacy_override"
         else:
             hook_health = str(runtime.get("claude_hook_health") or "unverified")
+            if hook_health == "healthy":
+                hook_health = "unverified"  # No live receipt exists in this file-based audit.
         screen_state = "unreadable"
         live_context: dict[str, Any] = {}
         try:
