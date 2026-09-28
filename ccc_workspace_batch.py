@@ -263,6 +263,8 @@ def _bootstrap_client(config, job):
 
 
 def _launch(config_path, job):
+    if 'standby_policy' in job:
+        raise RuntimeError('standby requires its own activation manager')
     path = job_path(config_path, job["id"])
     with (path.parent / "worker.log").open("ab") as log:
         subprocess.Popen([sys.executable, "-B", str(Path(__file__).resolve()), "run",
@@ -385,6 +387,8 @@ def start(config_path, selector, *, client=None, launch=True, private_check=Fals
             raise RuntimeError("本池已暂停；请先按 W 恢复，再创建或补做")
         cancel_epoch = rule.get("batch_cancelled_at")
         previous = core.load_json(job_path(config_path, rule["last_batch_id"]), {}) if rule.get("last_batch_id") else {}
+        if 'standby_policy' in previous:
+            raise RuntimeError('本池保留待机批次；须通过待机激活入口提交，不能复用普通启动')
         writable = True
         if previous:
             path = job_path(config_path, previous["id"])
@@ -647,18 +651,22 @@ def native_launch_argv(config_path, job, index):
         hook = shlex.join([sys.executable, "-B", str(Path(__file__).resolve()), "bind-initial",
                            "--config", str(config_path), "--job", job["id"],
                            "--index", str(index), "--launch-id", job["slots"][index]["launch_id"]])
-        # Native 0.156's normalized hook identity uses sorted JSON via
-        # version_for_toml; trust only this session-flags handler, not other hooks.
-        normalized = {"event_name": "session_start", "matcher": "startup", "hooks": [
-            {"type": "command", "command": hook, "timeout": 5, "async": False}]}
-        trust = "sha256:" + hashlib.sha256(json.dumps(
-            normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
-        key = "/<session-flags>/config.toml:session_start:0:0"
-        argv.extend(["--enable", "hooks", "-c", 'hooks.SessionStart=[{matcher="startup",hooks=[{type="command",command='
-                     + json.dumps(hook) + ',timeout=5}]}]', "-c",
-                     "hooks.state={" + json.dumps(key) + '={enabled=true,trusted_hash=' + json.dumps(trust) + '}}'])
+        argv.extend(initial_hook_arguments(hook))
         argv.append(PROMPT)
     return argv
+
+
+def initial_hook_arguments(hook):
+    # Native 0.156's normalized hook identity uses sorted JSON via
+    # version_for_toml; trust only this session-flags handler, not other hooks.
+    normalized = {"event_name": "session_start", "matcher": "startup", "hooks": [
+        {"type": "command", "command": hook, "timeout": 5, "async": False}]}
+    trust = "sha256:" + hashlib.sha256(json.dumps(
+        normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+    key = "/<session-flags>/config.toml:session_start:0:0"
+    return ["--enable", "hooks", "-c", 'hooks.SessionStart=[{matcher="startup",hooks=[{type="command",command='
+            + json.dumps(hook) + ',timeout=5}]}]', "-c",
+            "hooks.state={" + json.dumps(key) + '={enabled=true,trusted_hash=' + json.dumps(trust) + '}}']
 
 
 def _claim_argv_initial(config_path, job_id, index, record):
@@ -883,6 +891,8 @@ def native_thread_name(target, native):
 
 
 def launch_registered(config_path, job_id, index, launch_id):
+    if 'standby_policy' in core.load_json(job_path(config_path, job_id), {}):
+        raise RuntimeError('standby requires its own guarded no-prompt launcher')
     register(config_path, job_id, index, launch_id)
     job = core.load_json(job_path(config_path, job_id), {})
     if (job["slots"][index].get("launch_id") != launch_id
@@ -1355,6 +1365,8 @@ class BatchWorker:
         self.path = job_path(config_path, job_id)
         self.store = core.ConfigStore(self.config_path)
         self.job = core.load_json(self.path, {})
+        if 'standby_policy' in self.job:
+            raise RuntimeError('standby requires its own activation manager')
         startup_mode(self.job, self.config_path)
         self.cache = SnapshotCache(workers=1)
         self.client = client or SnapshotClient(_client(self.store.load()), self.cache,
@@ -2857,6 +2869,8 @@ class BatchReconciler:
                     job = core.load_json(path, {})
                     if not job:
                         continue
+                    if 'standby_policy' in job:
+                        continue  # Preparation must never submit through the old worker.
                     current_config = self._config()
                     rule = next((r for r in current_config["workspace_rules"] if r.get("workspace_id") == job["workspace_id"]), {})
                     if (job.get("status") == "complete"
@@ -2897,7 +2911,7 @@ class BatchReconciler:
                 # A running worker holds the lock; it owns both job and proof.
                 if "lock" in str(exc).lower() and self.launch:
                     job = core.load_json(path, {})
-                    if job and allowed(self._config(), job):
+                    if job and 'standby_policy' not in job and allowed(self._config(), job):
                         retire_old_worker(job, config_path=self.path)
                 else:
                     logging.getLogger(core.APP_NAME).warning("batch=%s reconciliation: %s", jid, exc)

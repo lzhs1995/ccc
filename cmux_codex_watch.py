@@ -65,6 +65,7 @@ PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_APP_DIR = Path.home() / "Library" / "Application Support" / APP_NAME
 DEFAULT_RUNTIME_ROOT = DEFAULT_APP_DIR / "runtime"
 RUNTIME_FILES = ("cmux_codex_watch.py", "claude_ccc_protocol.py", "claude_ccc_event_hook.py", "ccc_observation.py", "ccc_scheduling.py", "ccc_native_lanes.py", "ccc_delivery.py", "ccc_codex_queue.py", "ccc_codex_goal.py", "ccc_workspace_batch.py", "ccc_private_check.py", "ccc_inventory.py", "ccc_batch_guard.py", "ccc_guard_transport.py", "ccc_guard_watchdog.py", "ccc_guard_scope.py", "ccc_guard_migration.py", "ccc_codex_launcher.py", "ccc_network_client.py", "ccc_network_guard.py", "ccc_mihomo.py", "ccc_native_processes.py", "ccc_access_budget.py", "ccc_access_gateway.py", "ccc_access_service.py", "ccc_batch_timing.py")
+RUNTIME_FILES += ("ccc_native_standby.py", "ccc_standby_identity.py", "ccc_standby_transport.py", "ccc_standby_launch.py")
 DEFAULT_LOG_DIR = Path.home() / "Library" / "Logs" / APP_NAME
 DEFAULT_CONFIG_PATH = DEFAULT_APP_DIR / "config.json"
 DEFAULT_STATE_PATH = DEFAULT_APP_DIR / "state.json"
@@ -3709,23 +3710,33 @@ class CmuxClient:
         self.runner = runner
         self.viewport_socket = viewport_socket
 
-    def _control_rpc(self, method: str, params: Mapping[str, Any], *, timeout: float = 8):
+    def _control_rpc(self, method: str, params: Mapping[str, Any], *, timeout: float = 8,
+                     write_guard=None):
         transport = self.viewport_socket
+        if write_guard is not None and (method != 'terminal.paste' or transport is None
+                or not transport.path or method not in transport.control_methods):
+            raise InputNotSentError('guarded activation requires atomic socket paste')
         if transport is None:
             return None
         borrowed = getattr(transport._connection_local, 'read_rpc', None)
         if borrowed is not None and method in {'system.tree', 'system.top'}:
             return borrowed(method, params)
         with transport.connection_window(timeout) as remaining:
+            if write_guard is not None:
+                return self._control_rpc_once(method, params, timeout=remaining, write_guard=write_guard)
             return self._control_rpc_once(method, params, timeout=remaining)
 
-    def _control_rpc_once(self, method: str, params: Mapping[str, Any], *, timeout: float = 8):
+    def _control_rpc_once(self, method: str, params: Mapping[str, Any], *, timeout: float = 8,
+                          write_guard=None):
         """Use the advertised endpoint without CLI selector-resolution RPCs.
 
         Input has one attempt and no transport fallback. A missing or malformed
         acknowledgement after writing remains uncertain in the delivery ledger.
         """
         transport = self.viewport_socket
+        if write_guard is not None and (method != 'terminal.paste' or transport is None
+                or not transport.path or method not in transport.control_methods):
+            raise InputNotSentError('guarded activation requires atomic socket paste')
         if (transport is None or not transport.path
                 or method not in getattr(transport, "control_methods", ())):
             return None
@@ -3747,6 +3758,14 @@ class CmuxClient:
             if seconds <= 0:
                 raise TimeoutError("control response deadline exceeded")
             return seconds
+        def write_request(connection):
+            nonlocal attempted
+            # The guard may inspect through this admitted connection. Its
+            # short critical section ends before the acknowledgement wait.
+            with write_guard() if write_guard is not None else contextlib.nullcontext():
+                connection.settimeout(remaining())
+                attempted = True
+                connection.sendall((json.dumps({"id": request_id, "method": method, "params": params}) + "\n").encode())
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
                 connection.settimeout(remaining())
@@ -3754,7 +3773,7 @@ class CmuxClient:
                 connection.settimeout(remaining())
                 if is_input or is_create:
                     check = getattr(self._input_guard_local, 'guards', {}).get(id(self))
-                    if check is not None:
+                    if check is not None or write_guard is not None:
                         def read_rpc(read_method, read_params):
                             if read_method not in {'system.tree', 'system.top', 'terminal.replay', 'surface.read_text'}:
                                 raise CmuxError('connected guard only permits read RPC')
@@ -3786,13 +3805,13 @@ class CmuxClient:
                             return value
                         transport._connection_local.read_rpc = read_rpc
                         try:
-                            if not check():
+                            if check is not None and not check():
                                 raise InputNotSentError('input authorization changed after controller admission')
+                            write_request(connection)
                         finally:
                             transport._connection_local.read_rpc = None
-                connection.settimeout(remaining())
-                attempted = True
-                connection.sendall((json.dumps({"id": request_id, "method": method, "params": params}) + "\n").encode())
+                if not attempted:
+                    write_request(connection)
                 data = bytearray()
                 while b"\n" not in data:
                     connection.settimeout(remaining())
