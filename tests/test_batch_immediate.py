@@ -173,6 +173,36 @@ class ImmediateBatchTests(unittest.TestCase):
         self.assertEqual(len(self.client.sent), 50)
         self.assertEqual(self.client.rename_sent, [])
 
+    def test_old_partial_worker_resumes_same_slots_without_recreating_or_resending(self):
+        original = self.worker
+        for slot in original.job['slots'][:8]:
+            original._create(slot)
+        for slot in original.job['slots'][:3]:
+            original._advance(slot)
+            original._advance(slot)
+        original.job['worker_version'] = 27
+        original.save()
+        identities = {slot['index']: (slot['surface_id'],
+                      dict(self.client.states[slot['surface_id']]), slot['launch_id'])
+                      for slot in original.job['slots'][:8]}
+        receipts = {index: (original.path.parent / f'surface-{index}.json').read_bytes()
+                    for index in identities}
+        original.close()
+        self.worker = batch.BatchWorker(self.config, self.job['job_id'], client=self.client,
+                                        queue=self.client, clock=lambda: self.now, pty_probe=lambda: True)
+        self.addCleanup(self.worker.close)
+        result = fixtures.WorkspaceBatchTests.finish(self)
+        self.assertEqual(result['started'], 50)
+        self.assertEqual(len(self.client.calls), 50)
+        self.assertEqual(len(self.client.sent), 50)
+        self.assertEqual(len(set(self.client.sent)), 50)
+        for index, (sid, native, launch_id) in identities.items():
+            slot = self.worker.job['slots'][index]
+            self.assertEqual((slot['surface_id'], slot['launch_id']), (sid, launch_id))
+            self.assertEqual(slot['session_id'], native['session_id'])
+            self.assertEqual(slot['pid'], native['pid'])
+            self.assertEqual((self.worker.path.parent / f'surface-{index}.json').read_bytes(), receipts[index])
+
     def test_configuration_generation_change_vetoes_cached_authority(self):
         first = self.worker._configuration()
         self.assertTrue(batch.allowed(first, self.worker.job))
@@ -193,6 +223,55 @@ class ImmediateBatchTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, '代际'):
                 self.worker._configuration()
         self.assertIsNone(self.worker._config_snapshot)
+
+    def confirmed_hold(self):
+        slot = self.worker.job['slots'][0]
+        slot.update(phase='confirmed', surface_id=str(uuid.uuid4()), session_id=str(uuid.uuid4()),
+                    launch_id=str(uuid.uuid4()), confirmation={'confirmed': True})
+        self.store.mutate(lambda config: config['workspace_rules'][0].setdefault('batch_start_holds', {}).update({
+            slot['surface_id']: {'job_id': self.worker.job['id'], 'index': 0, 'created_at': self.now}}))
+        self.worker._release_pending.add(0)
+        self.worker.save()
+        return slot
+
+    def test_slow_hold_release_does_not_block_other_slots_creating(self):
+        self.confirmed_hold()
+        self.worker._release_pool = RealThreadPoolExecutor(1)
+        entered, release = threading.Event(), threading.Event()
+        original = self.worker._release_many
+        def slow(slots):
+            entered.set()
+            if not release.wait(10):
+                raise AssertionError('test did not release the config writer')
+            original(slots)
+        with patch.object(self.worker, '_release_many', side_effect=slow):
+            try:
+                self.worker._flush_releases()
+                self.assertTrue(entered.wait(10))
+                self.worker.step()
+                self.assertEqual(len(self.client.calls), 49)
+                self.assertEqual(self.worker._release_pending, {0})
+            finally:
+                release.set()
+                self.worker.close()
+
+    def test_failed_hold_release_retains_pending_work_and_retries(self):
+        slot = self.confirmed_hold()
+        original, attempts = self.worker._release_many, []
+        def fail_once(slots):
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise RuntimeError('timed out waiting for config lock')
+            return original(slots)
+        with patch.object(self.worker, '_release_many', side_effect=fail_once):
+            self.worker._flush_releases()
+            self.assertEqual(self.worker._release_pending, {0})
+            self.assertTrue(core.batch_start_hold(self.store.load()['workspace_rules'][0], slot['surface_id']))
+            self.now += .03
+            self.worker._flush_releases()
+        self.assertEqual(attempts, [1, 1])
+        self.assertEqual(self.worker._release_pending, set())
+        self.assertFalse(core.batch_start_hold(self.store.load()['workspace_rules'][0], slot['surface_id']))
 
 
 class ConcurrentSQLiteTests(unittest.TestCase):

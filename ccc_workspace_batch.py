@@ -633,6 +633,132 @@ def prepare_sqlite_home(config_path, job_id):
         core.atomic_write_json(marker, {"at": time.time(), "metadata": copied})
 
 
+class _RegistrationUnchanged(Exception):
+    pass
+
+
+def _lock_busy(exc):
+    return (isinstance(exc, RuntimeError) and isinstance(exc.__cause__, OSError)
+            and exc.__cause__.errno in {errno.EACCES, errno.EAGAIN})
+
+
+def _registration_outcome(directory, request):
+    receipt = core.load_json(directory / f"surface-{request['index']}.json", {})
+    if all(receipt.get(key) == request.get(key) for key in
+           ("request_id", "surface_id", "workspace_id", "launch_id")):
+        return receipt
+    result = core.load_json(directory / f"registration-result-{request['index']}.json", {})
+    if result.get("request_id") == request["request_id"]:
+        raise RuntimeError(result.get("error") or "batch registration was rejected")
+    return None
+
+
+def _commit_registration_requests(config_path, job_id):
+    """One bootstrap commits every already-ready request in its original batch.
+
+    There is no wait for a cohort. The per-batch lock elects a writer while the
+    other bootstraps await their own durable receipt. Each native still waits
+    for its hold and repeats current authorization before exec.
+    """
+    path = job_path(config_path, job_id)
+    store = core.ConfigStore(Path(config_path))
+    try:
+        with core.FileLock(path.parent / "registration-group.lock", timeout_sec=0,
+                           purpose="batch registration group"):
+            requests = []
+            for index in range(COUNT):
+                source = path.parent / f"registration-{index}.json"
+                try:
+                    data = source.read_bytes()
+                except FileNotFoundError:
+                    continue
+                request = json.loads(data)
+                if (not isinstance(request, dict) or type(request.get("index")) is not int
+                        or request.get("index") != index
+                        or request.get("job_id") != job_id
+                        or not isinstance(request.get("request_id"), str)):
+                    raise RuntimeError("invalid batch registration request")
+                try:
+                    if _registration_outcome(path.parent, request):
+                        continue
+                except RuntimeError:
+                    continue  # This exact request already has a durable veto.
+                requests.append((source, data, request))
+            if not requests:
+                return True
+            accepted, rejected = [], []
+            def protect(latest):
+                # Atomic job replacements may happen while other slots reserve
+                # their launch IDs. Bind every request to the current slot.
+                job = core.load_json(path, {})
+                mode = startup_mode(job, config_path)
+                rule = core.workspace_rule_by_id(latest, job["workspace_id"])
+                changed = False
+                for source, data, request in requests:
+                    index, sid = request["index"], request["surface_id"]
+                    try:
+                        uuid.UUID(sid)
+                        if not allowed(latest, job):
+                            raise RuntimeError("batch paused or cancelled before launch")
+                        if (request["workspace_id"] != job["workspace_id"]
+                                or index >= len(job["slots"])
+                                or job["slots"][index].get("launch_id", "") != request["launch_id"]):
+                            raise RuntimeError("stale batch launch")
+                        if job["slots"][index].get("surface_id") not in (None, sid):
+                            raise RuntimeError("batch slot already has its original surface")
+                        old = core.load_json(path.parent / f"surface-{index}.json", {})
+                        if old and old.get("surface_id") != sid:
+                            raise RuntimeError("batch slot already belongs to another surface")
+                        previous = core.batch_start_hold(rule, sid)
+                        if sid in rule.get("excluded_surface_ids", []) and not (previous or {}).get("legacy"):
+                            raise RuntimeError("new surface was excluded by its operator")
+                        if previous and previous.get("job_id") != job_id:
+                            raise RuntimeError("surface already belongs to another batch")
+                        if previous and not previous.get("legacy") and previous.get("index") != index:
+                            raise RuntimeError("surface already belongs to another batch slot")
+                        if any(other != sid and isinstance(hold, dict)
+                               and hold.get("job_id") == job_id and hold.get("index") == index
+                               for other, hold in rule.get("batch_start_holds", {}).items()):
+                            raise RuntimeError("batch slot already protects its original surface")
+                        if mode == "access_check":
+                            record = {"job_id": job_id, "index": index}
+                            slots = rule.setdefault("access_check_slots", {})
+                            if slots.get(sid) != record:
+                                slots[sid] = record
+                                changed = True
+                        if job["slots"][index].get("phase") != "confirmed" and not previous:
+                            rule.setdefault("batch_start_holds", {})[sid] = {
+                                "job_id": job_id, "index": index, "created_at": request["requested_at"]}
+                            changed = True
+                        accepted.append((source, data, request))
+                    except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+                        rejected.append((source, data, request, str(exc)))
+                if not changed:
+                    # Skip a full config rewrite when a late bootstrap already
+                    # has its exact hold or all requests were vetoed.
+                    raise _RegistrationUnchanged()
+            try:
+                store.mutate(protect)
+            except _RegistrationUnchanged:
+                pass
+            # No receipt is visible before the entire config commit succeeds.
+            # A subsequent attempt reconciles an interrupted receipt write.
+            for source, data, request in accepted:
+                if source.read_bytes() != data:
+                    continue
+                core.atomic_write_json(path.parent / f"surface-{request['index']}.json",
+                    {**request, "registered_at": time.time(), "registration_policy": "coalesced-v1"})
+            for source, data, request, error in rejected:
+                if source.read_bytes() == data:
+                    core.atomic_write_json(path.parent / f"registration-result-{request['index']}.json",
+                        {"request_id": request["request_id"], "error": error, "at": time.time()})
+            return True
+    except RuntimeError as exc:
+        if _lock_busy(exc):
+            return False
+        raise
+
+
 def register(config_path, job_id, index, launch_id=""):
     """Runs in the newly created shell before Codex starts (without a prompt)."""
     path = job_path(config_path, job_id)
@@ -646,24 +772,8 @@ def register(config_path, job_id, index, launch_id=""):
     uuid.UUID(sid)
     if wid != job["workspace_id"]:
         raise RuntimeError("new surface workspace does not match its batch")
-    store = core.ConfigStore(Path(config_path))
     receipt = path.parent / f"surface-{index}.json"
     with core.workspace_input_lock(config_path, wid, shared=True):
-        def protect(latest):
-            if not allowed(latest, job):
-                raise RuntimeError("batch paused or cancelled before launch")
-            rule = core.workspace_rule_by_id(latest, wid)
-            previous = core.batch_start_hold(rule, sid)
-            if sid in rule.get("excluded_surface_ids", []) and not (previous or {}).get("legacy"):
-                raise RuntimeError("new surface was excluded by its operator")
-            if previous and previous.get("job_id") != job_id:
-                raise RuntimeError("surface already belongs to another batch")
-            if startup_mode(job, config_path) == 'access_check':
-                rule.setdefault('access_check_slots', {})[sid] = {'job_id': job_id, 'index': index}
-            # A late/repeated bootstrap cannot put a proven session on hold.
-            if job["slots"][index].get("phase") != "confirmed":
-                rule.setdefault("batch_start_holds", {})[sid] = {
-                    "job_id": job_id, "index": index, "created_at": time.time()}
         with core.FileLock(receipt.with_suffix(".lock"), timeout_sec=5):
             job = core.load_json(path, {})
             if (job["slots"][index].get("launch_id") or "") != launch_id:
@@ -671,14 +781,26 @@ def register(config_path, job_id, index, launch_id=""):
             old = core.load_json(receipt, {})
             if old and old.get("surface_id") != sid:
                 raise RuntimeError("batch slot already belongs to another surface")
-            store.mutate(protect)
             prepare_slot_sqlite_home(config_path, job_id, index)
             directory = prepare_working_directory(config_path, job, index)
-            core.atomic_write_json(receipt, {"surface_id": sid, "workspace_id": wid,
-                                            "launch_id": launch_id, "registered_at": time.time(),
-                                            "shell_pid": os.getppid(),
-                                            "shell_start": batch_shell_identity(os.getppid()),
-                                            **({"working_directory": str(directory)} if directory else {})})
+            request = {"job_id": job_id, "index": index, "request_id": str(uuid.uuid4()),
+                       "surface_id": sid, "workspace_id": wid, "launch_id": launch_id,
+                       "requested_at": time.time(), "shell_pid": os.getppid(),
+                       "shell_start": batch_shell_identity(os.getppid()),
+                       **({"working_directory": str(directory)} if directory else {})}
+            core.atomic_write_json(path.parent / f"registration-{index}.json", request)
+            next_check = time.monotonic() + .25
+            while not _registration_outcome(path.parent, request):
+                _commit_registration_requests(config_path, job_id)
+                if _registration_outcome(path.parent, request):
+                    break
+                if time.monotonic() >= next_check:
+                    current = core.load_json(path, {})
+                    if (not allowed(core.ConfigStore(Path(config_path)).load(), current)
+                            or current["slots"][index].get("launch_id", "") != launch_id):
+                        raise RuntimeError("batch authorization changed before native launch")
+                    next_check = time.monotonic() + .25
+                time.sleep(.005)
 
 
 class BatchWorker:
@@ -713,8 +835,12 @@ class BatchWorker:
         self._inflight = {}
         self._slot_due = {}
         self._release_pending = set()
+        self._release_pool = None
+        self._release_future = None
+        self._release_retry_at = 0
         self._wakeup = threading.Event()
         self._closed = False
+        self._close_done = False
         self._config_read_lock = threading.RLock()
         self._config_snapshot = None
 
@@ -869,30 +995,65 @@ class BatchWorker:
             self._inflight.pop(index)
         self._flush_releases()
 
-    def _flush_releases(self):
+    def _flush_releases(self, *, schedule=True):
+        future = self._release_future
+        if future is not None:
+            if not future.done():
+                return
+            self._release_future = None
+            try:
+                slots = future.result()
+            except (OSError, ValueError, RuntimeError) as exc:
+                # A config lock timeout is known unsent input. Keep every hold
+                # and pending release; other slots continue while this retries.
+                self._release_retry_at = self.clock() + STARTUP_POLL_SEC
+                with self._state_lock:
+                    self._wait("hold_release", "等待原启动保护移交：" + str(exc))
+                    self.save()
+                return
+            with self._state_lock:
+                for saved in slots:
+                    slot = self.job["slots"][saved["index"]]
+                    if all(slot.get(key) == saved.get(key) for key in ("surface_id", "session_id", "launch_id")):
+                        slot["hold_released_at"] = saved["hold_released_at"]
+                        self._release_pending.discard(saved["index"])
+                self.save()
+        if not schedule or self.clock() < self._release_retry_at:
+            return
         with self._state_lock:
             ready = [index for index in self._release_pending if index not in self._inflight]
             slots = [copy.deepcopy(self.job["slots"][index]) for index in ready]
             slots = [s for s in slots if s.get("phase") == "confirmed" and s.get("confirmation", {}).get("confirmed")]
         if not slots:
             return
-        # Do not hold the job mutex over config I/O: another slot's launch
-        # reservation must not wait for a different pool's config writer.
-        self._release_many(slots)
-        with self._state_lock:
-            for saved in slots:
-                slot = self.job["slots"][saved["index"]]
-                if all(slot.get(key) == saved.get(key) for key in ("surface_id", "session_id", "launch_id")):
-                    slot["hold_released_at"] = saved["hold_released_at"]
-            self._release_pending.difference_update(s["index"] for s in slots)
-            self.save()
+        # A different pool's config writer must not occupy the slot dispatcher.
+        # Exactly one coalesced release writer runs per original worker.
+        if self._release_pool is None:
+            self._release_pool = ThreadPoolExecutor(1, thread_name_prefix="ccc-batch-release")
+        def release():
+            self._release_many(slots)
+            return slots
+        self._release_future = self._release_pool.submit(release)
+        self._release_future.add_done_callback(lambda _: self._wakeup.set())
+        if self._release_future.done():
+            self._flush_releases(schedule=False)
 
     def close(self):
+        if self._close_done:
+            return
         self._closed = True
-        if self._slot_pool is not None:
-            self._slot_pool.shutdown(wait=True, cancel_futures=False)
-            self._collect_slots()
-        self.cache.close()
+        try:
+            if self._slot_pool is not None:
+                self._slot_pool.shutdown(wait=True, cancel_futures=False)
+                self._collect_slots()
+        finally:
+            try:
+                if self._release_pool is not None:
+                    self._release_pool.shutdown(wait=True, cancel_futures=False)
+                    self._flush_releases(schedule=False)
+            finally:
+                self.cache.close()
+                self._close_done = True
 
     def _stopping(self):
         return self._closed or (self._slot_parent is not None and self._slot_parent._closed)
@@ -1820,10 +1981,12 @@ class BatchWorker:
         self._dispatch_slots(ready)
         self._collect_slots()
         with self._state_lock:
-            if not self._inflight and all(s["phase"] == "confirmed" for s in self.job["slots"]):
+            if (not self._inflight and not self._release_pending and self._release_future is None
+                    and all(s["phase"] == "confirmed" for s in self.job["slots"])):
                 self.job["status"] = "complete"
                 self._clear_wait()
-            elif not self._inflight and all(s["phase"] in {"confirmed", "blocked", "surface_closed"} for s in self.job["slots"]):
+            elif (not self._inflight and not self._release_pending and self._release_future is None
+                    and all(s["phase"] in {"confirmed", "blocked", "surface_closed"} for s in self.job["slots"])):
                 self.job["status"] = "needs_attention"
                 self._clear_wait()
             elif self._wait_observed:
