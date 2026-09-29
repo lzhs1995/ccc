@@ -1,0 +1,282 @@
+# Changelog
+
+## 0.2.30 (unreleased)
+
+- Reduce repeated parsing under the shared batch startup lock with a bounded cache of unchanged jobs that cannot contribute startup capacity. Invalidate on file replacement or modification; retain four initialization permits, the 0.5-second interval, the 30-second lease and a fresh authorization check before reservation.
+- Keep the fixed short prompt for newly created b checks while the original native identity, first task, failed-turn history and durable CCC sends still prove that check. Ordinary user tasks and existing B/b/N policies retain their continuation semantics. Queue recovery pins each attempt's original message and rechecks short-check input after persisting its intent.
+- Show preparation waits, naming and first-task acceptance separately from model success. Retain the wait start time without repeated identical writes and remove stale wait messages when progress resumes.
+
+## 0.2.29
+
+- Add explicit manual-route failover in anonymous reachability mode. Probe the actual selected fixed route, retain a healthy manual choice, and transfer the named service selector to its automatic child only after consecutive fresh failures and a newly verified replacement. Show actual manual protection before background candidate counts.
+- Bind each check to live proxy identities, fixed dialers, the configured provider, selector edges and physical-interface generation. Reject conflicting global/provider names and recheck the user's current selection before the single selector update. HTTP 401/429/500 remain reachable; the live HEAD check rejects 403 and transport failure using fresh URL-specific Mihomo health, not a generic delay/alive flag.
+- Share the four probe workers and prioritize the route carrying user traffic. Anonymous checks use no API key or model generation. Failover changes new connections without a Clash reload or connection deletion; existing streams retain their original path and broken remote streams use native retries.
+- Preserve original B/b, sustained N, its existing gateways and journals, and fixed non-AnyRouter routing. Manual failover requires an explicit policy and does not activate for legacy response-mode configurations.
+
+## 0.2.28
+
+- Keep sustained N batches retryable after a connection failure before any request bytes are sent. Return a retryable 503 after durably completing the unused reservation, preserve the other waiting slots, and check every upstream reader for EOF before releasing the initial fifty requests. Finite batches and uncertain dispatched requests retain their existing limits.
+- Show connection preparation, actual upstream activity and fixed transport diagnostics in N status. Preserve native reconnect and original-session continuation, the short request, tool/title exclusion, and the per-batch success gate.
+- Add a separate, explicit one-shot repair for an idle old N listener whose entire accounting history proves no request was dispatched. Bind the complete historical job inventory, original listener, fifty native sessions and failed local 409 turns. Retain the old port and journal; record each paste and Enter before issuing it. Normal upgrades never invoke this repair automatically.
+- Keep original B/b, automatic pause/Interrupt policy, native settings and network modules unchanged. Extend isolated native acceptance to reproduce the old connection refusal and recover the same fifty original CLI sessions.
+
+## 0.2.27
+
+- Make new N batches explicitly sustained: retain all 50 slots, inherit the provider's native HTTP and stream retries, and continue confirmed retryable failures in the original sessions. Remove the cumulative 1000-attempt cutoff from new batches. Existing finite batches retain their limits, listeners and journals.
+- Stream sustained accounting history with bounded per-slot memory and serialize reservation numbers without delaying the immediate success gate behind disk writes. Retain durable counts, unresolved-restart protection and bounded recent dispatch diagnostics.
+- Keep the fixed short upstream request, tool/title exclusion, requested output limit and per-workspace success gate. After a complete reply, new checks stop and in-flight requests finish naturally. Original B/b and automatic pause/Interrupt behavior remain unchanged.
+- Add a native loopback acceptance path that preserves real retry defaults and requires an observed 5/5 reconnect, all fifty original-session continuations, more than 1000 real HTTP requests and sustained rejection before the fixture permits success. Protocol pressure and native CLI resource measurements remain separate evidence.
+
+## 0.2.26
+
+- Add explicit `probe.validation_mode=reachability` for anonymous AnyRouter route checks. A fixed malformed request never loads API credentials or requests model generation. Structured API authentication, capacity and rate-limit replies establish reachability; explicit network blocks and uncertain HTML remain distinct. Existing configurations retain complete-response validation unless this mode is selected.
+- Keep route reachability separate from model availability and expose selectable, reachable, blocked, failed, recovering and untested counts with check times. Refuse stale state from another validation mode. Keep manual selection independent of the automatic pool.
+- Match evidence freshness to the unchanged slow polling interval. Recheck a first transport failure, quarantine repeated failures, and require fresh recovery evidence after cooldown or configuration changes. Preserve existing model evidence, quarantine history and consumed probe reservations across the opt-in transition.
+- Preserve N protocol fixes, original B/b behavior and automatic pause/Interrupt settings. Local private routing changes and anonymous route results are separate deployment evidence; API reachability does not guarantee model capacity or account billing behavior.
+
+## 0.2.25
+
+- Accept repeated upstream metadata headers, including separate Set-Cookie fields, on API and CONNECT responses. Keep native request headers and response framing/interpretation headers strict. Record fixed, bounded protocol diagnostics without credentials, cookies or upstream body text.
+- Project each N slot's request outcome into the Supervisor table, focus details, workspace error count and an errors filter. Share the same decision with the continuation gate: confirmed congestion remains retryable within its original budget; uncertain requests are shown as blocked instead of working. Current failures supersede the old submitted footer message.
+- Use a separate listener and owner directory for each immutable access runtime. Existing gateways, ports, native clients and journals remain in place when a new version starts. Original B/b, network modules, automatic pause and automatic Interrupt policy are unchanged.
+- Extend local native acceptance with repeated response headers, 25 HTTP and 25 SSE congestion rejections, actual CCC continuation, and both initial/final panel projections. This does not establish AnyRouter availability or a particular account charge.
+
+## 0.2.24
+
+- Add a separate `N` / `--access-check` mode that retains 50 concurrent native slots while forwarding only a fixed, small Responses request. A complete assistant reply closes new admission inside the stream parser; in-flight requests finish naturally and automatic interruption remains OFF. Preserve original `B` and separate `b` until operator acceptance.
+- Bound each opt-in job to 1000 durable HTTP reservations, with `max_output_tokens=128` on every upstream request. Drop native history, tool schemas, auxiliary title threads and tool continuations before the upstream. Do not remove rejected limits, refund cancelled attempts, or reopen an unresolved batch after restart. Output limits depend on upstream compliance and are not a billing guarantee.
+- Share one asynchronous access gateway per configuration with four storage workers and independent job gates. Parse complete SSE events before chunk padding, reuse TLS contexts, close transport before slow cancellation persistence, and report failed initial cohorts as closed rather than spending more reservations on futile retries. Keep native checks separate from the existing network guard.
+- Validate the optional mode with real native B50 in an existing workspace, exact UUID ownership and cleanup, plus separate 1000-request loopback TLS/CONNECT pressure. Protocol concurrency is not evidence that this Mac can host 1000 native CLI surfaces.
+- Make original B authorize folder access for the exact inherited directory in that native invocation, including first-time home-directory launches. Keep the directory and original prompt, and do not change global Codex trust or approval settings. Native B50 acceptance starts from an untrusted directory and checks all 50 original-session continuations.
+- Recognize Codex's pathless global AGENTS context when confirming the original B startup prompt. Explicit user events, malformed context and appended human text remain separate input and cannot grant continuation.
+- Revalidate saved `different user prompt` startup blocks against the original session, transcript identity, submission offset and task. Persist bounded progress, keep the old rejection as evidence, and release only the confirmed slot's startup hold without replaying its prompt or changing operator pauses and exclusions.
+- Cache batch reconciliation's validated configuration while its file identity is unchanged; check for changes at every authorization boundary. Skip fully confirmed completed jobs, bound idle worker caches, and read UI batch summaries only for visible workspaces while retaining all history.
+- Share and index each native binding-file generation across historical B workers instead of repeatedly decoding the full archive. Detect replacement, deletion and malformed files on every use; keep fresh native identity and send checks. Share the existing fleet snapshot and preserve bytes/mtime of unchanged historical jobs after worker eviction.
+- Expose the existing empty-directory short-answer policy as a separate `b` button/key, with explicit confirmation and the persisted mode shown in progress. Preserve uppercase `B`, unfinished batch policies and both automatic-pause/cut switches OFF. This opt-in startup avoids the first folder-trust dialog without trusting the user's home or changing global Codex configuration.
+- Extend real native B50 acceptance to fail every initial turn on a private loopback API and require exactly one CCC continuation in each original session. Keep the default prompt, working directory, automatic pause OFF and network behavior unchanged.
+
+## 0.2.23
+
+- Bind each queued network probe to one credential and model snapshot. Pair completed results and reservations with that contract in the event journal. A temporarily unreadable credential file suspends probing and publication without erasing prior qualification or isolation; a real account/model change still requires new API admission.
+- After three consecutive API failures of the same class across at least two candidate paths, delay deep recovery checks by 60, 120, 240 and at most 300 seconds. Light checks continue; completed success ends the delay. Keep durable reservations, completion spacing, restart barriers, route quarantine and manual selection independent.
+- Prevent a previously qualified current path with repeated API errors from monopolizing deep checks. Other eligible paths may be checked while the current path waits its normal interval; API errors still do not trigger node quarantine or rotate the current selection.
+- Add automatic-pool diagnostics to network status: ready/candidate counts, recent API outcomes, recovery delay, configured model, credential source and contract. Distinguish local credential/observer errors, upstream failures, rate limits, permission errors and route failures. Clash's ordinary delay-test Timeout is not a complete API validation result.
+
+## 0.2.21
+
+- Render only current cmux surfaces and use their current workspace names and references. Historical registrations no longer reappear as paused terminals or relabel a real workspace whose display number was reused.
+- Copy the selected full native session ID with `y`/`Y` or by clicking its session cell. Unknown, conflicting and truncated IDs never replace the clipboard; clipboard work runs outside the input thread.
+- Distinguish confirmed closed surfaces, inactive shells and queued followups from continuation faults. Require fresh matching workspace/process evidence, honor the native monitor's actual bounded observation cadence, and retain unconfirmed-delivery and live-owner failures.
+- Treat failed janitor measurements as temporarily unavailable instead of inventing configuration drift. Block cleanup until a complete check succeeds, preserve genuine trips and operator pauses, and expose the original trip reason in the controller and Supervisor.
+- Read janitor safety configuration consistently without a grep/tail/cut pipeline, replace baselines atomically, keep status read-only, and retain the cleanup gate when state publication fails. Recovery still requires the existing rearm/resume checks.
+- Preserve existing B, continuation authorization and network behavior. Automatic workspace pause remains disabled; its optional rule still requires three consecutive complete real replies from one original session.
+
+## 0.2.20
+
+- Keep fleet target merging linear in targets and workspace rules, and move it outside shared target locks. Native completion monitoring and authorization no longer wait for a full fleet merge.
+- Discover exact local Codex surface/workspace identities independently of slow GUI process snapshots. Expired, ambiguous, remote and noninteractive hints cannot enroll a target; native writer, original session, failed turn and input checks still gate every continuation.
+- Pin canonical transcript paths for native monitoring instead of repeatedly resolving unchanged paths. Publish coverage per surface during a scan with a bounded measured freshness allowance, so a busy fleet does not repeatedly fall back to full viewport polling.
+- Confirm missing B surfaces with a new topology request before declaring them closed. Reconcile falsely closed original slots only with matching launch receipts and current workspace membership; submitted work stays on its original confirmation path.
+- Allow an explicit B after a definitively finished batch with closed/excluded slots. Keep live or uncertain old slots, pending submissions and creation receipts instead of duplicating the batch.
+- Make both B confirmation paths report the current automatic-pause policy. Automatic pause remains off; the optional connectivity rule still requires three consecutive complete real responses from one original session.
+- Add a fleet acceptance tool with 843 isolated surfaces, real native transcript parsing, durable send records and concurrent configuration changes, plus original-process loopback acceptance without production API requests.
+
+## 0.2.19
+
+- Separate the user-owned AnyRouter selector from the guard's automatic selector. Prepare complete static manual routes, ordered Tokyo dependencies and a preserved emergency default. An empty automatic provider or stopped detector cannot delete or override manual choices.
+- Bind network waiting to the effective Clash route and selector configuration. GLOBAL/manual choices and other active profiles do not inherit an automatic-pool outage; a manual choice during a failed provider refresh remains visible.
+- Keep the publisher and cleanup alive when health/status writes fail, including ENOSPC. Hold routing mutations while observer persistence is unavailable and never dispatch a paid probe without its durable reservation. Preserve consumed budgets and quarantine evidence.
+- Persist unfinished probe reservations and wait a full configured budget interval after worker completion before the next paid request. Delayed fsync/journal work, queued workers, discarded evidence, clock changes and restarts cannot accelerate actual dispatch; runtime rate tightening takes effect on the same completion barrier.
+- Identify the API credential by the actual key used by the probe, so JSON formatting and unrelated auth-file metadata cannot revoke every route's qualification. Real credential changes still require new admission.
+- Extend same-binary AnyTLS acceptance to selector migration, manual rescue with a dead publisher and an Offline-only automatic pool, and cold startup without a publisher cache. Verify two old streams, newly produced frames, connection IDs, explicit stream ends and forced garbage collection.
+- Preserve v0.2.18 B/continuation behavior and keep automatic workspace pause disabled. This update does not change B authorization, native events, scope, heartbeat or STOP logic.
+
+## 0.2.18
+
+- Keep automatic workspace pause disabled. B now launches the verified native Codex executable directly, without re-entering an old conditional launcher or adopting existing sessions.
+- Replace first-delta success with three consecutive complete, nonempty successful turns from one exact native session. Exclude reasoning, tools, history and duplicate events; reset on failure or identity change. This optional policy remains off.
+- Preserve session, transcript and submission evidence when a remote-endpoint error is displayed. Recovery may only relaunch a proved pre-session startup failure in its original surface.
+- Restore four shared native initialization permits with bounded leases. A newly created tab does not immediately release its permit and flood the remaining cold starts.
+- Recover high-demand failures despite a stale stalled-goal footer when the current original failed turn is proven. Deduplicate accepted submissions across restart and recheck native state after acquiring the workspace input lock.
+- Recover the original failed turn when a missed Hook and an idle, closed rollout leave only the verified native thread writer lock. Check process birth, surface/workspace, file identities and lifecycle again before using that evidence.
+- Keep observations running through unrelated batch configuration updates, preserve overdue readers' order, share one discovery snapshot and retain known targets when process enumeration is incomplete. Preserve the final input and pause checks.
+- Show that automatic pause is disabled in the B confirmation and status display; historical first-event stops no longer claim connectivity under the new rule.
+- Keep existing relay backends and all pause/history/configuration records during upgrade. No Clash or network-policy change is part of this repair.
+
+## 0.2.17
+
+- Add an optional independent AnyRouter network guard with isolated Mihomo probes, real Responses/SSE admission, persistent quarantine recovery and shared probe budgets. Keep a healthy commercial pool, rotate on confirmed route failure and reserve ordered Tokyo residential chains for fallback.
+- Preserve consumed probe-budget reservations across wall-clock rollback, including guard restarts, instead of admitting an extra billable probe.
+- Honor configured probe spacing longer than one minute across restarts while keeping the per-minute budget independent.
+- Retain Clash's cached routes while a restarted publisher awaits its first selector reconciliation, instead of briefly publishing an offline-only catalog.
+- Read subscription updates asynchronously so slow parsing cannot stall probe results, routing or heartbeats. Clear recovered subscription errors independently of probe-core faults and preserve a confirmed network outage in status.
+- Date and order probe evidence by worker completion and refresh the reservation clock after local processing, preventing delayed results from becoming new admission evidence, clearing an intervening failure, or using an outdated probe-budget timestamp.
+- Separate local probe setup failures from remote CONNECT/TLS failures. Fence both successful and failed in-flight evidence across detected physical interface changes, including DHCP self-assigned addresses, without erasing quarantine or refunding reservations. Preserve the current provider and selection while the interface is unavailable.
+- Prefer validator-reachable recovery candidates without bypassing admission, and schedule overdue inventory fairly behind the current route. Use Interactive resource priority for the network service and retain bounded probe-stage, interface, reservation and selection diagnostics.
+- Publish only admitted routes through a loopback provider, retain active definitions until selection commits, and pin complete-chain dependencies. Normal failover does not reload Clash or close connections. Add a same-binary stream-preservation acceptance tool for initial profile migration.
+- Add isolated AnyTLS acceptance with two concurrent HTTPS streams, changed provider payloads, adapter pruning, forced garbage collection and explicit post-change frames/end markers; exercise the production binary without API traffic.
+- Show network health in the Supervisor and expose `ccc network status`, `probe` and `install`. Only verified AnyRouter failed turns wait for a confirmed network outage; original B STOP, scope, heartbeat, pause and native-turn gates remain independent.
+- Resolve native named profile files and attached CLI options when binding failed turns to AnyRouter. Exclude remote clients, legacy profile ambiguity, prompt text after `--`, and configuration changes or replacements during inspection so other providers cannot inherit an unrelated network pause.
+- Require local process ownership for native error-URL binding as well. Distinguish the actual Responses request endpoint from help links in an upstream error body.
+
+## 0.2.16
+
+- Fence new B workspace input synchronously when a native model event arrives, before awaiting membership verification. Only confirmed current membership authorizes success and interruption; moved surfaces release the provisional fence without stopping the old workspace.
+- Require structurally valid, contiguous B job slots for both original and migrated protection rules. Reject malformed records instead of treating their presence as authorization.
+- Preserve every original session on any migration failure before history preflight completes, including discovery and fence-persistence errors. Keep post-preflight setup failures on the existing scoped stop path.
+- Require verified stopping within one second before B can rearm a successful pool. Late or incomplete proof keeps the pool paused until an explicit W recovery.
+- Keep stalled goals on the verified native goal-resume path. Missing or already-consumed goal evidence cannot fall through to an ordinary continuation prompt.
+
+## 0.2.15
+
+- Interrupt every Codex in a genuine B batch workspace on its first fresh native model response. Fence new/queued requests immediately, verify native backend exit, and escalate exact processes at 350/650 ms against a one-second deadline. Current workspace UUIDs and microsecond process identities exclude other workspaces and moved surfaces.
+- Add a private native RPC relay, independent watchdog, persistent stop records and original-session migration. Early success cancels unfinished batch slots. W restores the same sessions without replaying prompts or filling cancelled slots; B after confirmed success starts a new batch. Persist empty sessions without model calls and suppress hidden title-generation requests during connection tests.
+- Reconcile exited fork processes before reporting a coverage failure. Finish original-history preflight before migration can stop a process; refuse destructive migration when the original writer owns an unlinked or replaced history file.
+- Treat the global Dock as window-owned even when cmux displays it under the selected workspace, so B never interrupts unrelated global Dock sessions.
+- Recover a verified native stalled goal even when its original rollout was unlinked or replaced. Require the live writer, original SQLite identities, matching terminal error and current blocked goal; issue one native `/goal resume` with separately verified draft and Enter. Ordinary slash-command sending remains disabled.
+- Add local-upstream acceptance for real cmux B50, early cancellation, W/B lifecycle, native/watchdog failure, moved-surface isolation and unlinked-rollout goal recovery.
+
+## 0.2.14
+
+- Recognize the dim background-terminal status bar when verified RGB composer particles occupy its usual blank separator. Keep the same position, complete text, dim-style and wrapping checks; real output and unverified particles still block recovery. This fixes completed rate-limit/high-demand turns incorrectly marked as superseded on animated Codex surfaces.
+
+## 0.2.13
+
+- Keep active native Codex reconnects out of the send queue before topology preflight, so a provider outage cannot fill every send slot with tasks that are still retrying. Revalidate completion again before actual input.
+- Match both `We're` and `We’re` in the complete high-demand banner, including wrapped text. A typographic apostrophe must not leave an authorized failed task classified as idle.
+- Recognize native Hook termination cards without an exit status, as well as timeouts, when a current provider failure needs continuation. Hook failures alone never trigger input; explicit hook decisions and newer task output still block it.
+- Add a backed-up, opt-in migration for the legacy Codex shell/launchd binary-copy loop, and document matched official CLI/helper upgrades without resetting sessions or TCC permissions.
+- Confirm the original batch task through combined AGENTS/environment context and incremental, partial JSONL records. Persist proof before releasing startup protection; recover legacy holds from every relevant batch.
+- Separate startup holds from operator exclusions and show `整池／启动中`. Repeated workspace authorization is idempotent and preserves manual P, exclusions and per-surface pauses.
+- Share timestamped tree/process inventories across the watcher, panel and batch workers. Coalesce failed scans, limit global process discovery to once per five seconds, and continue local confirmation during RPC failures.
+- Share four startup permits and at most two starts per second. Menus and drafts yield their permit; uncertain RPCs keep their durable record without monopolizing capacity. A waiting pool cannot block all other pools, and capacity checks read only active jobs.
+- Give new batches separate SQLite runtimes, seeded through read-only native metadata backups. Avoid both the busy global log database and a full reindex of old rollouts. Discover new Codex children directly from the bootstrap shell when system.top is unavailable.
+- Confirm the first task without waiting for topology refresh, releasing its startup permit promptly. Read native writer descriptors directly on macOS instead of launching lsof for each poll; incomplete reads, descriptor reuse and process/session changes still reject evidence.
+- Let send preflights join an in-flight cross-process topology refresh with a bounded wait, retaining fresh-snapshot requirements instead of repeatedly caching a transient `tree refresh pending` failure.
+- Read and rank janitor candidate timestamps in one process, retaining oldest-first selection and all disposal checks without spawning a separate `stat` for every candidate.
+- Queue B when macOS PTYs are exhausted instead of creating unusable tabs. Recover proven pre-session database/PTY startup failures in the same surface, preserving native sessions, drafts and operator pauses. Include an optional LaunchDaemon for macOS's supported 999-PTY ceiling.
+- Retry cmux's exact pre-dispatch polling rejection with exponential backoff, including legacy batch slots stranded with stale launch receipts. Preserve uncertain deliveries and recheck original surfaces, native sessions, drafts and pool authorization before each retry.
+
+## 0.2.12
+
+- Confirm a new native Codex session before its first rollout exists, using the
+  original process and UUIDv7 writer lock. Ignore read-only history index files
+  when recovering the active transcript.
+- Submit each batch prompt with a separately recorded Enter after verifying
+  its exact draft. Handle terminal spans that merge prompt padding and text;
+  preserve extra user text and ambiguous delivery instead of resubmitting.
+- Confirm first-task starts from both native user-message formats. Retain the
+  original launch time when retrying a paused batch.
+- Recognize the complete rate-limit banner when native Codex adds a second
+  prefix, while retaining draft, menu and quoted-example protection.
+
+## 0.2.8
+
+- Wake guarded observation from original native failures; retry a temporarily
+  unavailable observation every second without rereading unchanged transcripts.
+  Drafts, menus, queues and acknowledged input stop priority retries.
+- Use the advertised control socket for inventory and Codex continuation,
+  require process-inclusive inventory, and preserve uncertain delivery records.
+  Handle animated composer overlays, word-wrapped errors, native HTTP failures,
+  and stale Working text above a later failure.
+- Add `P` for workspace pause/Interrupt and `W` for workspace resume. Persist
+  the pool pause before input, drain in-flight Codex input with a workspace
+  barrier, then send Escape to live main-area Codex. Keep original sessions,
+  individual pauses/exclusions, and the pool gate on partial transport failure.
+- Retry transient cmux read/socket failures without permanently pausing authorized
+  surfaces. Preserve explicit pauses and delivery records.
+- Scan the full visible viewport when terminal grids contain bottom padding.
+  Recognize the exact two-line Codex Hook timeout diagnostic without treating it
+  as new task progress; other Hook errors and user/approval text stay protected.
+- Wait for the original Codex task to end before continuation, and revalidate
+  that task at the input boundary. Persist one submission per failed task.
+  Recover missing Hook identity from the live process's original open transcript,
+  checking PID/start time and both cmux UUIDs without fabricating Hook events.
+- Keep the native-task guard active while shared process identity is refreshing;
+  a missing Hook plus a pending process snapshot is not a legacy-client bypass.
+- Reconcile timed-out input using two fresh empty-composer observations and an
+  unchanged failed task. Verified absent input can retry instead of remaining
+  blocked forever. Queued CCC prompts retain a durable, single-attempt recovery
+  record; user drafts and ambiguous delivery remain protected.
+- Remove the unwanted delayed-observation label from the Supervisor.
+- Expire janitor quarantine after three hours, run expiry independently, and
+  drain approved backlogs in bounded batches with restartable progress records.
+
+## 0.2.7
+
+Includes the previously unpublished 0.2.2–0.2.6 working drafts.
+
+- Replace whole-batch polling with independent per-UUID deadlines, bounded
+  observation/send pools (32/8 by default), and completion wakeups. Slow readers
+  and sends no longer hold every target until a batch finishes. Share process
+  snapshots and their classification, and bound background maintenance work.
+- Read fresh viewports over the CLI-discovered cmux v2 socket without spawning
+  a process for every read/replay. Validate request and target identities, bound
+  response size and total timeout, and retain CLI fallback for legacy/auth modes.
+- Reuse one current grid for known error candidates while retaining lightweight
+  text checks for idle/Working/menu states. Share a single fleet process scan,
+  finish diagnostic refreshes before declaring Hook inventory complete, and
+  remove launchd Background throttling from the deadline-sensitive watcher.
+- Keep missing/unverified Claude Hooks and known Hook/model blockers out of the
+  healthy continuation count even when the terminal viewport is readable.
+- Preserve workspace-scoped discovery over the shared fleet snapshot and bound
+  watcher thread switching to reduce deadline-thread GIL starvation.
+- Spread revisit deadlines across the configured period, retaining immediate
+  first reads and avoiding cadence drift or bursts after missed deadlines.
+- Remove unchanged-config lock convoys and whole-fleet copies/owner inspections
+  from shared locks. Wake at observation deadlines, persist the already encoded
+  state once, and prevent Claude event-error persistence from deadlocking.
+- Coalesce concurrent durable state writes and publish health outside the
+  scheduler. Persist every send attempt before input; recheck authorization
+  after persistence. Ignore stale workers after pause or registration changes.
+- Re-read each send candidate and retain Working, composer, queue, Dock,
+  manager, completion and Claude Hook guards. A send timeout remains
+  `delivery_unknown` across restart until read-only progress evidence resolves
+  it. A lone prompt echo below an old error is insufficient confirmation.
+- Report actual read age, dispatch lag, send queue/persistence/transport times
+  and delivery outcomes in status and Supervisor. Stack health requires this
+  evidence, and status reads no longer run live process/discovery scans.
+- Recover current high-demand and rate-limit banners across wraps, reconnect
+  details and background-terminal chrome on the configured repeat interval.
+  Keep the 60-second floor for reconnect-only stalls. Recognize the renamed
+  tool-call queue banner and retain current errors beneath continuation echoes.
+- Follow live Codex tabs in explicitly monitored, unpaused panes while honoring
+  current registration and workspace exclusions at the input boundary.
+- Show a current `400 invalid_encrypted_content` as a provider blocker without
+  sending retry prompts or replacing the session.
+
+## 0.2.1
+
+- Recognize current Codex reconnect errors across split spans, wrapped status
+  lines and nested `high demand` details while retaining genuine Working guards.
+- Enforce a 60-second reconnect repeat floor across timer/request changes and
+  watcher restarts. Ordinary error retries keep their configured interval.
+- Recognize both queue headers across wraps and a lone pending continuation;
+  accepted prompt echoes supersede older errors until a new error appears.
+- Ignore verified RGB braille overlays with dim composer placeholders, while
+  protecting typed placeholder text and actual braille input.
+- Report provider quota-specific 401 errors as `token_exhausted` / `额度耗尽`
+  without sending or changing credentials, sessions or monitoring settings.
+
+## 0.2.0
+
+- Revalidate the latest genuine Stop rejected before explicit Claude enrollment,
+  preserving its ID, ordering, rejection provenance and submit deduplication.
+- Report component-owned terminal observation coverage and registration readiness;
+  active gaps and unknown evidence no longer hide behind a healthy daemon PID.
+- Recover current text reads through validated viewport replay; distinguish
+  uninitialized native runtimes and reject foreign processes attached by TTY reuse.
+- Install checksummed immutable watcher bundles outside Documents and retain
+  rollback without restoring configuration, state or event ledgers.
+- Wait through launchd's asynchronous removal interval with bounded bootstrap
+  retries, including the rollback path.
+- Retain deferred Stop ordering, later-prompt supersession and HTTP retry guards.
+- Recover Codex provider `rate limit exceeded` banners without requiring a 429
+  prefix, including wrapped text, while preserving working/input/queue guards.
+- Bring the current TUI, stack, janitor, profile manager, diagnostics and regression
+  suites into the existing public repository with Python 3.10+ compatibility.
+- Add isolated profile PTY tests, macOS CI, release manifests and operations notes.
+
+## 0.1.0
+
+Initial public source release.

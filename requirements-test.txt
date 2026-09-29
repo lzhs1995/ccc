@@ -1,0 +1,3 @@
+# Only the test/acceptance TOML decoder needs this on Python 3.10.
+# The CCC runtime continues to use the standard library exclusively.
+tomli==2.2.1; python_version < "3.11"

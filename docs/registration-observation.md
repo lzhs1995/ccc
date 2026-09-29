@@ -1,0 +1,136 @@
+# Registration and observation incident notes
+
+## Registration after an already rejected Stop
+
+A newly created Claude session could emit its Stop before explicit enrollment.
+The watcher correctly rejected the event as unauthorized, but the ledger then
+made it a permanent duplicate. Adding the target changed authorization without
+revisiting that original event, so a stopped session could wait for another Hook
+that would never arrive.
+
+The fix revalidates one original genuine event after registration, checks exact
+session/process ownership and later-event ordering, then atomically advances the
+existing ledger entry. It preserves all final send guards and original rejection
+history. It neither bulk-replays old events nor resets the ledger.
+
+Regression coverage includes enrollment before/after Stop, later human input,
+completed events, PID reuse, foreign identity, interrupted handling, reserved
+transactions, repeated delivery, restart and input protection.
+
+## Logical terminal slots without native runtimes
+
+`read-screen` returned `Failed to read terminal text` for terminal slots that were
+still present in the cmux tree. Replay returned IDs and sequence zero without a
+render grid. Native diagnostics showed `runtime_surface_ready=false`, no creation
+time and a literal `nil` pointer. Repeated text reads could not initialize that
+runtime. Separately, reused TTYs could attach an unrelated live process to one
+of those old slots.
+
+The fix separates current viewport acquisition, process identity and native
+runtime state. Read failures can use a fresh, validated replay grid. Dormancy
+requires both missing native runtime and evidence of no owned live agent. Foreign
+CMUX identity is rejected before process classification. Incomplete evidence
+remains unknown.
+
+Tests pin missing versus valid sequence-zero grids, literal `nil`, normal
+background windows, foreign workspace/surface identity, descendants of foreign
+roots, stale observations and configuration changes.
+
+## Green daemon status hid coverage gaps
+
+The old overall verdict checked launchd, process liveness and global pause, while
+individual terminals could remain unreadable. The watcher now publishes a
+separate observation verdict and per-target readiness. Stack and TUI project the
+same result instead of computing competing classifications.
+
+## Provider rate limits without an HTTP status
+
+Codex can print `rate limit exceeded: Your requests to MODEL for MODEL in REGION
+have exceeded rate limit.` without the older `exceeded retry limit` or HTTP 429
+text. That full provider banner now enters the existing rate-limit recovery
+path, including hard or word-wrapped viewports. A mention of rate limits, a
+quoted example, an unverified marker or a disconnected partial banner does not
+qualify. Working indicators, queued follow-ups, user composer text and newer
+transcript output still suppress submission. An already working session needs
+no additional prompt; CCC send counters identify its own actions only.
+
+## Codex reconnect status and accepted prompts
+
+Codex can show a recoverable provider error beneath `• Reconnecting... N/M`,
+with the bullet, label and timer in separate cmux spans. The nested `└` detail
+can start inside a column-zero span. These rows belong to one current error
+block. Only a complete reconnect header is excluded from the Working check;
+genuine Working output underneath it still blocks a send.
+
+Reconnect retries have a 60-second minimum interval after the first send, even
+when the attempt counter, timer, request ID or viewport changes. The persisted
+last-send time keeps this protection through a watcher restart. Ordinary
+terminal error banners retain the configured repeat interval.
+
+Both `Queued follow-up inputs` and `Messages to be submitted after next tool
+call` block another submission, including wrapped headers and a lone pending
+continuation row. A newer `›` prompt echo supersedes an old error even when it
+contains the configured continuation phrase: text alone cannot prove who sent
+it. A new error or reconnect block below that prompt can become eligible again.
+
+## Overlay glyphs and provider quota blockers
+
+The current RGB braille overlay is ignored only with its span metadata; in the
+composer it additionally requires a visible dim placeholder. Typed placeholder
+words or braille at cursor Home remain protected user input.
+
+A quota-specific provider 401 is reported as `token_exhausted` / `额度耗尽` and
+never triggers a continuation. Monitoring stays enabled. Restore provider
+quota or authorization and retry within the original session; CCC does not
+change credentials or infer that a persistent 401 banner has become retryable.
+
+## Earlier fixes retained in this release
+
+- Install the complete daemon bundle outside Documents, with manifests and
+  atomic activation/rollback of code and plist only.
+- Check later sends before renewing a deferred retry window.
+- Suppress old unfinished Stops superseded by a later genuine prompt for the
+  same surface/session/process.
+- Respect HTTP 4xx/5xx client retry countdowns, including the final attempt.
+
+The general lesson is to verify the entire chain: explicit authorization,
+correct live identity, current observation, safe input state, one submit
+transaction, and actual prompt acceptance. File installation, a live PID, a
+ledger write or a green summary alone proves only part of that chain.
+
+## Native observation cadence and slow process queries (v0.2.9)
+
+On a busy Mac, `ps -p` for just three bound processes exceeded eight seconds.
+Using a one-second `ps` timeout for event-monitor coverage therefore removed
+every native monitor at once. Using the GUI process snapshot for the same
+purpose had a similar failure during its refresh gaps. Both approaches caused
+redundant fleet-wide viewport reads and delayed recovery observations.
+
+Native coverage now uses direct `PROC_PIDTBSDINFO` reads of already-bound PIDs.
+A complete response, matching PID, Codex name, live process and original start
+time are required. Short reads, exited processes and PID reuse cannot supply
+coverage. Sending performs the same identity check again without a cache.
+The existing original transcript, UUID, draft, pause and delivery guards remain
+in force. Native task snapshots stop parsing at the newest lifecycle record.
+
+Only healthy native coverage reduces routine viewport polling. An error wakes
+its surface immediately, even while an observation is in flight. Coverage loss
+restores ordinary polling; it never disables observation. Regression cases cover
+coverage expiry, source removal, process reuse, unavailable GUI metadata, short
+native reads and priority wakes during the slower routine cadence.
+
+Validate recovery over a complete time window: enumerate each original failed
+turn, correlate its recorded send and the subsequent `task_started` in that
+same transcript. Keep protected drafts, menus and user-aborted turns separate.
+Counting only the last acknowledged send per surface misses earlier delays.
+
+## Original sessions without a SessionStart Hook (v0.2.10)
+
+The remaining long recoveries used a live open transcript instead of a native
+Hook binding. Their process lookup could become unknown on every GUI inventory
+refresh, even after the original PID and transcript had been verified. During
+an explicit refresh-pending/unavailable gap, CCC now reuses that PID only as a
+hint. It verifies the native process start, exact workspace/surface environment,
+actual open transcript and process identity again. A fresh conflicting process
+label, multiple agents, changed PID/start, moved workspace or multiple open
+transcripts still blocks input. No Hook record is synthesized.
