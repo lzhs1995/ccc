@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>__LABEL__</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__HOME__/.config/cmux-janitor/cmux-janitor.sh</string>
+    </array>
+
+    <!-- every 30 minutes -->
+    <key>StartInterval</key>
+    <integer>1800</integer>
+
+    <!-- do not fire at load time; wait for the first interval -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!-- the script writes its own log; keep launchd's stderr for crash triage only -->
+    <key>StandardOutPath</key>
+    <string>__HOME__/.config/cmux-janitor/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.config/cmux-janitor/launchd.err.log</string>
+
+    <key>WorkingDirectory</key>
+    <string>__HOME__/.config/cmux-janitor</string>
+
+    <!-- background-priority I/O so a sweep never competes with interactive work -->
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>LowPriorityIO</key>
+    <true/>
+    <key>Nice</key>
+    <integer>10</integer>
+
+    <!-- never restart in a tight loop if the script exits nonzero -->
+    <key>KeepAlive</key>
+    <false/>
+</dict>
+</plist>
