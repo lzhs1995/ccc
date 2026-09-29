@@ -1,0 +1,477 @@
+"""Exercise the production scheduler, not a serial fake-client bypass."""
+import threading
+import time
+import unittest
+from concurrent.futures import ThreadPoolExecutor
+
+from ccc_scheduling import CoalescingWriter, SnapshotCache, SnapshotClient, SurfaceScheduler
+
+
+def targets(count):
+    return [{"surface_id": str(i), "workspace_id": "workspace", "enabled": True} for i in range(count)]
+
+
+class SchedulerTests(unittest.TestCase):
+    def pump(self, scheduler, items, predicate, *, generation=1):
+        deadline = time.monotonic() + 4
+        while not predicate() and time.monotonic() < deadline:
+            scheduler.wakeup.clear()
+            scheduler.tick(items, generation=generation)
+            scheduler.wakeup.wait(0.005)
+        self.assertTrue(predicate(), scheduler.snapshot())
+
+    def test_first_reads_are_immediate_then_deadlines_are_spread_across_the_period(self):
+        now, counts = [100.0], {}
+        def observe(target, current):
+            sid = target['surface_id']
+            counts[sid] = counts.get(sid, 0) + 1
+        scheduler = SurfaceScheduler(observe, lambda *args: self.fail('unexpected send'),
+                                     clock=lambda: now[0])
+        items = targets(4)
+        try:
+            self.pump(scheduler, items, lambda: len(counts) == 4 and scheduler.snapshot()['observing'] == 0)
+            self.assertEqual(counts, {str(i): 1 for i in range(4)})
+            for at, sid in ((100.25, '1'), (100.5, '2'), (100.75, '3'), (101.0, '0')):
+                now[0] = at
+                before = dict(counts)
+                self.pump(scheduler, items, lambda: counts[sid] == 2 and scheduler.snapshot()['observing'] == 0)
+                self.assertEqual({key for key in counts if counts[key] != before[key]}, {sid})
+            self.assertEqual(counts, {str(i): 2 for i in range(4)})
+        finally:
+            scheduler.close()
+
+    def test_native_coverage_reduces_regular_reads_but_failure_and_lost_coverage_are_immediate(self):
+        now, covered, calls = [100.0], [True], []
+        scheduler = SurfaceScheduler(lambda *_: calls.append(now[0]), lambda *_: None,
+            clock=lambda: now[0], observation_interval=lambda target, base: 10 if covered[0] else base)
+        items = targets(1)
+        try:
+            self.pump(scheduler, items, lambda: len(calls) == 1 and scheduler.snapshot()['observing'] == 0)
+            now[0] = 101
+            for _ in range(5):
+                scheduler.tick(items, generation=1)
+            self.assertEqual(calls, [100])
+            self.assertTrue(scheduler.request_observation('0', 'workspace'))
+            self.pump(scheduler, items, lambda: len(calls) == 2 and scheduler.snapshot()['observing'] == 0)
+            self.assertEqual(calls[-1], 101)
+            now[0] = 102
+            covered[0] = False
+            self.pump(scheduler, items, lambda: len(calls) == 3 and scheduler.snapshot()['observing'] == 0)
+            self.assertEqual(calls[-1], 102)
+            now[0] = 103
+            self.pump(scheduler, items, lambda: len(calls) == 4)
+        finally:
+            scheduler.close()
+
+    def test_native_hint_jumps_full_scan_backlog_without_starving_regular_reads(self):
+        entered, release = threading.Event(), threading.Event()
+        seen = []
+        def observe(target, current):
+            seen.append(target["surface_id"])
+            if len(seen) == 1:
+                entered.set()
+                release.wait(4)
+        scheduler = SurfaceScheduler(observe, lambda *_: self.fail("hint authorized a send"),
+                                     observe_workers=1, clock=lambda: 100)
+        items = targets(40)
+        try:
+            scheduler.tick(items, generation=1)
+            self.assertTrue(entered.wait(2))
+            for sid in ("39", "38", "37", "36"):
+                self.assertTrue(scheduler.request_observation(sid, "workspace"))
+            release.set()
+            self.pump(scheduler, items, lambda: len(seen) == 40)
+            self.assertEqual(seen[:6], ["0", "36", "37", "38", "1", "39"])
+            self.assertEqual(len(set(seen)), 40)
+        finally:
+            release.set()
+            scheduler.close()
+
+    def test_native_hint_during_observation_is_kept_for_next_fresh_read(self):
+        entered, release = threading.Event(), threading.Event()
+        seen = []
+        def observe(target, current):
+            seen.append(target["surface_id"])
+            if len(seen) == 1:
+                entered.set()
+                release.wait(4)
+        scheduler = SurfaceScheduler(observe, lambda *_: self.fail("unexpected send"),
+                                     observe_workers=1, clock=lambda: 100)
+        items = targets(1)
+        try:
+            scheduler.tick(items, generation=1)
+            self.assertTrue(entered.wait(2))
+            scheduler.request_observation("0", "workspace")
+            release.set()
+            self.pump(scheduler, items, lambda: len(seen) == 2 and scheduler.snapshot()["observing"] == 0)
+            for _ in range(5):
+                scheduler.tick(items, generation=1)
+            self.assertEqual(seen, ["0", "0"])
+        finally:
+            release.set()
+            scheduler.close()
+
+    def test_native_hint_cannot_revive_paused_removed_or_moved_target(self):
+        scheduler = SurfaceScheduler(lambda *_: None, lambda *_: self.fail("unexpected send"), clock=lambda: 100)
+        try:
+            self.pump(scheduler, targets(1), lambda: scheduler.snapshot()["targets"] == 1)
+            self.assertFalse(scheduler.request_observation("0", "wrong-workspace"))
+            self.assertFalse(scheduler.request_observation("missing", "workspace"))
+            scheduler.tick([], generation=2)
+            self.assertFalse(scheduler.request_observation("0", "workspace"))
+        finally:
+            scheduler.close()
+
+    def test_late_dispatch_keeps_the_original_cadence_without_replaying_missed_periods(self):
+        now, calls = [100.0], []
+        scheduler = SurfaceScheduler(lambda *_: calls.append(now[0]), lambda *_: None, clock=lambda: now[0])
+        items = targets(1)
+        try:
+            self.pump(scheduler, items, lambda: len(calls) == 1 and scheduler.snapshot()['observing'] == 0)
+            now[0] = 103.2
+            self.pump(scheduler, items, lambda: len(calls) == 2 and scheduler.snapshot()['observing'] == 0)
+            for _ in range(3):
+                scheduler.tick(items, generation=1)
+            self.assertEqual(calls, [100.0, 103.2])
+            now[0] = 104.0
+            self.pump(scheduler, items, lambda: len(calls) == 3)
+            self.assertEqual(calls[-1], 104.0)
+        finally:
+            scheduler.close()
+
+    def test_delayed_future_consumption_preserves_the_due_time_and_reports_lag(self):
+        now, calls, dispatch_lags = [100.0], [], []
+        scheduler = SurfaceScheduler(lambda *_: calls.append(now[0]), lambda *_: None,
+                                     clock=lambda: now[0],
+                                     on_dispatch=lambda target, phase, lag: dispatch_lags.append(lag))
+        items = targets(1)
+        try:
+            scheduler.tick(items, generation=1)
+            self.assertTrue(scheduler.wakeup.wait(2))
+            self.assertEqual(calls, [100.0])
+            # The read has completed, but the deadline thread cannot consume
+            # its Future until well after the next scheduled observation.
+            now[0] = 103.2
+            self.pump(scheduler, items, lambda: len(calls) == 2 and scheduler.snapshot()['observing'] == 0)
+            self.assertEqual(calls, [100.0, 103.2])
+            self.assertAlmostEqual(dispatch_lags[-1], 2.2)
+            for _ in range(3):
+                scheduler.tick(items, generation=1)
+            self.assertEqual(len(calls), 2)
+            now[0] = 104.0
+            self.pump(scheduler, items, lambda: len(calls) == 3)
+            self.assertAlmostEqual(dispatch_lags[-1], 0.0)
+        finally:
+            scheduler.close()
+
+    def test_slow_observation_does_not_block_next_tick_of_39_peers(self):
+        release, entered = threading.Event(), threading.Event()
+        counts, lock = {}, threading.Lock()
+        now = [100.0]
+        def observe(target, current):
+            sid = target["surface_id"]
+            with lock:
+                counts[sid] = counts.get(sid, 0) + 1
+            if sid == "0":
+                entered.set()
+                release.wait(4)
+        scheduler = SurfaceScheduler(observe, lambda *args: self.fail("unexpected send"),
+                                     observe_workers=8, clock=lambda: now[0])
+        try:
+            items = targets(40)
+            self.pump(scheduler, items, lambda: len(counts) == 40)
+            self.assertTrue(entered.is_set())
+            for second in (101, 102):
+                now[0] = second
+                self.pump(scheduler, items, lambda: all(counts.get(str(i), 0) >= second - 99
+                                                     for i in range(1, 40)))
+            self.assertEqual(counts["0"], 1)
+        finally:
+            release.set()
+            scheduler.close()
+
+    def test_172_targets_progress_while_one_send_waits_and_capacity_is_bounded(self):
+        release = threading.Event()
+        sent, observed, active = set(), set(), set()
+        lock = threading.Lock()
+        maxima = {"observe": 0, "send": 0}
+        def enter(sid, phase):
+            with lock:
+                self.assertFalse(any(item[0] == sid for item in active))
+                active.add((sid, phase))
+                maxima[phase] = max(maxima[phase], sum(p == phase for _, p in active))
+        def observe(target, current):
+            sid = target["surface_id"]
+            enter(sid, "observe")
+            with lock:
+                observed.add(sid)
+                active.remove((sid, "observe"))
+            return "error"
+        def send(target, candidate, current):
+            sid = target["surface_id"]
+            enter(sid, "send")
+            if sid == "0":
+                release.wait(4)
+            with lock:
+                sent.add(sid)
+                active.remove((sid, "send"))
+        scheduler = SurfaceScheduler(observe, send, observe_workers=16, send_workers=4, clock=lambda: 100)
+        try:
+            self.pump(scheduler, targets(172), lambda: len(sent) == 171 and scheduler.snapshot()["sending"] == 1)
+            self.assertEqual(len(observed), 172)
+            self.assertNotIn("0", sent)
+            self.assertLessEqual(maxima["observe"], 16)
+            self.assertLessEqual(maxima["send"], 4)
+            self.assertEqual(scheduler.snapshot()["sending"], 1)
+        finally:
+            release.set()
+            scheduler.close()
+
+    def test_pause_invalidates_inflight_observation_and_same_uuid_resume(self):
+        entered, release = threading.Event(), threading.Event()
+        sent, checks = [], []
+        def observe(target, current):
+            entered.set()
+            release.wait(4)
+            checks.append(current())
+            return "error"
+        scheduler = SurfaceScheduler(observe, lambda *args: sent.append(args), clock=lambda: 100)
+        try:
+            scheduler.tick(targets(1), generation=1)
+            self.assertTrue(entered.wait(2))
+            scheduler.tick([], generation=2)
+            # The old worker must remain invalid even if the UUID is enabled again.
+            scheduler.tick(targets(1), generation=3)
+            release.set()
+            self.pump(scheduler, [], lambda: bool(checks), generation=3)
+            self.assertEqual(checks, [False])
+            self.assertEqual(sent, [])
+        finally:
+            release.set()
+            scheduler.close()
+
+    def test_worker_exception_isolated_and_retry_keeps_interval(self):
+        now, seen, errors = [100.0], [], []
+        def observe(target, current):
+            seen.append(target["surface_id"])
+            if target["surface_id"] == "0":
+                raise RuntimeError("one reader failed")
+        scheduler = SurfaceScheduler(observe, lambda *args: None, clock=lambda: now[0],
+                                     on_error=lambda target, phase, error: errors.append((target, phase)))
+        try:
+            self.pump(scheduler, targets(2), lambda: len(errors) == 1 and "1" in seen)
+            for _ in range(3):
+                scheduler.tick(targets(2), generation=1)
+            self.assertEqual(seen.count("0"), 1)
+            now[0] = 101
+            self.pump(scheduler, targets(2), lambda: len(errors) == 2)
+        finally:
+            scheduler.close()
+
+    def test_wait_uses_next_deadline_without_spinning_when_workers_are_full(self):
+        now, entered, release = [100.0], threading.Event(), threading.Event()
+        def observe(*args):
+            entered.set()
+            release.wait(3)
+        scheduler = SurfaceScheduler(observe, lambda *args: None, observe_workers=1,
+                                     clock=lambda: now[0])
+        try:
+            scheduler.tick(targets(2))
+            self.assertTrue(entered.wait(1))
+            self.assertEqual(scheduler.wait_timeout(0.1), 0.1)
+            release.set()
+            self.pump(scheduler, targets(2), lambda: scheduler.snapshot()["observing"] == 0,
+                      generation=None)
+            now[0] = 100.475
+            self.assertAlmostEqual(scheduler.wait_timeout(0.1), 0.025)
+        finally:
+            release.set()
+            scheduler.close()
+
+
+class SnapshotTests(unittest.TestCase):
+    def test_fleet_process_scan_and_labels_are_shared_across_workspaces(self):
+        calls, classifications, now = [], [], [100.0]
+        class Client:
+            def top_all(self):
+                calls.append(now[0])
+                return {"sample": now[0]}
+            def top(self, workspace_id):
+                raise AssertionError("redundant workspace process scan")
+        cache = SnapshotCache(clock=lambda: now[0])
+        client = SnapshotClient(Client(), cache)
+        def classify(top):
+            classifications.append(top)
+            return {"surface": top["sample"]}
+        try:
+            for wid in ("a", "b", "c"):
+                self.assertEqual(client.process_labels(wid, classify, wait=True), {"surface": 100.0})
+            self.assertEqual(client.top_all(), {"sample": 100.0})
+            self.assertEqual(calls, [100.0])
+            self.assertEqual(len(classifications), 1)
+            now[0] = 106
+            self.assertEqual(client.process_labels("b", classify, wait=True), {"surface": 106})
+            self.assertEqual(calls, [100.0, 106])
+            self.assertEqual(len(classifications), 2)
+        finally:
+            cache.close()
+
+    def test_workspace_discovery_receives_only_its_slice_of_the_shared_fleet(self):
+        calls, now = [], [100.0]
+        class Client:
+            def top_all(self):
+                calls.append(now[0])
+                return {"windows": [{"id": "window", "workspaces": [
+                    {"kind": "workspace", "id": "a", "surfaces": [{"id": "surface-a", "sample": now[0]}]},
+                    {"kind": "workspace", "id": "b", "surfaces": [{"id": "surface-b", "sample": now[0]}]},
+                ]}]}
+        cache = SnapshotCache(clock=lambda: now[0])
+        client = SnapshotClient(Client(), cache)
+        try:
+            a, b = client.top("a"), client.top("b")
+            self.assertEqual([ws["id"] for ws in a["windows"][0]["workspaces"]], ["a"])
+            self.assertEqual([ws["id"] for ws in b["windows"][0]["workspaces"]], ["b"])
+            self.assertEqual(client.top("closed"), {"windows": []})
+            self.assertEqual(calls, [100.0])
+            self.assertIs(client.top("a"), a)
+            now[0] = 106
+            self.assertEqual(client.top("a")["windows"][0]["workspaces"][0]["surfaces"][0]["sample"], 106)
+            self.assertEqual(calls, [100.0, 106])
+        finally:
+            cache.close()
+
+    def test_process_classification_is_shared_and_tracks_replaced_workspace_snapshot(self):
+        now, calls = [100.0], []
+        class Client:
+            def top(self, workspace_id):
+                return {"generation": now[0]}
+        cache = SnapshotCache(clock=lambda: now[0])
+        def classify(top):
+            calls.append(top["generation"])
+            return {"label": top["generation"]}
+        try:
+            clients = [SnapshotClient(Client(), cache) for _ in range(40)]
+            with ThreadPoolExecutor(8) as pool:
+                values = list(pool.map(lambda c: c.process_labels("w", classify, wait=True), clients))
+            self.assertEqual(values, [{"label": 100.0}] * 40)
+            self.assertEqual(calls, [100.0])
+            now[0] = 106
+            self.assertEqual(clients[0].process_labels("w", classify, wait=True), {"label": 106})
+            self.assertEqual(calls, [100.0, 106])
+            self.assertEqual(len(cache._entries), 2)
+        finally:
+            cache.close()
+
+    def test_concurrent_cold_workspace_uses_exactly_one_rpc(self):
+        cache = SnapshotCache()
+        entered, release = threading.Event(), threading.Event()
+        calls = []
+        def load():
+            calls.append(1)
+            entered.set()
+            release.wait(4)
+            return {"workspace": "same"}
+        try:
+            with ThreadPoolExecutor(8) as pool:
+                futures = [pool.submit(cache.get, "same", load, ttl=5) for _ in range(8)]
+                self.assertTrue(entered.wait(2))
+                self.assertIsNone(cache.get("same", load, ttl=5, wait=False))
+                release.set()
+                self.assertTrue(all(f.result(3) == {"workspace": "same"} for f in futures))
+            self.assertEqual(len(calls), 1)
+        finally:
+            release.set()
+            cache.close()
+
+    def test_observation_can_continue_while_process_refresh_waits(self):
+        cache = SnapshotCache()
+        entered, release = threading.Event(), threading.Event()
+        def load():
+            entered.set()
+            release.wait(4)
+            return {"ok": True}
+        try:
+            self.assertIsNone(cache.get("workspace", load, ttl=5, wait=False))
+            self.assertTrue(entered.wait(2))
+            # A send preflight's topology read is not queued behind that scan.
+            self.assertEqual(cache.get("tree", lambda: {"tree": True}, ttl=1), {"tree": True})
+        finally:
+            release.set()
+            cache.close()
+
+    def test_failure_backoff_and_ttl_start_when_query_finishes(self):
+        now, calls = [100.0], []
+        cache = SnapshotCache(clock=lambda: now[0])
+        def fail():
+            calls.append(1)
+            raise ValueError("transport failed")
+        try:
+            for _ in range(4):
+                with self.assertRaises(ValueError):
+                    cache.get("workspace", fail, ttl=5)
+            self.assertEqual(len(calls), 1)
+            now[0] = 102
+            def slow():
+                now[0] = 110
+                return {"ok": True}
+            self.assertEqual(cache.get("workspace", slow, ttl=5), {"ok": True})
+            now[0] = 111
+            self.assertEqual(cache.get("workspace", fail, ttl=5), {"ok": True})
+            self.assertEqual(len(calls), 1)
+        finally:
+            cache.close()
+
+
+class PersistenceTests(unittest.TestCase):
+    def test_requests_during_io_coalesce_and_wait_for_the_next_durable_write(self):
+        entered = [threading.Event(), threading.Event()]
+        release = [threading.Event(), threading.Event()]
+        writes = []
+        def write():
+            index = len(writes)
+            writes.append(index)
+            entered[index].set()
+            if not release[index].wait(4):
+                raise TimeoutError("test write was not released")
+        writer = CoalescingWriter(write, delay=0)
+        try:
+            writer.request(wait=False)
+            self.assertTrue(entered[0].wait(2))
+            with ThreadPoolExecutor(8) as pool:
+                futures = [pool.submit(writer.request) for _ in range(8)]
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    with writer._condition:
+                        if len(writer._waiters) == 8:
+                            break
+                    entered[1].wait(0.001)
+                release[0].set()
+                self.assertTrue(entered[1].wait(2))
+                self.assertTrue(all(not f.done() for f in futures))
+                release[1].set()
+                for future in futures:
+                    future.result(2)
+            self.assertEqual(len(writes), 2)
+        finally:
+            for event in release:
+                event.set()
+            writer.close()
+
+    def test_persistence_failure_reaches_waiter_and_next_request_can_recover(self):
+        writes = []
+        def write():
+            writes.append(1)
+            if len(writes) == 1:
+                raise OSError("disk unavailable")
+        writer = CoalescingWriter(write, delay=0)
+        try:
+            with self.assertRaisesRegex(OSError, "disk unavailable"):
+                writer.request()
+            writer.request()
+            self.assertEqual(len(writes), 2)
+        finally:
+            writer.close()
+
+
+if __name__ == "__main__":
+    unittest.main()
