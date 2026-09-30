@@ -7,21 +7,24 @@ and the connected input guard. No CLI or automatic daemon entrypoint is enabled.
 from __future__ import annotations
 
 import copy
+import contextlib
 import os
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 import threading
 
 from ccc_native_standby import COUNT, identifier, write_once
 
 
 class StandbyManager:
-    def __init__(self, ledger, *, generation_current, boot_current, authorized, observe, send):
-        callbacks = (generation_current, boot_current, authorized, observe, send)
+    def __init__(self, ledger, *, generation_current, boot_current, authorized, observe, send,
+                 operation_context=contextlib.nullcontext):
+        callbacks = (generation_current, boot_current, authorized, observe, send, operation_context)
         if not all(callable(callback) for callback in callbacks):
             raise ValueError('complete standby adapter callbacks required')
         self.ledger = ledger
         self.generation_current, self.boot_current = generation_current, boot_current
         self.authorized, self.observer, self.sender = authorized, observe, send
+        self.operation_context = operation_context
         self._operation = threading.RLock()
         self._state_lock = threading.RLock()
         self._executor = ThreadPoolExecutor(max_workers=COUNT, thread_name_prefix='ccc-standby')
@@ -58,7 +61,9 @@ class StandbyManager:
         # The real adapter must include CmuxClient's original connected
         # input_guard here, not just workspace.enabled from a cached config.
         value = self.authorized(index) is True
-        self._alive()
+        # Authorization can block on connected reads. Check generation/boot
+        # again on its return, including inside the ledger's actual write lock.
+        self._current()
         return value
 
     def _observe(self, index):
@@ -83,14 +88,26 @@ class StandbyManager:
             self.state, self.ready_count = 'invalidated', 0
         self.ledger._invalidate(reason)
 
+    def _gather(self, callback):
+        # Keep this operation's live caller authorization installed until all
+        # submitted callbacks have finished, including an early result error
+        # or a partial submission failure. No old worker may inherit a later
+        # button action's authorization.
+        futures = []
+        try:
+            for index in range(COUNT):
+                futures.append(self._executor.submit(callback, index))
+            return [future.result() for future in futures]
+        finally:
+            wait(futures)
+
     def refresh(self):
-        with self._operation:
+        with self._operation, self.operation_context():
             if self.state in {'observation_only', 'activated', 'partial', 'invalidated', 'closed'}:
                 return self.status()
             try:
                 self._current()
-                futures = [self._executor.submit(self._observe, index) for index in range(COUNT)]
-                rows = [future.result() for future in futures]
+                rows = self._gather(self._observe)
                 self._current()
                 if not all(self._authorized(index) for index in range(COUNT)):
                     raise ValueError('standby workspace or original authorization changed')
@@ -110,13 +127,15 @@ class StandbyManager:
                 raise
             return self.status()
 
-    def activate(self, *, action_id, mode, prompt):
+    def activate(self, *, action_id, mode, prompt, committed=None):
         """Consume one confirmed UI action, attempt original inputs once.
 
         This returns delivery outcomes only. Native task_started/Hook and the
         two original UI clocks remain required for startup acceptance.
         """
-        with self._operation:
+        with self._operation, self.operation_context():
+            if committed is not None and not callable(committed):
+                raise ValueError('activation commit observer must be callable')
             if self.state in {'activated', 'partial', 'observation_only'}:
                 return {'new_activation': False, **self.status()}
             if self.state != 'ready':
@@ -130,6 +149,11 @@ class StandbyManager:
                     self._publish('observation_only')
                     return {'new_activation': False, **self.status()}
                 self._publish('activating')
+                # Bind the accepted UI action to the durable activation before
+                # any worker can send. Failure consumes the action permanently.
+                if committed is not None:
+                    committed()
+                    self._current()
 
                 def attempt(index):
                     try:
@@ -139,8 +163,7 @@ class StandbyManager:
                     except Exception as exc:
                         return {'index': index, 'acknowledged': False, 'error': type(exc).__name__}
 
-                futures = [self._executor.submit(attempt, index) for index in range(COUNT)]
-                outcomes = [future.result() for future in futures]
+                outcomes = self._gather(attempt)
                 self._result = {'action_id': identifier(action_id), 'cohort_id': self.ledger.manifest['cohort_id'],
                     'workspace_id': self.ledger.manifest['workspace_id'], 'boot_id': self.ledger.manifest['boot_id'],
                     'outcomes': outcomes, 'acknowledged_inputs': sum(row['acknowledged'] for row in outcomes),

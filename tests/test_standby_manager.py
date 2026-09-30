@@ -80,6 +80,22 @@ class ManagerTests(unittest.TestCase):
         self.assertFalse(self.activate()['new_activation'])
         self.assertEqual(len(self.sent), 50)
 
+    def test_final_authorization_callback_cannot_change_generation_or_boot(self):
+        self.manager.refresh()
+        inside_send = [False]
+        def authorized(index):
+            if inside_send[0]:
+                self.gen = 'd' * 64
+            return True
+        def send(row, prompt, input_id, *, write_guard):
+            inside_send[0] = True
+            with write_guard():
+                self.sent.append((row['index'], input_id))
+        self.manager.authorized = authorized
+        self.manager.sender = send
+        self.assertEqual(self.activate()['state'], 'invalidated')
+        self.assertEqual(self.sent, [])
+
     def test_writer_identity_cannot_change_after_ready(self):
         self.manager.refresh(); self.rows[0]['writer_identity'][1] += 1
         self.assertEqual(self.activate()['state'], 'invalidated')

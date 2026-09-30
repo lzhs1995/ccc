@@ -11,22 +11,31 @@ postactivation Hook binding. The launcher supports b/N only. A separate manager
 now collects complete readiness observations and attempts one activation; it
 never upgrades identity-only observations to readiness. A generation checker
 pins a declared dependency graph, including symbolic-link targets and optional
-missing files. The real adapter must still discover the complete effective
-configuration graph and prove native readiness. The normal start/worker/recovery
+missing files. The real adapter must preserve the original profile, skills and
+permissions and observe native readiness. A complete export of native memory
+configuration and warning-free skills are not user requirements. File-source discovery, a live
+bootstrap generation bridge, preparation ownership, guarded activation and
+first-task observation are implemented separately. The normal start/worker/recovery
 entrypoints reject or skip standby descriptors so they cannot submit a task
-while the dedicated manager is unconnected. There is no standby UI entrypoint
-or running cohort yet. Tests use synthetic process evidence, temporary-file
+while the dedicated manager is unconnected. The b/N entrypoint now contacts
+the original live owner; an absent or unready owner cannot cold-launch a
+replacement. No production standby cohort is running yet. Tests use synthetic process evidence, temporary-file
 Darwin events and isolated local Unix sockets; they do not establish zero-model
 readiness or performance.
 
 The optional generation event mode arms kernel vnode watches over declared
 content, links, and ancestor path identities, then rescans and checks pending
-events. An event, registration/read error, fork or close permanently invalidates
-the pin. It never accepts an empty queue after consuming a change. Activation
+events. A dependency change, registration/read error, fork or close permanently
+invalidates the pin. It never accepts an empty queue after consuming a dependency change. Activation
 checks use nonblocking event reads plus effective-setting hashes instead of
 rescanning every skill file for every slot. Ancestors outside the declared graph
 watch identity changes rather than unrelated child writes. Missing dependencies
-conservatively watch their nearest existing parent for child changes. The
+watch their nearest existing parent and check the specific first missing child
+on directory events; unrelated job/log siblings are allowed. Directory vnode
+events have no child names, so this proves current absence, not the absence of
+a transient appearance-and-removal between checks. Once an appearance is
+observed, invalidation is permanent. Existing-file content round trips and
+ancestor permission or identity changes still invalidate. The
 descriptor cap fails closed; no polling fallback silently certifies readiness.
 
 Manager cancellation uses a short status lock separate from the operation lock
@@ -36,6 +45,33 @@ in-memory readiness; close always shuts down the executor. ACK counts are not
 native task-start counts or startup acceptance.
 
 ## Ownership and preparation
+
+`ccc_standby_factory.admit` assembles the preparation owner, activation manager
+and private UI endpoint under the original workspace admission/input locks.
+It creates only empty working directories and immutable job/owner records;
+native creation begins at an explicit `prepare()` call. A completed ordinary
+batch can precede admission after its worker lock is obtained. A standby batch
+can precede another admission after immutable submission settlement: all fifty
+original task receipts validate, initial holds are released, send workers and
+the first-task observer have returned, and the original owner remains alive.
+Admission revalidates the settlement, boot and live owner throughout capture
+and commit; it preserves the old job, worker lock and continuation routes.
+The settlement marks neither job nor run terminal and is not a latency or
+whole-run acceptance certificate. The caller must supply a live source
+pin and actual readiness reader. This assembly layer supplies neither a
+synthetic readiness proof nor a production source/request observer.
+
+Admission requires an explicit target environment. The same normalized value
+is passed to file-source capture and stored in a job-bound private 0600
+envelope for the original bootstraps. Only the new surface's terminal identity
+comes from its shell; HOME, CODEX_HOME, PATH, credentials and provider settings
+come from the selected target. Parent agent identifiers are removed. The
+launcher sets its three documented runtime/event overrides, fixes PWD, and
+uses execve with that exact environment. Public claims and bootstrap commands
+contain hashes, not credential values. Envelope changes permanently invalidate
+the bridge; launch guards and subsequent original-process inspection check
+the environment binding. Selecting the actual user's target environment is
+the production caller's responsibility, with no ambient-shell fallback.
 
 A standby cohort contains exactly 50 original native processes in one selected,
 authorized workspace. Prepare them unfocused in that same workspace; do not
@@ -71,7 +107,7 @@ automatic title request may have occurred. Readiness must be invalidated when
 these conditions change. A private loopback provider will prove zero requests
 through a bounded idle interval before any real-provider standby is used.
 
-A candidate local `/pwd` preparation command is under consideration. The
+A single local `/pwd` preparation command is implemented. The
 reference source records the original `from_tui/op/ListSkills` after the main
 loop has dequeued it and then awaits refresh inline. A later, newly rendered
 `/pwd` response can therefore prove that this wait returned. It does not prove
@@ -80,7 +116,10 @@ behavior, without adding a new requirement that all skills be warning-free.
 The command must be separately consumed and counted as preparation control
 input, never as a task. Its actual zero-model behavior, empty pending queue and
 composer, original identity and final generation checks still need the native
-adapter and single-process verification. No control input has been sent yet.
+adapter and production verification. Native run102 observed one original
+process, one `/pwd`, and zero requests at its private loopback provider. Its
+private configuration disabled plugins/apps and host skill discovery, so it
+does not establish production skill preservation, readiness or startup latency.
 
 ## Activation
 
@@ -100,6 +139,26 @@ of the same action observes the existing activation; a different action
 cannot reuse or overwrite it. Never label this job_created/new_job: true.
 Record standby_activated/new_activation: true as its own timing-chain event.
 
+`ccc_standby_timing.py` implements a separate version 2 receipt. The manager's
+commit callback runs after durable activation consumption and before submission
+of any send worker. `activation-ui.json` binds both original UI clocks and the
+runtime hashes to the immutable preparation job, cohort, activation, attempt,
+original roster and boot. It does not add job_created to the legacy v1 chain.
+`FirstTaskObserver` records a stable task_started observation in
+`standby-first-observation-{index}.json`, even if the matching prompt has not
+arrived yet. Only its subsequent confirmed first-task receipt can certify that
+observation. Reopening the observer preserves the first monotonic timestamp and
+rechecks its original transcript prefix.
+
+`activation-terminal.json` is a distinct native-observation terminal. Complete
+requires 50 unique original confirmed tasks; timeout, cancellation and failure
+remain non-passing. The evaluator reports upper bounds from both input_read and
+confirmation_accepted. ACKs and action_finished cannot substitute for task
+observations or this terminal. A slow observation leaves latency unproven; it
+does not establish that the native task started late. The producer is connected
+to the live owner and b/N UI entrypoint. Verification remains offline; real UI
+startup latency has not passed.
+
 The live manager should already hold the per-original delivery channels and
 readiness snapshot. At activation, check each original live identity and
 authorization again, persist its one-shot input claim, and issue one atomic
@@ -113,6 +172,13 @@ After each original first task and prompt are verified, release its existing
 initial hold into the continuation machinery. Retain private-check retry
 policy, unique failure/input/next-turn accounting and automatic B cutoff
 disabled. Preparation is never counted as a task or continuation.
+
+FirstTaskObserver binds the original job, activation, input claim and startup
+Hook to the native first task. A not-yet-persisted Hook transcript is pending.
+Confirmation is persisted before the exact slot hold is released; unrelated
+holds and operator exclusions are retained. Cached and restarted observations
+verify the original transcript prefix again, allowing append-only progress.
+This observer sends no input and cannot establish readiness on its own.
 
 The ledger transport callback takes a write_guard context manager. Enter it
 around the actual socket write, then release it before waiting for the ACK.
@@ -161,11 +227,38 @@ more processes. Keep handles for every native, worker and sampling process.
 4. Independent terminal receipt binds action/cohort/job/workspace/mode/boot
    and original identities; collected_at is not the end of the run. A sample
    window must cover the UI origin through this terminal record.
-5. Verify b/N/B semantics and sustained500 unique continuations under one
-   second before installation/release. New standby code requires its own full
+5. Verify b/N/B semantics and ten batches of 50: five workspaces with 100
+   original sessions each, all 500 simultaneously alive. Verify each original's
+   continuation under one second separately; 500 continuation events do not
+   substitute for 500 live sessions. New standby code requires its own full
    regression, CI and immutable package review; 7de1c09 does not certify it.
 
-Configuration and skills generation validation is an open implementation
-requirement, not permission to use stale cached skills. Shared global config
-must not be rewritten for the optimization. No production warm pool has been
-started at this checkpoint.
+## Resident entrypoint
+
+`ccc_standby_runner.py` owns one production caller. It reads an explicitly
+selected private invocation with its original SHA256; the native environment
+is supplied in that file rather than inferred from the runner's shell.
+The invocation binds the original native argv, provider, upstream URL,
+environment, CCC config, workspace, b/N mode, cmux binary/socket and lifetime.
+It preserves selected skills, profile and permissions. Each selected provider
+URL is routed through its own local observer while upstream proxy and CA
+selection remain separate from native loopback bypass.
+
+Without `--prepare`, the runner admits one cohort and starts no native process.
+With `--prepare`, it creates the original 50 idle sessions once; the real b/N
+UI still owns activation. `runner-open.json` contains the immutable job path,
+cohort/workspace/mode/boot and source hashes for observation to begin before
+the real UI action exists. SIGINT, SIGTERM and the explicit lifetime revoke
+worker callbacks and close the owner and route handles. They do not kill native
+processes. First-task completion keeps the routes alive for continuation.
+`runner-closed.json` is never a job or whole-run terminal.
+
+The runner's intent is consumed once. Reusing its evidence directory cannot
+start another cohort. Submission settlement and subsequent cohort admission
+are implemented: admission validates the preceding live owner's immutable
+settlement while that owner retains its worker lock and routes. This is not
+a whole-run terminal; that separate record remains pending implementation.
+Configuration and skills
+sources are pinned for the admitted generation; shared global config must not
+be rewritten for this optimization. No production warm pool has been started
+at this checkpoint.

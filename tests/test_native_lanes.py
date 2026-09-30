@@ -5,6 +5,7 @@ import tempfile
 import time
 import unittest
 import sys
+import subprocess
 from unittest.mock import Mock
 
 import cmux_codex_watch as core
@@ -12,6 +13,39 @@ from ccc_native_lanes import AuthorizationCells, InterpreterLane, refresh_native
 
 
 class NativeLaneTests(unittest.TestCase):
+    @unittest.skipUnless(sys.version_info >= (3,14), 'native lanes use Python 3.14 interpreters')
+    def test_real_lane_keeps_info_receipts_on_inherited_stderr(self):
+        # Stop at construction, before config, sockets or native observation.
+        # A fresh interpreter must initialize its own logging, even though
+        # logging in the parent process has already been configured.
+        child = '''
+import logging
+import cmux_codex_watch as core
+from ccc_native_lanes import run_native_lane
+def stop(self, *args):
+    logging.getLogger(core.APP_NAME).info('lane-test-state-and-send-receipt')
+    raise RuntimeError('construction-stop')
+core.WatchDaemon.__init__ = stop
+for _ in range(2):
+    try:
+        run_native_lane('{"config_path":"unused", "state_path":"unused"}', bytes([1]), 0, None, None)
+    except RuntimeError as exc:
+        assert str(exc) == 'construction-stop'
+'''
+        script = ("import logging\nfrom concurrent import interpreters\n"
+                  "logging.basicConfig(level=logging.INFO)\n"
+                  "lane=interpreters.create()\ntry:\n"
+                  f"    lane.exec({child!r})\nfinally:\n    lane.close()\n")
+        result = subprocess.run([sys.executable, '-B', '-c', script],
+                                cwd=Path(core.__file__).parent,
+                                capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = [line for line in result.stderr.splitlines()
+                 if 'lane-test-state-and-send-receipt' in line]
+        self.assertEqual(len(lines), 2, result.stderr)
+        for line in lines:
+            self.assertRegex(line, r'^\d{4}-\d{2}-\d{2} .* INFO lane-test-state-and-send-receipt$')
+
     def test_transient_initial_native_read_is_retried_without_rechecking_known_sources(self):
         recovery=Mock()
         target={'surface_id':'new','workspace_id':'owned'}

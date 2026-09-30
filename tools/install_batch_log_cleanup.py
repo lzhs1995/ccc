@@ -25,7 +25,9 @@ def main():
         parser.error('--enable requires --install')
     source = Path(__file__).with_name('batch_log_cleanup.py')
     destination = Path.home() / '.config/cmux-janitor/ccc-batch-logs'
-    label = 'com.lzhs.cmux-ccc-batch-logs'
+    prefix = (os.environ.get('CCC_LABEL_PREFIX')
+              or f"com.{os.environ.get('USER') or Path.home().name or 'user'}")
+    label = f'{prefix}.cmux-ccc-batch-logs'
     policy = {'version': 1, 'enabled': args.enable,
               'app': str(Path.home() / 'Library/Application Support/cmux-codex-continue'),
               'source_sha256': hashlib.sha256(source.read_bytes()).hexdigest(),

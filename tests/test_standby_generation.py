@@ -71,12 +71,49 @@ class GenerationTests(unittest.TestCase):
         root = self.roots['skills'][0]; (root / 'cycle').symlink_to(root)
         with self.assertRaises(ValueError): self.pin()
 
+    def test_ancestor_link_tracks_identity_without_unrelated_target_contents(self):
+        target = self.root / 'ancestor-target'; target.mkdir()
+        declared = target / 'declared'; declared.write_text('config')
+        os.mkfifo(target / 'unrelated-fifo')
+        link = self.root / 'ancestor-link'; link.symlink_to(target, target_is_directory=True)
+        roots = {scope: [link / 'declared'] for scope in SCOPES}
+        pin = StandbyGeneration(roots, lambda: self.settings)
+        self.assertEqual(pin.current(), pin.value)
+        (target / 'unrelated-file').write_text('unrelated')
+        self.assertEqual(pin.current(), pin.value)
+        link.rename(self.root / 'old-link')
+        link.symlink_to(target, target_is_directory=True)
+        with self.assertRaises(ValueError):
+            pin.current()
+
     def test_failure_and_resource_limit_refuse(self):
         with self.assertRaises(ValueError): self.pin(max_entries=1)
         pin = self.pin()
         with patch.object(pin, '_snapshot', side_effect=OSError('unreadable')):
             with self.assertRaises(OSError): pin.current()
         with self.assertRaises(ValueError): pin.current()
+
+    @unittest.skipUnless(hasattr(select, 'kqueue') and hasattr(os, 'O_SYMLINK'), 'Darwin vnode events')
+    def test_each_intermediate_link_is_watched_without_sibling_recursion(self):
+        for leaf in (False, True):
+            with self.subTest(leaf=leaf), tempfile.TemporaryDirectory(dir=self.root) as temp:
+                root = Path(temp)
+                target = root / 'target'; target.mkdir()
+                (target / 'declared').write_text('config')
+                os.mkfifo(target / 'unrelated')
+                a, b = root / 'a', root / 'b'
+                b.symlink_to('target/declared' if leaf else 'target')
+                a.symlink_to('b')
+                dependency = a if leaf else a / 'declared'
+                pin = StandbyGeneration({scope: [dependency] for scope in SCOPES},
+                                        lambda: self.settings, use_events=True)
+                self.addCleanup(pin.close)
+                self.assertIn(str(b), pin._inventory_paths)
+                self.assertEqual(pin.current(), pin.value)
+                replacement = root / 'replacement'
+                replacement.symlink_to('target/declared' if leaf else 'target')
+                os.replace(replacement, b)
+                with self.assertRaises(ValueError): pin.current()
 
     def test_change_during_other_file_read_detected(self):
         pin = self.pin(); real = pin.effective
@@ -128,10 +165,72 @@ class GenerationTests(unittest.TestCase):
         with self.assertRaises(ValueError): pin.current()
 
     @unittest.skipUnless(hasattr(select, 'kqueue') and hasattr(os, 'O_SYMLINK'), 'Darwin vnode events')
+    def test_capture_cannot_pin_an_effective_value_outside_its_snapshot(self):
+        # A transient B between the two baseline scans and watch-arm scan
+        # previously became the fast-path baseline for an A generation.
+        calls = [0]
+        def effective():
+            calls[0] += 1
+            return {'profile': 'B' if calls[0] == 5 or calls[0] >= 8 else 'A'}
+        pin = None
+        try:
+            with self.assertRaises(ValueError):
+                pin = StandbyGeneration(self.roots, effective, use_events=True)
+                pin.current()
+        finally:
+            if pin is not None:
+                pin.close()
+
+    @unittest.skipUnless(hasattr(select, 'kqueue') and hasattr(os, 'O_SYMLINK'), 'Darwin vnode events')
     def test_unrelated_sibling_creation_does_not_invalidate_ancestors(self):
         pin = self.pin(use_events=True); self.addCleanup(pin.close)
         (self.root / 'unrelated.log').write_text('not a declared dependency')
         self.assertEqual(pin.current(), pin.value)
+
+    @unittest.skipUnless(hasattr(select, 'kqueue') and hasattr(os, 'O_SYMLINK'), 'Darwin vnode events')
+    def test_missing_source_allows_job_siblings_but_observed_appearance_latches(self):
+        optional = self.root / 'optional/config.toml'
+        self.roots['codex_config'].append(optional)
+        pin = self.pin(use_events=True); self.addCleanup(pin.close)
+        with patch.object(pin, '_snapshot', side_effect=AssertionError('hot rescan')):
+            unrelated = self.root / 'standby'; unrelated.mkdir()
+            (unrelated / 'receipt.json').write_text('{}')
+            (self.root / 'log.txt').write_text('unrelated')
+            self.assertEqual(pin.current(), pin.value)
+            optional.parent.mkdir()
+            with self.assertRaises(ValueError): pin.current()
+            optional.parent.rmdir()
+            with self.assertRaises(ValueError): pin.current()
+
+    @unittest.skipUnless(hasattr(select, 'kqueue') and hasattr(os, 'O_SYMLINK'), 'Darwin vnode events')
+    def test_missing_parent_permissions_and_identity_still_invalidate(self):
+        for change in ('permissions', 'replace'):
+            with self.subTest(change=change), tempfile.TemporaryDirectory(dir=self.root) as temp:
+                parent = Path(temp) / 'ancestor'; parent.mkdir(mode=0o700)
+                roots = {**self.roots, 'codex_config': [parent / 'config.toml']}
+                pin = StandbyGeneration(roots, lambda: self.settings, use_events=True)
+                self.addCleanup(pin.close)
+                if change == 'permissions':
+                    parent.chmod(0o755)
+                    parent.chmod(0o700)
+                else:
+                    saved = parent.with_name('saved'); parent.rename(saved)
+                    parent.symlink_to(saved, target_is_directory=True)
+                with self.assertRaises(ValueError): pin.current()
+
+    @unittest.skipUnless(hasattr(select, 'kqueue') and hasattr(os, 'O_SYMLINK'), 'Darwin vnode events')
+    def test_ensure_app_dir_avoids_redundant_attribute_event(self):
+        from cmux_codex_watch import ensure_app_dir
+        app = self.root / 'app'; app.mkdir(mode=0o700)
+        roots = {**self.roots, 'codex_config': [app / 'optional.toml']}
+        pin = StandbyGeneration(roots, lambda: self.settings, use_events=True)
+        self.addCleanup(pin.close)
+        ensure_app_dir(app)
+        self.assertEqual(pin.current(), pin.value)
+        app.chmod(0o755)
+        ensure_app_dir(app)
+        self.assertEqual(app.stat().st_mode & 0o7777, 0o700)
+        with self.assertRaises(ValueError): pin.current()
 
 
 if __name__ == '__main__':

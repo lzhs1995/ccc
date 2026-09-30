@@ -388,7 +388,11 @@ def start(config_path, selector, *, client=None, launch=True, private_check=Fals
         cancel_epoch = rule.get("batch_cancelled_at")
         previous = core.load_json(job_path(config_path, rule["last_batch_id"]), {}) if rule.get("last_batch_id") else {}
         if 'standby_policy' in previous:
-            raise RuntimeError('本池保留待机批次；须通过待机激活入口提交，不能复用普通启动')
+            if not launch or access_check or not (private_check or native_access):
+                raise RuntimeError('本池保留待机批次；仅原 b/N 按钮可激活，不能复用普通启动')
+            from ccc_standby_entry import activate_existing
+            return activate_existing(config_path, previous,
+                mode='N' if native_access else 'b', origin=ui_trace)
         writable = True
         if previous:
             path = job_path(config_path, previous["id"])
@@ -627,7 +631,7 @@ def native_trace_identity(config_path, job, index, *, prepare=False):
     return identities
 
 
-def native_launch_argv(config_path, job, index):
+def native_launch_argv(config_path, job, index, *, native_argv=None):
     """Resolve the exact native executable without putting long argv in a PTY."""
     mode = startup_mode(job, config_path)
     from ccc_batch_guard import AUTOMATIC_POOL_STOP, native_binary
@@ -635,7 +639,8 @@ def native_launch_argv(config_path, job, index):
         return [sys.executable, "-B", str(Path(__file__).with_name("ccc_batch_guard.py")),
                 "launch", "--config", str(config_path), "--job", job["id"], "--index", str(index)]
     directory, context = workspace_launch_context(config_path, job, index)
-    argv = [native_binary(), *(["--cd", str(directory)] if directory else []), *context,
+    argv = [*(native_argv if native_argv is not None else [native_binary()]),
+            *(["--cd", str(directory)] if directory else []), *context,
             "-c", "sqlite_home=" + json.dumps(str(sqlite_home(config_path, job["id"], index).resolve()))]
     trace_directory = native_trace_directory(config_path, job, index)
     if trace_directory is not None:

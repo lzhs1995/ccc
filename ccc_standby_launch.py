@@ -17,7 +17,8 @@ import time
 
 import cmux_codex_watch as core
 import ccc_workspace_batch as batch
-from ccc_native_standby import POLICY, COUNT, generation, identifier, write_once, digest
+import ccc_standby_environment as native_environment
+from ccc_native_standby import POLICY, COUNT, controller_identifier, generation, identifier, write_once, digest
 
 
 def policy(job, config_path):
@@ -37,7 +38,7 @@ def policy(job, config_path):
         raise ValueError('invalid explicit native standby job policy')
     return {'policy': POLICY, 'job_id': identifier(job['id']),
             'cohort_id': identifier(job['standby_cohort_id']),
-            'workspace_id': identifier(job['workspace_id']), 'mode': job['standby_mode'],
+            'workspace_id': controller_identifier(job['workspace_id']), 'mode': job['standby_mode'],
             'boot_id': identifier(job['standby_boot_id']),
             'generation': generation(job['standby_generation'])}
 
@@ -49,11 +50,18 @@ def launch_argv(config_path, job, index):
     identifier(job['slots'][index]['launch_id'])
     # This base has no initial_prompt_policy, so it cannot append a prompt or
     # install the argv-first-task Hook. Keep the native cwd/trust/SQLite policy.
-    argv = batch.native_launch_argv(config_path, job, index)
+    if 'standby_target' in job:
+        from ccc_standby_target import slot_argv
+        argv = batch.native_launch_argv(config_path, job, index,
+                                      native_argv=slot_argv(job['standby_target'], index))
+    else:
+        argv = batch.native_launch_argv(config_path, job, index)
     command = shlex.join([sys.executable, '-B', str(Path(__file__).resolve()), 'bind',
         '--config', str(config_path), '--job', job['id'], '--index', str(index),
         '--launch-id', job['slots'][index]['launch_id']])
-    argv.extend(['--disable', 'skill_search', *batch.initial_hook_arguments(command)])
+    # Preserve the selected native skill features, including explicit CLI
+    # enable/disable choices. Readiness must observe the actual configuration.
+    argv.extend(batch.initial_hook_arguments(command))
     return argv  # No positional prompt, resume/fork, naming or probe request.
 
 
@@ -63,12 +71,15 @@ def claim_path(config_path, job_id, index):
     return batch.job_path(config_path, job_id).parent / f'standby-native-{index}.json'
 
 
-def exec_claimed(config_path, job_id, index, record, argv, final_guard, final_authorized):
+def exec_claimed(config_path, job_id, index, record, argv, final_guard, final_authorized, *, environment):
     if (record.get('policy') != POLICY or record.get('job_id') != job_id
             or record.get('index') != index or record.get('argv') != argv
             or not argv or not Path(argv[0]).is_absolute()
             or any(not isinstance(v, str) or '\0' in v for v in argv)):
         raise ValueError('standby claim and argv disagree')
+    environment = dict(environment)
+    if native_environment.signature(environment) != record.get('environment_sha256'):
+        raise ValueError('standby exec environment differs from claim')
     argv = list(argv)
     path = claim_path(config_path, job_id, index)
     raw = write_once(path, record)
@@ -80,10 +91,33 @@ def exec_claimed(config_path, job_id, index, record, argv, final_guard, final_au
         raise ValueError('standby launch claim changed')
     if not final_authorized():
         raise ValueError('standby launch authorization changed at exec')
-    os.execv(argv[0], argv)
+    # --cd selects native's logical project, but does not bind the OS cwd.
+    # Enter the declared original directory before exec; retain both final
+    # guards after the change. This runs only in the one-shot bootstrap.
+    previous = os.open('.', os.O_RDONLY | os.O_DIRECTORY)
+    target = None
+    try:
+        target = os.open(record['cwd'], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        info = os.fstat(target)
+        if [info.st_dev, info.st_ino] != record['cwd_generation'][:2]:
+            raise ValueError('standby original working directory changed')
+        os.fchdir(target)
+        if not final_guard() or not final_authorized():
+            raise ValueError('standby launch authorization changed after entering cwd')
+        here = os.stat('.')
+        if ([here.st_dev, here.st_ino] != record['cwd_generation'][:2]
+                or Path.cwd() != Path(record['cwd']).resolve(strict=True)):
+            raise ValueError('standby OS working directory changed before exec')
+        os.execve(argv[0], argv, environment)
+    finally:
+        # Real exec never returns. Failed or mocked exec restores its caller.
+        os.fchdir(previous)
+        os.close(previous)
+        if target is not None:
+            os.close(target)
 
 
-def launch_registered(config_path, job_id, index, launch_id, *, generation_current):
+def launch_registered(config_path, job_id, index, launch_id, *, generation_current, environment_current):
     """Retain register()'s durable initial hold, then exec one original native.
 
     No default generation provider: the manager must cover effective profile,
@@ -94,6 +128,12 @@ def launch_registered(config_path, job_id, index, launch_id, *, generation_curre
     path = batch.job_path(config_path, job_id)
     job = core.load_json(path, {})
     selected = policy(job, config_path)
+    if not callable(environment_current):
+        raise ValueError('explicit target environment reader required')
+    target_environment = native_environment.template(environment_current())
+    target_sha256 = native_environment.signature(target_environment)
+    if job.get('standby_environment_sha256') != target_sha256:
+        raise ValueError('standby target environment differs from admitted job')
     if not callable(generation_current) or generation_current() != selected['generation']:
         raise ValueError('standby effective configuration is not current')
     if boot_id() != selected['boot_id']:
@@ -122,16 +162,18 @@ def launch_registered(config_path, job_id, index, launch_id, *, generation_curre
     with os.fdopen(os.open(tui, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), 'wb') as handle:
         os.fsync(handle.fileno())
     info = tui.stat()
-    environment = {'TOKIO_WORKER_THREADS': '2', 'CODEX_TUI_RECORD_SESSION': '1',
-                   'CODEX_TUI_SESSION_LOG_PATH': str(tui)}
-    os.environ.update(environment)
+    surface_environment = {k: os.environ[k] for k in native_environment.SURFACE_KEYS if k in os.environ}
+    environment = native_environment.compose(target_environment, surface_environment,
+        workspace_id=wid, surface_id=sid, cwd=cwd, tui_log=tui)
     record = {**selected, 'job_id': job_id, 'workspace_id': wid, 'surface_id': sid,
               'index': index, 'launch_id': launch_id, 'bootstrap_pid': pid, 'bootstrap_birth': born,
               'receipt_sha256': hashlib.sha256(raw).hexdigest(), 'cwd': str(cwd),
               'cwd_generation': list(files[cwd]), 'argv': argv, 'executable': str(executable),
               'executable_generation': list(files[executable]), 'at': time.time(), 'state': 'exec_intent',
               'tui_log': str(tui), 'tui_log_identity': [info.st_dev, info.st_ino],
-              'requested_environment': environment}
+              'requested_environment': {k: environment[k] for k in native_environment.FIXED_KEYS},
+              'target_environment_sha256': target_sha256,
+              'environment_sha256': native_environment.signature(environment)}
 
     def permission_current():
         current = core.load_json(path, {})
@@ -141,7 +183,9 @@ def launch_registered(config_path, job_id, index, launch_id, *, generation_curre
                 or any(p.is_symlink() or batch._file_generation(p) != value for p, value in files.items())
                 or receipt_path.read_bytes() != raw or any(cwd.iterdir())
                 or Path(argv[0]).resolve(strict=True) != executable or birth(pid) != born
-                or any(os.environ.get(k) != v for k, v in environment.items())
+                or {k: os.environ[k] for k in native_environment.SURFACE_KEYS if k in os.environ} != surface_environment
+                or native_environment.template(environment_current()) != target_environment
+                or current.get('standby_environment_sha256') != target_sha256
                 or boot_id() != selected['boot_id'] or generation_current() != selected['generation']):
             return False
         config = core.ConfigStore(Path(config_path)).load()
@@ -161,7 +205,8 @@ def launch_registered(config_path, job_id, index, launch_id, *, generation_curre
         return core.find_main_surface(client.workspace_tree(wid), sid).get('workspace_id') == wid
 
     with core.workspace_input_lock(config_path, wid, shared=True):
-        exec_claimed(config_path, job_id, index, record, argv, authorized, permission_current)
+        exec_claimed(config_path, job_id, index, record, argv, authorized, permission_current,
+                     environment=environment)
 
 
 def bind_initial(config_path, job_id, index, launch_id, payload):
@@ -207,7 +252,7 @@ def bind_initial(config_path, job_id, index, launch_id, payload):
     if (directory.is_symlink() or os.path.lexists(directory / 'invalidated.json')
             or any(activation.get(k) != selected[k] for k in
                    ('policy', 'cohort_id', 'boot_id', 'mode', 'generation'))
-            or identifier(activation['workspace_id']) != selected['workspace_id']
+            or controller_identifier(activation['workspace_id']) != selected['workspace_id']
             or activation.get('count') != COUNT or manifest.get('count') != COUNT
             or any(activation.get(k) != v for k, v in manifest.items())
             or activation['originals'] != originals or len(originals) != COUNT
@@ -229,17 +274,19 @@ def bind_initial(config_path, job_id, index, launch_id, payload):
             or native_claim.get('launch_id') != launch_id
             or native_claim.get('bootstrap_pid') != row['pid'] or native_claim.get('bootstrap_birth') != row['birth']
             or any(native_claim.get(k) != selected[k] for k in ('cohort_id', 'boot_id', 'mode', 'generation'))
-            or identifier(native_claim['surface_id']) != row['surface_id']
-            or identifier(native_claim['workspace_id']) != row['workspace_id']
+            or controller_identifier(native_claim['surface_id']) != row['surface_id']
+            or controller_identifier(native_claim['workspace_id']) != row['workspace_id']
             or identifier(payload['session_id']) != row['session_id']
             or payload.get('hook_event_name') != 'SessionStart' or payload.get('source') != 'startup'
             or Path(payload['cwd']).resolve() != Path(native_claim['cwd']).resolve()):
         raise ValueError('standby Hook differs from original activation')
     current = process(row['pid'], launch=True)
     if (not current or current.get('birth') != row['birth'] or current.get('remote')
+            or ('environment_sha256' in native_claim and
+                native_environment.signature(current.get('environment')) != native_claim['environment_sha256'])
             or current.get('argv') != native_claim['argv']
-            or identifier(current['surface_id']) != row['surface_id']
-            or identifier(current['environment_workspace_id']) != row['workspace_id']):
+            or controller_identifier(current['surface_id']) != row['surface_id']
+            or controller_identifier(current['environment_workspace_id']) != row['workspace_id']):
         raise ValueError('standby Hook process identity changed')
     root = (Path(current['environment'].get('CODEX_HOME') or Path.home() / '.codex') / 'sessions').resolve()
     lock = Path(row['writer_lock'])

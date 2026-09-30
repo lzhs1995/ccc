@@ -69,6 +69,7 @@ class BatchFixture:
         slot = core.load_json(batch.job_path(self.test.config, jid), {})['slots'][index]
         self.test.assertEqual(slot['phase'], 'creating')
         sid, session = str(uuid.uuid4()), str(uuid.uuid4())
+        sid = getattr(self.test, 'controller_id', str)(sid)
         self.calls.append(sid)
         with patch.dict(os.environ, {'CMUX_SURFACE_ID': sid, 'CMUX_WORKSPACE_ID': wid}):
             batch.register(self.test.config, jid, index, tokens[tokens.index('--launch-id') + 1])
@@ -164,6 +165,7 @@ class WorkspaceBatchTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.config = self.root / 'config.json'
         self.wid, self.window, self.pane = (str(uuid.uuid4()) for _ in range(3))
+        self.wid = getattr(self, 'controller_id', str)(self.wid)
         self.store = core.ConfigStore(self.config)
         self.store.mutate(lambda c: c.update(mode='armed', global_paused=False))
         self.client = BatchFixture(self)

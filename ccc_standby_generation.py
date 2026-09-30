@@ -11,12 +11,18 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import resource
 import select
 import stat
 import threading
 
 
 SCOPES = {'runtime', 'native_binary', 'codex_config', 'profile', 'skills', 'rules'}
+# The production source census includes the native binary, complete host skills
+# and plugin caches. Keep the small standalone defaults; opt production into
+# these explicit ceilings without changing any user's declared source graph.
+PRODUCTION_BOUNDS = {'use_events': True, 'max_entries': 50000,
+                     'max_read_bytes': 1536 * 1024**2, 'max_watch_files': 40000}
 
 
 def _digest(value):
@@ -33,7 +39,16 @@ def _ancestor_stamp(info):
     # Unrelated children of /Users, HOME or CODEX_HOME are not configuration.
     # Preserve path/type/owner/mode, without treating a sibling creation as a
     # source change. Declared dependency directories still track all children.
+    if stat.S_ISLNK(info.st_mode):
+        return _stamp(info)
     return [info.st_dev, info.st_ino, info.st_mode, info.st_uid]
+
+
+def _access_stable_stamp(info):
+    # Darwin exec/read can emit NOTE_ATTRIB for access time alone. Keep all
+    # mutation timestamps and permission/ownership/link metadata in this
+    # exception's comparison; a chmod/content round trip changes ctime.
+    return [*_stamp(info), info.st_gid, info.st_nlink, info.st_flags]
 
 
 class StandbyGeneration:
@@ -47,6 +62,34 @@ class StandbyGeneration:
     """
     def __init__(self, roots, effective, *, max_entries=50000, max_read_bytes=512 * 1024**2,
                  use_events=False, max_watch_files=4096):
+        self._configure(roots, effective, max_entries, max_read_bytes)
+        self._lock = threading.RLock()
+        self._invalid = False
+        self._watch = None
+        with self._lock:
+            first = self._snapshot()
+            if self._snapshot() != first:
+                self._invalid = True
+                raise ValueError('launch dependencies changed during generation capture')
+            self.value = first
+            # The fast path must compare against the effective settings that
+            # produced value, never an independent callback between snapshots.
+            self._effective_sha = self._snapshot_effective_sha
+            self._roots_sha = _digest(self.roots)
+            if use_events:
+                try:
+                    self._watch = _VnodeWatch(self._inventory_paths, max_watch_files,
+                                              self._missing_children)
+                    # Register first, rescan every dependency, then drain.
+                    # Changes in the registration window cannot disappear.
+                    if self._snapshot() != self.value:
+                        raise ValueError('dependencies changed while arming watches')
+                    self._watch.check()
+                except BaseException:
+                    self.close()
+                    raise
+
+    def _configure(self, roots, effective, max_entries, max_read_bytes):
         if set(roots) != SCOPES or any(not paths for paths in roots.values()):
             raise ValueError('all effective launch dependency scopes are required')
         self.roots = {key: tuple(sorted(str(Path(p)) for p in paths)) for key, paths in roots.items()}
@@ -58,36 +101,83 @@ class StandbyGeneration:
         self.effective = effective
         self.max_entries, self.max_read_bytes = max_entries, max_read_bytes
         self._cache = {}
-        self._lock = threading.RLock()
-        self._invalid = False
-        self._watch = None
-        with self._lock:
-            first = self._snapshot()
-            if self._snapshot() != first:
-                self._invalid = True
-                raise ValueError('launch dependencies changed during generation capture')
-            self.value = first
-            self._effective_sha = _digest(self.effective())
-            self._roots_sha = _digest(self.roots)
-            if use_events:
-                try:
-                    self._watch = _VnodeWatch(self._inventory_paths, max_watch_files)
-                    # Register first, rescan every dependency, then drain.
-                    # Changes in the registration window cannot disappear.
-                    if self._snapshot() != self.value:
-                        raise ValueError('dependencies changed while arming watches')
-                    self._watch.check()
-                except Exception:
-                    self.close()
-                    raise
+        self.read_bytes_total = 0
 
-    def _snapshot(self):
+    @classmethod
+    def measure(cls, roots, *, max_entries=50000):
+        """Metadata-only capacity report using the identical dependency walk.
+
+        This does not create a generation, arm events, read contents or certify
+        readiness. No exclusions or source filtering are applied.
+        """
+        probe = cls.__new__(cls)
+        probe._configure(roots, lambda: {'capacity_only': True}, max_entries, 1)
+        probe._snapshot(read_contents=False)
+        return probe.capacity
+
+    def _snapshot(self, *, read_contents=True):
         effective = self.effective()
         if not isinstance(effective, dict) or not effective:
             raise ValueError('effective settings are unavailable')
         effective_sha = _digest(effective)
         rows, anchors, active, seen = {}, {}, set(), set()
         read_bytes = 0
+        file_identities = {}
+        root_usage = {}
+        current_root = None
+        resolving = set()
+
+        def budget_error(message, path, **details):
+            error = ValueError(message + ': ' + str(path))
+            error.dependency_budget = {'path': str(path), 'root': current_root,
+                'entries': len(seen), 'ancestors': len(anchors),
+                'read_bytes': read_bytes, 'max_read_bytes': self.max_read_bytes,
+                'max_entries': self.max_entries, **details}
+            return error
+
+        def anchor_path(path):
+            # Ancestor links contribute path identities, not all content below
+            # their targets. /tmp -> /private/tmp must not inventory every
+            # unrelated temporary directory or special file on the machine.
+            # Resolve one component/hop at a time: Path.resolve() alone loses
+            # intermediate links in A -> B -> C, leaving B unwatched.
+            current = Path(path.anchor)
+            for part in ('.', *path.parts[1:]):
+                if part == '..':
+                    current = current.parent
+                elif part != '.':
+                    current = current / part
+                key = str(current)
+                try:
+                    info = current.lstat()
+                except FileNotFoundError:
+                    identity = ['missing']
+                    if key in anchors and anchors[key] != identity:
+                        raise ValueError('launch ancestor changed while resolving')
+                    anchors[key] = identity
+                    continue
+                identity = _ancestor_stamp(info)
+                if key in anchors and anchors[key] != identity:
+                    raise ValueError('launch ancestor changed while resolving')
+                anchors[key] = identity
+                if len(anchors) + len(seen) > self.max_entries:
+                    raise budget_error('launch dependency inventory too large', current)
+                if stat.S_ISLNK(info.st_mode):
+                    if key in resolving or len(resolving) >= 40:
+                        raise ValueError('cyclic launch dependency link')
+                    resolving.add(key)
+                    try:
+                        target = Path(os.readlink(current))
+                        target = target if target.is_absolute() else current.parent / target
+                        resolved = anchor_path(target)
+                        if not os.path.lexists(resolved):
+                            raise ValueError('unresolved launch dependency link')
+                        if _ancestor_stamp(current.lstat()) != identity:
+                            raise ValueError('launch link changed while resolving')
+                        current = resolved
+                    finally:
+                        resolving.remove(key)
+            return current
 
         def visit(path):
             nonlocal read_bytes
@@ -98,17 +188,10 @@ class StandbyGeneration:
                 return
             seen.add(key)
             if len(seen) > self.max_entries:
-                raise ValueError('launch dependency inventory too large')
+                raise budget_error('launch dependency inventory too large', path)
             # Track every ancestor symlink as well as its resolved target.
             # A root beneath a replaced symlink is not the original graph.
-            for parent in reversed(path.parents):
-                if str(parent) not in anchors:
-                    try:
-                        anchors[str(parent)] = _ancestor_stamp(parent.lstat())
-                    except FileNotFoundError:
-                        anchors[str(parent)] = ['missing']
-                if parent.is_symlink():
-                    visit(parent)
+            anchor_path(path.parent)
             try:
                 before = path.lstat()
             except FileNotFoundError:
@@ -119,7 +202,7 @@ class StandbyGeneration:
             try:
                 if stat.S_ISLNK(before.st_mode):
                     target = os.readlink(path)
-                    resolved = path.resolve(strict=True)
+                    resolved = anchor_path(path)
                     rows[key] = ['link', identity, target, str(resolved)]
                     visit(resolved)
                 elif stat.S_ISDIR(before.st_mode):
@@ -128,13 +211,23 @@ class StandbyGeneration:
                     for child in children:
                         visit(child)
                 elif stat.S_ISREG(before.st_mode):
-                    cached = self._cache.get(key)
-                    if cached is not None and cached[0] == identity:
+                    # Share content only for the same inode AND full stamp.
+                    # Every path, ancestor and intermediate symlink stays in
+                    # the inventory and receives the usual final identity check.
+                    inode = (before.st_dev, before.st_ino)
+                    if inode not in file_identities:
+                        file_identities[inode] = before.st_size
+                        root_usage[current_root] = root_usage.get(current_root, 0) + before.st_size
+                    cached = self._cache.get(inode)
+                    if not read_contents:
+                        content_sha = None
+                    elif cached is not None and cached[0] == identity:
                         content_sha = cached[1]
                     else:
                         read_bytes += before.st_size
                         if read_bytes > self.max_read_bytes:
-                            raise ValueError('launch dependency read budget exceeded')
+                            raise budget_error('launch dependency read budget exceeded', path,
+                                               file_bytes=before.st_size)
                         with path.open('rb') as stream:
                             if _stamp(os.fstat(stream.fileno())) != identity:
                                 raise ValueError('dependency replaced before reading')
@@ -148,7 +241,7 @@ class StandbyGeneration:
                             if _stamp(os.fstat(stream.fileno())) != identity:
                                 raise ValueError('dependency changed while reading')
                         content_sha = content.hexdigest()
-                        self._cache[key] = (identity, content_sha)
+                        self._cache[inode] = (identity, content_sha)
                     rows[key] = ['file', identity, content_sha]
                 else:
                     raise ValueError('unsupported launch dependency file type')
@@ -157,8 +250,9 @@ class StandbyGeneration:
             finally:
                 active.remove(key)
 
-        for paths in self.roots.values():
+        for scope, paths in sorted(self.roots.items()):
             for path in paths:
+                current_root = path
                 visit(Path(path))
         if _digest(self.effective()) != effective_sha:
             raise ValueError('effective settings changed during inventory')
@@ -178,16 +272,31 @@ class StandbyGeneration:
             elif _stamp(path.lstat()) != row[1]:
                 raise ValueError('dependency changed before snapshot completed')
         self._inventory_paths = {name: 'identity' for name in anchors}
+        self._missing_children = {}
         for name, row in rows.items():
             if row[0] != 'missing':
                 self._inventory_paths[name] = 'content'
             else:
-                # A missing source has no vnode. Any child change on its
-                # nearest existing ancestor conservatively invalidates it.
+                # A missing source has no vnode. Watch its nearest existing
+                # parent, then check the specific missing child on a directory
+                # event. Job/log siblings are not configuration dependencies.
                 parent = Path(name).parent
                 while not os.path.lexists(parent):
                     parent = parent.parent
-                self._inventory_paths[str(parent)] = 'content'
+                child = parent / Path(name).relative_to(parent).parts[0]
+                self._missing_children.setdefault(str(parent), set()).add(str(child))
+        for parent in self._missing_children:
+            if self._inventory_paths.get(parent) != 'content':
+                self._inventory_paths[parent] = 'missing'
+        existing = [Path(p).lstat() for p in self._inventory_paths if os.path.lexists(p)]
+        self.read_bytes_total += read_bytes
+        self.capacity = {'entries': len(rows), 'ancestors': len(anchors),
+            'file_inodes': len(file_identities), 'unique_file_bytes': sum(file_identities.values()),
+            'root_unique_bytes': root_usage, 'read_bytes_total': self.read_bytes_total,
+            'watch_paths': len(existing),
+            'watch_inodes': len({(s.st_dev, s.st_ino) for s in existing}),
+            'rlimit_nofile': list(resource.getrlimit(resource.RLIMIT_NOFILE))}
+        self._snapshot_effective_sha = effective_sha
         return _digest({'roots': self.roots, 'effective': effective_sha, 'entries': rows,
                         'ancestors': anchors})
 
@@ -221,33 +330,72 @@ class StandbyGeneration:
 class _VnodeWatch:
     """Darwin event latch covering leaves, symlinks and every ancestor.
 
-    Any event or query failure invalidates permanently. We never clear an
-    event and accept a subsequent empty queue, or reuse the old vnode after
-    replacement. Registration/descriptor limits fail closed, with no fallback.
+    Dependency content/identity changes and query failures latch permanently.
+    Directory notifications carry no child name: optional missing paths are
+    checked on those events. This proves current absence, not that a missing
+    file could never have appeared and vanished between checks. Existing
+    dependency vnodes still detect content round trips. No replaced vnode is
+    reused. Registration/descriptor limits fail closed, with no fallback.
     """
-    def __init__(self, paths, limit):
+    def __init__(self, paths, limit, missing_children=None):
         if not hasattr(select, 'kqueue') or not hasattr(os, 'O_SYMLINK'):
             raise ValueError('native dependency events unavailable')
-        existing = [(Path(path), kind) for path, kind in paths.items() if os.path.lexists(path)]
-        if type(limit) is not int or not 1 <= limit <= 8192 or len(existing) > limit:
+        if type(limit) is not int or not 1 <= limit <= 50000:
             raise ValueError('dependency watch descriptor limit exceeded')
+        # One vnode descriptor can cover multiple paths to that same inode.
+        # Keep every alias and its strongest requested event mask: resolving
+        # paths here would silently lose intermediate symlink identities.
+        groups = {}
+        for name, kind in paths.items():
+            path = Path(name)
+            try:
+                info = path.lstat()
+            except FileNotFoundError:
+                continue
+            if kind not in ('content', 'identity', 'missing'):
+                raise ValueError('unknown dependency watch kind')
+            groups.setdefault((info.st_dev, info.st_ino), []).append(
+                (path, kind, _ancestor_stamp(info), stat.S_ISDIR(info.st_mode)))
+        soft_limit = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+        # Leave space for controller/routes/worker IO. Existing unrelated FDs
+        # can still exhaust the process/kernel budget; open failure below
+        # closes everything already acquired, without changing OS limits.
+        if (len(groups) > limit or (soft_limit != resource.RLIM_INFINITY
+                                  and len(groups) + 1024 > soft_limit)):
+            error = ValueError('dependency watch descriptor limit exceeded')
+            error.dependency_budget = {'watch_paths': sum(map(len, groups.values())),
+                'watch_inodes': len(groups), 'max_watch_files': limit,
+                'rlimit_nofile': soft_limit, 'reserved_descriptors': 1024}
+            raise error
         self._fds = []
+        self._entries = {}
+        self._access_stamps = {}
+        self._missing = missing_children or {}
         self._queue = select.kqueue()
         self._invalid = False
         self._pid = os.getpid()
         try:
             identity_notes = (select.KQ_NOTE_DELETE |
                      select.KQ_NOTE_ATTRIB | select.KQ_NOTE_LINK | select.KQ_NOTE_RENAME | select.KQ_NOTE_REVOKE)
-            for path, kind in existing:
+            for aliases in groups.values():
                 notes = identity_notes
-                if kind == 'content':
+                if any(kind in ('content', 'missing') for _, kind, _, _ in aliases):
                     notes |= select.KQ_NOTE_WRITE | select.KQ_NOTE_EXTEND
+                path = aliases[0][0]
                 fd = os.open(path, os.O_EVTONLY | os.O_SYMLINK | os.O_CLOEXEC)
                 self._fds.append(fd)
+                info = os.fstat(fd)
+                identity = _ancestor_stamp(info)
+                for alias, _, expected, _ in aliases:
+                    if identity != expected or _ancestor_stamp(alias.lstat()) != expected:
+                        raise ValueError('dependency changed during watch registration')
+                self._entries[fd] = aliases
+                if stat.S_ISREG(info.st_mode):
+                    self._access_stamps[fd] = (_access_stable_stamp(info), info.st_atime_ns)
                 event = select.kevent(fd, filter=select.KQ_FILTER_VNODE,
                     flags=select.KQ_EV_ADD | select.KQ_EV_ENABLE | select.KQ_EV_CLEAR, fflags=notes)
                 self._queue.control([event], 0, 0)
-        except Exception:
+        except BaseException:
             self.close()
             raise
 
@@ -255,8 +403,43 @@ class _VnodeWatch:
         if self._invalid or self._pid != os.getpid():
             raise ValueError('dependency event watcher invalidated or inherited')
         try:
-            if self._queue.control([], 1, 0):
-                raise ValueError('native dependency event observed')
+            for _ in range(3):
+                events = self._queue.control([], max(1, min(4096, len(self._fds))), 0)
+                if not events:
+                    return
+                for event in events:
+                    entry = self._entries.get(event.ident)
+                    if (entry is None or event.filter != select.KQ_FILTER_VNODE
+                            or event.flags & (select.KQ_EV_ERROR | select.KQ_EV_EOF)):
+                        raise ValueError('native dependency event source failed')
+                    child_notes = select.KQ_NOTE_WRITE | select.KQ_NOTE_EXTEND | select.KQ_NOTE_LINK
+                    fd_info = os.fstat(event.ident)
+                    fd_identity = _ancestor_stamp(fd_info)
+                    access = self._access_stamps.get(event.ident)
+                    if (event.fflags == select.KQ_NOTE_ATTRIB and access is not None
+                            and _access_stable_stamp(fd_info) == access[0]
+                            and fd_info.st_atime_ns != access[1]):
+                        # Every original alias must still identify this exact
+                        # unchanged regular file. No WRITE/EXTEND or directory
+                        # event is forgiven, even if bytes were restored.
+                        infos = [path.lstat() for path, _, _, _ in entry]
+                        if all(_access_stable_stamp(info) == access[0]
+                               and info.st_atime_ns == fd_info.st_atime_ns for info in infos):
+                            self._access_stamps[event.ident] = (access[0], fd_info.st_atime_ns)
+                            continue
+                    for path, kind, identity, directory in entry:
+                        if (kind == 'content' or not directory or not event.fflags
+                                or event.fflags & ~child_notes
+                                or _ancestor_stamp(path.lstat()) != identity
+                                or fd_identity != identity):
+                            error = ValueError('native dependency event observed')
+                            error.dependency_event = {'path': str(path), 'kind': kind,
+                                'fflags': event.fflags, 'flags': event.flags}
+                            raise error
+                        for child in self._missing.get(str(path), ()):
+                            if os.path.lexists(child):
+                                raise ValueError('optional dependency path appeared')
+            raise ValueError('native dependency events did not settle')
         except Exception:
             self._invalid = True
             raise

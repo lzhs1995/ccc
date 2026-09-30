@@ -330,6 +330,13 @@ def run_native_lane(initial, flags, lane_cell, commands, results):
     settings = json.loads(initial)
     if not flags[lane_cell]:
         return
+    # Subinterpreters have independent logging state. The parent's handlers
+    # are not inherited, so INFO state transitions and send receipts otherwise
+    # disappear once a surface is assigned to a lane. Use inherited stderr;
+    # launchd already retains it, without opening a competing rotating file.
+    import logging
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(message)s")
     sys.setswitchinterval(min(sys.getswitchinterval(), .001))
     class LaneDaemon(core.WatchDaemon):
         def _load_config_at_startup(self):

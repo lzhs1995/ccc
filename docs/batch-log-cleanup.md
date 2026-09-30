@@ -17,7 +17,7 @@ cmux 全拓扑、进程表和全机打开文件；持久化删除意图后再次
 目录和文件必须属于当前用户，拒符号链接、硬链接和他人可写文件；unlink 使用
 逐层 O_NOFOLLOW 打开的目录 FD，并再次核对父链及文件身份。
 
-自动模式由单独 launchd 任务 `com.lzhs.cmux-ccc-batch-logs` 每 30 分钟执行，
+自动模式由单独 launchd 任务 `com.<当前用户名>.cmux-ccc-batch-logs`（可用 `CCC_LABEL_PREFIX` 覆盖前缀） 每 30 分钟执行，
 安装包默认 `enabled=false`。启用需要明确的 `--install --enable`。
 正常闲置期限 7 天；可用空间不足 10 GiB 时改为 24 小时，所有活跃排除仍有效。
 每轮最多 32 批，按日志占用降序选择；只保留最近 32 个小型计划/回执文件。

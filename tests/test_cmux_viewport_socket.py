@@ -15,16 +15,16 @@ from tests.test_watch import FakeClient, HIGH_DEMAND_TEXT, armed_daemon, grid_pa
 
 
 @contextlib.contextmanager
-def server(handler):
+def server(handler, *, backlog=8, workers=4):
     with tempfile.TemporaryDirectory(prefix="ccc-socket-", dir="/tmp") as directory:
         path = str(Path(directory) / "rpc.sock")
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         listener.bind(path)
-        listener.listen(8)
+        listener.listen(backlog)
         listener.settimeout(0.05)
         stopped = threading.Event()
         requests, errors = [], []
-        with ThreadPoolExecutor(4) as pool:
+        with ThreadPoolExecutor(workers) as pool:
             def handle(connection):
                 try:
                     with connection:

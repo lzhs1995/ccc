@@ -6,10 +6,22 @@ import time
 import unittest
 from unittest.mock import Mock, patch
 
-from ccc_codex_queue import QueueRecovery, completed_error
+from ccc_codex_queue import QueueRecovery, completed_error, _retryable_completed_message
 
 
 class QueueRecoveryTests(unittest.TestCase):
+    def test_terminal_provider_blockers_override_stream_wrapper(self):
+        for detail in (
+                'unexpected status 401 Unauthorized',
+                'unknown status code 403',
+                'HTTP 429 {"error":{"code":"insufficient_quota"}}',
+                'unexpected status 400 {"error":{"code":"invalid_encrypted_content"}}'):
+            with self.subTest(detail=detail):
+                self.assertFalse(_retryable_completed_message(
+                    'stream disconnected before completion: ' + detail))
+        self.assertTrue(_retryable_completed_message(
+            'stream disconnected before completion: unexpected status 429 Too Many Requests'))
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)

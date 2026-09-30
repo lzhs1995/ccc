@@ -32,6 +32,16 @@ def identifier(value):
     return value.lower()
 
 
+def controller_identifier(value):
+    """Validate cmux identity without changing its rule, lock or RPC spelling.
+
+    cmux exports uppercase UUIDs. Its existing controller paths and permission
+    records use those exact strings; only our generated IDs are canonicalized.
+    """
+    identifier(value)
+    return value
+
+
 def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
@@ -50,9 +60,11 @@ def original(value, workspace_id):
                                 'session_id', 'pid', 'birth', 'claim_sha256', 'argv_sha256')}
     if type(row['index']) is not int or not 0 <= row['index'] < COUNT:
         raise ValueError('invalid standby slot')
-    for key in ('launch_id', 'surface_id', 'workspace_id', 'session_id'):
+    for key in ('launch_id', 'session_id'):
         row[key] = identifier(row[key])
-    if row['workspace_id'] != identifier(workspace_id):
+    for key in ('surface_id', 'workspace_id'):
+        row[key] = controller_identifier(row[key])
+    if row['workspace_id'] != controller_identifier(workspace_id):
         raise ValueError('foreign standby workspace')
     if (type(row['pid']) is not int or not 1 < row['pid'] < 2**31
             or not isinstance(row['birth'], list) or len(row['birth']) != 2
@@ -141,7 +153,7 @@ class StandbyLedger:
     @classmethod
     def create(cls, directory, *, cohort_id, workspace_id, boot_id, mode, prompt, config_generation, clock=time.monotonic):
         value = {'policy': POLICY, 'count': COUNT, 'cohort_id': identifier(cohort_id),
-                 'workspace_id': identifier(workspace_id), 'boot_id': identifier(boot_id),
+                 'workspace_id': controller_identifier(workspace_id), 'boot_id': identifier(boot_id),
                  'mode': mode, 'prompt': prompt, 'generation': generation(config_generation)}
         if mode not in ('b', 'N', 'B') or not isinstance(prompt, str) or not prompt or '\0' in prompt:
             raise ValueError('invalid standby mode')
@@ -196,8 +208,9 @@ class StandbyLedger:
                         raise ValueError('standby original configuration changed')
                     rows.append(original(observation, self.manifest['workspace_id']))
                 if ({r['index'] for r in rows} != set(range(COUNT))
-                        or any(len({r[k] for r in rows}) != COUNT for k in
-                               ('launch_id', 'surface_id', 'session_id', 'pid'))):
+                        or len({r['pid'] for r in rows}) != COUNT
+                        or any(len({identifier(r[k]) for r in rows}) != COUNT for k in
+                               ('launch_id', 'surface_id', 'session_id'))):
                     raise ValueError('standby originals are not unique')
                 rows.sort(key=lambda r: r['index'])
                 if self._originals_raw is not None and json.loads(self._originals_raw) != rows:
@@ -271,10 +284,15 @@ class StandbyLedger:
 
         def check():
             evidence_current()
+            # Authorization may perform blocking connected reads or invoke
+            # the caller's input guard. Observe the original after it returns,
+            # so an identity/queue change during authorization is not hidden.
+            if authorized(index) is not True:
+                raise ValueError('original standby authorization changed')
             current = observe(index)
             fresh(current, activation['boot_id'], self.clock())
             if (original(current, activation['workspace_id']) != expected
-                    or current.get('generation') != activation['generation'] or authorized(index) is not True):
+                    or current.get('generation') != activation['generation']):
                 raise ValueError('original standby identity or authorization changed')
             evidence_current()  # Callbacks may block while another slot invalidates the cohort.
 

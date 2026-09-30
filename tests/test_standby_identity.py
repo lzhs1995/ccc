@@ -9,6 +9,7 @@ import uuid
 
 import ccc_standby_identity as identity
 import ccc_workspace_batch as batch
+import ccc_standby_environment as native_environment
 from ccc_native_standby import POLICY
 
 
@@ -76,6 +77,29 @@ class StandbyIdentityTests(unittest.TestCase):
             return value
         with self.assertRaises(ValueError):
             self.inspect(process_reader=read)
+
+    def bind_environment(self):
+        target = {'HOME': str(self.root), 'API_KEY': 'test-selected-only'}
+        self.environment_sha = native_environment.signature(target)
+        self.process['environment'] = dict(target)
+        self.claim.update(target_environment_sha256=self.environment_sha,
+                          environment_sha256=self.environment_sha)
+        self.claim_path.write_text(json.dumps(self.claim))
+        self.sha = hashlib.sha256(self.claim_path.read_bytes()).hexdigest()
+
+    def test_original_process_environment_matches_admitted_target(self):
+        self.bind_environment()
+        self.assertTrue(self.inspect(expected_environment_sha256=self.environment_sha)['startup_observed'])
+
+    def test_original_process_credential_drift_refuses(self):
+        self.bind_environment()
+        self.process['environment']['API_KEY'] = 'wrong-key'
+        with self.assertRaises(ValueError):
+            self.inspect(expected_environment_sha256=self.environment_sha)
+
+    def test_expected_environment_cannot_fall_back_to_legacy_claim(self):
+        with self.assertRaises(ValueError):
+            self.inspect(expected_environment_sha256='a' * 64)
 
     def test_foreign_workspace_and_changed_argv_are_rejected(self):
         self.process['environment_workspace_id'] = str(uuid.uuid4())

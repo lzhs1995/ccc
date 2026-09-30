@@ -6,6 +6,7 @@ import unittest
 from unittest import mock
 
 import cmux_codex_watch as core
+from tests.provider_retry_fixture import bind_ready_provider
 from tests.test_watch import FakeClient, armed_daemon, span
 
 
@@ -58,6 +59,8 @@ def visible_text(payload):
     return "\n".join(core.Grid.from_rpc(payload, "surface-uuid").lines)
 
 
+
+
 class CodexProviderRateLimitTests(unittest.TestCase):
     def test_token_rate_limit_reaches_structural_parser_through_both_wrap_forms(self):
         for columns in (40, 80, 126, 160):
@@ -96,6 +99,7 @@ class CodexProviderRateLimitTests(unittest.TestCase):
             payload = status_payload(PROVIDER_TOKEN_RATE_LIMIT)
             client = FakeClient(payload, visible_text(payload))
             daemon = armed_daemon(directory, client)
+            bind_ready_provider(self, daemon, PROVIDER_TOKEN_RATE_LIMIT)
             daemon.process_once(client)
             self.assertEqual(len(client.sent), 1)
             self.assertEqual(daemon.runtime['surface-uuid'].error_type, 'rate_limit')
@@ -188,6 +192,7 @@ class CodexProviderRateLimitTests(unittest.TestCase):
             payload = status_payload(PROVIDER_RATE_LIMIT)
             client = FakeClient(payload, visible_text(payload))
             daemon = armed_daemon(directory, client)
+            bind_ready_provider(self, daemon, PROVIDER_RATE_LIMIT)
             daemon.process_once(client)
             self.assertEqual(len(client.sent), 1)
             self.assertEqual(daemon.runtime["surface-uuid"].error_type, "rate_limit")
@@ -305,6 +310,7 @@ class CodexStatusChromeTests(unittest.TestCase):
                 payload = captured_payload()
                 client = FakeClient(payload, visible_text(payload))
                 daemon = armed_daemon(directory, client)
+                bind_ready_provider(self, daemon, ERRORS['rate_limit'])
                 daemon.process_once(client)
                 self.assertEqual(len(client.sent), 1)
                 payload["render_grid"]["row_spans"].append(span(50, 0, newer))
@@ -321,6 +327,7 @@ class CodexStatusChromeTests(unittest.TestCase):
                     payload["render_grid"]["row_spans"].append(span(50, 0, "• Queued follow-up inputs"))
                 client = FakeClient(payload, visible_text(payload))
                 daemon = armed_daemon(directory, client)
+                bind_ready_provider(self, daemon, ERRORS['rate_limit'])
                 config_path = Path(directory) / "config.json"
                 config = json.loads(config_path.read_text())
                 config["targets"][0]["paused"] = True

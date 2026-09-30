@@ -7,12 +7,14 @@ import os
 from pathlib import Path
 import sys
 import unittest
+from tests.context_fixture import enter_context
 from unittest.mock import patch
 import uuid
 
 import cmux_codex_watch as core
 import ccc_workspace_batch as batch
 import ccc_standby_launch as launch
+import ccc_standby_environment as native_environment
 import ccc_native_standby as standby
 from tests import test_batch_argv_initial as fixtures
 
@@ -25,28 +27,34 @@ class StandbyLaunchTests(unittest.TestCase):
         self.worker.job.pop('initial_prompt_policy')
         self.boot = str(uuid.uuid4())
         self.gen = 'a' * 64
+        self.target_environment = {'HOME': str(self.root.resolve()),
+            'CODEX_HOME': str((self.root / 'standby-home').resolve()),
+            'PATH': '/selected/bin', 'API_KEY': 'test-selected-credential'}
         self.worker.job.update(standby_policy=standby.POLICY, standby_mode='b',
+            standby_environment_sha256=native_environment.signature(self.target_environment),
             standby_cohort_id=str(uuid.uuid4()), standby_generation=self.gen,
             standby_boot_id=self.boot, native_runtime_policy=batch.NATIVE_RUNTIME_POLICY)
         self.worker.save()
         self.addCleanup(self.worker.close)
-        self.exec_mock = self.enterContext(patch.object(os, 'execv'))
-        self.enterContext(patch('ccc_batch_guard.native_binary', return_value=sys.executable))
-        self.birth_mock = self.enterContext(patch('ccc_guard_scope.birth', return_value=[1234, 5678]))
-        self.enterContext(patch('ccc_batch_timing.boot_id', return_value=self.boot))
-        self.enterContext(patch.object(batch, 'register'))
-        self.enterContext(patch.object(batch, '_bootstrap_client', return_value=self.client))
-        self.enterContext(patch.dict(os.environ, {'CMUX_SURFACE_ID': self.slot['surface_id'],
+        self.exec_mock = enter_context(self, patch.object(os, 'execve'))
+        enter_context(self, patch('ccc_batch_guard.native_binary', return_value=sys.executable))
+        self.birth_mock = enter_context(self, patch('ccc_guard_scope.birth', return_value=[1234, 5678]))
+        enter_context(self, patch('ccc_batch_timing.boot_id', return_value=self.boot))
+        enter_context(self, patch.object(batch, 'register'))
+        enter_context(self, patch.object(batch, '_bootstrap_client', return_value=self.client))
+        enter_context(self, patch.dict(os.environ, {'CMUX_SURFACE_ID': self.slot['surface_id'],
             'CMUX_WORKSPACE_ID': self.wid}))
 
     def start_native(self, **changes):
         return launch.launch_registered(self.config, self.worker.job['id'], 0, self.slot['launch_id'],
-            generation_current=changes.get('generation_current', lambda: self.gen))
+            generation_current=changes.get('generation_current', lambda: self.gen),
+            environment_current=changes.get('environment_current', lambda: dict(self.target_environment)))
 
     def test_exact_no_prompt_argv_is_consumed_before_guarded_exec(self):
         argv = launch.launch_argv(self.config, self.worker.job, 0)
         self.start_native()
-        self.exec_mock.assert_called_once_with(argv[0], argv)
+        self.exec_mock.assert_called_once()
+        self.assertEqual(self.exec_mock.call_args.args[:2], (argv[0], argv))
         claim = json.loads(launch.claim_path(self.config, self.worker.job['id'], 0).read_bytes())
         self.assertEqual(claim['argv'], argv)
         self.assertEqual(claim['policy'], standby.POLICY)
@@ -64,6 +72,23 @@ class StandbyLaunchTests(unittest.TestCase):
             self.start_native()
         self.assertEqual(self.exec_mock.call_count, 1)
 
+    def test_standby_preserves_original_skill_feature_selection(self):
+        for options in ([], ['--enable', 'skill_search'],
+                        ['--disable', 'skill_search'],
+                        ['-c', 'features.skill_search=true']):
+            with self.subTest(options=options):
+                job = copy.deepcopy(self.worker.job)
+                job['standby_target'] = {
+                    'argv': [sys.executable, *options], 'provider': 'custom',
+                    'upstream_url': 'https://example.invalid/v1',
+                    'route_urls': [f'http://127.0.0.1:43210/{"a" * 48}/{i}'
+                                   for i in range(50)]}
+                argv = launch.launch_argv(self.config, job, 0)
+                self.assertEqual(argv[1:1 + len(options)], options)
+                skill_options = [v for v in argv if 'skill_search' in v]
+                self.assertEqual(skill_options, [v for v in options if 'skill_search' in v])
+        self.exec_mock.assert_not_called()
+
     def test_wrong_mode_mixed_policy_and_legacy_are_rejected(self):
         for key, value in (('standby_mode', 'B'), ('standby_policy', 'old'),
                            ('initial_prompt_policy', batch.ARGV_INITIAL_POLICY),
@@ -73,6 +98,74 @@ class StandbyLaunchTests(unittest.TestCase):
             with self.subTest(key=key), self.assertRaises(ValueError):
                 launch.launch_argv(self.config, {**self.worker.job, key:value}, 0)
         self.exec_mock.assert_not_called()
+
+    def test_exec_uses_target_credentials_not_new_shell_and_claim_has_only_hashes(self):
+        with patch.dict(os.environ, {'PATH': '/wrong/bin', 'API_KEY': 'wrong-key',
+                'NEW_CREDENTIAL': 'unselected', 'CODEX_THREAD_ID': 'parent-thread'}):
+            self.start_native()
+        environment = self.exec_mock.call_args.args[2]
+        for key, value in self.target_environment.items():
+            self.assertEqual(environment[key], value)
+        self.assertNotIn('NEW_CREDENTIAL', environment)
+        self.assertNotIn('CODEX_THREAD_ID', environment)
+        raw = launch.claim_path(self.config, self.worker.job['id'], 0).read_bytes()
+        self.assertNotIn(b'test-selected-credential', raw)
+        self.assertNotIn(b'wrong-key', raw)
+        claim = json.loads(raw)
+        self.assertEqual(claim['environment_sha256'], native_environment.signature(environment))
+        self.assertEqual(environment['CMUX_SURFACE_ID'], self.slot['surface_id'])
+
+    def test_environment_revoked_after_entering_cwd_prevents_exec(self):
+        previous = Path.cwd()
+        def current():
+            value = dict(self.target_environment)
+            if Path.cwd() != previous:
+                value['API_KEY'] = 'changed-at-final-guard'
+            return value
+        with self.assertRaises(ValueError):
+            self.start_native(environment_current=current)
+        self.exec_mock.assert_not_called()
+        self.assertEqual(Path.cwd(), previous)
+        self.assertTrue(launch.claim_path(self.config, self.worker.job['id'], 0).exists())
+
+    def test_wrong_admitted_environment_refuses_before_registration(self):
+        self.worker.job['standby_environment_sha256'] = 'b' * 64
+        self.worker.save()
+        with self.assertRaises(ValueError):
+            self.start_native()
+        batch.register.assert_not_called()
+        self.exec_mock.assert_not_called()
+
+    def test_surface_identity_change_in_environment_callback_refuses_exec(self):
+        previous = Path.cwd()
+        def current():
+            if Path.cwd() != previous:
+                os.environ['CMUX_SURFACE_ID'] = str(uuid.uuid4())
+            return dict(self.target_environment)
+        with self.assertRaises(ValueError):
+            self.start_native(environment_current=current)
+        self.exec_mock.assert_not_called()
+
+    def test_actual_exec_enters_declared_cwd_and_restores_mock_caller(self):
+        previous = Path.cwd()
+        observed = []
+        self.exec_mock.side_effect = lambda *_: observed.append(Path.cwd())
+        self.start_native()
+        claim = json.loads(launch.claim_path(self.config, self.worker.job['id'], 0).read_bytes())
+        self.assertEqual(observed, [Path(claim['cwd'])])
+        self.assertEqual(Path.cwd(), previous)
+
+    def test_cwd_change_during_last_authorization_refuses_exec(self):
+        previous = Path.cwd()
+        def generation():
+            if Path.cwd() != previous:
+                os.chdir(previous)
+            return self.gen
+        with self.assertRaisesRegex(ValueError, 'OS working directory changed'):
+            self.start_native(generation_current=generation)
+        self.exec_mock.assert_not_called()
+        self.assertEqual(Path.cwd(), previous)
+        self.assertTrue(launch.claim_path(self.config, self.worker.job['id'], 0).exists())
 
     def test_legacy_entrypoints_cannot_submit_or_resume_standby(self):
         before = self.worker.path.read_bytes()
@@ -105,7 +198,7 @@ class StandbyLaunchTests(unittest.TestCase):
 
     def test_exec_final_guards_recheck_permission_birth_hold_and_policy(self):
         checks = []
-        def inspect(config, job_id, index, record, argv, first, final):
+        def inspect(config, job_id, index, record, argv, first, final, *, environment):
             for check in (first, final):
                 self.assertTrue(check())
                 self.birth_mock.return_value = [1234, 5679]
@@ -172,10 +265,10 @@ class StandbyLaunchTests(unittest.TestCase):
             authorized=lambda i:True, send=send)
         self.native = dict(pid=rows[0]['pid'], birth=rows[0]['birth'], argv=self.claim['argv'],
             surface_id=self.slot['surface_id'], environment_workspace_id=self.wid,
-            environment={'CODEX_HOME':str(self.native_home)})
-        self.enterContext(patch('ccc_guard_scope.process', return_value=self.native))
+            environment=copy.deepcopy(self.exec_mock.call_args.args[2]))
+        enter_context(self, patch('ccc_guard_scope.process', return_value=self.native))
         self.files = {p:dict(device=p.stat().st_dev,inode=p.stat().st_ino) for p in (self.lock,tui)}
-        self.enterContext(patch('ccc_codex_queue.process_writable_files', side_effect=lambda *a, **k:copy.deepcopy(self.files)))
+        enter_context(self, patch('ccc_codex_queue.process_writable_files', side_effect=lambda *a, **k:copy.deepcopy(self.files)))
         return dict(hook_event_name='SessionStart', source='startup', session_id=self.session,
                     cwd=self.claim['cwd'], transcript_path=None)
 

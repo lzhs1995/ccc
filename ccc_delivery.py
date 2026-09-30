@@ -20,7 +20,7 @@ FIELDS = (
     "send_started_at", "send_io_started_at", "send_completed_at", "send_attempt_evidence",
     "last_send_error", "last_send_at", "send_count", "awaiting", "awaiting_suppressed",
     "sent_fingerprint", "sent_screen_signature", "codex_sent_turn_key",
-    "codex_observed_turn_key", "codex_goal_resume", "codex_private_check", "codex_input_phase",
+    "codex_observed_turn_key", "codex_goal_resume", "codex_goal_proof", "codex_private_check", "codex_input_phase",
     "episode_id", "episode_started_at", "error_type",
 )
 
@@ -65,6 +65,8 @@ class DeliveryStore:
                 raise ValueError("invalid durable delivery evidence: " + key)
         if "codex_private_check" in saved and not isinstance(saved["codex_private_check"], dict):
             raise ValueError("invalid durable delivery private check")
+        if "codex_goal_proof" in saved and not isinstance(saved["codex_goal_proof"], dict):
+            raise ValueError("invalid durable delivery goal proof")
         if saved.get("delivery_status", "") not in {"", "sending", "accepted", "confirmed", "failed", "unknown", "cancelled", "retryable"}:
             raise ValueError("invalid durable delivery status")
         if saved.get("codex_input_phase", "") not in {"", "text_pending", "enter_pending", "enter_acknowledged", "text_retained",

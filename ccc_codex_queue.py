@@ -100,6 +100,7 @@ def task_snapshot(path, session_id):
     snapshot = {**({"model_provider": first["payload"]["model_provider"]} if first["payload"].get("model_provider") else {}),
             "kind": latest["payload"]["type"], "at": at,
             "turn_id": latest["payload"].get("turn_id"), "error": latest["payload"].get("error"),
+            "last_agent_message": latest["payload"].get("last_agent_message"),
             "signature": [after.st_ino, after.st_size, after.st_mtime_ns]}
     with _task_snapshot_lock:
         _task_snapshots[key] = (signature, snapshot)
@@ -111,6 +112,13 @@ def task_snapshot(path, session_id):
 
 def _retryable_completed_message(message):
     normalized = " ".join(message.lower().split())
+    compact = re.sub(r'\s+', '', normalized)
+    if (('"error":{' in compact and '"insufficient_quota"' in compact)
+            or 'invalid_encrypted_content' in normalized
+            or re.search(r'(?:unexpected\s+status(?:\s+code)?|unknown\s+status\s+code|http(?:/\d(?:\.\d)?)?|last\s+status)\s*[:=]?\s*(?:400|401|403)\b', normalized)
+            or '401' in normalized and any(x in normalized for x in (
+                '额度已用尽', 'remainquota', 'insufficient_quota', 'quota exceeded'))):
+        return False
     return (any(x in normalized for x in ("currently experiencing high demand", "rate limit exceeded",
                                           "temporarily unavailable", "stream disconnected before completion"))
             or normalized == "connection failed: error sending request")
@@ -167,7 +175,7 @@ if sys.platform == "darwin":
         _proc_listpids = ctypes.CDLL("/usr/lib/libproc.dylib").proc_listpids
         _proc_listpids.argtypes = [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_int]
         _proc_listpids.restype = ctypes.c_int
-        _proc_pidfdinfo = ctypes.CDLL("/usr/lib/libproc.dylib").proc_pidfdinfo
+        _proc_pidfdinfo = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True).proc_pidfdinfo
         _proc_pidfdinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int,
                                    ctypes.c_void_p, ctypes.c_int]
         _proc_pidfdinfo.restype = ctypes.c_int
@@ -182,6 +190,14 @@ if sys.platform == "darwin":
         _procargs_bytes = os.sysconf("SC_ARG_MAX")
     except (OSError, AttributeError):
         pass
+
+
+class IncompleteVnodeRead(OSError):
+    """A vnode observation failed; no partial inventory is usable."""
+
+
+class VnodeInventoryChanged(OSError):
+    """Two complete reads disagreed; neither is stable identity evidence."""
 
 
 def process_writable_files(pid, *, identities=False):
@@ -214,13 +230,17 @@ def process_writable_files(pid, *, identities=False):
             raise OSError("truncated process descriptor inventory")
         return frozenset(e.fd for e in entries[:count // item_size] if e.kind == 1)
 
-    def vnodes(fds):
+    def vnodes(fds, phase):
         result = {}
         for fd in fds:
             info = _VnodeFdInfo()
             size = ctypes.sizeof(info)
-            if _proc_pidfdinfo(pid, fd, 2, ctypes.byref(info), size) != size:
-                raise OSError("incomplete vnode descriptor")
+            ctypes.set_errno(0)
+            returned = _proc_pidfdinfo(pid, fd, 2, ctypes.byref(info), size)
+            native_errno = ctypes.get_errno()
+            if returned != size:
+                raise IncompleteVnodeRead(native_errno, "incomplete vnode descriptor: "
+                    f"pid={pid} fd={fd} phase={phase} returned={returned} expected={size}")
             # Access mode, path, device and inode also detect reuse of an FD
             # number between the two inventories. Ignore changing timestamps.
             vnode = bytes(info.vnode)
@@ -228,9 +248,9 @@ def process_writable_files(pid, *, identities=False):
         return result
 
     before = descriptors()
-    files = vnodes(before)
-    if descriptors() != before or vnodes(before) != files:
-        raise OSError("process vnode descriptors changed")
+    files = vnodes(before, 'initial')
+    if descriptors() != before or vnodes(before, 'verification') != files:
+        raise VnodeInventoryChanged("process vnode descriptors changed")
     paths = {} if identities else set()
     for flags, name, _device, _inode in files.values():
         if flags & 2:  # Kernel FWRITE, not userspace O_WRONLY.
@@ -1013,10 +1033,26 @@ class QueueRecovery:
             return bool(self.attempts and any(r.get("surface_id") == sid and r.get("phase") in {"edited", "unconfirmed"}
                                              for r in self.attempts.values()))
 
-    def recover(self, target, runtime, *, read_view, edit_queued, enter, authorized, message=None):
+    def blocks_turn(self, target, turn):
+        """A queue key already attempted for this turn also consumes goal retry.
+
+        Includes ambiguous edits/Enter and survives daemon restart. Transport
+        acknowledgement does not mean native lifecycle has caught up yet.
+        """
+        with self.lock:
+            self._refresh_attempts()
+            return self.attempts is None or any(
+                r.get('surface_id') == target['surface_id']
+                and r.get('workspace_id') == target['workspace_id']
+                and r.get('session_id') == turn.get('session_id')
+                and r.get('turn_id') == turn.get('turn_id')
+                for r in self.attempts.values())
+
+    def recover(self, target, runtime, *, read_view, edit_queued, enter, authorized, message=None, read_evidence=None):
         # Each invocation owns its exact text. Never mutate the shared default
         # while other B/b/N surfaces are recovering their own queued inputs.
         message = self.message if message is None else message
+        evidence_now = (lambda: self.evidence(target)) if read_evidence is None else read_evidence
         sid = target["surface_id"]
         with self.lock:
             self._refresh_attempts()
@@ -1028,13 +1064,15 @@ class QueueRecovery:
                 or target.get("paused") or not target.get("enabled", True)):
             return ""
         try:
-            evidence = self.evidence(target)
+            evidence = evidence_now()
             if not evidence:
                 return ""
             turn = {k: evidence.get(k) for k in ("session_id", "pid", "process_start", "completed_at", "turn_id")}
             key = hashlib.sha256(json.dumps([sid, turn], sort_keys=True).encode()).hexdigest()
             with self.lock:
                 previous = self.attempts.get(key)
+            if previous is None and self.blocks_turn(target, evidence):
+                return "queue_recovery_unconfirmed"
             if previous:
                 if previous.get("message", self.message) != message:
                     return "queue_recovery_unconfirmed"
@@ -1043,7 +1081,7 @@ class QueueRecovery:
                 if previous["phase"] in {"edited", "unconfirmed"}:
                     view = read_view()
                     if (not view.get("busy") and not view.get("queued") and view.get("draft") == message
-                            and authorized() and self.evidence(target) == evidence):
+                            and authorized() and evidence_now() == evidence):
                         record = previous
                         self.write_attempt(key, {**record, "phase": "submitting"})
                         enter()
@@ -1054,7 +1092,7 @@ class QueueRecovery:
             if (not view.get("empty") or view.get("busy") or not view.get("editable")
                     or view.get("queued") != [message] or not authorized()):
                 return ""
-            if self.evidence(target) != evidence:
+            if evidence_now() != evidence:
                 return ""
             record = {"surface_id": sid, "workspace_id": target["workspace_id"],
                       **evidence, "message": message, "phase": "editing", "at": time.time()}
@@ -1064,7 +1102,7 @@ class QueueRecovery:
             time.sleep(0.15)
             view = read_view()
             if (view.get("busy") or view.get("queued") or view.get("draft") != message
-                    or not authorized() or self.evidence(target) != evidence):
+                    or not authorized() or evidence_now() != evidence):
                 self.write_attempt(key, {**record, "phase": "unconfirmed"})
                 return "queue_recovery_unconfirmed"
             self.write_attempt(key, {**record, "phase": "submitting"})

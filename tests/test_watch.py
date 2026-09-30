@@ -567,7 +567,7 @@ class WatchTests(unittest.TestCase):
 
     def test_armed_send_blocks_dock_surface_even_without_manager_id(self):
         with tempfile.TemporaryDirectory() as directory:
-            error = "exceeded retry limit, last status: 429 Too Many Requests"
+            error = "We're currently experiencing high demand, which may cause temporary errors."
             tree = {"windows": [{"workspaces": [{"panes": [{"surfaces": [{
                 "id": "surface-uuid", "ref": "surface:84", "dock_scope": "global",
                 "workspace_id": "workspace-uuid",
@@ -580,7 +580,7 @@ class WatchTests(unittest.TestCase):
 
     def test_armed_send_blocks_persisted_manager_surface_without_tree_lookup(self):
         with tempfile.TemporaryDirectory() as directory:
-            error = "exceeded retry limit, last status: 429 Too Many Requests"
+            error = "We're currently experiencing high demand, which may cause temporary errors."
             client = FakeClient(grid_payload([], error=error), "■ " + error)
             daemon = armed_daemon(directory, client)
             daemon.config["manager_surface_id"] = "surface-uuid"
@@ -659,8 +659,8 @@ class WatchTests(unittest.TestCase):
                 "targets": [{"surface_id": "surface-uuid", "workspace_id": "workspace-uuid", "enabled": True, "paused": False}],
             }
             config_path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
-            payload = grid_payload([], error="exceeded retry limit, last status: 429 Too Many Requests")
-            client = FakeClient(payload, "■ exceeded retry limit, last status: 429 Too Many Requests")
+            payload = grid_payload([], error="We're currently experiencing high demand, which may cause temporary errors.")
+            client = FakeClient(payload, "■ We're currently experiencing high demand, which may cause temporary errors.")
             daemon = WatchDaemon(config_path, state_path, client=client)
             daemon.process_once(client)
             self.assertEqual(client.sent, [("workspace-uuid", "surface-uuid", "任务请继续")])
@@ -709,8 +709,8 @@ class WatchTests(unittest.TestCase):
                 "targets": [{"surface_id": "surface-uuid", "workspace_id": "workspace-uuid", "enabled": True, "paused": False}],
             }
             config_path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
-            payload = grid_payload([], error="exceeded retry limit, last status: 429 Too Many Requests")
-            client = FakeClient(payload, "■ exceeded retry limit, last status: 429 Too Many Requests")
+            payload = grid_payload([], error="We're currently experiencing high demand, which may cause temporary errors.")
+            client = FakeClient(payload, "■ We're currently experiencing high demand, which may cause temporary errors.")
             daemon = WatchDaemon(config_path, state_path, client=client)
             daemon.process_once(client)
             daemon.process_once(client)
@@ -1636,8 +1636,8 @@ class WatchTests(unittest.TestCase):
 
     def test_healthy_401_prose_is_not_an_exhausted_token(self):
         """Only the provider's quota banner counts, not any mention of 401."""
-        self.assertIsNone(core._match_error_block(
-            "■ unexpected status 401 Unauthorized: check your API key"))
+        self.assertEqual(core._match_error_block(
+            "■ unexpected status 401 Unauthorized: check your API key"), "http_401")
         self.assertIsNone(core._match_error_block(
             "■ the docs explain 该令牌额度已用尽 as a billing state"))
 
@@ -1676,8 +1676,8 @@ class WatchTests(unittest.TestCase):
                 "targets": [{"surface_id": "surface-uuid", "workspace_id": "workspace-uuid", "enabled": True, "paused": False}],
             }
             config_path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
-            payload = grid_payload([], error="exceeded retry limit, last status: 429 Too Many Requests")
-            client = FakeClient(payload, "■ exceeded retry limit, last status: 429 Too Many Requests")
+            payload = grid_payload([], error="We're currently experiencing high demand, which may cause temporary errors.")
+            client = FakeClient(payload, "■ We're currently experiencing high demand, which may cause temporary errors.")
             daemon = WatchDaemon(config_path, state_path, client=client)
             daemon.process_once(client)
             self.assertEqual(client.sent, [])
@@ -1794,13 +1794,13 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(state.kind, "recoverable_error")
         self.assertEqual(state.error_type, "stream")
 
-    def test_rate_limit_requires_both_retry_limit_and_429(self):
+    def test_retry_limit_with_500_is_a_server_error(self):
         payload = grid_payload([], error="exceeded retry limit, last status: 500")
-        self.assertEqual(classify_grid(Grid.from_rpc(payload, "surface-uuid")).kind, "idle")
+        self.assertEqual(classify_grid(Grid.from_rpc(payload, "surface-uuid")).error_type, "http_500")
 
     def test_generic_400_is_not_recoverable(self):
         payload = grid_payload([], error="HTTP 400 Bad Request: invalid model")
-        self.assertEqual(classify_grid(Grid.from_rpc(payload, "surface-uuid")).kind, "idle")
+        self.assertEqual(classify_grid(Grid.from_rpc(payload, "surface-uuid")).kind, "provider_blocked")
 
     def test_generic_405_without_method_phrase_is_not_recoverable(self):
         payload = grid_payload([], error="see port 405 in the lab notes")
@@ -1982,13 +1982,13 @@ class WatchTests(unittest.TestCase):
 
     def test_alternating_errors_keep_one_episode(self):
         with tempfile.TemporaryDirectory() as directory:
-            payload = grid_payload([], error="exceeded retry limit, last status: 429 Too Many Requests")
-            client = FakeClient(payload, "■ exceeded retry limit, last status: 429 Too Many Requests")
+            payload = grid_payload([], error="We're currently experiencing high demand, which may cause temporary errors.")
+            client = FakeClient(payload, "■ We're currently experiencing high demand, which may cause temporary errors.")
             daemon = armed_daemon(directory, client)
             daemon.process_once(client)
             first_episode = daemon.runtime["surface-uuid"].episode_id
             for text in (
-                "unexpected status 503 Service Unavailable",
+                "unexpected status 405 Method Not Allowed",
                 "stream disconnected before completion",
                 "We're currently experiencing high demand, which may cause temporary errors.",
             ):
@@ -2001,8 +2001,8 @@ class WatchTests(unittest.TestCase):
 
     def test_multiple_uuids_are_isolated(self):
         with tempfile.TemporaryDirectory() as directory:
-            payload = grid_payload([], error="exceeded retry limit, last status: 429 Too Many Requests")
-            client = FakeClient(payload, "■ exceeded retry limit, last status: 429 Too Many Requests")
+            payload = grid_payload([], error="We're currently experiencing high demand, which may cause temporary errors.")
+            client = FakeClient(payload, "■ We're currently experiencing high demand, which may cause temporary errors.")
             daemon = armed_daemon(directory, client, extra_targets=[
                 {"surface_id": "surface-a", "workspace_id": "workspace-a", "enabled": True, "paused": False},
                 {"surface_id": "surface-b", "workspace_id": "workspace-b", "enabled": True, "paused": False},
@@ -2016,7 +2016,7 @@ class WatchTests(unittest.TestCase):
 
     def test_explicit_grid_failure_pauses_only_that_surface(self):
         with tempfile.TemporaryDirectory() as directory:
-            error = "exceeded retry limit, last status: 429 Too Many Requests"
+            error = "We're currently experiencing high demand, which may cause temporary errors."
             invalid = grid_payload([], error=error)
             invalid["render_grid"].pop("cursor")
             client = PerSurfaceClient(
@@ -2085,7 +2085,7 @@ class WatchTests(unittest.TestCase):
                 "ref": "surface:48",
                 "processes": [{"kind": "process", "name": "codex", "path": "/opt/homebrew/bin/codex"}],
             })
-            error = "exceeded retry limit, last status: 429 Too Many Requests"
+            error = "We're currently experiencing high demand, which may cause temporary errors."
             invalid = grid_payload([], error=error)
             invalid["render_grid"].pop("cursor")
             client = PerSurfaceClient(
@@ -2491,7 +2491,7 @@ class WatchTests(unittest.TestCase):
             }
             config_path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
             tree, top = discovery_fixture()
-            error = "exceeded retry limit, last status: 429 Too Many Requests"
+            error = "We're currently experiencing high demand, which may cause temporary errors."
             client = FakeClient(grid_payload([], error=error), "■ " + error, tree=tree, top=top)
             daemon = WatchDaemon(config_path, state_path, client=client)
             daemon.process_once(client)

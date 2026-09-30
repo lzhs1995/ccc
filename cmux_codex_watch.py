@@ -47,6 +47,8 @@ from ccc_codex_queue import NativeCompletionWatcher, QueueRecovery
 from ccc_native_processes import NativeProcessIndex
 from ccc_scheduling import CoalescingWriter, SnapshotCache, SnapshotClient, SurfaceScheduler, TreeSnapshot
 from ccc_delivery import DeliveryStore
+from ccc_provider_retry import ProviderRetryStore, RETRYABLE as PROVIDER_RETRYABLE
+import sqlite3
 
 
 APP_NAME = "cmux-codex-continue"
@@ -64,9 +66,16 @@ DEFAULT_LABEL = f"{LABEL_PREFIX}.{APP_NAME}"
 PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_APP_DIR = Path.home() / "Library" / "Application Support" / APP_NAME
 DEFAULT_RUNTIME_ROOT = DEFAULT_APP_DIR / "runtime"
-RUNTIME_FILES = ("cmux_codex_watch.py", "claude_ccc_protocol.py", "claude_ccc_event_hook.py", "ccc_observation.py", "ccc_scheduling.py", "ccc_native_lanes.py", "ccc_delivery.py", "ccc_codex_queue.py", "ccc_codex_goal.py", "ccc_workspace_batch.py", "ccc_private_check.py", "ccc_inventory.py", "ccc_batch_guard.py", "ccc_guard_transport.py", "ccc_guard_watchdog.py", "ccc_guard_scope.py", "ccc_guard_migration.py", "ccc_codex_launcher.py", "ccc_network_client.py", "ccc_network_guard.py", "ccc_mihomo.py", "ccc_native_processes.py", "ccc_access_budget.py", "ccc_access_gateway.py", "ccc_access_service.py", "ccc_batch_timing.py")
+RUNTIME_FILES = ("cmux_codex_watch.py", "ccc_provider_retry.py", "claude_ccc_protocol.py", "claude_ccc_event_hook.py", "ccc_observation.py", "ccc_scheduling.py", "ccc_native_lanes.py", "ccc_delivery.py", "ccc_codex_queue.py", "ccc_codex_goal.py", "ccc_workspace_batch.py", "ccc_private_check.py", "ccc_inventory.py", "ccc_batch_guard.py", "ccc_guard_transport.py", "ccc_guard_watchdog.py", "ccc_guard_scope.py", "ccc_guard_migration.py", "ccc_codex_launcher.py", "ccc_network_client.py", "ccc_network_guard.py", "ccc_mihomo.py", "ccc_native_processes.py", "ccc_access_budget.py", "ccc_access_gateway.py", "ccc_access_service.py", "ccc_batch_timing.py")
 RUNTIME_FILES += ("ccc_native_standby.py", "ccc_standby_identity.py", "ccc_standby_transport.py", "ccc_standby_launch.py")
 RUNTIME_FILES += ("ccc_standby_generation.py", "ccc_standby_manager.py")
+RUNTIME_FILES += ("ccc_standby_sources.py", "ccc_standby_rollouts.py", "ccc_standby_readiness.py",
+                  "ccc_standby_bootstrap.py", "ccc_standby_prepare.py", "ccc_standby_activation.py",
+                  "ccc_standby_acceptance.py", "ccc_standby_timing.py",
+                  "ccc_standby_service.py", "ccc_standby_entry.py", "ccc_standby_factory.py",
+                  "ccc_standby_settlement.py",
+                  "ccc_standby_environment.py", "ccc_standby_routes.py",
+                  "ccc_standby_target.py", "ccc_standby_caller.py", "ccc_standby_runner.py")
 DEFAULT_LOG_DIR = Path.home() / "Library" / "Logs" / APP_NAME
 DEFAULT_CONFIG_PATH = DEFAULT_APP_DIR / "config.json"
 DEFAULT_STATE_PATH = DEFAULT_APP_DIR / "state.json"
@@ -521,6 +530,9 @@ class ScreenState:
     # Reconnect stalls have a 60-second repeat floor even as their timers change.
     allow_repeat: bool = True
     native_goal_stalled: bool = False
+    # Later transcript may only be an in-flight echo. This candidate needs
+    # the original blocked goal; an old failed rollout alone cannot send.
+    requires_goal_proof: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -575,6 +587,7 @@ class TargetRuntime:
     codex_observed_turn_key: str = ""
     codex_sent_turn_key: str = ""
     codex_goal_resume: bool = False
+    codex_goal_proof: dict[str, Any] = dataclasses.field(default_factory=dict)
     codex_input_phase: str = ""
     codex_private_check: dict[str, Any] = dataclasses.field(default_factory=dict)
     codex_absent_probe: str = ""
@@ -996,11 +1009,33 @@ def _provider_rate_limit_banner(compact: str) -> bool:
     """
 
     stripped = RECONNECT_COMPACT_PREFIX_RE.sub("", compact, count=1).lstrip("■⚠└")
-    return bool(PROVIDER_RATE_LIMIT_COMPACT_RE.match(stripped))
+    # Codex appends these native tips inside the same reconnect error block.
+    # Strip only the observed complete tips; arbitrary trailing prose must
+    # still prevent the full-banner match.
+    for tip in (
+        "└tip:pressctrl+gtoedityourcurrentdraftinanexternaleditor.",
+        "└tip:run/reviewtogetacodereviewofyourcurrentchanges.",
+    ):
+        if stripped.endswith(tip):
+            stripped = stripped[:-len(tip)]
+            break
+    peak_load = (
+        "thesystemiscurrentlyexperiencinghighdemandandcannotprocessyourrequest."
+        "yourrequestexceedsthemaximumusagesizeallowedduringpeakload."
+        "forimprovedcapacityreliability,considerswitchingtoprovisionedthroughput."
+    )
+    return bool(PROVIDER_RATE_LIMIT_COMPACT_RE.match(stripped)) or bool(
+        re.fullmatch(r"(?:ratelimitexceeded:){1,2}" + re.escape(peak_load), stripped)
+    )
 
 
 def _match_error_block(block_text: str) -> str | None:
     lower = re.sub(r"\s+", " ", block_text).strip().lower()
+    compact = re.sub(r"\s+", "", lower)
+    if ('"error":{' in compact and '"insufficient_quota"' in compact) or (
+            '401' in lower and any(token in lower for token in (
+                '额度已用尽', 'remainquota', 'insufficient_quota', 'quota exceeded'))):
+        return 'token_exhausted'
     if "exceeded retry limit" in lower and ("429" in lower or "too many requests" in lower):
         return "rate_limit"
     # Codex can surface the provider's terminal rate-limit error without an
@@ -1010,6 +1045,31 @@ def _match_error_block(block_text: str) -> str | None:
     compact = re.sub(r"\s+", "", lower)
     if "400" in compact and '"code":"invalid_encrypted_content"' in compact:
         return "invalid_encrypted_content"
+    # Classify explicit provider status before its outer stream-disconnect
+    # wrapper. Authentication/permission failures must never become nudges.
+    status_match = re.search(
+        r'(?:unexpected\s+status(?:\s+code)?|unknown\s+status\s+code|http(?:/\d(?:\.\d)?)?|last\s+status)'
+        r'\s*[:=]?\s*(400|401|403|429|500|502|503|504|524)\b', lower)
+    provider_status = int(status_match.group(1)) if status_match else None
+    if provider_status == 400:
+        return 'http_400'
+    if provider_status == 401:
+        if any(token in lower for token in ('额度已用尽', 'remainquota',
+                                            'insufficient_quota', 'quota exceeded')):
+            return 'token_exhausted'
+        return 'http_401'
+    if provider_status == 403:
+        return 'http_403'
+    if provider_status == 429:
+        return 'rate_limit'
+    # An HTTP 200 SSE response can carry a structured terminal error.
+    # Require an error object and an exact code; ordinary prose is not proof.
+    if ('"error":{' in compact and re.search(
+            r'"(?:code|type)":"(?:rate_limit_exceeded|rate_limit_error|rate_limited)"',
+            compact)):
+        return 'rate_limit'
+    if provider_status in {500, 502, 503, 504, 524}:
+        return f'http_{provider_status}'
     if _provider_rate_limit_banner(compact):
         return "rate_limit"
     # A narrow native viewport can hard-wrap inside "cause" ("c\nause").
@@ -1206,6 +1266,17 @@ def _find_last_error(
         if not block:
             continue
         error_type = _match_error_block("\n".join(block))
+        if error_type is None and _is_reconnect_marker(block[0]):
+            # Native reconnect cards append a rotating, sometimes wrapped Tip.
+            # Only split at its own tree row inside the already validated,
+            # contiguous card. The preceding error must still match in full;
+            # ordinary prose, detached tips and newer transcript stay blocking.
+            tip_index = next((i for i, line in enumerate(block[1:], 1)
+                              if re.match(r"^└\s+Tip:\s+\S", line)), None)
+            if tip_index is not None:
+                prefix = "\n".join(block[:tip_index])
+                if _provider_rate_limit_banner(re.sub(r"\s+", "", prefix.lower())):
+                    error_type = "rate_limit"
         if error_type is None:
             continue
         return ErrorScan(error_type, "\n".join(block), superseding_row is not None, superseding_row)
@@ -2241,7 +2312,11 @@ def classify_grid(grid: Grid) -> ScreenState:
     )
     if error is None:
         return ScreenState("idle", screen_signature=grid.signature(), reason="empty composer without current recoverable error")
-    if error.superseded:
+    goal_stalled = any('Goal stalled (/goal resume)' in line
+                       for line in lines[composer_row + 1:composer_row + 4])
+    goal_candidate = goal_stalled and error.error_type not in {
+        'token_exhausted', 'invalid_encrypted_content', 'http_400', 'http_401', 'http_403'}
+    if error.superseded and not goal_candidate:
         # Not plain "idle": the error is real, we are choosing not to act on it
         # because Codex printed something after it.  Reporting that choice keeps
         # a wrong suppression visible in the Supervisor instead of hiding it
@@ -2269,12 +2344,17 @@ def classify_grid(grid: Grid) -> ScreenState:
             reason="provider token out of quota; needs a new key or a top-up",
             ignored_chrome_rows=tuple(sorted(chrome_rows)),
         )
-    if error.error_type == "invalid_encrypted_content":
+    if error.error_type in {"invalid_encrypted_content", "http_400", "http_401", "http_403"}:
         return ScreenState(
             "provider_blocked", error_type=error.error_type,
             fingerprint=_short_hash(_stable_error_block(error.block)),
             screen_signature=grid.signature(),
-            reason="provider rejected encrypted session content (400); session preserved",
+            reason={
+                'invalid_encrypted_content': 'provider rejected encrypted session content (400); repair required; session preserved',
+                'http_400': 'provider request rejected (400); inspect parameters/protocol; session preserved',
+                'http_401': 'provider authentication rejected (401); verify credentials/quota; session preserved',
+                'http_403': 'provider permission rejected (403); verify access policy; session preserved',
+            }[error.error_type],
             message_kind="codex",
         )
     fingerprint = _short_hash(_stable_error_block(error.block))
@@ -2299,8 +2379,8 @@ def classify_grid(grid: Grid) -> ScreenState:
             error.error_type in PROVIDER_REPEAT_ERROR_TYPES
             or not _is_reconnect_marker(error.block)
         ),
-        native_goal_stalled=any("Goal stalled (/goal resume)" in line
-                                for line in lines[composer_row + 1:composer_row + 4]),
+        native_goal_stalled=goal_stalled,
+        requires_goal_proof=bool(error.superseded),
     )
 
 
@@ -2372,7 +2452,10 @@ def default_config() -> dict[str, Any]:
 def ensure_app_dir(path: Path = DEFAULT_APP_DIR) -> None:
     path.mkdir(parents=True, exist_ok=True)
     with contextlib.suppress(OSError):
-        os.chmod(path, 0o700)
+        # A no-op chmod still emits Darwin NOTE_ATTRIB and invalidates pinned
+        # native ancestry on every config lock. Apply only an actual change.
+        if path.stat().st_mode & 0o7777 != 0o700:
+            os.chmod(path, 0o700)
 
 
 def load_json(path: Path, default: Any) -> Any:
@@ -4186,30 +4269,40 @@ class CmuxClient:
             return
         self._run(["send", "--workspace", workspace_id, "--surface", surface_id, message], timeout=8)
 
-    def resume_codex_goal(self, workspace_id: str, surface_id: str) -> None:
+    def resume_codex_goal(self, workspace_id: str, surface_id: str, *, authorize) -> None:
         """Fixed native operation; caller proves this exact goal is stalled."""
         if not workspace_id or not surface_id:
             raise CmuxError("goal resume requires explicit workspace and surface UUIDs")
-        if self._control_rpc("surface.send_text", {
-            "workspace_id": workspace_id, "surface_id": surface_id, "text": "/goal resume",
-        }) is None:
-            self._run(["send", "--workspace", workspace_id, "--surface", surface_id, "/goal resume"], timeout=8)
+        if (not callable(authorize) or self.viewport_socket is None or not self.viewport_socket.path
+                or not {'surface.send_text', 'surface.send_key'} <= self.viewport_socket.control_methods):
+            raise InputNotSentError('goal resume requires connected input authorization')
+        with self.input_guard(lambda: authorize(None)):
+            if self._control_rpc('surface.send_text', {
+                'workspace_id': workspace_id, 'surface_id': surface_id, 'text': '/goal resume',
+            }) is None:
+                raise InputNotSentError('goal resume socket unavailable; no input fallback')
         # Slash commands are bracket-pasted as draft text by native Codex.
         # A newline in that paste is not Enter. Confirm our exact draft before
         # one explicit submission; never resend an uncertain paste or Enter.
-        deadline = time.monotonic() + 1
-        while time.monotonic() < deadline:
-            grid = Grid.from_rpc(self.replay(workspace_id, surface_id), surface_id)
-            status, row = _composer_status(grid)
-            if status == "composer_busy" and row is not None and grid.lines[row].strip() in {
-                    "› /goal resume", "> /goal resume"}:
-                if self._control_rpc("surface.send_key", {
-                    "workspace_id": workspace_id, "surface_id": surface_id, "key": "enter",
-                }) is None:
-                    self.send_key(workspace_id, surface_id, "enter")
-                return
-            time.sleep(.025)
-        raise CmuxError("native goal resume draft was not confirmed; Enter withheld")
+        try:
+            deadline = time.monotonic() + 1
+            while time.monotonic() < deadline:
+                grid = Grid.from_rpc(self.replay(workspace_id, surface_id), surface_id)
+                if WatchDaemon._codex_draft_matches(grid, '/goal resume'):
+                    with self.input_guard(lambda: authorize('/goal resume')):
+                        if self._control_rpc('surface.send_key', {
+                            'workspace_id': workspace_id, 'surface_id': surface_id, 'key': 'enter',
+                        }) is None:
+                            raise CmuxError('goal Enter socket unavailable; no fallback')
+                    return
+                if _composer_status(grid)[0] != 'empty':
+                    break
+                time.sleep(.025)
+            raise CmuxError('native goal resume draft was not confirmed; Enter withheld')
+        except (OSError, CmuxError, RuntimeError) as exc:
+            # Paste has been acknowledged. A withheld or uncertain Enter must
+            # never permit another paste of this goal operation after restart.
+            raise UncertainDeliveryError('goal draft/Enter retained: ' + str(exc)) from exc
 
     def draft_batch_session_name(self, workspace_id: str, surface_id: str, job_id: str, index: int) -> None:
         """Draft a fixed local name; the B worker separately proves and submits it."""
@@ -5237,6 +5330,7 @@ class WatchDaemon:
         self.config_path = config_path
         self.state_path = state_path
         self._delivery_store = DeliveryStore(config_path.parent / "codex-delivery")
+        self._provider_retry = ProviderRetryStore(config_path.parent / "codex-provider-retry.sqlite3")
         self.config_store = ConfigStore(config_path)
         native_home = Path.home() if config_path == DEFAULT_CONFIG_PATH else config_path.parent
         self.codex_queue_recovery = QueueRecovery(
@@ -7423,6 +7517,57 @@ class WatchDaemon:
         """Retry observation outages without changing authorization or delivery."""
         return observation_health.transient_observation_error(exc)
 
+    def _provider_retry_gate(self, target, runtime, state, *, attempt=None, dry_run=False):
+        """One persistent budget for plain, goal and queue error remedies."""
+        turn = self.codex_queue_recovery.current_turn(target) or {}
+        original = turn
+        if turn.get('kind') == 'unknown':
+            original = self._current_blocked_goal(target) or turn
+        error = original.get('error')
+        message = str(error.get('message') or '') if isinstance(error, dict) else ''
+        error_type = _match_error_block(message) or (state.error_type if state else None)
+        if error_type in {'token_exhausted', 'http_400', 'http_401', 'http_403', 'invalid_encrypted_content'}:
+            return False
+        if error_type not in PROVIDER_RETRYABLE:
+            return True
+        try:
+            provider = original.get('model_provider') or turn.get('model_provider')
+            if not provider:
+                from ccc_codex_goal import provider_for_turn
+                provider = provider_for_turn(target, original)
+            evidence = self._provider_retry.observe(original.get('session_id'), provider,
+                original.get('turn_id'), error_type, message, original.get('at'))
+            allowed = bool(evidence and (self._provider_retry.reserve(evidence, attempt)
+                           if attempt and not dry_run else self._provider_retry.ready(evidence, attempt)))
+        except (OSError, ValueError, TypeError, RuntimeError, sqlite3.Error):
+            runtime.paused_reason = 'provider retry evidence or durable ledger unavailable; session preserved'
+            return False
+        if not allowed:
+            runtime.paused_reason = ('provider retry cooldown or waiting for a shared retry slot; session preserved'
+                                     if error_type == 'rate_limit' else
+                                     'provider retry cooldown or four-remedy budget; session preserved')
+        elif runtime.paused_reason and runtime.paused_reason.startswith('provider retry '):
+            runtime.paused_reason = ''
+        return allowed
+
+    def _provider_retry_success(self, target):
+        if not self._provider_retry.path.exists():
+            return
+        turn = self.codex_queue_recovery.current_turn(target) or {}
+        if turn.get('kind') != 'task_complete' or not turn.get('last_agent_message'):
+            return
+        try:
+            provider = turn.get('model_provider')
+            if not provider:
+                from ccc_codex_goal import provider_for_turn
+                provider = provider_for_turn(target, turn)
+            self._provider_retry.success(turn.get('session_id'), provider,
+                at=turn.get('at'), completed_turn=turn.get('turn_id'),
+                last_agent_message=turn.get('last_agent_message'), error=turn.get('error'))
+        except (OSError, ValueError, TypeError, RuntimeError, sqlite3.Error):
+            # Missing success evidence never refunds a durable error budget.
+            return
+
     def _recover_stranded_codex_queue(self, target, runtime, state, client, current):
         if (state.kind != "queued_followup" and not (
                 state.kind == "composer_busy" and self.codex_queue_recovery.has_pending_draft(target["surface_id"])
@@ -7431,6 +7576,38 @@ class WatchDaemon:
         private_check = runtime.codex_private_check
         queue_message = private_check.get("message") if private_check else self.codex_queue_recovery.message
         private_snapshot = {}
+        provider_attempt = None
+
+        def provider_blocked(message):
+            return _match_error_block(str(message or '')) in {
+                'token_exhausted', 'http_400', 'http_401', 'http_403', 'invalid_encrypted_content'}
+
+        def queue_evidence():
+            turn = self.codex_queue_recovery.current_turn(target)
+            error = (turn or {}).get('error')
+            if isinstance(error, dict) and provider_blocked(error.get('message')):
+                return None
+            evidence = self.codex_queue_recovery.evidence(target)
+            # A late completion for an already resumed goal is still the same
+            # turn. Check the persisted send binding before the normal rollout
+            # path can authorize a second recovery (also after daemon restart).
+            sent_goal = runtime.codex_goal_proof
+            if (evidence and sent_goal
+                    and runtime.codex_sent_turn_key == self._goal_turn_key(sent_goal)
+                    and evidence.get('session_id') == sent_goal.get('session_id')
+                    and evidence.get('turn_id') == sent_goal.get('turn_id')):
+                return None
+            if evidence or private_check:
+                return evidence
+            # Only reuse a previously sent, exact CCC queue entry. A blocked
+            # native goal can supply terminal evidence when no rollout exists.
+            goal = self._current_blocked_goal(target)
+            if (not goal or provider_blocked(goal['error']['message'])
+                    or not _match_error_block('■ ' + goal['error']['message'])
+                    or runtime.codex_sent_turn_key.startswith('goal:')
+                    and runtime.codex_sent_turn_key == self._goal_turn_key(goal)):
+                return None
+            return {**goal, 'completed_at': goal['at']}
 
         def private_current():
             return (not private_check or (
@@ -7455,7 +7632,8 @@ class WatchDaemon:
                     draft = "".join(s.text for s in entered)
             return {"empty": kind == "empty", "draft": draft, "queued": queued,
                     "editable": any("edit last queued message" in x and ("⌥" in x or "alt" in x.lower()) for x in tail),
-                    "busy": _menu_present(grid.lines) or _working_present(grid.lines)
+                    "busy": provider_blocked('\n'.join(grid.lines))
+                            or _menu_present(grid.lines) or _working_present(grid.lines)
                             or any(re.search(r"^[•●]?\s*Reconnecting\.{3}", x.strip()) for x in grid.lines)}
 
         def authorized():
@@ -7484,6 +7662,8 @@ class WatchDaemon:
             with workspace_input_lock(self.config_path, target["workspace_id"], shared=True):
                 if not authorized():
                     raise CmuxError("workspace input no longer authorized")
+                if not self._provider_retry_gate(target, runtime, None, attempt=provider_attempt):
+                    raise CmuxError("provider retry cooldown or budget blocks queue input")
                 if private_check:
                     if not own_view() or not authorized():
                         raise CmuxError("原短检查队列或输入授权已改变；未发送按键")
@@ -7502,8 +7682,12 @@ class WatchDaemon:
                         raise CmuxError("原短检查来源、位置或草稿已改变；未发送按键")
                 base = client.client if isinstance(client, SnapshotClient) else client
                 original_turn = self.codex_queue_recovery.current_turn(target)
+                original_evidence = queue_evidence()
                 def connected_check():
-                    if not authorized() or self.codex_queue_recovery.current_turn(target) != original_turn:
+                    if (not original_evidence or not authorized()
+                            or not self._provider_retry_gate(target, runtime, None, attempt=provider_attempt)
+                            or queue_evidence() != original_evidence
+                            or self.codex_queue_recovery.current_turn(target) != original_turn):
                         return False
                     generation = self._config_mtime_ns
                     tree = base.workspace_tree(target['workspace_id'])
@@ -7511,7 +7695,9 @@ class WatchDaemon:
                     if (located.get('workspace_id') != target['workspace_id']
                             or is_dock_surface(tree, target['surface_id']) or not own_view()):
                         return False
-                    return (self.codex_queue_recovery.current_turn(target) == original_turn
+                    return (queue_evidence() == original_evidence
+                            and self._provider_retry_gate(target, runtime, None, attempt=provider_attempt)
+                            and self.codex_queue_recovery.current_turn(target) == original_turn
                             and self._active_send_target(target) is not None and current(fresh=True)
                             and generation == self._config_mtime_ns
                             and self.config.get('mode') == 'armed' and not self.config.get('global_paused')
@@ -7520,13 +7706,27 @@ class WatchDaemon:
                     with base.input_guard(connected_check):
                         send()
                 else:
+                    if not original_evidence or not own_view() or not authorized():
+                        raise CmuxError("原队列证据或输入授权已改变；未发送按键")
                     send()
 
+        initial_evidence = queue_evidence()
+        if not initial_evidence:
+            return state
+        # Match QueueRecovery's durable identity so an acknowledged Edit can
+        # finish after restart without charging a second remedy. Its ledger
+        # still forbids replay after an unknown or acknowledged Enter.
+        provider_turn = {k: initial_evidence.get(k) for k in
+                         ('session_id', 'pid', 'process_start', 'completed_at', 'turn_id')}
+        provider_attempt = 'queue:' + hashlib.sha256(json.dumps(
+            [target['surface_id'], provider_turn], sort_keys=True).encode()).hexdigest()
+        if not self._provider_retry_gate(target, runtime, None, attempt=provider_attempt, dry_run=True):
+            return state
         outcome = self.codex_queue_recovery.recover(
             target, runtime, read_view=view,
             edit_queued=lambda: guarded_key(lambda: client.edit_codex_queued_prompt(target["workspace_id"], target["surface_id"]), editing=True),
             enter=lambda: guarded_key(lambda: client.send_key(target["workspace_id"], target["surface_id"], "enter")),
-            authorized=authorized, message=queue_message,
+            authorized=authorized, message=queue_message, read_evidence=queue_evidence,
         )
         if outcome:
             self.logger.warning("surface=%s %s original_queued_prompt=true", target["surface_id"], outcome)
@@ -9801,8 +10001,11 @@ class WatchDaemon:
                 and {'surface.send_text', 'surface.send_key'} <= transport.control_methods)
 
     def _native_input_ready(self, target, runtime, state, client, proof, is_current, *, draft=None):
+        if not self._provider_retry_gate(target, runtime, state, attempt=runtime.send_attempt_id):
+            return False
         if proof:
-            return self._private_check_ready(proof, target, runtime, state, client, is_current, draft=draft)
+            return (self._private_check_ready(proof, target, runtime, state, client, is_current, draft=draft)
+                    and self._provider_retry_gate(target, runtime, state, attempt=runtime.send_attempt_id))
         if (self._active_send_target(target, is_current) is None
                 or self.config.get('mode') != 'armed' or self.config.get('global_paused')
                 or not self._codex_turn_ready(target, runtime, state, reserved=True)):
@@ -9818,6 +10021,33 @@ class WatchDaemon:
         ready = (self._codex_draft_matches(grid, draft) if draft is not None else
                  _composer_status(grid)[0] == 'empty' and classify_grid(grid).kind in SEND_ELIGIBLE_STATES)
         return (ready and self.codex_queue_recovery.current_turn(target) == turn
+                and self._provider_retry_gate(target, runtime, state, attempt=runtime.send_attempt_id)
+                and self._active_send_target(target, is_current) is not None
+                and generation == self._config_mtime_ns and self.config.get('mode') == 'armed'
+                and not self.config.get('global_paused'))
+
+    def _goal_input_ready(self, target, runtime, state, client, is_current, draft):
+        """Recheck the pinned goal and live input after each socket admission."""
+        if not self._provider_retry_gate(target, runtime, state, attempt=runtime.send_attempt_id):
+            return False
+        if (not runtime.codex_goal_resume
+                or self._active_send_target(target, is_current) is None
+                or self.config.get('mode') != 'armed' or self.config.get('global_paused')
+                or not self._codex_turn_ready(target, runtime, state, reserved=True)):
+            return False
+        generation = self._config_mtime_ns
+        base = client.client if isinstance(client, SnapshotClient) else client
+        tree = base.workspace_tree(target['workspace_id'])
+        sid, wid = target['surface_id'], target['workspace_id']
+        if find_main_surface(tree, sid).get('workspace_id') != wid or is_dock_surface(tree, sid):
+            return False
+        grid = Grid.from_rpc(base.replay(wid, sid), sid)
+        fresh = classify_grid(grid) if draft is None else None
+        ready = (self._codex_draft_matches(grid, draft) if draft is not None else
+                 _composer_status(grid)[0] == 'empty' and fresh.kind == 'recoverable_error'
+                 and fresh.native_goal_stalled and fresh.error_type == state.error_type)
+        return (ready and self._codex_turn_ready(target, runtime, state, reserved=True)
+                and self._provider_retry_gate(target, runtime, state, attempt=runtime.send_attempt_id)
                 and self._active_send_target(target, is_current) is not None
                 and generation == self._config_mtime_ns and self.config.get('mode') == 'armed'
                 and not self.config.get('global_paused'))
@@ -10035,6 +10265,12 @@ class WatchDaemon:
             return False
         if self._runtime_is_claude(runtime, state):
             return False
+        if state.kind == "queued_followup" and runtime.delivery_status in {"sending", "unknown"}:
+            # A visible queue does not identify which uncertain operation was
+            # accepted. Keep that attempt unresolved instead of editing it.
+            self._record_observation(surface_id, runtime, state)
+            runtime.state = "delivery_unknown"
+            return True
         if state.kind in {"working", "queued_followup"}:
             runtime.delivery_status = "confirmed"
             runtime.delivery_confirmed_at = time.time()
@@ -10115,11 +10351,15 @@ class WatchDaemon:
         surface_id = str(target["surface_id"])
         if self._reconcile_codex_delivery(surface_id, runtime, state):
             return
+        if not self._runtime_is_claude(runtime, state):
+            self._provider_retry_success(target)
         previous_state = runtime.state
         if state.kind not in SEND_ELIGIBLE_STATES:
             self._record_state(surface_id, runtime, state)
             return
         if state.message_kind == "codex" and not self._codex_turn_ready(target, runtime, state):
+            return
+        if state.message_kind == 'codex' and not self._provider_retry_gate(target, runtime, state):
             return
         if state.message_kind == "claude":
             state, send_guard_tree = self._prepare_claude_send(
@@ -10333,6 +10573,11 @@ class WatchDaemon:
                     runtime.delivery_status = "cancelled"
                     self._save_delivery(surface_id, runtime, state.message_kind == "codex", wait=False)
                     return
+                if (state.message_kind == 'codex' and not self._provider_retry_gate(
+                        target, runtime, state, attempt=runtime.send_attempt_id)):
+                    runtime.delivery_status = 'cancelled'
+                    self._save_delivery(surface_id, runtime, True, wait=False)
+                    return
                 if private_check:
                     self.private_checks.reserve(private_check, runtime.send_attempt_id)
                     private_reserved = True
@@ -10348,7 +10593,9 @@ class WatchDaemon:
                         (runtime.send_io_started_at - runtime.native_failure_at) * 1000, 3)
                     runtime.native_send_deadline_missed = runtime.native_complete_to_send_ms >= 1000
                 if runtime.codex_goal_resume:
-                    client.resume_codex_goal(str(target["workspace_id"]), surface_id)
+                    client.resume_codex_goal(str(target["workspace_id"]), surface_id,
+                        authorize=lambda draft: self._goal_input_ready(
+                            target, runtime, state, client, is_current, draft))
                 else:
                     input_attempted = True
                     message = outgoing_message if private_check else self._outgoing_message(state)
@@ -10421,23 +10668,48 @@ class WatchDaemon:
             return False
         return True
 
+    @staticmethod
+    def _goal_turn_key(goal):
+        return f"goal:{goal['session_id']}:{goal['goal_id']}:{goal['turn_id']}:{goal['at']}"
+
+    def _current_blocked_goal(self, target):
+        from ccc_codex_goal import blocked_goal
+        label = self.codex_queue_recovery.process_lookup(target) if self.codex_queue_recovery.process_lookup else {}
+        pids = label.get('agent_pids', [])
+        turn = self.codex_queue_recovery.current_turn(target)
+        binding = turn if turn and turn.get('kind') == 'task_complete' else None
+        goal = blocked_goal(target, pids[0], current_turn=binding) if label.get('agent_kind') == 'codex' and len(pids) == 1 else None
+        if not goal:
+            return None
+        if self.codex_queue_recovery.current_turn(target) != turn:
+            return None
+        if turn and turn.get('kind') != 'unknown':
+            if turn.get('session_id') != goal['session_id'] or type(turn.get('at')) not in (int, float):
+                return None
+            if turn['at'] >= goal['at'] and not (
+                    turn.get('kind') == 'task_complete' and turn.get('turn_id') == goal['turn_id']
+                    and (turn.get('error') or {}).get('message') == goal['error']['message']):
+                return None
+        return goal
+
     def _codex_turn_ready(self, target, runtime, state, *, reserved=False):
         if state.message_kind != "codex":
             runtime.codex_goal_resume = False
             return True
         if state.native_goal_stalled:
-            from ccc_codex_goal import blocked_goal
-            label = self.codex_queue_recovery.process_lookup(target) if self.codex_queue_recovery.process_lookup else {}
-            pids = label.get("agent_pids", [])
-            goal = blocked_goal(target, pids[0]) if label.get("agent_kind") == "codex" and len(pids) == 1 else None
+            goal = self._current_blocked_goal(target)
             if goal and _match_error_block("■ " + goal["error"]["message"]) == state.error_type:
-                key = f"goal:{goal['session_id']}:{goal['goal_id']}:{goal['turn_id']}:{goal['at']}"
-                if ((reserved and runtime.codex_goal_resume and runtime.codex_observed_turn_key == key)
+                key = self._goal_turn_key(goal)
+                if self.codex_queue_recovery.blocks_turn(target, goal):
+                    return False
+                if ((reserved and runtime.codex_goal_resume and runtime.codex_observed_turn_key == key
+                        and runtime.codex_goal_proof == goal)
                         or (not reserved and (runtime.codex_sent_turn_key != key
                             or runtime.delivery_status in {"failed", "cancelled", "retryable"}))):
-                    if not self._network_turn_ready(target, runtime, {**goal, "pid": pids[0]}):
+                    if not self._network_turn_ready(target, runtime, goal):
                         return False
                     runtime.codex_goal_resume = True
+                    runtime.codex_goal_proof = dict(goal)
                     runtime.codex_observed_turn_key = key
                     return True
                 # This stalled goal is already resumed. Do not also send 任务请继续.
@@ -10451,6 +10723,10 @@ class WatchDaemon:
             # not freeze a still-visible high-demand failure; continue below.
             runtime.codex_goal_resume = False
         runtime.codex_goal_resume = False
+        if state.requires_goal_proof:
+            self._record_state(str(target['surface_id']), runtime, dataclasses.replace(
+                state, kind='error_superseded', reason='in-flight transcript needs the original blocked goal'))
+            return False
         turn = self.codex_queue_recovery.current_turn(target)
         if turn is None and state.native_goal_stalled:
             turn = {"kind": "unknown"}
@@ -10470,6 +10746,8 @@ class WatchDaemon:
         error = turn.get("error")
         if (turn.get("kind") == "task_complete" and isinstance(error, Mapping)
                 and _match_error_block("■ " + str(error.get("message") or "")) == state.error_type):
+            if self.codex_queue_recovery.blocks_turn(target, turn):
+                return False
             key = f"{turn.get('session_id')}:{turn.get('turn_id')}:{turn.get('at')}"
             already_sent = key == runtime.codex_sent_turn_key
             # The renderer can retain an old error after accepting input.
