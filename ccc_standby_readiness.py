@@ -88,6 +88,7 @@ class StandbyRefreshBarrier:
         self._intent_raw = None
         self._last_clock = -1.0
         self._observation_deadline = None
+        self._attempt_deadline = None
         self._index = expected['index']
         self._expected = copy.deepcopy(expected)
         self.intent = self.directory / f'prepare-control-{self._index}.json'
@@ -140,19 +141,20 @@ class StandbyRefreshBarrier:
         return grid
 
     def _check_observation_deadline(self):
-        if (self._observation_deadline is not None
-                and self._now() >= self._observation_deadline):
+        deadlines = [d for d in (self._observation_deadline, self._attempt_deadline)
+                     if d is not None]
+        if deadlines and self._now() >= min(deadlines):
             raise TimeoutError('original vnode observation unavailable for 30 seconds')
 
-    def _inspect(self):
-        if not self._consumed:
+    def _inspect(self, *, before_write=False):
+        if not self._consumed or self._ack or before_write:
             self._check_observation_deadline()
         try:
-            return self.inspect()
+            observation = self.inspect()
         except StartupPending as pending:
-            return pending.observation
+            observation = pending.observation
         except ObservationPending as pending:
-            if self._consumed:
+            if self._consumed and not self._ack and not before_write:
                 raise
             self._live()
             if any(pending.observation.get(k) != v for k, v in self._expected.items()):
@@ -167,6 +169,14 @@ class StandbyRefreshBarrier:
             if now >= self._observation_deadline:
                 raise TimeoutError('original vnode observation unavailable for 30 seconds')
             raise _Preparing('original vnode observation pending') from pending
+        # A complete identity inspection already brackets two stable native
+        # inventories and PID/writer/prefix checks. It ends this unavailable
+        # episode, even if the next independent inspection is pending again.
+        # Keep a separate operation deadline so repeated recoveries cannot
+        # extend a connected write attempt indefinitely.
+        self._check_observation_deadline()
+        self._observation_deadline = None
+        return observation
 
     def _events(self, row):
         data, sent = _idle_prefix(self.claim)
@@ -187,9 +197,9 @@ class StandbyRefreshBarrier:
             raise ValueError('another skills refresh invalidated preparation control')
         return data, reloads
 
-    def _check(self, *, before_control=False):
+    def _check(self, *, before_control=False, before_write=False):
         self._live()
-        row = self._inspect()
+        row = self._inspect(before_write=before_write)
         if any(row.get(k) != value for k, value in self._expected.items()):
             raise ValueError('preparation original launch changed')
         identity = original(row, row['workspace_id'])
@@ -205,6 +215,10 @@ class StandbyRefreshBarrier:
             self._prefix, self._original = data, identity
             if self._consumed:
                 raise ValueError('native startup evidence lost after control consumption')
+            # A validated StartupPending observation includes complete vnode
+            # identity evidence. Native startup waiting is not continued
+            # file-inventory unavailability; a later outage gets its own bound.
+            self._observation_deadline = None
             raise _Preparing('original native startup not yet observed')
         # Retain the first complete original before another blocking read.
         # Pending observations may not rebase its writer, prefix or reload.
@@ -219,7 +233,7 @@ class StandbyRefreshBarrier:
         # These checks also run after potentially blocking connected reads.
         # Do not let a callback change the generation or native identity and
         # then use its previous positive result to authorize the write.
-        after = self._inspect()
+        after = self._inspect(before_write=before_write)
         if original(after, row['workspace_id']) != identity:
             raise ValueError('preparation identity changed after connected reads')
         after_data, after_reloads = self._events(after)
@@ -239,7 +253,15 @@ class StandbyRefreshBarrier:
         with self._write_lock:
             if self._write_entered:
                 raise ValueError('preparation input already attempted')
-            self._check(before_control=True)
+            while True:
+                try:
+                    self._check(before_control=True, before_write=True)
+                    break
+                except _Preparing:
+                    # No input bytes have been written: wait inside this
+                    # single transport attempt, never reconnect or resend.
+                    self._check_observation_deadline()
+                    time.sleep(0.02)
             self._check_observation_deadline()
             self._write_entered = True
             self._sent_at = self._now()
@@ -252,6 +274,7 @@ class StandbyRefreshBarrier:
             if self._consumed:
                 return False
             try:
+                self._attempt_deadline = self._now() + 30.0
                 row, grid = self._check(before_control=True)
                 self._check_observation_deadline()
                 control_id = str(uuid.uuid4())
@@ -269,12 +292,17 @@ class StandbyRefreshBarrier:
                 self._live()
                 self._ack_at = self._now()
                 self._ack = True
+                # A known ACK starts an observation-only phase. An unknown
+                # ACK never reaches here and must never permit a retry.
+                self._observation_deadline = None
                 return True
             except _Preparing:
                 return False
             except Exception as exc:
                 self.invalidate(exc)
                 raise
+            finally:
+                self._attempt_deadline = None
 
     def observe(self):
         """Return a current return-witness, not overall native readiness."""
@@ -282,7 +310,9 @@ class StandbyRefreshBarrier:
             if not self._ack:
                 return None
             try:
+                self._attempt_deadline = self._now() + 30.0
                 row, grid = self._check()
+                self._check_observation_deadline()
                 now = self._now()
                 if self._receipt is None:
                     if not pwd_visible(grid, self.claim['cwd']):
@@ -296,18 +326,26 @@ class StandbyRefreshBarrier:
                         'refresh_return_observed': True, 'refresh_success_verified': False,
                         'readiness_proven': False}
                     raw = write_once(self.return_receipt, value)
-                    self._check()  # Include changes while persisting the witness.
                     self._receipt = raw
+                    self._check()  # Include changes while persisting the witness.
                 if self.return_receipt.is_symlink() or self.return_receipt.read_bytes() != self._receipt:
                     raise ValueError('preparation return receipt changed')
+                self._check_observation_deadline()
+                self._observation_deadline = None
                 return {**row, 'boot_id': self._boot, 'generation': self._generation,
                     'observed_monotonic': self._now(), 'refresh_return_observed': True,
                     'refresh_success_verified': False, 'readiness_proven': False,
                     'preparation_control_count': 1, 'control_receipt_sha256': _sha(self._intent_raw),
                     'return_receipt_sha256': _sha(self._receipt)}
+            except _Preparing:
+                # Only observation can wait after ACK; prepare remains
+                # consumed and activation still requires complete evidence.
+                return None
             except Exception as exc:
                 self.invalidate(exc)
                 raise
+            finally:
+                self._attempt_deadline = None
 
     def observe_for_activation(self, *, connected_check=None, final_check=None):
         """Recheck a witnessed original using one bounded identity inspection.

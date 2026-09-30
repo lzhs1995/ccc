@@ -157,6 +157,52 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(self.manager.refreshes, 1)
         self.assertEqual(self.manager.writes, 0)
 
+    def test_preparation_read_limit_preserves_all_fifty_originals(self):
+        release = threading.Event()
+        full = threading.Event()
+        lock = threading.Lock()
+        active, peak, seen = [0], [0], []
+        def poll(index):
+            with lock:
+                active[0] += 1
+                peak[0] = max(peak[0], active[0])
+                seen.append(index)
+                if active[0] == 8:
+                    full.set()
+            try:
+                if not release.wait(3):
+                    raise TimeoutError('test failed to release preparation reads')
+                return {'witness': True}
+            finally:
+                with lock:
+                    active[0] -= 1
+        self.activation.preparation.poll = poll
+        self.owner.prepare()
+        try:
+            self.assertTrue(full.wait(3))
+            self.assertEqual(len(self.activation.preparation.created), 50)
+            self.assertEqual(peak[0], 8)
+        finally:
+            release.set()
+        self.owner._future.result(timeout=3)
+        self.assertEqual(sorted(seen), list(range(50)))
+        self.assertEqual(peak[0], 8)
+        self.assertEqual(self.owner.status()['state'], 'ready')
+
+    def test_cancelled_waiting_preparation_reader_never_polls(self):
+        for _ in range(8):
+            self.owner._preparation_reads.acquire()
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(self.owner._poll_preparation, 49)
+                self.owner._cancel.set()
+                with self.assertRaisesRegex(ValueError, 'cancelled'):
+                    future.result(timeout=1)
+            self.assertEqual(self.activation.preparation.polled, [])
+        finally:
+            for _ in range(8):
+                self.owner._preparation_reads.release()
+
     def test_route_commit_follows_durable_timing_before_any_send(self):
         sequence = []
         def commit(preparation, action, *, timing, authorized):

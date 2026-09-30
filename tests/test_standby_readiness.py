@@ -117,6 +117,40 @@ class RefreshBarrierTests(unittest.TestCase):
         self.assertFalse(self.barrier.intent.exists())
         self.assertFalse(self.writes)
 
+    def test_complete_identity_ends_outage_before_second_pending(self):
+        unavailable = self.unavailable_files()
+        self.barrier.inspect = unavailable
+        self.assertFalse(self.prepare())
+        self.clock = 129
+        calls = []
+        def inspect():
+            calls.append(1)
+            return self.native.inspect() if len(calls) == 1 else unavailable()
+        self.barrier.inspect = inspect
+        self.assertFalse(self.prepare())
+        self.assertEqual(self.barrier._observation_deadline, 159)
+        self.assertFalse(self.barrier.intent.exists())
+        self.clock = 131
+        self.barrier.inspect = self.native.inspect
+        self.assertTrue(self.prepare())
+        self.assertEqual(len(self.writes), 1)
+
+    def test_fresh_outage_after_complete_identity_still_expires(self):
+        self.barrier.inspect = self.unavailable_files()
+        self.assertFalse(self.prepare())
+        self.clock = 129
+        calls = []
+        unavailable = self.unavailable_files()
+        def inspect():
+            calls.append(1)
+            return self.native.inspect() if len(calls) == 1 else unavailable()
+        self.barrier.inspect = inspect
+        self.assertFalse(self.prepare())
+        self.clock = 159
+        with self.assertRaises(TimeoutError):
+            self.prepare()
+        self.assertFalse(self.writes)
+
     def test_changed_inventory_rechecks_birth(self):
         self.barrier.inspect = self.changing_files(
             lambda: self.native.process['birth'].__setitem__(1, 43))
@@ -127,7 +161,8 @@ class RefreshBarrierTests(unittest.TestCase):
         def sender(*args, **kwargs):
             self.barrier.inspect = self.changing_files()
             return self.send_control(*args, **kwargs)
-        with self.assertRaises(OSError): self.prepare(sender)
+        with mock.patch.object(readiness.time, 'sleep', side_effect=lambda _: setattr(self, 'clock', self.clock + 30)):
+            with self.assertRaises(TimeoutError): self.prepare(sender)
         self.assertTrue(self.barrier.intent.exists())
         self.barrier.inspect = self.native.inspect
         self.assertFalse(self.prepare())
@@ -256,12 +291,117 @@ class RefreshBarrierTests(unittest.TestCase):
         def send_with_failure(*args, **kwargs):
             self.barrier.inspect = self.unavailable_files()
             return self.send_control(*args, **kwargs)
-        with self.assertRaises(OSError): self.prepare(send_with_failure)
+        with mock.patch.object(readiness.time, 'sleep', side_effect=lambda _: setattr(self, 'clock', self.clock + 30)):
+            with self.assertRaises(TimeoutError): self.prepare(send_with_failure)
         self.assertTrue(self.barrier.intent.exists())
         self.assertTrue(self.barrier.invalid_receipt.exists())
         self.barrier.inspect = self.native.inspect
         self.assertFalse(self.prepare())
         self.assertFalse(self.writes)
+
+    def test_prewrite_pending_waits_inside_one_transport_attempt(self):
+        sends = []
+        unavailable = self.unavailable_files()
+        def sender(*args, **kwargs):
+            sends.append(1)
+            self.barrier.inspect = unavailable
+            return self.send_control(*args, **kwargs)
+        def recover(_):
+            self.clock += .02
+            self.barrier.inspect = self.native.inspect
+        with mock.patch.object(readiness.time, 'sleep', side_effect=recover):
+            self.assertTrue(self.prepare(sender))
+        self.assertEqual(sends, [1])
+        self.assertEqual(len(self.writes), 1)
+        self.assertFalse(self.prepare())
+
+    def test_prewrite_pending_rechecks_revocation_before_writing(self):
+        def sender(*args, **kwargs):
+            self.barrier.inspect = self.unavailable_files()
+            return self.send_control(*args, **kwargs)
+        def revoke(_):
+            self.allowed = False
+        with mock.patch.object(readiness.time, 'sleep', side_effect=revoke):
+            with self.assertRaises(ValueError): self.prepare(sender)
+        self.assertFalse(self.writes)
+        self.assertTrue(self.barrier.invalid_receipt.exists())
+        self.assertFalse(self.prepare())
+
+    def test_complete_vnodes_during_startup_end_missing_inventory_episode(self):
+        self.barrier.inspect = self.unavailable_files()
+        self.assertFalse(self.prepare())
+        self.clock += 29
+        self.native.events = self.native.events[:2]
+        self.native.save_events()
+        self.barrier.inspect = self.native.inspect
+        self.assertFalse(self.prepare())
+        self.assertFalse(self.writes)
+        self.clock += 31
+        self.assertFalse(self.prepare())
+        self.native.events.append(dict(dir='to_tui', kind='app_event', variant='StartupThreadStarted'))
+        self.reload()
+        self.assertTrue(self.prepare())
+        self.assertEqual(len(self.writes), 1)
+
+    def test_known_ack_pending_recovers_without_another_control(self):
+        self.assertTrue(self.prepare())
+        self.barrier.inspect = self.unavailable_files()
+        self.assertIsNone(self.barrier.observe())
+        self.assertFalse(self.prepare())
+        self.assertFalse(self.barrier.invalid_receipt.exists())
+        self.clock += 29
+        self.barrier.inspect = self.native.inspect
+        self.rendered()
+        self.assertTrue(self.barrier.observe()['refresh_return_observed'])
+        self.clock += 31
+        self.assertTrue(self.barrier.observe()['refresh_return_observed'])
+        self.assertEqual(len(self.writes), 1)
+
+    def test_known_ack_pending_deadline_does_not_extend(self):
+        self.assertTrue(self.prepare())
+        self.barrier.inspect = self.unavailable_files()
+        self.assertIsNone(self.barrier.observe())
+        self.clock += 29
+        self.assertIsNone(self.barrier.observe())
+        self.clock += 1
+        self.barrier.inspect = self.native.inspect
+        self.rendered()
+        with self.assertRaises(TimeoutError): self.barrier.observe()
+        self.assertTrue(self.barrier.invalid_receipt.exists())
+        self.assertFalse(self.prepare())
+        self.assertEqual(len(self.writes), 1)
+
+    def test_known_ack_pending_revocation_is_terminal(self):
+        self.assertTrue(self.prepare())
+        self.barrier.inspect = self.unavailable_files()
+        self.allowed = False
+        with self.assertRaises(ValueError): self.barrier.observe()
+        self.assertTrue(self.barrier.invalid_receipt.exists())
+        self.assertEqual(len(self.writes), 1)
+
+    def test_known_ack_pending_birth_change_is_terminal(self):
+        self.assertTrue(self.prepare())
+        self.barrier.inspect = self.unavailable_files(
+            mutate=lambda: self.native.process['birth'].__setitem__(1, 43))
+        with self.assertRaises(ValueError): self.barrier.observe()
+        self.assertTrue(self.barrier.invalid_receipt.exists())
+        self.assertEqual(len(self.writes), 1)
+
+    def test_pending_after_return_persistence_reuses_original_receipt(self):
+        self.assertTrue(self.prepare())
+        self.rendered()
+        unavailable = self.unavailable_files()
+        calls = []
+        def inspect():
+            calls.append(1)
+            return unavailable() if len(calls) == 3 else self.native.inspect()
+        self.barrier.inspect = inspect
+        self.assertIsNone(self.barrier.observe())
+        raw = self.barrier.return_receipt.read_bytes()
+        self.barrier.inspect = self.native.inspect
+        self.assertTrue(self.barrier.observe()['refresh_return_observed'])
+        self.assertEqual(self.barrier.return_receipt.read_bytes(), raw)
+        self.assertEqual(len(self.writes), 1)
 
     def test_one_control_and_current_return_witness_is_not_full_readiness(self):
         self.assertTrue(self.prepare())

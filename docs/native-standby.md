@@ -19,9 +19,19 @@ first-task observation are implemented separately. The normal start/worker/recov
 entrypoints reject or skip standby descriptors so they cannot submit a task
 while the dedicated manager is unconnected. The b/N entrypoint now contacts
 the original live owner; an absent or unready owner cannot cold-launch a
-replacement. No production standby cohort is running yet. Tests use synthetic process evidence, temporary-file
-Darwin events and isolated local Unix sockets; they do not establish zero-model
-readiness or performance.
+replacement. No persistent production standby cohort is running yet. Run123
+completed preparation with 50 real original sessions, 50 local `/pwd` controls,
+50 return witnesses and a production owner reporting ready50/50. Its selected
+provider routes recorded zero model requests during a three-second ready
+revalidation. Original identities and cleanup checks passed. The 68.412-second
+experiment duration is not activation latency. This proves preparation only:
+real UI activation, first-task timing, all-route zero requests and 500 concurrent
+sessions remain unverified. Earlier failed runs retain their original results.
+The launch preserves skill_search but explicitly overrides the per-slot
+provider URL, trusted temporary working directory, private SQLite directory and
+SessionStart binding hook. Unchanged config files do not imply identical runtime
+settings. Offline tests additionally use synthetic process evidence,
+temporary-file Darwin events and isolated local Unix sockets.
 
 The optional generation event mode arms kernel vnode watches over declared
 content, links, and ancestor path identities, then rescans and checks pending
@@ -37,6 +47,23 @@ a transient appearance-and-removal between checks. Once an appearance is
 observed, invalidation is permanent. Existing-file content round trips and
 ancestor permission or identity changes still invalidate. The
 descriptor cap fails closed; no polling fallback silently certifies readiness.
+
+Each event check consumes one snapshot sized to the registered watches, rather
+than waiting for unrelated ancestor activity to stop. Later events remain
+latched for subsequent checks. A pure regular-file ATTRIB notification is
+accepted only when the original descriptor and every alias retain the pinned
+mutation metadata (including inode, permissions, size, mtime and ctime). This
+also handles delayed access notifications with unchanged atime. WRITE, EXTEND,
+directory ATTRIB and changed mutation metadata still invalidate the generation.
+
+Preparation limits simultaneous native inventory readers to eight while
+retaining all fifty launches and activation workers. A complete original
+identity inspection ends an unavailable-inventory episode; every prepare or
+observe operation has its own thirty-second deadline. After a known control
+ACK, temporary inventory unavailability permits observation only. Before any
+bytes are written it can wait within the same connected transport attempt;
+the transport retains its own deadline. Unknown ACKs remain consumed and never
+permit resending the control. Activation still requires complete current proof.
 
 Manager cancellation uses a short status lock separate from the operation lock
 held while waiting for callbacks. Late ACKs remain recorded delivery facts and

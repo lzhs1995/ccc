@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import Mock, patch
 
 from ccc_standby_generation import _VnodeWatch, _access_stable_stamp
 
@@ -47,6 +48,21 @@ class AccessEventTests(unittest.TestCase):
         self.assertNotEqual(after.st_atime_ns, self.before.st_atime_ns)
         self.assertEqual(_access_stable_stamp(after), _access_stable_stamp(self.before))
         self.watch.check()
+
+    def test_repeated_execute_only_access(self):
+        for _ in range(20):
+            subprocess.run([str(self.file)], check=True, timeout=5)
+            self.assertEqual(_access_stable_stamp(self.file.stat()),
+                             _access_stable_stamp(self.before))
+            self.watch.check()
+
+    def test_delayed_attrib_with_identical_access_time(self):
+        queue = Mock()
+        queue.control.return_value = [select.kevent(self.watch._fds[0],
+            filter=select.KQ_FILTER_VNODE, fflags=select.KQ_NOTE_ATTRIB)]
+        with patch.object(self.watch, '_queue', queue):
+            self.watch.check()
+            self.watch.check()
 
     def test_same_mode_chmod_with_access_refuses(self):
         self.file.read_bytes()

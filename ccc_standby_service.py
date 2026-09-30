@@ -66,6 +66,10 @@ class CohortService:
         self.observation_timeout, self.poll_interval = observation_timeout, poll_interval
         self._lock = threading.RLock()
         self._stop, self._cancel = threading.Event(), threading.Event()
+        # Native FD inventories involve many libproc calls. Fifty concurrent
+        # readers prolong each snapshot while startup opens/closes files.
+        # Bound preparation reads only; launch and activation retain COUNT.
+        self._preparation_reads = threading.BoundedSemaphore(8)
         self._started = False
         self._origin = self._action = self._action_guard = None
         self._future = None
@@ -100,6 +104,16 @@ class CohortService:
     def _require_live(self):
         if not self._allowed():
             raise ValueError('standby service action cancelled or closed')
+
+    def _poll_preparation(self, index):
+        self._require_live()
+        while not self._preparation_reads.acquire(timeout=.05):
+            self._require_live()
+        try:
+            self._require_live()
+            return self.preparation.poll(index)
+        finally:
+            self._preparation_reads.release()
 
     def status(self):
         with self._lock:
@@ -142,13 +156,10 @@ class CohortService:
                 pending = set(range(COUNT))
                 while pending:
                     self._require_live()
-                    def poll(index):
-                        self._require_live()
-                        return self.preparation.poll(index)
                     futures = {}
                     try:
                         for i in pending:
-                            futures[pool.submit(poll, i)] = i
+                            futures[pool.submit(self._poll_preparation, i)] = i
                         for future in as_completed(futures):
                             if future.result() is not None:
                                 pending.remove(futures[future])

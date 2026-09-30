@@ -373,6 +373,7 @@ class _VnodeWatch:
         self._missing = missing_children or {}
         self._queue = select.kqueue()
         self._invalid = False
+        self.failure_diagnostic = None
         self._pid = os.getpid()
         try:
             identity_notes = (select.KQ_NOTE_DELETE |
@@ -403,45 +404,58 @@ class _VnodeWatch:
         if self._invalid or self._pid != os.getpid():
             raise ValueError('dependency event watcher invalidated or inherited')
         try:
-            for _ in range(3):
-                events = self._queue.control([], max(1, min(4096, len(self._fds))), 0)
-                if not events:
-                    return
-                for event in events:
-                    entry = self._entries.get(event.ident)
-                    if (entry is None or event.filter != select.KQ_FILTER_VNODE
-                            or event.flags & (select.KQ_EV_ERROR | select.KQ_EV_EOF)):
-                        raise ValueError('native dependency event source failed')
-                    child_notes = select.KQ_NOTE_WRITE | select.KQ_NOTE_EXTEND | select.KQ_NOTE_LINK
-                    fd_info = os.fstat(event.ident)
-                    fd_identity = _ancestor_stamp(fd_info)
-                    access = self._access_stamps.get(event.ident)
-                    if (event.fflags == select.KQ_NOTE_ATTRIB and access is not None
-                            and _access_stable_stamp(fd_info) == access[0]
-                            and fd_info.st_atime_ns != access[1]):
-                        # Every original alias must still identify this exact
-                        # unchanged regular file. No WRITE/EXTEND or directory
-                        # event is forgiven, even if bytes were restored.
-                        infos = [path.lstat() for path, _, _, _ in entry]
-                        if all(_access_stable_stamp(info) == access[0]
-                               and info.st_atime_ns == fd_info.st_atime_ns for info in infos):
-                            self._access_stamps[event.ident] = (access[0], fd_info.st_atime_ns)
-                            continue
-                    for path, kind, identity, directory in entry:
-                        if (kind == 'content' or not directory or not event.fflags
-                                or event.fflags & ~child_notes
-                                or _ancestor_stamp(path.lstat()) != identity
-                                or fd_identity != identity):
-                            error = ValueError('native dependency event observed')
-                            error.dependency_event = {'path': str(path), 'kind': kind,
-                                'fflags': event.fflags, 'flags': event.flags}
-                            raise error
-                        for child in self._missing.get(str(path), ()):
-                            if os.path.lexists(child):
-                                raise ValueError('optional dependency path appeared')
-            raise ValueError('native dependency events did not settle')
-        except Exception:
+            # EV_CLEAR coalesces each registered vnode into one pending event.
+            # Read enough entries for the whole registered set in one syscall.
+            # Requiring an empty queue after validation lets unrelated sibling
+            # writes starve a valid generation indefinitely. Events arriving
+            # after this snapshot remain latched for the next boundary check.
+            events = self._queue.control([], max(1, len(self._fds)), 0)
+            for event in events:
+                entry = self._entries.get(event.ident)
+                if (entry is None or event.filter != select.KQ_FILTER_VNODE
+                        or event.flags & (select.KQ_EV_ERROR | select.KQ_EV_EOF)):
+                    raise ValueError('native dependency event source failed')
+                child_notes = select.KQ_NOTE_WRITE | select.KQ_NOTE_EXTEND | select.KQ_NOTE_LINK
+                fd_info = os.fstat(event.ident)
+                fd_identity = _ancestor_stamp(fd_info)
+                access = self._access_stamps.get(event.ident)
+                if (event.fflags == select.KQ_NOTE_ATTRIB and access is not None
+                        and _access_stable_stamp(fd_info) == access[0]):
+                    # Every original alias must still identify this exact
+                    # unchanged regular file. No WRITE/EXTEND or directory
+                    # event is forgiven, even if bytes were restored.
+                    # A notification need not expose a new atime: delayed or
+                    # repeated ATTRIB can describe the already observed stamp.
+                    # Require unchanged mutation timestamps/permissions on all
+                    # aliases, rather than requiring access time to advance.
+                    infos = [path.lstat() for path, _, _, _ in entry]
+                    if all(_access_stable_stamp(info) == access[0]
+                           and info.st_atime_ns == fd_info.st_atime_ns for info in infos):
+                        self._access_stamps[event.ident] = (access[0], fd_info.st_atime_ns)
+                        continue
+                for path, kind, identity, directory in entry:
+                    if (kind == 'content' or not directory or not event.fflags
+                            or event.fflags & ~child_notes
+                            or _ancestor_stamp(path.lstat()) != identity
+                            or fd_identity != identity):
+                        error = ValueError('native dependency event observed')
+                        error.dependency_event = {'path': str(path), 'kind': kind,
+                            'fflags': event.fflags, 'flags': event.flags,
+                            'expected_identity': identity, 'fd_identity': fd_identity,
+                            'access_baseline': access,
+                            'current_access_stamp': _access_stable_stamp(fd_info),
+                            'current_atime_ns': fd_info.st_atime_ns}
+                        raise error
+                    for child in self._missing.get(str(path), ()):
+                        if os.path.lexists(child):
+                            raise ValueError('optional dependency path appeared')
+        except Exception as exc:
             self._invalid = True
+            # Other workers can observe invalidation before the original
+            # exception reaches the service. Preserve that first cause even
+            # after close, without retaining exception tracebacks or frames.
+            self.failure_diagnostic = {'error_type': type(exc).__name__,
+                'message': str(exc), 'dependency_event': getattr(exc, 'dependency_event', None)}
             raise
 
     def close(self):
