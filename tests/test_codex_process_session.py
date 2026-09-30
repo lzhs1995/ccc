@@ -1,0 +1,163 @@
+import json
+from pathlib import Path
+import subprocess
+import tempfile
+import unittest
+import uuid
+from unittest.mock import patch
+
+from ccc_codex_queue import QueueRecovery
+
+
+class ProcessSessionTests(unittest.TestCase):
+    def setUp(self):
+        files = patch('ccc_codex_queue._proc_pidfdinfo', None)
+        files.start()
+        self.addCleanup(files.stop)
+        portable = patch('ccc_codex_queue._procargs_sysctl', None)
+        portable.start()
+        self.addCleanup(portable.stop)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.path = self.root / "rollout.jsonl"
+        self.path.write_text(json.dumps({"type": "session_meta", "payload": {"id": "original"}}) + "\n" +
+            json.dumps({"type": "event_msg", "timestamp": "2026-09-22T08:00:00Z", "payload": {
+                "type": "task_complete", "turn_id": "failed-turn", "error": {"message": "rate limit exceeded"}}}) + "\n")
+        self.queue = QueueRecovery(self.root / "ledger", self.root / "missing-hooks", self.root, "continue")
+        self.queue.process_lookup = lambda _: {"agent_kind": "codex", "agent_pids": [123]}
+        self.target = {"surface_id": "s", "workspace_id": "w"}
+        self.command = "Tue Sep 22 01:00:00 2026 /opt/homebrew/bin/codex resume original CMUX_SURFACE_ID=s CMUX_WORKSPACE_ID=w"
+        self.paths = "f44\nau\nn" + str(self.path) + "\n"
+
+    def run_command(self, args, **kwargs):
+        return subprocess.CompletedProcess(args, 0, self.paths if args[0].endswith("lsof") else self.command, "")
+
+    def test_missing_hook_uses_current_process_original_open_transcript(self):
+        with patch("ccc_codex_queue.subprocess.run", side_effect=self.run_command) as run:
+            result = self.queue.current_turn(self.target)
+        self.assertEqual((result["kind"], result["session_id"], result["pid"]), ("task_complete", "original", 123))
+        self.assertTrue(all(call.args[0][0] in {"/bin/ps", "/usr/sbin/lsof"} for call in run.call_args_list))
+
+    def test_foreign_surface_identity_cannot_supply_a_turn(self):
+        self.command = self.command.replace("CMUX_SURFACE_ID=s", "CMUX_SURFACE_ID=foreign")
+        with patch("ccc_codex_queue.subprocess.run", side_effect=self.run_command):
+            self.assertEqual(self.queue.current_turn(self.target), {"kind": "unknown"})
+
+    def test_multiple_open_sessions_cannot_supply_a_turn(self):
+        second = self.root / "another.jsonl"
+        second.write_text(self.path.read_text())
+        self.paths += "f45\nau\nn" + str(second) + "\n"
+        with patch("ccc_codex_queue.subprocess.run", side_effect=self.run_command):
+            self.assertEqual(self.queue.current_turn(self.target), {"kind": "unknown"})
+
+    def test_process_replacement_during_read_blocks_evidence(self):
+        calls = 0
+        def run(args, **kwargs):
+            nonlocal calls
+            result = self.run_command(args, **kwargs)
+            if args[0] == "/bin/ps":
+                calls += 1
+                if calls == 2:
+                    result.stdout = result.stdout.replace("01:00:00", "01:01:00")
+            return result
+        with patch("ccc_codex_queue.subprocess.run", side_effect=run):
+            self.assertEqual(self.queue.current_turn(self.target), {"kind": "unknown"})
+
+    def test_unreadable_process_is_unknown(self):
+        with patch("ccc_codex_queue.subprocess.run", side_effect=subprocess.TimeoutExpired("ps", 2)):
+            self.assertEqual(self.queue.current_turn(self.target), {"kind": "unknown"})
+
+    def test_process_refresh_gap_cannot_be_treated_as_a_legacy_client(self):
+        for label in ({"agent_kind": "unknown", "summary": "process refresh pending"},
+                      {"agent_kind": "unknown", "summary": "process lookup unavailable"},
+                      {"agent_kind": "shell"}):
+            with self.subTest(label=label):
+                self.queue.process_lookup = lambda _, label=label: label
+                self.assertEqual(self.queue.current_turn(self.target), {"kind": "unknown"})
+
+    def test_verified_original_process_survives_gui_gap_with_fresh_native_guards(self):
+        with patch('ccc_codex_queue.subprocess.run', side_effect=self.run_command):
+            first = self.queue.current_turn(self.target)
+            self.queue.process_lookup = lambda _: {'agent_kind': 'unknown', 'summary': 'process refresh pending'}
+            with patch('ccc_codex_queue.codex_process_starts', return_value={123: first['process_start']}):
+                self.assertEqual(self.queue.current_turn(self.target)['session_id'], 'original')
+                self.command = self.command.replace('CMUX_SURFACE_ID=s', 'CMUX_SURFACE_ID=foreign')
+                self.assertEqual(self.queue.current_turn(self.target), {'kind': 'unknown'})
+
+    def test_gui_gap_cannot_reuse_changed_process_or_workspace(self):
+        with patch('ccc_codex_queue.subprocess.run', side_effect=self.run_command):
+            first = self.queue.current_turn(self.target)
+            self.queue.process_lookup = lambda _: {'agent_kind': 'unknown', 'summary': 'process lookup unavailable'}
+            with patch('ccc_codex_queue.codex_process_starts', return_value={123: first['process_start'] + 1}):
+                self.assertEqual(self.queue.current_turn(self.target), {'kind': 'unknown'})
+            with patch('ccc_codex_queue.codex_process_starts', return_value={123: first['process_start']}):
+                self.assertEqual(self.queue.current_turn({**self.target, 'workspace_id': 'other'}), {'kind': 'unknown'})
+
+    def test_fresh_conflicting_inventory_and_changed_open_session_still_veto_hint(self):
+        with patch('ccc_codex_queue.subprocess.run', side_effect=self.run_command):
+            first = self.queue.current_turn(self.target)
+            for label in ({'agent_kind': 'shell'}, {'agent_kind': 'codex', 'agent_pids': [123, 456]}):
+                self.queue.process_lookup = lambda _, label=label: label
+                self.assertEqual(self.queue.current_turn(self.target), {'kind': 'unknown'})
+            self.queue.process_lookup = lambda _: {'agent_kind': 'unknown', 'summary': 'process refresh pending'}
+            self.queue.open_file_cache.clear()
+            self.paths += 'f45\nau\nn' + str(self.root / 'second.jsonl') + '\n'
+            with patch('ccc_codex_queue.codex_process_starts', return_value={123: first['process_start']}):
+                self.assertEqual(self.queue.current_turn(self.target), {'kind': 'unknown'})
+
+    def test_gui_gap_cannot_substitute_a_different_sole_transcript(self):
+        with patch('ccc_codex_queue.subprocess.run', side_effect=self.run_command):
+            first = self.queue.current_turn(self.target)
+            original = dict(self.queue.open_file_sources['s'])
+            self.queue.process_lookup = lambda _: {'agent_kind': 'unknown', 'summary': 'process refresh pending'}
+            replacement = self.root / 'replacement.jsonl'
+            for content in (self.path.read_text(), self.path.read_text().replace('original', 'replacement')):
+                replacement.write_text(content)
+                self.paths = 'f45\nau\nn' + str(replacement) + '\n'
+                self.queue.open_file_cache.clear()
+                with patch('ccc_codex_queue.codex_process_starts', return_value={123: first['process_start']}):
+                    self.assertEqual(self.queue.current_turn(self.target), {'kind': 'unknown'})
+                self.assertEqual(self.queue.open_file_sources['s'], original)
+
+    def test_history_index_reads_cannot_become_the_active_session(self):
+        for access in ('r', ' ', ''):
+            self.paths = f'f44\na{access}\nn{self.path}\n'
+            with patch('ccc_codex_queue.subprocess.run', side_effect=self.run_command):
+                self.assertEqual(self.queue.current_turn(self.target), {'kind': 'unknown'})
+
+    def test_read_only_history_does_not_hide_the_current_writable_session(self):
+        self.paths = f'f12\nar\nn{self.root / "history.jsonl"}\n' + self.paths
+        with patch('ccc_codex_queue.subprocess.run', side_effect=self.run_command):
+            self.assertEqual(self.queue.current_turn(self.target)['session_id'], 'original')
+
+    def test_new_native_writer_lock_identifies_lazy_session_without_a_rollout(self):
+        sessions = self.root / 'sessions'
+        sessions.mkdir()
+        native_home = self.root / 'native'
+        locks = native_home / 'thread-writer-locks'
+        locks.mkdir(parents=True)
+        (native_home / 'sessions').symlink_to(sessions, target_is_directory=True)
+        sid = str(uuid.UUID(int=(1000500 << 80) | (7 << 76) | (2 << 62) | 1))
+        lock = locks / f'{sid}.lock'
+        lock.touch()
+        self.paths = f'f48\nau\nn{lock}\n'
+        self.queue.sessions_root = sessions
+        with patch('ccc_codex_queue.subprocess.run', side_effect=self.run_command), \
+                patch('ccc_codex_queue.process_placement_start', return_value=1000), \
+                patch('ccc_codex_queue.time.time', return_value=1002):
+            native = self.queue.initial_session(self.target, 1000.25)
+            self.assertEqual(native, {'kind': 'uninitialized', 'session_id': sid, 'pid': 123, 'process_start': 1000})
+            self.assertIsNone(self.queue.initial_session(self.target, 1001))  # Existing UUID.
+            history = sessions / f'rollout-{sid}.jsonl'
+            history.write_text('{}\n')
+            self.assertIsNone(self.queue.initial_session(self.target, 1000.25))
+            history.unlink()
+            self.paths += f'f49\nau\nn{locks / (str(uuid.uuid4()) + ".lock")}\n'
+            self.assertIsNone(self.queue.initial_session(self.target, 1000.25))
+            self.paths = f'f48\nar\nn{lock}\n'
+            self.assertIsNone(self.queue.initial_session(self.target, 1000.25))
+
+
+if __name__ == "__main__":
+    unittest.main()
