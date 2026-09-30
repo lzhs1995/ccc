@@ -84,6 +84,17 @@ class NativeWakeupTests(unittest.TestCase):
         self.watcher.scan()
         self.assertEqual(self.watcher.signatures, {})
 
+    def test_live_and_aborted_turns_keep_fast_visible_error_observation(self):
+        self.sources[0]['identity_current'] = True
+        target = {'surface_id': 'surface', 'workspace_id': 'workspace'}
+        for kind in ('task_started', 'turn_aborted', 'user_message'):
+            self.event(kind, error=False)
+            self.watcher.scan()
+            self.assertEqual(self.watcher.observation_interval(target, .1), .1)
+        self.event('task_complete', error=False)
+        self.watcher.scan()
+        self.assertEqual(self.watcher.observation_interval(target, .1), 10)
+
     def test_large_context_after_native_start_retains_verified_monitor_coverage(self):
         self.path.write_text(json.dumps({'type':'session_meta','payload':{'id':'session'}})+'\n')
         self.event('task_started',error=False)
@@ -91,7 +102,7 @@ class NativeWakeupTests(unittest.TestCase):
             f.write(json.dumps({'type':'world_state','payload':{'text':'x'*80000}})+'\n')
         self.sources[0]['identity_current']=True
         self.watcher.scan()
-        self.assertEqual(self.watcher.observation_interval({'surface_id':'surface','workspace_id':'workspace'},1),10)
+        self.assertEqual(self.watcher.observation_interval({'surface_id':'surface','workspace_id':'workspace'},1),1)
         self.assertEqual(self.woken,[])
         with patch.object(Path,'open',side_effect=AssertionError('unchanged context reread')):
             self.watcher.scan()
@@ -157,7 +168,7 @@ class NativeWakeupTests(unittest.TestCase):
         self.sources[0]['identity_current'] = True
         target = {'surface_id': 'surface', 'workspace_id': 'workspace'}
         self.assertEqual(self.watcher.observation_interval(target, 1), 1)
-        self.event('task_started', error=False)
+        self.event('task_complete', error=False)
         self.watcher.scan()
         self.assertEqual(self.watcher.observation_interval(target, 1), 10)
         self.assertEqual(self.watcher.observation_interval({**target, 'workspace_id': 'moved'}, 1), 1)
@@ -183,7 +194,7 @@ class NativeWakeupTests(unittest.TestCase):
         self.assertEqual(self.watcher.coverage, {})
 
     def test_coverage_is_published_before_the_rest_of_a_slow_scan(self):
-        self.event('task_started', error=False)
+        self.event('task_complete', error=False)
         self.sources[0]['identity_current'] = True
         other = self.root / 'other.jsonl'
         other.write_bytes(self.path.read_bytes())
@@ -214,7 +225,7 @@ class NativeWakeupTests(unittest.TestCase):
             now[0] += 3
             return self.sources
         self.watcher.sources = sources
-        self.event('task_started', error=False)
+        self.event('task_complete', error=False)
         self.watcher.scan()
         target = {'surface_id': 'surface', 'workspace_id': 'workspace'}
         self.assertEqual(self.watcher.coverage_seconds, 5)

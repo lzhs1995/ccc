@@ -559,7 +559,13 @@ class NativeCompletionWatcher:
         A failed source falls back on that scan; a stalled scanner loses its
         bounded lease. Native failures still request an immediate priority read.
         """
-        checked = self.coverage.get((str(target["surface_id"]), str(target["workspace_id"])))
+        identity = (str(target["surface_id"]), str(target["workspace_id"]))
+        # Live retries are painted before task_complete. A covered transcript
+        # cannot replace fast viewport reads while a turn is active or aborted.
+        kinds = [kind for key, kind in self.lifecycle.items() if key[:2] == identity]
+        if not kinds or any(kind != "task_complete" for kind in kinds):
+            return fallback
+        checked = self.coverage.get(identity)
         if checked is not None and 0 <= self.clock() - checked <= self.coverage_seconds:
             return max(fallback, 10.0)
         return fallback
