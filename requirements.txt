@@ -1,0 +1,2 @@
+# CCC uses Python standard-library modules only.
+# macOS users must install cmux separately: https://cmuxterm.app/
