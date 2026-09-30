@@ -64,6 +64,28 @@ class CodexReconnectRecoveryTests(unittest.TestCase):
             daemon.process_once(client)
             self.assertEqual(len(client.sent), 1)
 
+    def test_terminal_rate_limit_dispatch_at_quarter_second_without_replay(self):
+        errors = (self.PEAK_LOAD,
+                  "rate limit exceeded: Your requests to gpt-6-astra for gpt-6-astra in eastus2 have exceeded token rate limit.")
+        for error in errors:
+            with self.subTest(error=error), tempfile.TemporaryDirectory() as directory:
+                payload = grid_payload([], error=error, columns=500)
+                client = FakeClient(payload, "\n".join(visible_lines(payload)))
+                daemon = armed_daemon(directory, client)
+                now, _ = self.bind_provider(daemon, error, ready=False)
+                daemon.process_once(client)
+                self.assertEqual(client.sent, [])
+                now[0] = 200.249
+                daemon.process_once(client)
+                self.assertEqual(client.sent, [])
+                now[0] = 200.25
+                daemon.process_once(client)
+                self.assertEqual(len(client.sent), 1)
+                for later in (200.5, 201.0, 260.0):
+                    now[0] = later
+                    daemon.process_once(client)
+                    self.assertEqual(len(client.sent), 1)
+
     def test_peak_load_native_tips_preserve_recovery_and_dedup(self):
         for tip in ('└ Tip: Press ctrl+g to edit your current draft in an external editor.',
                     '└ Tip: Run /review to get a code review of your current changes.'):
@@ -153,7 +175,7 @@ class CodexReconnectRecoveryTests(unittest.TestCase):
         return payload
 
     def bind_provider(self, daemon, error='HTTP 429 Too Many Requests', *, ready=True):
-        now = [1000.0]
+        now = [1000.0 if ready else 200.0]
         turn = {'kind': 'task_complete', 'session_id': 'original', 'turn_id': 'failed',
                 'at': 200.0, 'model_provider': 'synthetic-provider', 'error': {'message': error}}
         daemon.codex_queue_recovery.current_turn = lambda _: dict(turn)
@@ -197,6 +219,8 @@ class CodexReconnectRecoveryTests(unittest.TestCase):
                                      'rate_limit', 'HTTP 429 Too Many Requests', 200.0)
             for index in range(4):
                 now[0] += 200
+                evidence = store.observe('original', 'synthetic-provider', f'failed-{index}',
+                                         'rate_limit', 'HTTP 429 Too Many Requests', 200.0 + index)
                 self.assertTrue(store.reserve(evidence, str(index)))
             now[0] += 200
             self.assertFalse(store.ready(evidence))
@@ -214,10 +238,7 @@ class CodexReconnectRecoveryTests(unittest.TestCase):
             fresh = store.observe('original', 'synthetic-provider', 'new-failure',
                                   'rate_limit', 'HTTP 429 Too Many Requests', 301.0)
             now[0] += 15
-            # Success refunds this session's budget, not the shared provider
-            # cooldown left by its fourth rate-limit reservation.
-            self.assertFalse(store.reserve(fresh, 'after-success'))
-            now[0] += 900
+            # A later completed answer permits the next original failure.
             self.assertTrue(store.reserve(fresh, 'after-success'))
 
     def test_provider_auth_and_permission_do_not_send(self):
@@ -226,7 +247,7 @@ class CodexReconnectRecoveryTests(unittest.TestCase):
             self.check_without_send(payload, 'provider_blocked')
 
     def test_provider_budget_waits_and_stops_after_four_remedies_across_turns(self):
-        for error in ('HTTP 429 Too Many Requests', 'HTTP 500 Internal Server Error',
+        for error in ('HTTP 500 Internal Server Error',
                       'HTTP 524 A timeout occurred'):
             with self.subTest(error=error), tempfile.TemporaryDirectory() as directory:
                 payload = grid_payload([], error=error)

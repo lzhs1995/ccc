@@ -22,15 +22,15 @@ class ProviderFairnessTests(unittest.TestCase):
         self.now = 1120
         self.assertTrue(self.store.reserve(self.a, 'first'))
         self.assertFalse(self.store.ready(self.b))
-        self.now = 1121
+        self.now = 1120.01
         self.a = self.store.observe('fast', 'p', 'a2', 'rate_limit', 'rate limit', self.now)
 
     def test_waiting_session_wins_even_when_previous_winner_polls_first(self):
-        for now in range(1150, 2020, 30):
+        for now in (1120.02, 1120.03, 1120.04):
             self.now = now
             self.assertFalse(self.store.ready(self.b))
         self.store = ProviderRetryStore(self.path, clock=lambda: self.now, jitter=lambda: 0)
-        self.now = 2020
+        self.now = 1120.26
         self.assertFalse(self.store.reserve(self.a, 'second-fast'))
         self.assertTrue(self.store.reserve(self.b, 'waiting-send'))
         self.assertTrue(self.store.reserve(self.b, 'waiting-send'))

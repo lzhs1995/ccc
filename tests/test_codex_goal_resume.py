@@ -157,14 +157,14 @@ class NativeGoalEvidenceTests(unittest.TestCase):
         turn = self.primary_turn()
         self.assertIsNotNone(goal.blocked_goal(self.target, 12345, current_turn=turn))
         self.assertEqual(goal.provider_for_turn(self.target, turn), 'original-provider')
-        clock = [self.now + 1]
+        clock = [turn["at"] + .1]
         store = ProviderRetryStore(self.goals.parent / 'retry.sqlite', clock=lambda: clock[0], jitter=lambda: 0)
         daemon = SimpleNamespace(codex_queue_recovery=SimpleNamespace(current_turn=lambda _: turn), _provider_retry=store)
         runtime = SimpleNamespace(paused_reason='')
         method = core.WatchDaemon._provider_retry_gate
         state = SimpleNamespace(error_type='rate_limit')
         self.assertFalse(method(daemon, self.target, runtime, state))
-        clock[0] += 1000
+        clock[0] += .15
         self.assertTrue(method(daemon, self.target, runtime, state), runtime.paused_reason)
 
     def test_multilock_missing_primary_rejects_goal_and_provider(self):
@@ -344,11 +344,11 @@ class GoalResumeDeliveryTests(unittest.TestCase):
         self.retry_now += 15
 
     def test_goal_waits_for_durable_error_delay_before_one_resume(self):
-        self.retry_now = 1000.0
+        self.retry_now = 200.0
         with patch.object(goal, 'blocked_goal', return_value=self.proof):
             self.daemon.process_once(self.client)
             self.assertEqual(self.client.sent, [])
-            self.retry_now = 1015.0
+            self.retry_now = 200.25
             self.daemon.process_once(self.client)
             self.assertEqual([row[-1] for row in self.client.sent], ['/goal resume'])
 

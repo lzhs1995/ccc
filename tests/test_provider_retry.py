@@ -26,10 +26,10 @@ class ProviderRetryTests(unittest.TestCase):
     def test_observation_is_stable_and_waits_before_first_error_remedy(self):
         e = self.observe()
         self.assertFalse(self.store.reserve(e, 'a'))
-        self.now += 14
+        self.now += .249
         self.assertEqual(e, self.store.observe('s', 'p', 't', 'rate_limit', 'rate limit', 1000))
         self.assertFalse(self.store.reserve(e, 'a'))
-        self.now += 1
+        self.now += .001
         self.assertTrue(self.store.reserve(e, 'a'))
         self.assertTrue(self.store.reserve(e, 'a'))
         self.assertFalse(self.store.reserve(e, 'b'))
@@ -95,9 +95,9 @@ class ProviderRetryTests(unittest.TestCase):
         reserved_at = self.now
         e = self.observe(turn='eastus2', message='rate limit exceeded: Your requests to gpt-6-astra for gpt-6-astra in eastus2 have exceeded token rate limit.')
         self.store = ProviderRetryStore(self.path, clock=lambda: self.now, jitter=lambda: 0)
-        self.now = reserved_at + 899
+        self.now = reserved_at + .249
         self.assertFalse(self.store.reserve(e, 'fifth'))
-        self.now += 1
+        self.now += .001
         self.assertTrue(self.store.reserve(e, 'fifth'))
         self.assertTrue(self.store.reserve(e, 'fifth'))
         self.assertFalse(self.store.reserve(e, 'duplicate'))
@@ -117,9 +117,9 @@ class ProviderRetryTests(unittest.TestCase):
             record = json.loads(db.execute('SELECT record FROM episodes').fetchone()[0])
             record.update(count=4, due=1120, attempt='old-accepted', reserved_stamp='old')
             self.store._save(db, e['identity'], record)
-        self.now = 1899
+        self.now = 1000.249
         self.assertFalse(self.store.reserve(e, 'new'))
-        self.now = 1900
+        self.now = 1000.25
         self.assertTrue(self.store.reserve(e, 'new'))
         with self.store.transaction() as db:
             self.assertEqual(json.loads(db.execute('SELECT record FROM episodes').fetchone()[0])['count'], 5)
@@ -136,9 +136,9 @@ class ProviderRetryTests(unittest.TestCase):
         self.store = ProviderRetryStore(self.path, clock=lambda: self.now, jitter=lambda: 0)
         self.now = 1750
         e = self.observe(turn='another-failure')
-        self.now = 1899
+        self.now = 1750.249
         self.assertFalse(self.store.reserve(e, 'new'))
-        self.now = 1900
+        self.now = 1750.25
         self.assertTrue(self.store.reserve(e, 'new'))
         self.assertFalse(self.store.reserve(e, 'duplicate'))
         with self.store.transaction() as db:

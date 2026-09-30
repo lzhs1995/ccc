@@ -16,7 +16,8 @@ import time
 
 
 RETRYABLE = frozenset({'rate_limit', 'http_500', 'http_502', 'http_503', 'http_504', 'http_524'})
-RATE_LIMIT_RECOVERY_INTERVAL = 900
+RATE_LIMIT_RECOVERY_INTERVAL = 0.25
+RATE_LIMIT_PROVIDER_SPACING = 0.05
 
 
 def retry_after(message, observed_at):
@@ -55,6 +56,7 @@ class ProviderRetryStore:
             connection.execute('CREATE TABLE IF NOT EXISTS cooldowns (provider TEXT PRIMARY KEY, until REAL NOT NULL)')
             connection.execute('CREATE TABLE IF NOT EXISTS server_floors (provider TEXT PRIMARY KEY, until REAL NOT NULL)')
             connection.execute('CREATE TABLE IF NOT EXISTS waiters (identity TEXT PRIMARY KEY, provider TEXT NOT NULL, stamp TEXT NOT NULL, queued_at REAL NOT NULL, seen_at REAL NOT NULL)')
+            connection.execute('CREATE TABLE IF NOT EXISTS rate_slots (provider TEXT PRIMARY KEY, until REAL NOT NULL)')
             connection.execute('BEGIN IMMEDIATE')
             yield connection
             connection.commit()
@@ -101,12 +103,13 @@ class ProviderRetryStore:
                 if len(record['seen']) >= 256 and error_type != 'rate_limit':
                     raise ValueError('provider failure history limit reached; success proof required')
                 now = self.clock()
-                delay = (15, 30, 60, 120)[min(record['count'], 3)]
+                delay = (RATE_LIMIT_RECOVERY_INTERVAL if error_type == 'rate_limit'
+                         else (15, 30, 60, 120)[min(record['count'], 3)])
                 noise = float(self.jitter())
                 if not math.isfinite(noise) or not 0 <= noise <= .1:
                     raise ValueError('invalid retry jitter')
                 server = retry_after(message, at)
-                deadline = max(now + delay * (1 + noise), server)
+                deadline = max((at + delay if error_type == 'rate_limit' else now + delay * (1 + noise)), server)
                 record['seen'][stamp] = deadline
                 # Keep bounded history without turning sustained transient load
                 # into a permanent stop. Older failures are rejected above.
@@ -144,13 +147,18 @@ class ProviderRetryStore:
                 return not (floor and now < floor[0]) and record.get('reserved_stamp') == evidence['stamp']
             cooldown = connection.execute('SELECT until FROM cooldowns WHERE provider=?', (evidence['provider'],)).fetchone()
             sustained_rate_limit = evidence.get('error_type') == 'rate_limit'
-            # Four remedies cap other failures. Transient capacity limits use
-            # a durable low-frequency recovery lane after the initial burst.
-            # Legacy records already store the previous reservation + 120s.
-            slow_due = (record.get('last_reserved_at', record.get('legacy_recovery_anchor', now))
-                        + RATE_LIMIT_RECOVERY_INTERVAL)
+            # Rate-limit recovery follows the original failure timestamp. Old
+            # synthetic 15–900s due/cooldown values remain as historical data,
+            # but cannot defer this policy. Server floors remain authoritative.
+            if sustained_rate_limit:
+                cooldown = connection.execute('SELECT until FROM rate_slots WHERE provider=?',
+                                              (evidence['provider'],)).fetchone()
+                due = max(record['failure_at'], record.get('last_reserved_at', 0)) + RATE_LIMIT_RECOVERY_INTERVAL
+            else:
+                due = record.get('due', float('inf'))
             if (evidence['stamp'] not in record['seen']
-                    or record['count'] >= 4 and not sustained_rate_limit):
+                    or record['count'] >= 4 and not sustained_rate_limit
+                    or record.get('reserved_stamp') == evidence['stamp']):
                 return False
             # Eligible live callers keep their place across provider cooldowns.
             # A fast polling session must not repeatedly win every shared slot.
@@ -164,8 +172,7 @@ class ProviderRetryStore:
             first = connection.execute('SELECT identity FROM waiters WHERE provider=? ORDER BY queued_at, identity LIMIT 1',
                                        (evidence['provider'],)).fetchone()
             if ((floor and now < floor[0]) or (cooldown and now < cooldown[0])
-                    or record['count'] >= 4 and now < slow_due
-                    or now < record.get('due', float('inf'))
+                    or now < due
                     or first[0] != evidence['identity']):
                 return False
             if attempt is None or dry_run:
@@ -174,11 +181,15 @@ class ProviderRetryStore:
             record['attempt'] = attempt
             record['reserved_stamp'] = evidence['stamp']
             record['last_reserved_at'] = now
-            record['due'] = now + (RATE_LIMIT_RECOVERY_INTERVAL if sustained_rate_limit and record['count'] >= 4
+            record['due'] = now + (RATE_LIMIT_RECOVERY_INTERVAL if sustained_rate_limit
                                    else (15, 30, 60, 120)[min(record['count'], 3)])
             self._save(connection, evidence['identity'], record)
             connection.execute('DELETE FROM waiters WHERE identity=?', (evidence['identity'],))
-            connection.execute('INSERT INTO cooldowns VALUES (?, ?) ON CONFLICT(provider) DO UPDATE SET until=MAX(until,excluded.until)', (evidence['provider'], record['due']))
+            if sustained_rate_limit:
+                connection.execute('INSERT INTO rate_slots VALUES (?, ?) ON CONFLICT(provider) DO UPDATE SET until=MAX(until,excluded.until)',
+                                   (evidence['provider'], now + RATE_LIMIT_PROVIDER_SPACING))
+            else:
+                connection.execute('INSERT INTO cooldowns VALUES (?, ?) ON CONFLICT(provider) DO UPDATE SET until=MAX(until,excluded.until)', (evidence['provider'], record['due']))
             return True
 
     def success(self, session, provider, *, at, completed_turn, last_agent_message, error):
