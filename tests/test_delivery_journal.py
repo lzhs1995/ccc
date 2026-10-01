@@ -1,5 +1,6 @@
 """Actual SQLite durability and writer failure boundaries for native input."""
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 import json
 from pathlib import Path
 import sqlite3
@@ -12,6 +13,7 @@ from unittest import mock
 import cmux_codex_watch as core
 from ccc_delivery import DeliveryStore
 from tests.test_watch import FakeClient, HIGH_DEMAND_TEXT, armed_daemon, grid_payload
+from tests.native_failure_fixture import bind_native_failure
 
 
 class DeliveryJournalTests(unittest.TestCase):
@@ -39,6 +41,7 @@ class DeliveryJournalTests(unittest.TestCase):
     def test_commit_error_prevents_actual_send(self):
         client = FakeClient(grid_payload([], error=HIGH_DEMAND_TEXT), '■ ' + HIGH_DEMAND_TEXT)
         daemon = armed_daemon(self.directory.name, client)
+        bind_native_failure(daemon, HIGH_DEMAND_TEXT)
         self.addCleanup(daemon._process_snapshots.close)
         daemon._delivery_store.start()
         self.addCleanup(daemon._delivery_store.close)
@@ -123,7 +126,7 @@ class DeliveryJournalTests(unittest.TestCase):
         self.store.persist('good', core.TargetRuntime(send_attempt_id='good'))
         self.store.persist('bad', core.TargetRuntime(send_attempt_id='bad'))
         database = Path(self.directory.name) / 'delivery.sqlite3'
-        with sqlite3.connect(database) as connection:
+        with closing(sqlite3.connect(database)) as connection:
             original = json.loads(connection.execute("SELECT record FROM delivery WHERE surface_id='bad'").fetchone()[0])
             for field, value in (('awaiting', 'false'), ('send_count', -1), ('send_started_at', float('nan')),
                                  ('codex_goal_resume', 1), ('codex_private_check', []), ('delivery_status', 'anything')):

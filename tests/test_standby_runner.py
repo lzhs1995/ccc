@@ -54,6 +54,54 @@ class RunnerTests(unittest.TestCase):
     def invocation(self):
         return runner.Invocation(self.path, self.sha)
 
+    def test_resource_reports_do_not_promote_job_terminal(self):
+        self.caller.routes.report.return_value = {'resources_released': True}
+        self.owner.endpoint.resource_report.return_value = {'resources_released': True}
+        self.caller.sources.resource_report.return_value = {'resources_released': True}
+        self.make().run()
+        closed = json.loads((self.output / 'runner-closed.json').read_bytes())
+        self.assertTrue(closed['communication_resources_released'])
+        self.assertTrue(closed['all_resources_released'])
+        self.assertFalse(closed['job_terminal'])
+        self.assertFalse(closed['run_terminal'])
+        self.assertFalse(closed['native_processes_terminated'])
+
+    def test_source_close_failure_blocks_all_resource_release(self):
+        self.caller.routes.report.return_value = {'resources_released': True}
+        self.owner.endpoint.resource_report.return_value = {'resources_released': True}
+        self.caller.sources.resource_report.return_value = {
+            'resources_released': False, 'close_errors': [{'errno': 5}]}
+        self.make().run()
+        closed = json.loads((self.output / 'runner-closed.json').read_bytes())
+        self.assertTrue(closed['communication_resources_released'])
+        self.assertFalse(closed['all_resources_released'])
+        self.assertEqual(closed['source_resources']['close_errors'], [{'errno': 5}])
+
+    def test_source_observation_error_is_unknown(self):
+        self.caller.sources.resource_report.side_effect = OSError('unavailable')
+        self.make().run()
+        closed = json.loads((self.output / 'runner-closed.json').read_bytes())
+        self.assertFalse(closed['all_resources_released'])
+        self.assertEqual(closed['source_resources']['observation_error'], 'OSError')
+
+    def test_resource_observation_failure_is_preserved(self):
+        self.caller.routes.report.side_effect = OSError('unavailable')
+        self.owner.endpoint.resource_report.return_value = {'resources_released': True}
+        self.make().run()
+        closed = json.loads((self.output / 'runner-closed.json').read_bytes())
+        self.assertTrue(closed['handles_closed'])
+        self.assertFalse(closed['communication_resources_released'])
+        self.assertEqual(closed['communication_resources']['routes']['observation_error'], 'OSError')
+
+    def test_lingering_owner_resource_prevents_communication_terminal(self):
+        self.caller.routes.report.return_value = {'resources_released': True}
+        self.owner.endpoint.resource_report.return_value = {
+            'resources_released': False, 'worker_threads_alive': 1}
+        self.make().run()
+        closed = json.loads((self.output / 'runner-closed.json').read_bytes())
+        self.assertFalse(closed['communication_resources_released'])
+        self.assertEqual(closed['communication_resources']['owner_endpoint']['worker_threads_alive'], 1)
+
     def make(self, **kwargs):
         return runner.Runner(self.invocation(), self.output, stop=self.stop,
             caller_factory=self.factory, client_factory=self.client_factory, **kwargs)
@@ -158,6 +206,44 @@ class RunnerTests(unittest.TestCase):
         self.owner.status.side_effect = None
         self.owner.status.return_value = {**self.status, 'state': 'failed'}
         self.assertEqual(self.make().run(), 1)
+
+    def test_original_service_failure_saved_before_emit_and_close(self):
+        original = {**self.status, 'state': 'failed',
+                    'error': 'ValueError: original preparation failure',
+                    'observation_error': None}
+        self.owner.status.side_effect = None
+        self.owner.status.return_value = original
+        path = self.output / 'runner-service-failure.json'
+        def verify_saved():
+            saved = json.loads(path.read_bytes())
+            self.assertEqual(saved['status'], original)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        def emit(progress):
+            if progress.get('state') == 'failed':
+                verify_saved()
+                self.assertNotIn('error', progress)
+                raise RuntimeError('later public callback failure')
+        self.caller.close.side_effect = verify_saved
+        with self.assertRaisesRegex(RuntimeError, 'later public'):
+            self.make().run(emit=emit)
+        verify_saved()
+        self.caller.close.assert_called_once()
+
+    def test_failure_diagnostic_write_error_still_closes_resources(self):
+        self.owner.status.side_effect = None
+        self.owner.status.return_value = {**self.status, 'state': 'failed', 'error': 'original'}
+        real = runner.write_once
+        def write(path, value):
+            if path.name == 'runner-service-failure.json':
+                raise OSError('diagnostic disk failure')
+            return real(path, value)
+        with patch.object(runner, 'write_once', side_effect=write):
+            with self.assertRaisesRegex(OSError, 'diagnostic disk failure'):
+                self.make().run()
+        self.caller.close.assert_called_once()
+        closed = json.loads((self.output / 'runner-closed.json').read_bytes())
+        self.assertTrue(closed['handles_closed'])
+        self.assertEqual(closed['error_type'], 'OSError')
 
     def test_same_bytes_replacement_permanently_invalidates(self):
         obj = self.invocation()

@@ -21,7 +21,7 @@ import cmux_codex_watch as core
 import ccc_workspace_batch as batch
 import ccc_standby_launch as launch
 from ccc_batch_timing import boot_id, stamp
-from ccc_codex_queue import epoch, process_writable_files
+from ccc_codex_queue import epoch, process_writable_files, IncompleteVnodeRead, VnodeInventoryChanged
 from ccc_guard_scope import process, birth
 from ccc_native_standby import COUNT, digest, identifier, write_once
 
@@ -336,6 +336,11 @@ class FirstTaskObserver:
                 if release:
                     self._release(index, row, claim, hook, slot)
                 return copy.deepcopy(record)
+            except (IncompleteVnodeRead, VnodeInventoryChanged):
+                # A changing FD inventory is no proof either way. The caller's
+                # original observation deadline bounds subsequent polls. Never
+                # release a hold or return a cached receipt on this poll.
+                return None
             except BaseException:
                 self._failed.add(index)
                 raise

@@ -12,7 +12,20 @@ from unittest import mock
 
 import ccc_observation as health
 import cmux_codex_watch as core
-from tests.test_watch import FakeClient, HIGH_DEMAND_TEXT, armed_daemon, grid_payload, process_fixture, span, visible_lines
+from tests.native_failure_fixture import bind_native_failure
+from tests.test_watch import FakeClient, HIGH_DEMAND_TEXT, armed_daemon as unbound_daemon, grid_payload, process_fixture, span, visible_lines
+
+
+def armed_daemon(directory, client, extra_targets=None):
+    """Delivery-layer fixture with an explicit, stable native failed turn.
+
+    Rendering an error alone no longer authorizes delivery. Keep the shared
+    unbound fixture unchanged so missing-proof gate tests remain meaningful.
+    Each scheduler target has its own synthetic native session identity.
+    """
+    daemon = unbound_daemon(directory, client, extra_targets=extra_targets)
+    bind_native_failure(daemon, HIGH_DEMAND_TEXT)
+    return daemon
 
 
 def error_frame():

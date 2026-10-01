@@ -7,6 +7,7 @@ from pathlib import Path
 import socket
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 import uuid
@@ -156,6 +157,28 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(sorted(self.activation.preparation.polled), list(range(50)))
         self.assertEqual(self.manager.refreshes, 1)
         self.assertEqual(self.manager.writes, 0)
+
+    def test_pending_slot_repolled_while_another_slot_is_blocked(self):
+        entered, release, repolled = threading.Event(), threading.Event(), threading.Event()
+        attempts = []
+        def poll(index):
+            if index == 0:
+                entered.set()
+                if not release.wait(3): raise TimeoutError('test release absent')
+            if index == 1:
+                attempts.append(index)
+                if len(attempts) == 1: return None
+                repolled.set()
+            return {'witness': True}
+        self.activation.preparation.poll = poll
+        self.owner.prepare()
+        try:
+            self.assertTrue(entered.wait(1))
+            self.assertTrue(repolled.wait(1), 'pending slot waited for unrelated blocked slot')
+        finally:
+            release.set()
+            self.owner._future.result(timeout=3)
+        self.assertEqual(self.owner.status()['state'], 'ready')
 
     def test_preparation_read_limit_preserves_all_fifty_originals(self):
         release = threading.Event()
@@ -459,6 +482,42 @@ class EndpointTests(unittest.TestCase):
         endpoint = service.ServiceEndpoint(self.owner, directory)
         self.addCleanup(endpoint.close)
         return endpoint
+
+    def test_resource_report_empty_endpoint_close(self):
+        endpoint = self.endpoint()
+        self.assertFalse(endpoint.resource_report()['resources_released'])
+        endpoint.close()
+        report = endpoint.resource_report()
+        self.assertTrue(report['resources_released'])
+        self.assertFalse(report['socket_path_present'])
+        self.assertEqual(report['worker_threads_alive'], 0)
+
+    def test_listener_close_does_not_claim_inflight_handler_completed(self):
+        endpoint = self.endpoint()
+        entered, release = threading.Event(), threading.Event()
+        def answer(_):
+            entered.set()
+            release.wait(3)
+            return {'ok': False}
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(client.close)
+        self.addCleanup(release.set)
+        client.settimeout(2)
+        with patch.object(endpoint, 'answer', side_effect=answer):
+            client.connect(str(endpoint.socket_path))
+            client.sendall(b'{}\n')
+            self.assertTrue(entered.wait(2))
+            endpoint.close()
+            report = endpoint.resource_report()
+            self.assertTrue(report['listener_closed'])
+            self.assertFalse(report['resources_released'])
+            self.assertEqual(report['worker_threads_alive'], 1)
+            self.assertEqual(report['connections'], 1)
+            release.set()
+            deadline = time.monotonic() + 2
+            while not endpoint.resource_report()['resources_released'] and time.monotonic() < deadline:
+                time.sleep(.005)
+            self.assertTrue(endpoint.resource_report()['resources_released'])
 
     def test_real_socket_status_does_not_start_preparation(self):
         endpoint = self.endpoint()

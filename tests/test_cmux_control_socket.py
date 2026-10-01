@@ -151,11 +151,13 @@ class ControlSocketTests(unittest.TestCase):
             self.assertEqual(len(requests), 1)
 
     def test_uncertain_control_send_reaches_daemon_delivery_ledger(self):
+        from tests.native_failure_fixture import bind_native_failure
         payload = grid_payload([], error=HIGH_DEMAND_TEXT)
         with tempfile.TemporaryDirectory() as directory:
             client = FakeClient(payload, "■ " + HIGH_DEMAND_TEXT)
             client.send = mock.Mock(side_effect=core.UncertainDeliveryError("lost socket acknowledgement"))
             daemon = armed_daemon(directory, client)
+            bind_native_failure(daemon, HIGH_DEMAND_TEXT)
             with mock.patch.object(core.time, "time", return_value=1000):
                 daemon.process_once(client)
                 daemon.process_once(client)

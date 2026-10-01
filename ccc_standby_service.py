@@ -153,23 +153,27 @@ class CohortService:
                     for future in futures:
                         future.cancel()
                     raise
-                pending = set(range(COUNT))
-                while pending:
-                    self._require_live()
-                    futures = {}
-                    try:
-                        for i in pending:
-                            futures[pool.submit(self._poll_preparation, i)] = i
-                        for future in as_completed(futures):
-                            if future.result() is not None:
-                                pending.remove(futures[future])
-                    except BaseException:
-                        self._cancel.set()
-                        for future in futures:
-                            future.cancel()
-                        raise
-                    if pending:
+                def prepare_original(index):
+                    # A slow unrelated slot must not consume this original's
+                    # bounded observation window between successive polls.
+                    # Each slot retains its existing one-shot control ledger.
+                    while True:
+                        self._require_live()
+                        result = self._poll_preparation(index)
+                        if result is not None:
+                            return result
                         self._stop.wait(self.poll_interval)
+                futures = []
+                try:
+                    for i in range(COUNT):
+                        futures.append(pool.submit(prepare_original, i))
+                    for future in as_completed(futures):
+                        future.result()
+                except BaseException:
+                    self._cancel.set()
+                    for future in futures:
+                        future.cancel()
+                    raise
             # A refresh witness alone is insufficient; the actual owner's
             # proof reader decides whether each original can enter ready.
             while True:
@@ -337,6 +341,29 @@ class _Server(socketserver.ThreadingUnixStreamServer):
     daemon_threads = True
     block_on_close = False
 
+    def __init__(self, *args, **kwargs):
+        self.resources_lock = threading.RLock()
+        self.connections = set()
+        self.workers = set()
+        super().__init__(*args, **kwargs)
+
+    def get_request(self):
+        connection, address = super().get_request()
+        with self.resources_lock:
+            self.connections.add(connection)
+        return connection, address
+
+    def process_request_thread(self, request, client_address):
+        with self.resources_lock:
+            self.workers = {worker for worker in self.workers if worker.is_alive()}
+            self.workers.add(threading.current_thread())
+        super().process_request_thread(request, client_address)
+
+    def close_request(self, request):
+        super().close_request(request)
+        with self.resources_lock:
+            self.connections.discard(request)
+
 
 class _Handler(socketserver.StreamRequestHandler):
     def handle(self):
@@ -439,6 +466,30 @@ class ServiceEndpoint:
     def _authorized(self):
         self._check()
         return True
+
+    def resource_report(self):
+        """Observe local RPC resources, not native or whole-job completion.
+
+        A closed listener can coexist with a still-running request handler.
+        Keep that distinction even after close() returned. This is a sampled
+        report and never permission to terminate the handler's native task.
+        """
+        server = self._server
+        if server is None:
+            listener_closed, connections, workers = True, 0, 0
+        else:
+            with server.resources_lock:
+                server.workers = {worker for worker in server.workers if worker.is_alive()}
+                listener_closed = server.socket.fileno() == -1
+                connections, workers = len(server.connections), len(server.workers)
+        server_alive = self._thread is not None and self._thread.is_alive()
+        socket_path_present = os.path.lexists(self.socket_path)
+        closed = self._closed.is_set()
+        return {'closed': closed, 'listener_closed': listener_closed,
+                'server_thread_alive': server_alive, 'worker_threads_alive': workers,
+                'connections': connections, 'socket_path_present': socket_path_present,
+                'resources_released': (closed and listener_closed and not server_alive
+                    and not workers and not connections and not socket_path_present)}
 
     def close(self):
         self._closed.set()

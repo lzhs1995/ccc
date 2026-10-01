@@ -199,10 +199,36 @@ def launch_registered(config_path, job_id, index, launch_id, *, generation_curre
                 and not any(t.get('surface_id') == sid and (t.get('paused') or not t.get('enabled', True))
                             for t in config['targets']))
 
+    membership_seen = False
+    membership_deadline = None
+
     def authorized():
-        if not permission_current():
-            return False
-        return core.find_main_surface(client.workspace_tree(wid), sid).get('workspace_id') == wid
+        nonlocal membership_seen, membership_deadline
+        # A create ACK can precede visibility in the controller's tree. Wait
+        # only for this original surface's first observation, never recreate
+        # it or treat absence as authorization. After visibility, disappearance
+        # is a revocation and the final exec guard must reject immediately.
+        if membership_deadline is None:
+            membership_deadline = time.monotonic() + 5.0
+        while True:
+            if not permission_current():
+                return False
+            tree = client.workspace_tree(wid)  # RPC errors are not retried.
+            records = core.main_surface_records(tree)
+            matches = [row for row in records if row['surface_id'] == sid]
+            if matches:
+                if len(matches) != 1 or matches[0]['workspace_id'] != wid:
+                    return False
+                if not membership_seen and time.monotonic() >= membership_deadline:
+                    raise ValueError('standby initial surface visibility deadline exceeded')
+                membership_seen = True
+                return True
+            if membership_seen:
+                raise core.CmuxError(f'main-area surface not found: {sid}')
+            remaining = membership_deadline - time.monotonic()
+            if remaining <= 0:
+                raise ValueError('standby initial surface visibility deadline exceeded')
+            time.sleep(min(0.05, remaining))
 
     with core.workspace_input_lock(config_path, wid, shared=True):
         exec_claimed(config_path, job_id, index, record, argv, authorized, permission_current,

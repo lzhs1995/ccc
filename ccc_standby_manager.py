@@ -103,29 +103,37 @@ class StandbyManager:
 
     def refresh(self):
         with self._operation, self.operation_context():
-            if self.state in {'observation_only', 'activated', 'partial', 'invalidated', 'closed'}:
-                return self.status()
-            try:
-                self._current()
-                rows = self._gather(self._observe)
-                self._current()
-                if not all(self._authorized(index) for index in range(COUNT)):
-                    raise ValueError('standby workspace or original authorization changed')
-                ready_count = sum(row is not None for row in rows)
-                if ready_count != COUNT:
-                    # Incomplete initial preparation is progress. Losing a
-                    # previously complete cohort is permanent invalidation.
-                    if self.state == 'ready':
-                        raise ValueError('standby readiness was lost')
-                    self._publish('preparing', ready_count)
-                    return self.status()
-                self.ledger.observe_ready(rows, config_generation=self.generation_current(),
-                    boot_id=self.boot_current(), authorized=True)
-                self._publish('ready', COUNT)
-            except Exception as exc:
-                self.invalidate(exc)
-                raise
+            return self._refresh_locked()
+
+    def _refresh_locked(self):
+        """Refresh within the existing operation and caller authorization context."""
+        if self.state in {'observation_only', 'activated', 'partial', 'invalidated', 'closed'}:
             return self.status()
+        try:
+            self._current()
+            rows = self._gather(self._observe)
+            self._current()
+            # These independent slot checks already run on workers during
+            # observation/delivery. Serial checks age out otherwise fresh
+            # observations as cohort size grows. Drain all futures before
+            # leaving the original caller authorization context.
+            if not all(self._gather(self._authorized)):
+                raise ValueError('standby workspace or original authorization changed')
+            ready_count = sum(row is not None for row in rows)
+            if ready_count != COUNT:
+                # Incomplete initial preparation is progress. Losing a
+                # previously complete cohort is permanent invalidation.
+                if self.state == 'ready':
+                    raise ValueError('standby readiness was lost')
+                self._publish('preparing', ready_count)
+                return self.status()
+            self.ledger.observe_ready(rows, config_generation=self.generation_current(),
+                boot_id=self.boot_current(), authorized=True)
+            self._publish('ready', COUNT)
+        except Exception as exc:
+            self.invalidate(exc)
+            raise
+        return self.status()
 
     def activate(self, *, action_id, mode, prompt, committed=None):
         """Consume one confirmed UI action, attempt original inputs once.
@@ -141,8 +149,11 @@ class StandbyManager:
             if self.state != 'ready':
                 raise ValueError('complete fresh standby readiness required')
             try:
+                # User confirmation may arrive long after preparation. Inspect
+                # the same native originals anew; never renew cached timestamps.
+                self._refresh_locked()
                 self._current()
-                permitted = all(self._authorized(index) for index in range(COUNT))
+                permitted = all(self._gather(self._authorized))
                 consumed = self.ledger.consume_activation(action_id=action_id, mode=mode, prompt=prompt,
                     config_generation=self.generation_current(), boot_id=self.boot_current(), authorized=permitted)
                 if not consumed:

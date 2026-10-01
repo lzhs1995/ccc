@@ -4,12 +4,63 @@ import hashlib
 import json
 from pathlib import Path
 import tempfile
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 import unittest
 from unittest.mock import Mock, patch
 import uuid
 
 import ccc_standby_prepare as prep
 from tests.test_standby_bootstrap import descriptor
+
+
+class FreshTopologyTests(unittest.TestCase):
+    def test_late_readers_require_new_snapshot_and_share_only_pending_wave(self):
+        self.exercise(False)
+
+    def test_failed_wave_releases_waiters_without_reusing_or_retrying_it(self):
+        self.exercise(True)
+
+    def exercise(self, fail):
+        entered, release = threading.Event(), threading.Event()
+        reads = []
+        def read():
+            reads.append(len(reads) + 1)
+            if len(reads) == 1:
+                entered.set()
+                if not release.wait(3):
+                    raise TimeoutError('test release missing')
+                if fail:
+                    raise OSError('original RPC failed')
+            return {'snapshot': len(reads), 'surfaces': [len(reads)]}
+        fresh = prep.FreshTopology(read)
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            first = pool.submit(fresh)
+            self.assertTrue(entered.wait(3))
+            later = [pool.submit(fresh) for _ in range(3)]
+            try:
+                deadline = time.monotonic() + 3
+                while True:
+                    with fresh.condition:
+                        count = len(fresh.pending)
+                    if count == 3 or time.monotonic() >= deadline:
+                        break
+                    time.sleep(.001)
+                self.assertEqual(count, 3)
+            finally:
+                release.set()
+            if fail:
+                with self.assertRaisesRegex(OSError, 'original RPC failed'):
+                    first.result(timeout=3)
+            else:
+                self.assertEqual(first.result(timeout=3)['snapshot'], 1)
+            values = [f.result(timeout=3) for f in later]
+        self.assertEqual([v['snapshot'] for v in values], [2, 2, 2])
+        values[0]['surfaces'].clear()
+        self.assertEqual(values[1]['surfaces'], [2])
+        self.assertEqual(fresh()['snapshot'], 3)  # No cached sequential read.
+        self.assertEqual(reads, [1, 2, 3])
 
 
 class PreparationTests(unittest.TestCase):
@@ -93,6 +144,46 @@ class PreparationTests(unittest.TestCase):
         self.assertEqual(len(self.writes), 1)
         self.assertTrue((self.directory / 'create-intent-0.json').exists())
         self.assertFalse((self.directory / 'create-ack-0.json').exists())
+
+    def test_known_ack_preserved_when_source_changes_after_create(self):
+        create = self.client.new_codex_surface.side_effect
+        def changed(*args, **kwargs):
+            result = create(*args, **kwargs)
+            self.pin.current.return_value = 'changed'
+            return result
+        self.client.new_codex_surface.side_effect = changed
+        with self.assertRaisesRegex(ValueError, 'lifetime changed'):
+            self.owner.launch_one(0)
+        ack = json.loads((self.directory/'create-ack-0.json').read_bytes())
+        self.assertEqual(ack['surface_id'], self.sid)
+        self.assertEqual(self.owner._surfaces[0], self.sid)
+        self.assertTrue(self.owner._failed.is_set())
+        from tools.standby_preparation_inventory import inventory
+        evidence = inventory(self.config, self.job['id'], self.directory)
+        self.assertEqual(len(evidence['rows']), 50)
+        self.assertEqual(evidence['rows'][0]['surface_id'], self.sid)
+        self.assertEqual(evidence['rows'][0]['state'], 'unknown_process')
+        self.assertTrue(all(r['state'] == 'unrecorded' for r in evidence['rows'][1:]))
+        self.assertFalse(evidence['cleanup_proven'])
+        self.pin.current.return_value = self.job['standby_generation']
+        with self.assertRaises(ValueError):
+            self.owner.launch_one(0)
+        self.assertEqual(len(self.writes), 1)
+
+    def test_ack_persistence_failure_never_recreates(self):
+        original = prep.write_once
+        def write(path, value):
+            if path.name == 'create-ack-0.json':
+                raise OSError('disk failure')
+            return original(path, value)
+        with patch.object(prep, 'write_once', side_effect=write):
+            with self.assertRaisesRegex(OSError, 'disk failure'):
+                self.owner.launch_one(0)
+        with self.assertRaises(ValueError):
+            self.owner.launch_one(0)
+        self.assertEqual(len(self.writes), 1)
+        self.assertTrue((self.directory/'create-intent-0.json').exists())
+        self.assertFalse((self.directory/'create-ack-0.json').exists())
 
     def test_pause_during_connection_refuses_create_and_does_not_revive(self):
         self.before_write = self.revoke
@@ -198,10 +289,29 @@ class PreparationTests(unittest.TestCase):
         files, barrier, birth = self.writer_observation()
         files.side_effect = OSError('incomplete vnode descriptor')
         birth.side_effect = [[4, 5], [4, 6]]
-        with self.assertRaises(ValueError):
+        with self.assertRaises(ValueError) as caught:
             self.owner.poll(0)
+        self.assertEqual(caught.exception.process_observation['observed_birth'], [4, 6])
+        self.assertEqual(caught.exception.process_observation['stage'], 'after_writer_inventory_error')
         self.assertTrue(self.owner._failed.is_set())
         barrier.assert_not_called()
+
+    def test_missing_birth_preserves_first_observation_and_never_sends(self):
+        files, barrier, birth = self.writer_observation()
+        birth.return_value = None
+        with self.assertRaises(ValueError) as caught:
+            self.owner.poll(0)
+        evidence = caught.exception.process_observation
+        self.assertEqual(evidence['expected_birth'], [4, 5])
+        self.assertIsNone(evidence['observed_birth'])
+        self.assertEqual(evidence['pid'], 123)
+        self.assertEqual(evidence['stage'], 'before_native_writer')
+        self.assertEqual(len(evidence['claim_sha256']), 64)
+        birth.assert_called_once_with(123, observation={})
+        files.assert_not_called()
+        barrier.assert_not_called()
+        self.assertTrue(self.owner._failed.is_set())
+        self.assertEqual(len(self.writes), 1)
 
     def test_writer_inventory_error_with_pause_is_terminal(self):
         files, barrier, _ = self.writer_observation()

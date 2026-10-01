@@ -73,6 +73,54 @@ class BootstrapTests(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=50) as executor:
             self.assertEqual(sorted(executor.map(read, range(50))), list(range(50)))
 
+    def test_launch_failure_is_saved_without_relaunch(self):
+        command = shlex.split(self.server.command(0))
+        error = ValueError('original exec guard refused')
+        with patch.object(bridge.launch, 'launch_registered', side_effect=error) as called:
+            with patch('sys.argv', command[2:]), self.assertRaises(ValueError) as caught:
+                bridge.main()
+        self.assertIs(caught.exception, error)
+        called.assert_called_once()
+        record = json.loads((self.root / 'bootstrap-failure-0.json').read_text())
+        self.assertEqual(record['job_id'], self.job['id'])
+        self.assertEqual(record['spec_sha256'], self.server.sha256)
+        self.assertEqual(record['launch_id'], self.job['slots'][0]['launch_id'])
+        self.assertIn('original exec guard refused', record['traceback'])
+
+    def test_existing_failure_is_not_overwritten_or_retried(self):
+        path = self.root / 'bootstrap-failure-0.json'
+        path.write_bytes(b'original failure')
+        command = shlex.split(self.server.command(0))
+        error = ValueError('later failure')
+        with patch.object(bridge.launch, 'launch_registered', side_effect=error) as called:
+            with patch('sys.argv', command[2:]), self.assertRaises(ValueError) as caught:
+                bridge.main()
+        self.assertIs(caught.exception, error)
+        self.assertEqual(path.read_bytes(), b'original failure')
+        called.assert_called_once()
+        self.assertTrue(error.bootstrap_diagnostic_error)
+
+    def test_failure_identity_preserves_unknown_and_drift_without_retry(self):
+        command = shlex.split(self.server.command(0))
+        for samples in (([123, 45], [123, 45]), (None, None), ([123, 45], [124, 0])):
+            with self.subTest(samples=samples):
+                path = self.root / 'bootstrap-failure-0.json'
+                path.unlink(missing_ok=True)
+                error = ValueError('generation refused before registration')
+                with patch.object(bridge, 'birth', side_effect=samples), \
+                     patch.dict(bridge.os.environ, CMUX_SURFACE_ID='original-surface',
+                                CMUX_WORKSPACE_ID='original-workspace'), \
+                     patch.object(bridge.launch, 'launch_registered', side_effect=error) as called, \
+                     patch('sys.argv', command[2:]), self.assertRaises(ValueError) as caught:
+                    bridge.main()
+                self.assertIs(caught.exception, error)
+                called.assert_called_once()
+                observed = json.loads(path.read_text())['bootstrap_identity']
+                self.assertEqual(observed['birth_before'], samples[0])
+                self.assertEqual(observed['birth_after'], samples[1])
+                self.assertEqual(observed['surface_id'], 'original-surface')
+                self.assertEqual(observed['workspace_id_after'], 'original-workspace')
+
     def test_source_a_b_a_never_revives_reader_or_owner(self):
         self.value = 'b'*64
         with self.assertRaises(ValueError):

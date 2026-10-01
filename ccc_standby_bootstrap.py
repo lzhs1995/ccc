@@ -19,9 +19,12 @@ import socketserver
 import stat
 import sys
 import threading
+import time
+import traceback
 import uuid
 
 import ccc_standby_launch as launch
+from ccc_guard_scope import birth
 from ccc_native_standby import generation, identifier, write_once
 from ccc_standby_environment import EnvironmentFile, template, signature
 
@@ -258,9 +261,42 @@ def main():
     selected = {k: spec[k] for k in
                 ('policy', 'job_id', 'cohort_id', 'workspace_id', 'mode', 'boot_id', 'generation')}
     environment = EnvironmentFile(spec['environment_path'], spec['environment_sha256'], selected)
-    launch.launch_registered(args.config, spec['job_id'], args.index,
-        spec['launch_ids'][args.index], generation_current=current,
-        environment_current=environment.current)
+    directory_identity = _identity(args.spec.parent, stat.S_ISDIR)
+    bootstrap_pid = os.getpid()
+    bootstrap_birth = birth(bootstrap_pid)
+    bootstrap_surface = os.environ.get('CMUX_SURFACE_ID')
+    bootstrap_workspace = os.environ.get('CMUX_WORKSPACE_ID')
+    try:
+        launch.launch_registered(args.config, spec['job_id'], args.index,
+            spec['launch_ids'][args.index], generation_current=current,
+            environment_current=environment.current)
+    except BaseException as error:
+        # Successful exec never returns. Preserve the bootstrap's own failure,
+        # rather than inferring its cause later from an unavailable PID.
+        try:
+            if _identity(args.spec.parent, stat.S_ISDIR) != directory_identity:
+                raise ValueError('bootstrap diagnostic directory changed')
+            write_once(args.spec.parent / f'bootstrap-failure-{args.index}.json', {
+                'kind': 'bootstrap_launch_failure', **selected,
+                'index': args.index, 'launch_id': spec['launch_ids'][args.index],
+                'spec_sha256': args.spec_sha256, 'pid': os.getpid(),
+                # Diagnostic observations, not a registration/cleanup claim.
+                # Preserve both samples so unknown/drift cannot certify identity.
+                'bootstrap_identity': {
+                    'pid': bootstrap_pid, 'birth_before': bootstrap_birth,
+                    'birth_after': birth(bootstrap_pid),
+                    'surface_id': bootstrap_surface,
+                    'workspace_id': bootstrap_workspace,
+                    'surface_id_after': os.environ.get('CMUX_SURFACE_ID'),
+                    'workspace_id_after': os.environ.get('CMUX_WORKSPACE_ID'),
+                },
+                'at': time.time(), 'monotonic_ns': time.monotonic_ns(),
+                'error': repr(error), 'traceback': traceback.format_exc(),
+            })
+        except BaseException as diagnostic_error:
+            # Keep the original failure and never retry the consumed launch.
+            error.bootstrap_diagnostic_error = repr(diagnostic_error)
+        raise
 
 
 if __name__ == '__main__':

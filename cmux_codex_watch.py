@@ -6958,11 +6958,19 @@ class WatchDaemon:
         log_path = DEFAULT_LOG_DIR / "watch.log"
         log_dir_was_missing = not DEFAULT_LOG_DIR.exists()
         DEFAULT_LOG_DIR.mkdir(parents=True, exist_ok=True)
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(asctime)s %(levelname)s %(message)s",
-            handlers=[logging.FileHandler(log_path, encoding="utf-8"), logging.StreamHandler(sys.stderr)],
-        )
+        handlers = [logging.FileHandler(log_path, encoding="utf-8"), logging.StreamHandler(sys.stderr)]
+        try:
+            logging.basicConfig(
+                level=logging.INFO,
+                format="%(asctime)s %(levelname)s %(message)s",
+                handlers=handlers,
+            )
+        finally:
+            # basicConfig leaves existing root configuration intact. It does
+            # not take ownership of supplied handlers in that case.
+            for handler in handlers:
+                if handler not in logging.getLogger().handlers:
+                    handler.close()
         # Seed the log-channel baseline so the first periodic check compares
         # against the inode we actually opened rather than re-discovering it.
         try:

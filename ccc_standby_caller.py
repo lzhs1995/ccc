@@ -79,6 +79,9 @@ class CohortSources:
     def close(self):
         self.pin.close()
 
+    def resource_report(self):
+        return self.pin.resource_report()
+
 
 class ProductionCaller:
     """Own the original routes until explicitly closed, including continuation.

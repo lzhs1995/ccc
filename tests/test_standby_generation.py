@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from ccc_standby_generation import SCOPES, StandbyGeneration
+from ccc_standby_generation import SCOPES, StandbyGeneration, _VnodeWatch
 
 
 class GenerationTests(unittest.TestCase):
@@ -29,6 +29,41 @@ class GenerationTests(unittest.TestCase):
         pin = self.pin()
         self.assertEqual(pin.current(), pin.value)
         self.assertEqual(before, {str(p): p.read_bytes() for p in self.root.rglob('*') if p.is_file()})
+
+    def test_non_event_resource_report_requires_close(self):
+        pin = self.pin()
+        self.assertFalse(pin.resource_report()['resources_released'])
+        pin.close()
+        self.assertTrue(pin.resource_report()['resources_released'])
+
+    @unittest.skipUnless(hasattr(select, 'kqueue'), 'Darwin kqueue required')
+    def test_real_watcher_close_receipt(self):
+        path = self.root / 'watched'; path.write_text('data')
+        watcher = _VnodeWatch({str(path): 'content'}, 10)
+        self.addCleanup(watcher.close)
+        self.assertFalse(watcher.resource_report()['resources_released'])
+        watcher.close()
+        report = watcher.resource_report()
+        self.assertTrue(report['resources_released'])
+        self.assertEqual(report['successful_vnode_closes'], 1)
+        watcher.close()
+        self.assertEqual(watcher.resource_report(), report)
+
+    @unittest.skipUnless(hasattr(select, 'kqueue'), 'Darwin kqueue required')
+    def test_close_error_is_not_erased_or_retried(self):
+        path = self.root / 'watched'; path.write_text('data')
+        watcher = _VnodeWatch({str(path): 'content'}, 10)
+        fd = watcher._fds[0]
+        try:
+            with patch('ccc_standby_generation.os.close', side_effect=OSError(5, 'injected')) as close:
+                watcher.close()
+                watcher.close()
+                self.assertEqual(close.call_count, 1)
+            report = watcher.resource_report()
+            self.assertFalse(report['resources_released'])
+            self.assertEqual(report['close_errors'], [{'fd': fd, 'errno': 5}])
+        finally:
+            os.close(fd)
 
     def test_each_dependency_change_invalidates(self):
         for name in SCOPES:

@@ -180,6 +180,15 @@ class Runner:
                     break
                 self._check()
                 state = self.owner.status()
+                if state['state'] == 'failed':
+                    # Preserve the original private failure before callbacks or
+                    # teardown can hide it behind a closed-endpoint exception.
+                    # Do not include these diagnostics in public UI progress.
+                    write_once(self.directory / 'runner-service-failure.json', {
+                        'version': 1, 'kind': 'standby_runner_service_failure',
+                        'invocation_id': value['invocation_id'],
+                        'observed_at': time.time(), 'observed_monotonic': self.clock(),
+                        'status': state})
                 # Keep raw service diagnostics in the original private service;
                 # public progress needs no credentials or native argv/env.
                 progress = {key: state.get(key) for key in (
@@ -216,6 +225,36 @@ class Runner:
                         'closed_at': time.time(), 'closed_monotonic': self.clock(),
                         'job_terminal': False, 'run_terminal': False,
                         'native_processes_terminated': False}
+                    # Preserve actual communication-resource observations.
+                    # close() returning alone does not prove handler exit or
+                    # native completion; missing/error reports stay unknown.
+                    closed['communication_resources'] = {}
+                    for name, resource, method in (
+                        ('routes', getattr(self.caller, 'routes', None), 'report'),
+                        ('owner_endpoint', getattr(self.owner, 'endpoint', None), 'resource_report'),
+                    ):
+                        try:
+                            report = getattr(resource, method)()
+                            if not isinstance(report, dict):
+                                raise ValueError('resource report unavailable')
+                            closed['communication_resources'][name] = report
+                        except Exception as exc:
+                            closed['communication_resources'][name] = {
+                                'resources_released': False, 'observation_error': type(exc).__name__}
+                    closed['communication_resources_released'] = all(
+                        report.get('resources_released') is True
+                        for report in closed['communication_resources'].values())
+                    try:
+                        sources = self.caller.sources.resource_report()
+                        if not isinstance(sources, dict):
+                            raise ValueError('source resource report unavailable')
+                    except Exception as exc:
+                        sources = {'resources_released': False,
+                                   'observation_error': type(exc).__name__}
+                    closed['source_resources'] = sources
+                    closed['all_resources_released'] = (
+                        closed['communication_resources_released'] and
+                        sources.get('resources_released') is True and close_error is None)
                     write_once(self.directory / 'runner-closed.json', closed)
         return 1 if reason.startswith('service_') and reason != 'service_cancelled' else 0
 

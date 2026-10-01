@@ -82,7 +82,7 @@ class ActivationOwner:
             raise ValueError('invalid activation slot')
         return self.preparation.job['slots'][index]
 
-    def authorized(self, index):
+    def authorized(self, index, *, topology=True):
         """Reapply the caller's live input guard inside the ledger write lock.
 
         CmuxClient also invokes this thread's input guard on connection
@@ -102,7 +102,8 @@ class ActivationOwner:
             if check is not None and check != self._caller_authorized and check() is not True:
                 self._invalid.set()
                 return False
-            allowed = self.preparation._authorized(index, surface_id=sid, connected=self.client)
+            allowed = self.preparation._authorized(index, surface_id=sid,
+                connected=self.client if topology else None)
             self._current()
             if allowed is not True:
                 self._invalid.set()
@@ -154,13 +155,18 @@ class ActivationOwner:
                     raise ValueError('readiness proof does not cover the original activation')
                 # Both callbacks precede the barrier's actual screen read and
                 # final original PID/writer/rollout/prefix inspection.
-                if not self.authorized(index):
+                # The preparation barrier immediately follows this callback
+                # with its own connected topology/permission check, then
+                # repeats it after replay and after native identity reads.
+                # Retain every live caller/source/permission check here, but
+                # do not issue the same topology RPC twice at this boundary.
+                if not self.authorized(index, topology=False):
                     raise ValueError('activation observation no longer authorized')
                 checked.append((baseline, proof is not None, row['return_receipt_sha256']))
 
             final_checks = []
             def final():
-                if final_checks or not self.authorized(index):
+                if final_checks or not self.authorized(index, topology=False):
                     raise ValueError('activation final action authorization refused')
                 final_checks.append(True)
 

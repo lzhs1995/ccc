@@ -69,6 +69,39 @@ class FirstTaskTests(unittest.TestCase):
         self.assertEqual(self.observer.poll(0), result)
         self.assertFalse(self.client.sent)
 
+    def test_incomplete_inventory_waits_without_releasing_then_rechecks(self):
+        self.task()
+        for error in (acceptance.IncompleteVnodeRead(9, 'closed fd'),
+                      acceptance.VnodeInventoryChanged('changed')):
+            with patch.object(acceptance, 'process_writable_files', side_effect=error):
+                self.assertIsNone(self.observer.poll(0))
+                self.assertIsNone(self.observer.poll(0))
+            self.assertTrue(self.hold())
+            self.assertFalse(self.result_path.exists())
+            self.assertNotIn(0, self.observer._failed)
+        self.assertTrue(self.observer.poll(0)['confirmation']['confirmed'])
+        self.assertFalse(self.hold())
+        self.assertFalse(self.client.sent)
+
+    def test_incomplete_final_read_never_releases_cached_confirmation(self):
+        self.task()
+        original = self.observer._live
+        calls = []
+        def live(*args):
+            calls.append(1)
+            if len(calls) == 3:
+                raise acceptance.IncompleteVnodeRead(9, 'final read')
+            return original(*args)
+        with patch.object(self.observer, '_live', side_effect=live):
+            self.assertIsNone(self.observer.poll(0))
+        self.assertTrue(self.hold())
+        self.assertFalse(self.result_path.exists())
+        self.born.return_value = [999, 1]
+        with self.assertRaises(ValueError):
+            self.observer.poll(0)
+        self.assertTrue(self.hold())
+        self.assertFalse(self.client.sent)
+
     def test_missing_hook_never_substitutes_ack(self):
         self.task()
         (self.worker.path.parent / 'standby-session-0.json').unlink()

@@ -510,7 +510,8 @@ def main(args):
         write(output/'frozen-slots.json',logs)
         output_checks=[];first_tasks=[];timings=[]
         for slot in logs:
-            records=[json.loads(line) for line in Path(slot['frozen_transcript']).read_text().splitlines()]
+            transcript_raw=Path(slot['frozen_transcript']).read_bytes()
+            records=[json.loads(line) for line in transcript_raw.splitlines()]
             metadata=next((r.get('payload',{}) for r in records if r.get('type')=='session_meta'),{})
             first=next((r for r in records if r.get('type')=='event_msg'
                         and r.get('payload',{}).get('type')=='task_started'),None)
@@ -521,10 +522,13 @@ def main(args):
             completions=[r['payload'] for r in records if r.get('type')=='event_msg'
                          and r.get('payload',{}).get('type')=='task_complete']
             last=completions[-1] if completions else {}
+            lifecycle=native_acceptance_metrics.evaluate_native_completion(
+                records, slot['session_id'], args.rounds)
             output_checks.append({'surface_id':slot['surface_id'],'session_id':slot['session_id'],
                 'turn_id':last.get('turn_id'),'error':last.get('error'),
                 'last_agent_message':last.get('last_agent_message'),
-                'strict_ok':bool(last and not last.get('error') and last.get('last_agent_message','')=='OK')})
+                'transcript_sha256':hashlib.sha256(transcript_raw).hexdigest(),
+                'lifecycle':lifecycle, 'strict_ok':lifecycle['passed']})
         write(output/'final-output-checks.json',output_checks)
         report['strict_final_ok']=sum(r['strict_ok'] for r in output_checks)
         if logs:

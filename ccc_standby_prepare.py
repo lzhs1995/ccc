@@ -7,6 +7,7 @@ surface after an unknown result, or reconstructs an old owner from disk.
 from __future__ import annotations
 
 from functools import partial
+import copy
 import hashlib
 import json
 from pathlib import Path
@@ -25,6 +26,47 @@ from ccc_standby_rollouts import RolloutInventory
 from ccc_standby_environment import template, signature
 
 
+class FreshTopology:
+    """Coalesce pending readers, never attach a reader to an ongoing RPC.
+
+    Each cohort is detached before its read starts. A later caller waits for
+    a new read, so a post-replay check cannot inherit a pre-replay snapshot.
+    There is no cache, worker thread, or retry of failed reads.
+    """
+    def __init__(self, read):
+        self.read = read
+        self.condition = threading.Condition()
+        self.pending = []
+        self.active = False
+
+    def __call__(self):
+        ticket = {}
+        with self.condition:
+            self.pending.append(ticket)
+            while True:
+                if ticket.get('done'):
+                    if 'error' in ticket:
+                        raise ticket['error']
+                    return copy.deepcopy(ticket['value'])
+                if not self.active:
+                    self.active = True
+                    cohort, self.pending = self.pending, []
+                    break
+                self.condition.wait()
+        try:
+            result = {'value': self.read()}
+        except BaseException as exc:
+            result = {'error': exc}
+        with self.condition:
+            for pending in cohort:
+                pending.update(result, done=True)
+            self.active = False
+            self.condition.notify_all()
+        if 'error' in result:
+            raise result['error']
+        return copy.deepcopy(result['value'])
+
+
 class PreparationOwner:
     def __init__(self, config_path, job_id, *, directory, client, source_pin,
                  sessions_root, target_environment):
@@ -41,6 +83,7 @@ class PreparationOwner:
             raise ValueError('preparation environment differs from original job')
         self.directory = Path(directory)
         self.client, self.source_pin = client, source_pin
+        self._topology = FreshTopology(lambda: self.client.workspace_tree(self.job['workspace_id']))
         self.sessions_root = Path(sessions_root).resolve(strict=True)
         self._closed = threading.Event()
         self._failed = threading.Event()
@@ -100,7 +143,9 @@ class PreparationOwner:
         if not self._permission(index, surface_id):
             return False
         if surface_id is not None and connected is not None:
-            target = core.find_main_surface(connected.workspace_tree(self.job['workspace_id']), surface_id)
+            tree = (self._topology() if connected is self.client else
+                    connected.workspace_tree(self.job['workspace_id']))
+            target = core.find_main_surface(tree, surface_id)
             if target.get('workspace_id') != self.job['workspace_id']:
                 self._failed.set()
                 return False
@@ -159,12 +204,15 @@ class PreparationOwner:
                         surface = self.client.new_codex_surface(win['id'], self.job['workspace_id'],
                             pane['id'], command, clean_shell=True)
                 identifier(surface)
-                self._current()
+                # The create already happened. Preserve its known identity even
+                # if the source/lifetime changed while the ACK was in flight.
+                # Recording evidence grants no further launch authorization.
                 write_once(self.directory / f'create-ack-{index}.json', {
                     'index': index, 'launch_id': self.job['slots'][index]['launch_id'],
                     'surface_id': surface, 'workspace_id': self.job['workspace_id'],
                     'at': time.time()})
                 self._surfaces[index] = surface
+                self._current()
                 return surface
             except BaseException:
                 self._failed.set()
@@ -194,8 +242,24 @@ class PreparationOwner:
         # identity or send input. The full helper performs all checks next.
         from ccc_guard_scope import process, birth
         from ccc_codex_queue import process_writable_files
-        if birth(claim['bootstrap_pid']) != claim['bootstrap_birth']:
-            raise ValueError('original preparation bootstrap exited or was replaced')
+        def check_birth(stage):
+            syscall = {}
+            observed = birth(claim['bootstrap_pid'], observation=syscall)
+            if observed != claim['bootstrap_birth']:
+                error = ValueError('original preparation bootstrap identity unavailable or changed')
+                error.process_observation = {
+                    'stage': stage, 'index': index,
+                    'pid': claim['bootstrap_pid'],
+                    'expected_birth': claim['bootstrap_birth'],
+                    'observed_birth': observed,
+                    'syscall': syscall,
+                    'claim_sha256': hashlib.sha256(raw).hexdigest(),
+                    'surface_id': self._surfaces[index],
+                    'at': time.time(),
+                    'monotonic_ns': time.monotonic_ns(),
+                }
+                raise error
+        check_birth('before_native_writer')
         native = process(claim['bootstrap_pid'], launch=True)
         if not native:
             return None
@@ -205,8 +269,7 @@ class PreparationOwner:
             # Startup can close/reuse descriptors between libproc reads. This
             # is unknown evidence, not a writer witness. Retry observation on
             # a later bounded poll; never construct a barrier or send input.
-            if birth(claim['bootstrap_pid']) != claim['bootstrap_birth']:
-                raise ValueError('original preparation bootstrap exited or was replaced')
+            check_birth('after_writer_inventory_error')
             if not self._authorized(index):
                 raise ValueError('preparation observation no longer authorized')
             return None

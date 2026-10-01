@@ -809,8 +809,13 @@ class QueueRecovery:
         The current process must belong to this exact workspace and surface,
         and hold exactly one original rollout open. No Hook is synthesized.
         """
-        if self.process_lookup is None or not self.sessions_root.is_dir():
+        if self.process_lookup is None:
             return None
+        # A configured native reader losing its sessions directory is not a
+        # legacy client. None permits viewport-only dispatch downstream and
+        # could submit while the original turn is still reconnecting.
+        if not self.sessions_root.is_dir():
+            return {"kind": "unknown"}
         label = self.process_lookup(target)
         hint_started = None
         hint_source = None

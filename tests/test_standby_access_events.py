@@ -69,6 +69,33 @@ class AccessEventTests(unittest.TestCase):
         self.file.chmod(0o700)
         self.reject()
 
+    def test_read_between_fd_and_alias_observations(self):
+        queue = Mock()
+        queue.control.return_value = [select.kevent(self.watch._fds[0],
+            filter=select.KQ_FILTER_VNODE, fflags=select.KQ_NOTE_ATTRIB)]
+        original = Path.lstat
+        def read_then_stat(path, *args, **kwargs):
+            self.file.read_bytes()
+            return original(path, *args, **kwargs)
+        with patch.object(self.watch, '_queue', queue), patch.object(Path, 'lstat', read_then_stat):
+            self.watch.check()
+        self.assertNotEqual(self.file.stat().st_atime_ns, self.before.st_atime_ns)
+
+    def test_mutation_after_last_alias_observation_refuses(self):
+        queue = Mock()
+        queue.control.return_value = [select.kevent(self.watch._fds[0],
+            filter=select.KQ_FILTER_VNODE, fflags=select.KQ_NOTE_ATTRIB)]
+        original = Path.lstat
+        calls = []
+        def stat_then_mutate(path, *args, **kwargs):
+            info = original(path, *args, **kwargs)
+            calls.append(path)
+            if len(calls) == 2:
+                self.file.chmod(0o600)
+            return info
+        with patch.object(self.watch, '_queue', queue), patch.object(Path, 'lstat', stat_then_mutate):
+            self.reject()
+
     def test_mode_roundtrip_with_access_refuses(self):
         self.file.read_bytes()
         self.file.chmod(0o600)

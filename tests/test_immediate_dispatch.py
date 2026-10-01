@@ -15,6 +15,7 @@ from ccc_delivery import DeliveryStore
 from ccc_codex_queue import task_snapshot
 from ccc_scheduling import CoalescingWriter, SurfaceScheduler
 from tests.test_watch import FakeClient, HIGH_DEMAND_TEXT, armed_daemon, grid_payload
+from tests.native_failure_fixture import bind_native_failure
 
 
 class ImmediateSchedulerTests(unittest.TestCase):
@@ -23,6 +24,7 @@ class ImmediateSchedulerTests(unittest.TestCase):
             held, release = threading.Event(), threading.Event()
             client = FakeClient(grid_payload([], error=HIGH_DEMAND_TEXT), '■ ' + HIGH_DEMAND_TEXT)
             daemon = armed_daemon(directory, client)
+            bind_native_failure(daemon, HIGH_DEMAND_TEXT)
             read = client.read_screen
             first = [True]
             def delayed(*args):

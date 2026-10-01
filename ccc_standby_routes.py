@@ -65,6 +65,7 @@ class RouteObserver:
         self._closed = self._failed = False
         self._action = None
         self._connections = set()
+        self._workers = set()
         self._upstreams = {}
         self._pending = 0
         self._accepted = 0
@@ -88,9 +89,13 @@ class RouteObserver:
                 return connection, address
 
             def close_request(self, request):
+                super().close_request(request)
                 with owner._lock:
                     owner._connections.discard(request)
-                super().close_request(request)
+
+            def process_request_thread(self, request, client_address):
+                owner._track_worker(threading.current_thread())
+                super().process_request_thread(request, client_address)
 
             def handle_error(self, request, address):
                 # Never allow an unhandled parser/transport error to support
@@ -184,6 +189,11 @@ class RouteObserver:
             with self._lock:
                 if not self._closed:
                     self._failed = True
+
+    def _track_worker(self, thread):
+        with self._lock:
+            self._workers = {worker for worker in self._workers if worker.is_alive()}
+            self._workers.add(thread)
 
     def _index(self, target):
         try:
@@ -368,7 +378,9 @@ class RouteObserver:
                 with contextlib.suppress(OSError):
                     target.shutdown(socket.SHUT_WR)
         thread = threading.Thread(target=pump, args=(handler.rfile, upstream), daemon=True)
-        thread.start()
+        with self._lock:
+            thread.start()
+            self._track_worker(thread)
         pump(response.fp, handler.connection)
         with contextlib.suppress(OSError):
             handler.connection.shutdown(socket.SHUT_RD)
@@ -424,7 +436,23 @@ class RouteObserver:
 
     def report(self):
         with self._lock:
+            self._workers = {worker for worker in self._workers if worker.is_alive()}
+            resources = {
+                'listener_closed': self._server.socket.fileno() == -1,
+                'server_thread_alive': self._thread.is_alive(),
+                'worker_threads_alive': len(self._workers),
+                'downstream_connections': len(self._connections),
+                'upstream_connections': len(self._upstreams),
+                'upstream_sockets': sum(len(streams) for streams in self._upstreams.values()),
+            }
+            released = (self._closed and resources['listener_closed']
+                        and not resources['server_thread_alive']
+                        and not resources['worker_threads_alive']
+                        and not resources['downstream_connections']
+                        and not resources['upstream_connections']
+                        and not resources['upstream_sockets'] and self._pending == 0)
             return {'action_id': self._action, 'closed': self._closed, 'failed': self._failed,
+                    'resources': resources, 'resources_released': released,
                     'pending_connections': self._pending, 'accepted_connections': self._accepted,
                     'unattributed_requests': self._unattributed, 'slots': copy.deepcopy(self._records)}
 

@@ -2,6 +2,7 @@ import copy
 from pathlib import Path
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 import uuid
@@ -55,6 +56,43 @@ class ManagerTests(unittest.TestCase):
         self.assertFalse(self.activate()['new_activation'])
         self.assertEqual(len({item[1] for item in self.sent}), 50)
 
+    def test_confirmation_after_idle_reobserves_originals_once(self):
+        self.manager.refresh()
+        self.now += 30
+        for row in self.rows:
+            row['observed_monotonic'] = self.now
+        self.assertEqual(self.activate()['delivery']['acknowledged_inputs'], 50)
+        self.assertFalse(self.activate()['new_activation'])
+        self.assertEqual(len(self.sent), 50)
+
+    def test_confirmation_rejects_stale_observer_without_consuming(self):
+        self.manager.refresh()
+        self.now += 30
+        with self.assertRaises(ValueError): self.activate()
+        self.assertEqual(self.sent, [])
+        self.assertFalse((self.directory / 'activation.json').exists())
+
+    def test_confirmation_rejects_lost_readiness_before_any_send(self):
+        self.manager.refresh()
+        self.rows[49]['readiness_proven'] = False
+        with self.assertRaises(ValueError): self.activate()
+        self.assertEqual(self.sent, [])
+        self.assertFalse((self.directory / 'activation.json').exists())
+
+    def test_slow_independent_authorization_does_not_age_out_whole_cohort(self):
+        self.ledger.clock = time.monotonic
+        def observe(index):
+            return {**copy.deepcopy(self.rows[index]), 'observed_monotonic': time.monotonic()}
+        self.manager.observer = observe
+        self.manager.refresh()
+        def authorized(index):
+            time.sleep(.05)
+            return True
+        self.manager.authorized = authorized
+        result = self.activate()
+        self.assertEqual(result['delivery']['acknowledged_inputs'], 50)
+        self.assertEqual(len(self.sent), 50)
+
     def test_lost_readiness_does_not_revive(self):
         self.manager.refresh(); self.rows[0]['readiness_proven'] = False
         with self.assertRaises(ValueError): self.manager.refresh()
@@ -98,8 +136,9 @@ class ManagerTests(unittest.TestCase):
 
     def test_writer_identity_cannot_change_after_ready(self):
         self.manager.refresh(); self.rows[0]['writer_identity'][1] += 1
-        self.assertEqual(self.activate()['state'], 'invalidated')
-        self.assertNotIn(0, [i for i, _ in self.sent])
+        with self.assertRaises(ValueError): self.activate()
+        self.assertEqual(self.manager.status()['state'], 'invalidated')
+        self.assertEqual(self.sent, [])
 
     def test_consumed_restart_is_observation_only(self):
         self.manager.refresh(); self.activate()

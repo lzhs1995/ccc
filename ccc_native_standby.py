@@ -90,7 +90,12 @@ def fresh(observation, boot_id, now):
             or type(now) not in (int, float) or not math.isfinite(now)
             or at < 0 or not 0 <= now - at <= MAX_OBSERVATION_AGE
             or observation.get('boot_id') != boot_id):
-        raise ValueError('stale or foreign standby observation')
+        valid_clock = (type(at) in (int, float) and math.isfinite(at)
+                       and type(now) in (int, float) and math.isfinite(now))
+        age = now - at if valid_clock else None
+        raise ValueError('stale or foreign standby observation: '
+                         f'age_seconds={age!r}, max_age_seconds={MAX_OBSERVATION_AGE}, '
+                         f'boot_matches={observation.get("boot_id") == boot_id}')
     if (observation.get('initialized') is not True or observation.get('idle') is not True
             or observation.get('composer_empty') is not True
             or observation.get('pending_approval') is not False

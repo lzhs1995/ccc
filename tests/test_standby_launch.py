@@ -89,6 +89,84 @@ class StandbyLaunchTests(unittest.TestCase):
                 self.assertEqual(skill_options, [v for v in options if 'skill_search' in v])
         self.exec_mock.assert_not_called()
 
+    def membership_sequence(self, values):
+        original = self.client.workspace_tree(self.wid)
+        absent = copy.deepcopy(original)
+        for window in absent['windows']:
+            for workspace in window['workspaces']:
+                for pane in workspace['panes']:
+                    pane['surfaces'] = []
+        return patch.object(self.client, 'workspace_tree',
+                            side_effect=[original if v else absent for v in values])
+
+    def test_created_surface_waits_for_initial_tree_visibility_without_recreation(self):
+        with self.membership_sequence([False, False, True, True]), \
+                patch.object(launch.time, 'sleep') as wait:
+            self.start_native()
+        self.assertEqual(wait.call_count, 2)
+        self.exec_mock.assert_called_once()
+        batch.register.assert_called_once()
+        self.assertFalse(self.client.sent)
+
+    def test_initial_tree_wait_has_monotonic_deadline_and_keeps_claim(self):
+        clock = [10.0]
+        def advance(_):
+            clock[0] = 16.0
+        with self.membership_sequence([False, False]), \
+                patch.object(launch.time, 'monotonic', side_effect=lambda: clock[0]), \
+                patch.object(launch.time, 'sleep', side_effect=advance):
+            with self.assertRaisesRegex(ValueError, 'visibility deadline'):
+                self.start_native()
+        self.exec_mock.assert_not_called()
+        self.assertTrue(launch.claim_path(self.config, self.worker.job['id'], 0).exists())
+
+    def test_initial_tree_wait_rechecks_birth_before_another_read(self):
+        def revoke(_):
+            self.birth_mock.return_value = None
+        with self.membership_sequence([False]) as tree, \
+                patch.object(launch.time, 'sleep', side_effect=revoke):
+            with self.assertRaises(ValueError):
+                self.start_native()
+        self.assertEqual(tree.call_count, 1)
+        self.exec_mock.assert_not_called()
+
+    def test_visible_surface_disappearance_at_exec_is_not_retried(self):
+        with self.membership_sequence([True, False]), patch.object(launch.time, 'sleep') as wait:
+            with self.assertRaises(core.CmuxError):
+                self.start_native()
+        wait.assert_not_called()
+        self.exec_mock.assert_not_called()
+
+    def test_initial_tree_rpc_failure_is_not_retried(self):
+        with patch.object(self.client, 'workspace_tree', side_effect=core.CmuxError('RPC failed')), \
+                patch.object(launch.time, 'sleep') as wait:
+            with self.assertRaisesRegex(core.CmuxError, 'RPC failed'):
+                self.start_native()
+        wait.assert_not_called()
+        self.exec_mock.assert_not_called()
+
+    def test_tree_visibility_returning_after_deadline_does_not_exec(self):
+        clock = [10.0]
+        original = self.client.workspace_tree(self.wid)
+        def delayed_tree(_):
+            clock[0] = 16.0
+            return original
+        with patch.object(self.client, 'workspace_tree', side_effect=delayed_tree), \
+                patch.object(launch.time, 'monotonic', side_effect=lambda: clock[0]):
+            with self.assertRaisesRegex(ValueError, 'visibility deadline'):
+                self.start_native()
+        self.exec_mock.assert_not_called()
+
+    def test_initial_tree_duplicate_identity_does_not_exec(self):
+        tree = copy.deepcopy(self.client.workspace_tree(self.wid))
+        tree['windows'].extend(copy.deepcopy(tree['windows']))
+        with patch.object(self.client, 'workspace_tree', return_value=tree), \
+                patch.object(launch.time, 'sleep') as wait:
+            with self.assertRaises(ValueError):
+                self.start_native()
+        wait.assert_not_called()
+        self.exec_mock.assert_not_called()
+
     def test_wrong_mode_mixed_policy_and_legacy_are_rejected(self):
         for key, value in (('standby_mode', 'B'), ('standby_policy', 'old'),
                            ('initial_prompt_policy', batch.ARGV_INITIAL_POLICY),

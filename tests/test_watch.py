@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import cmux_codex_watch as core  # noqa: E402
 import claude_ccc_protocol as protocol  # noqa: E402
+from tests.native_failure_fixture import bind_native_failure
 
 from cmux_codex_watch import (  # noqa: E402
     CLAUDE_MESSAGE,
@@ -574,6 +575,7 @@ class WatchTests(unittest.TestCase):
             }]}]}]}]}
             client = FakeClient(grid_payload([], error=error), "■ " + error, tree=tree)
             daemon = armed_daemon(directory, client)
+            bind_native_failure(daemon, HIGH_DEMAND_TEXT)
             daemon.process_once(client)
             self.assertEqual(client.sent, [])
             self.assertEqual(daemon.runtime["surface-uuid"].state, "blocked_dock")
@@ -583,6 +585,7 @@ class WatchTests(unittest.TestCase):
             error = "We're currently experiencing high demand, which may cause temporary errors."
             client = FakeClient(grid_payload([], error=error), "■ " + error)
             daemon = armed_daemon(directory, client)
+            bind_native_failure(daemon, HIGH_DEMAND_TEXT)
             daemon.config["manager_surface_id"] = "surface-uuid"
             daemon.process_once(client)
             self.assertEqual(client.sent, [])
@@ -662,6 +665,7 @@ class WatchTests(unittest.TestCase):
             payload = grid_payload([], error="We're currently experiencing high demand, which may cause temporary errors.")
             client = FakeClient(payload, "■ We're currently experiencing high demand, which may cause temporary errors.")
             daemon = WatchDaemon(config_path, state_path, client=client)
+            bind_native_failure(daemon, HIGH_DEMAND_TEXT)
             daemon.process_once(client)
             self.assertEqual(client.sent, [("workspace-uuid", "surface-uuid", "任务请继续")])
 
@@ -691,7 +695,7 @@ class WatchTests(unittest.TestCase):
         ])
         self.assertEqual(classify_grid(Grid.from_rpc(payload, "surface-uuid")).kind, "idle")
 
-    def test_same_frame_guard_suppresses_one_duplicate_then_retries(self):
+    def test_same_frame_never_retries_consumed_native_turn(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config_path = root / "config.json"
@@ -712,11 +716,12 @@ class WatchTests(unittest.TestCase):
             payload = grid_payload([], error="We're currently experiencing high demand, which may cause temporary errors.")
             client = FakeClient(payload, "■ We're currently experiencing high demand, which may cause temporary errors.")
             daemon = WatchDaemon(config_path, state_path, client=client)
+            native = bind_native_failure(daemon, "We're currently experiencing high demand, which may cause temporary errors.")
             daemon.process_once(client)
             daemon.process_once(client)
             self.assertEqual(len(client.sent), 1)
             daemon.process_once(client)
-            self.assertEqual(len(client.sent), 2)
+            self.assertEqual(len(client.sent), 1)
 
     def test_default_retry_intervals_are_one_second(self):
         config = default_config()
@@ -730,7 +735,7 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(remaining_poll_delay(1.0, 0.25), 0.75)
         self.assertEqual(remaining_poll_delay(1.0, 1.25), 0.0)
 
-    def test_current_error_retries_each_second_without_extra_frame_delay(self):
+    def test_new_failed_native_turn_can_resume_after_interval(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config_path = root / "config.json"
@@ -749,6 +754,7 @@ class WatchTests(unittest.TestCase):
             error = "We're currently experiencing high demand, which may cause temporary errors."
             client = FakeClient(grid_payload([], error=error), "■ " + error)
             daemon = WatchDaemon(config_path, state_path, client=client)
+            native = bind_native_failure(daemon, "We're currently experiencing high demand, which may cause temporary errors.")
 
             daemon.process_once(client)
             runtime = daemon.runtime["surface-uuid"]
@@ -757,6 +763,11 @@ class WatchTests(unittest.TestCase):
             daemon.process_once(client)
             self.assertEqual(len(client.sent), 1)
             runtime.last_send_at -= 1.1
+            daemon.process_once(client)
+            self.assertEqual(len(client.sent), 1)
+            previous = native(daemon.config["targets"][0])
+            native.side_effect = None
+            native.return_value = dict(previous, turn_id="failed-two")
             daemon.process_once(client)
             self.assertEqual(len(client.sent), 2)
 
@@ -785,6 +796,7 @@ class WatchTests(unittest.TestCase):
             error = "We're currently experiencing high demand, which may cause temporary errors."
             client = FakeClient(grid_payload([], error=error), "■ " + error)
             daemon = self._one_second_daemon(directory, client)
+            native = bind_native_failure(daemon, "We're currently experiencing high demand, which may cause temporary errors.")
 
             daemon.process_once(client)
 
@@ -802,6 +814,7 @@ class WatchTests(unittest.TestCase):
             error = "We're currently experiencing high demand, which may cause temporary errors."
             client = FakeClient(grid_payload([], error=error), "■ " + error)
             daemon = self._one_second_daemon(directory, client)
+            native = bind_native_failure(daemon, "We're currently experiencing high demand, which may cause temporary errors.")
 
             daemon.process_once(client)
             episode = daemon.runtime["surface-uuid"].episode_id
@@ -826,6 +839,7 @@ class WatchTests(unittest.TestCase):
             error = "We're currently experiencing high demand, which may cause temporary errors."
             client = FakeClient(grid_payload([], error=error), "■ " + error)
             daemon = self._one_second_daemon(directory, client)
+            native = bind_native_failure(daemon, "We're currently experiencing high demand, which may cause temporary errors.")
 
             for _ in range(8):
                 client.text = "■ " + error
@@ -842,6 +856,7 @@ class WatchTests(unittest.TestCase):
             error = "We're currently experiencing high demand, which may cause temporary errors."
             client = FakeClient(grid_payload([], error=error), "■ " + error)
             daemon = self._one_second_daemon(directory, client)
+            native = bind_native_failure(daemon, "We're currently experiencing high demand, which may cause temporary errors.")
             daemon.process_once(client)
             episode = daemon.runtime["surface-uuid"].episode_id
 
@@ -929,6 +944,7 @@ class WatchTests(unittest.TestCase):
                 top=process_fixture(("surface-uuid", "codex")),
             )
             daemon = self._one_second_daemon(directory, client)
+            bind_native_failure(daemon, HIGH_DEMAND_TEXT)
 
             daemon.process_once(client)
 
@@ -1090,6 +1106,7 @@ class WatchTests(unittest.TestCase):
             error = "We're currently experiencing high demand, which may cause temporary errors."
             client = FakeClient(grid_payload([], error=error), "\n".join(["> ", "\u25a0 " + error]))
             daemon = self._one_second_daemon(directory, client)
+            bind_native_failure(daemon, HIGH_DEMAND_TEXT)
             daemon.process_once(client)
             self.assertEqual(len(client.sent), 1)
 
@@ -1144,6 +1161,7 @@ class WatchTests(unittest.TestCase):
             ])
             client = FakeClient(grid_payload([], error=error), screen)
             daemon = self._one_second_daemon(directory, client)
+            bind_native_failure(daemon, HIGH_DEMAND_TEXT)
             daemon.process_once(client)
 
             # The rescue actually went out; the surface has already moved on to
@@ -1287,6 +1305,7 @@ class WatchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             client = FakeClient(payload, "\n".join(visible_lines(payload)))
             daemon = armed_daemon(directory, client)
+            bind_native_failure(daemon, HIGH_DEMAND_TEXT)
             daemon.process_once(client)
             self.assertEqual(len(client.sent), 1)
 
@@ -1641,14 +1660,13 @@ class WatchTests(unittest.TestCase):
         self.assertIsNone(core._match_error_block(
             "■ the docs explain 该令牌额度已用尽 as a billing state"))
 
-    def test_repeat_send_delay_bounds_one_episode(self):
-        # A changing error frame must still respect the one-second lower bound.
-        # Once it expires, the same live error episode is retried without a
-        # 20-second hold.
+    def test_changed_frames_and_elapsed_delay_do_not_reauthorize_same_turn(self):
+        # Neither changing frames nor elapsed time proves a new failed turn.
         with tempfile.TemporaryDirectory() as directory:
             error = "We're currently experiencing high demand, which may cause temporary errors."
             client = FakeClient(grid_payload(["turn 0"], error=error), "■ " + error)
             daemon = armed_daemon(directory, client)
+            native = bind_native_failure(daemon, "We're currently experiencing high demand, which may cause temporary errors.")
             daemon.config["repeat_send_delay_sec"] = 1
             for turn in range(1, 8):
                 daemon.process_once(client)
@@ -1656,10 +1674,10 @@ class WatchTests(unittest.TestCase):
                 client.payload = grid_payload([f"turn {turn}"], error=error)
             self.assertEqual(len(client.sent), 1)
 
-            # Once one second has passed a repeat is allowed again.
+            # Elapsed time cannot authorize replay of the consumed failure.
             daemon.runtime["surface-uuid"].last_send_at -= 1.1
             daemon.process_once(client)
-            self.assertEqual(len(client.sent), 2)
+            self.assertEqual(len(client.sent), 1)
 
     def test_running_daemon_reloads_arm_from_disk(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1679,6 +1697,7 @@ class WatchTests(unittest.TestCase):
             payload = grid_payload([], error="We're currently experiencing high demand, which may cause temporary errors.")
             client = FakeClient(payload, "■ We're currently experiencing high demand, which may cause temporary errors.")
             daemon = WatchDaemon(config_path, state_path, client=client)
+            native = bind_native_failure(daemon, "We're currently experiencing high demand, which may cause temporary errors.")
             daemon.process_once(client)
             self.assertEqual(client.sent, [])
             config["mode"] = "armed"
@@ -1876,7 +1895,7 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(state.kind, "recoverable_error")
         self.assertEqual(state.error_type, "high_demand")
 
-    def test_reconnect_high_demand_is_not_working_and_sends_once(self):
+    def test_reconnect_high_demand_waits_for_native_final_failure_and_sends_once(self):
         payload = reconnect_payload("2/5")
         text = "\n".join(visible_lines(payload))
         self.assertEqual(classify_text_prefilter(text).kind, "candidate")
@@ -1885,18 +1904,28 @@ class WatchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             client = FakeClient(payload, text)
             daemon = armed_daemon(directory, client)
+            self.addCleanup(daemon._process_snapshots.close)
+            turn = mock.Mock()
+            daemon.codex_queue_recovery.current_turn = turn
+            for attempt in ("2/5", "5/5"):
+                client.payload = reconnect_payload(attempt)
+                client.text = "\n".join(visible_lines(client.payload))
+                for kind in ("task_started", "unknown"):
+                    with self.subTest(attempt=attempt, native=kind):
+                        turn.return_value = {"kind": kind}
+                        daemon.process_once(client)
+                        self.assertEqual(client.sent, [])
+            client.payload = grid_payload([], error=HIGH_DEMAND_TEXT)
+            client.text = "\n".join(visible_lines(client.payload))
+            turn.return_value = {"kind": "task_complete", "session_id": "original",
+                                 "turn_id": "failed-one", "at": 100,
+                                 "error": {"message": HIGH_DEMAND_TEXT}}
             daemon.process_once(client)
             self.assertEqual(client.sent, [("workspace-uuid", "surface-uuid", "任务请继续")])
-            later = reconnect_payload("5/5", elapsed="2m 01s")
-            client.payload = later
-            client.text = "\n".join(visible_lines(later))
+            daemon.runtime["surface-uuid"].last_send_at -= 1.1
+            daemon.runtime["surface-uuid"].awaiting = False
             daemon.process_once(client)
             self.assertEqual(len(client.sent), 1)
-            daemon.runtime["surface-uuid"].last_send_at -= 1.1
-            daemon.process_once(client)
-            self.assertEqual(len(client.sent), 2)
-            daemon.process_once(client)
-            self.assertEqual(len(client.sent), 2)
 
     def test_high_demand_spinner_overlay_is_still_current(self):
         payload = grid_payload([], error=HIGH_DEMAND_TEXT)
@@ -1909,6 +1938,7 @@ class WatchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             client = FakeClient(payload, "\n".join(visible_lines(payload)))
             daemon = armed_daemon(directory, client)
+            bind_native_failure(daemon, HIGH_DEMAND_TEXT)
             daemon.process_once(client)
             self.assertEqual(len(client.sent), 1)
 
@@ -1925,7 +1955,7 @@ class WatchTests(unittest.TestCase):
         state = classify_grid(Grid.from_rpc(payload, "surface-uuid"))
         self.assertEqual((state.kind, state.error_type), ("recoverable_error", "high_demand"))
 
-    def test_live_split_reconnect_spans_are_current_high_demand(self):
+    def test_live_split_reconnect_requires_native_final_failure(self):
         # 2026-09-14 capture: cmux splits the reconnect bullet from
         # the word "Reconnecting", and puts the nested high-demand line in a
         # column-0 span starting with two spaces.  The old validator required
@@ -1953,8 +1983,21 @@ class WatchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             client = FakeClient(payload, "\n".join(visible_lines(payload)))
             daemon = armed_daemon(directory, client)
+            native = bind_native_failure(daemon, HIGH_DEMAND_TEXT)
+            final = native(daemon.config["targets"][0])
+            native.side_effect = None
+            for kind in ("unknown", "task_started"):
+                native.return_value = dict(final, kind=kind)
+                daemon.process_once(client)
+                self.assertEqual(client.sent, [], kind)
+            # Recovery is authorized only by the actual final failure.
+            native.return_value = final
+            client.payload = grid_payload([], error=HIGH_DEMAND_TEXT)
+            client.text = "■ " + HIGH_DEMAND_TEXT
             daemon.process_once(client)
             self.assertEqual(client.sent, [("workspace-uuid", "surface-uuid", "任务请继续")])
+            daemon.process_once(client)
+            self.assertEqual(len(client.sent), 1)
 
     def test_replay_requires_both_uuids(self):
         with self.assertRaises(IncompatibleError):
@@ -1985,6 +2028,7 @@ class WatchTests(unittest.TestCase):
             payload = grid_payload([], error="We're currently experiencing high demand, which may cause temporary errors.")
             client = FakeClient(payload, "■ We're currently experiencing high demand, which may cause temporary errors.")
             daemon = armed_daemon(directory, client)
+            bind_native_failure(daemon, HIGH_DEMAND_TEXT)
             daemon.process_once(client)
             first_episode = daemon.runtime["surface-uuid"].episode_id
             for text in (
@@ -2007,6 +2051,7 @@ class WatchTests(unittest.TestCase):
                 {"surface_id": "surface-a", "workspace_id": "workspace-a", "enabled": True, "paused": False},
                 {"surface_id": "surface-b", "workspace_id": "workspace-b", "enabled": True, "paused": False},
             ])
+            bind_native_failure(daemon, HIGH_DEMAND_TEXT)
             daemon.process_once(client)
             self.assertEqual(client.sent, [
                 ("workspace-a", "surface-a", "任务请继续"),
@@ -2027,6 +2072,7 @@ class WatchTests(unittest.TestCase):
                 {"surface_id": "surface-a", "workspace_id": "workspace-a", "enabled": True, "paused": False},
                 {"surface_id": "surface-b", "workspace_id": "workspace-b", "enabled": True, "paused": False},
             ])
+            bind_native_failure(daemon, HIGH_DEMAND_TEXT)
             daemon.process_once(client)
             self.assertEqual(daemon.config["mode"], "armed")
             self.assertTrue(daemon.config["targets"][0]["paused"])
@@ -2095,6 +2141,7 @@ class WatchTests(unittest.TestCase):
                 top=top,
             )
             daemon = WatchDaemon(config_path, state_path, client=client)
+            bind_native_failure(daemon, HIGH_DEMAND_TEXT)
             daemon.process_once(client)
             rule = daemon.config["workspace_rules"][0]
             self.assertEqual(daemon.config["mode"], "armed")
@@ -2494,6 +2541,7 @@ class WatchTests(unittest.TestCase):
             error = "We're currently experiencing high demand, which may cause temporary errors."
             client = FakeClient(grid_payload([], error=error), "■ " + error, tree=tree, top=top)
             daemon = WatchDaemon(config_path, state_path, client=client)
+            bind_native_failure(daemon, HIGH_DEMAND_TEXT)
             daemon.process_once(client)
             self.assertEqual(set(daemon.dynamic_targets), {"codex-a"})
             self.assertEqual(client.sent, [("workspace-uuid", "codex-a", "任务请继续")])
@@ -3345,6 +3393,7 @@ class WatchTests(unittest.TestCase):
             error = "We're currently experiencing high demand, which may cause temporary errors."
             client = FakeClient(grid_payload([], error=error), "■ " + error)
             daemon = self._claude_armed_daemon(directory, client)
+            bind_native_failure(daemon, HIGH_DEMAND_TEXT)
             daemon.process_once(client)
             self.assertEqual(len(client.sent), 1)
             self.assertEqual(client.sent[0][2], "任务请继续")
@@ -3395,6 +3444,7 @@ class WatchTests(unittest.TestCase):
                 top=process_fixture(("surface-uuid", "codex")),
             )
             daemon = self._claude_armed_daemon(directory, client)
+            bind_native_failure(daemon, HIGH_DEMAND_TEXT)
             before = [dict(item) for item in daemon.config["targets"]]
             daemon.process_once(client)
             self.assertEqual(len(client.sent), 1)
@@ -5150,6 +5200,38 @@ class WatchTests(unittest.TestCase):
 
 
 class DaemonRuntimeIdentityTests(unittest.TestCase):
+    def test_run_closes_only_log_handlers_not_owned_by_root(self):
+        for installed in (False, True):
+            with self.subTest(installed=installed), tempfile.TemporaryDirectory() as directory:
+                client = FakeClient(claude_grid_payload(), text=claude_idle_screen(), ping_ok=False)
+                daemon = armed_daemon(directory, client)
+                daemon.stop_requested = True
+                root = logging.getLogger()
+                original = list(root.handlers)
+                supplied = []
+
+                def configure(**kwargs):
+                    supplied.extend(kwargs["handlers"])
+                    if installed:
+                        for handler in supplied:
+                            root.addHandler(handler)
+
+                try:
+                    with mock.patch("cmux_codex_watch.DEFAULT_LOG_DIR", Path(directory) / "logs"), \
+                            mock.patch.object(logging, "basicConfig", side_effect=configure):
+                        daemon.run()
+                    self.assertEqual(len(supplied), 2)
+                    file_handler = supplied[0]
+                    self.assertEqual(file_handler.stream is not None, installed)
+                    if installed:
+                        self.assertFalse(file_handler.stream.closed)
+                    for handler in original:
+                        self.assertIn(handler, root.handlers)
+                finally:
+                    for handler in supplied:
+                        root.removeHandler(handler)
+                        handler.close()
+
     """Stage 0: a running daemon must be able to prove which code it loaded."""
 
     def test_identity_file_records_source_sha_and_pid(self):

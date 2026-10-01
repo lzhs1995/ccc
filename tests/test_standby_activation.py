@@ -224,6 +224,72 @@ class ActivationTests(unittest.TestCase):
 
 
 class ActivationTailTests(unittest.TestCase):
+    def test_joined_observation_keeps_three_topology_boundaries_and_live_revocation(self):
+        from ccc_standby_prepare import PreparationOwner, FreshTopology
+        for mode in ('stable', 'proof_revoke', 'replay_revoke', 'last_tree_move'):
+            with self.subTest(mode=mode):
+                native = readiness_fixture.RefreshBarrierTests()
+                native.setUp()
+                try:
+                    self.assertTrue(native.prepare())
+                    native.rendered()
+                    row = native.barrier.observe()
+                    wid, sid = row['workspace_id'], row['surface_id']
+                    client = core.CmuxClient(runner=mock.Mock(side_effect=AssertionError('no CLI')))
+                    trees = []
+                    def tree(workspace):
+                        trees.append(workspace)
+                        surfaces = [] if mode == 'last_tree_move' and len(trees) == 3 else [
+                            {'id': sid, 'ref': 'surface:1', 'type': 'terminal'}]
+                        return {'windows': [{'id': str(uuid.uuid4()), 'workspaces': [
+                            {'id': wid, 'panes': [{'id': str(uuid.uuid4()), 'surfaces': surfaces}]}]}]}
+                    client.workspace_tree = tree
+                    prep = SimpleNamespace(job={'workspace_id': wid, 'slots': [row]},
+                        client=client, _topology=FreshTopology(lambda: tree(wid)),
+                        _current=lambda: native.generation,
+                        _permission=lambda *_: native.allowed, _failed=threading.Event())
+                    prep._authorized = lambda *a, **kw: PreparationOwner._authorization(prep, *a, **kw)
+                    prep._surfaces = {0: sid}
+                    prep.selected = dict(generation=native.generation, boot_id=native.boot,
+                        workspace_id=wid, job_id=row['job_id'])
+                    prep.observe_for_activation = lambda index, **kw: native.barrier.observe_for_activation(**kw)
+                    native.barrier.authorized = lambda _, observed: prep._authorized(
+                        0, surface_id=observed['surface_id'], connected=client)
+                    replay = native.client.replay.side_effect
+                    def screen(*args, **kwargs):
+                        value = replay(*args, **kwargs)
+                        if mode == 'replay_revoke': native.allowed = False
+                        return value
+                    native.client.replay.side_effect = screen
+                    owner = activation.ActivationOwner.__new__(activation.ActivationOwner)
+                    owner.preparation, owner.client = prep, client
+                    owner._selected = copy.deepcopy(prep.selected)
+                    owner._invalid, owner._lock = threading.Event(), threading.RLock()
+                    owner._originals = {}
+                    owner._operation_active, owner._operation_guard = True, lambda: native.allowed
+                    owner.ledger = SimpleNamespace(clock=lambda: native.clock)
+                    def proof(index, observed):
+                        if mode == 'proof_revoke': native.allowed = False
+                        return dict(readiness_proven=True, sources_complete=True,
+                            job_id=row['job_id'], generation=native.generation, boot_id=native.boot,
+                            original=original(observed, wid),
+                            return_receipt_sha256=observed['return_receipt_sha256'], model_request_count=0)
+                    owner.proof_reader = proof
+                    if mode == 'stable':
+                        self.assertTrue(owner.observe(0)['readiness_proven'])
+                        self.assertEqual(trees, [wid] * 3)
+                        self.assertTrue(owner.authorized(0))
+                        self.assertEqual(trees, [wid] * 4)  # send authorization still reads topology
+                    else:
+                        with self.assertRaises((ValueError, RuntimeError)):
+                            owner.observe(0)
+                        self.assertTrue(owner._invalid.is_set())
+                        self.assertEqual(len(trees), {'proof_revoke': 0,
+                            'replay_revoke': 1, 'last_tree_move': 3}[mode])
+                    client.runner.assert_not_called()
+                finally:
+                    native.doCleanups()
+
     def test_real_identity_fd_revocation_and_final_authorization_identity_changes(self):
         for mode in ('stable', 'revoke', 'birth', 'user_turn'):
             with self.subTest(mode=mode):

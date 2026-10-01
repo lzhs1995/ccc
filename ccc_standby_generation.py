@@ -65,6 +65,7 @@ class StandbyGeneration:
         self._configure(roots, effective, max_entries, max_read_bytes)
         self._lock = threading.RLock()
         self._invalid = False
+        self._closed = False
         self._watch = None
         with self._lock:
             first = self._snapshot()
@@ -322,9 +323,18 @@ class StandbyGeneration:
     def close(self):
         with self._lock:
             self._invalid = True
+            self._closed = True
             if self._watch is not None:
                 self._watch.close()
             self._cache.clear()
+
+    def resource_report(self):
+        with self._lock:
+            watch = self._watch.resource_report() if self._watch is not None else None
+            return {'closed': self._closed, 'watcher': watch,
+                    'cached_inodes': len(self._cache),
+                    'resources_released': self._closed and not self._cache and
+                        (watch is None or watch['resources_released'] is True)}
 
 
 class _VnodeWatch:
@@ -368,6 +378,10 @@ class _VnodeWatch:
                 'rlimit_nofile': soft_limit, 'reserved_descriptors': 1024}
             raise error
         self._fds = []
+        self._close_started = False
+        self._closed_fds = 0
+        self._close_errors = []
+        self._queue_closed = False
         self._entries = {}
         self._access_stamps = {}
         self._missing = missing_children or {}
@@ -427,11 +441,13 @@ class _VnodeWatch:
                     # A notification need not expose a new atime: delayed or
                     # repeated ATTRIB can describe the already observed stamp.
                     # Require unchanged mutation timestamps/permissions on all
-                    # aliases, rather than requiring access time to advance.
+                    # aliases. Concurrent reads/exec can advance atime between
+                    # these observations; atime equality is not an invariant.
                     infos = [path.lstat() for path, _, _, _ in entry]
-                    if all(_access_stable_stamp(info) == access[0]
-                           and info.st_atime_ns == fd_info.st_atime_ns for info in infos):
-                        self._access_stamps[event.ident] = (access[0], fd_info.st_atime_ns)
+                    final_info = os.fstat(event.ident)
+                    if (all(_access_stable_stamp(info) == access[0] for info in infos)
+                            and _access_stable_stamp(final_info) == access[0]):
+                        self._access_stamps[event.ident] = (access[0], final_info.st_atime_ns)
                         continue
                 for path, kind, identity, directory in entry:
                     if (kind == 'content' or not directory or not event.fflags
@@ -460,10 +476,29 @@ class _VnodeWatch:
 
     def close(self):
         self._invalid = True
+        if self._close_started:
+            return  # Never retry a descriptor whose ownership is now uncertain.
+        self._close_started = True
         for fd in self._fds:
             try:
                 os.close(fd)
-            except OSError:
-                pass
+                self._closed_fds += 1
+            except OSError as exc:
+                self._close_errors.append({'fd': fd, 'errno': exc.errno})
         self._fds.clear()
-        self._queue.close()
+        try:
+            self._queue.close()
+            self._queue_closed = self._queue.closed
+        except OSError as exc:
+            self._close_errors.append({'resource': 'kqueue', 'errno': exc.errno})
+            raise
+
+    def resource_report(self):
+        return {'close_started': self._close_started,
+                'remaining_owned_fds': len(self._fds),
+                'successful_vnode_closes': self._closed_fds,
+                'close_errors': [dict(row) for row in self._close_errors],
+                'queue_closed': self._queue_closed,
+                'resources_released': self._close_started and not self._fds and
+                    not self._close_errors and self._queue_closed,
+                'scope': 'owned close syscall results; descriptor numbers may subsequently be reused'}

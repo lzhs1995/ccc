@@ -279,6 +279,7 @@ class CodexReconnectRecoveryTests(unittest.TestCase):
                 text = '\n'.join(visible_lines(payload))
                 client = FakeClient(payload, text)
                 daemon = armed_daemon(directory, client)
+                self.bind_provider(daemon, error)
                 self.addCleanup(daemon._process_snapshots.close)
                 self.assertEqual(core.classify_grid(core.Grid.from_rpc(payload, 'surface-uuid')).kind, expected)
                 daemon.process_once(client)
@@ -313,6 +314,7 @@ class CodexReconnectRecoveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             client = FakeClient(payload, "\n".join(visible_lines(payload)))
             daemon = armed_daemon(directory, client)
+            self.bind_provider(daemon, HIGH_DEMAND_TEXT)
             with mock.patch.object(core.time, "time", return_value=1000) as clock:
                 daemon.process_once(client)
                 self.assertEqual(len(client.sent), 1)
@@ -332,11 +334,12 @@ class CodexReconnectRecoveryTests(unittest.TestCase):
                 self.assertNotEqual(first_fingerprint, latest.fingerprint)
                 daemon.save()
                 restarted = core.WatchDaemon(daemon.config_path, daemon.state_path, client=client)
+                self.bind_provider(restarted, HIGH_DEMAND_TEXT)
                 restarted.process_once(client)
                 self.assertEqual(len(client.sent), 1)
                 clock.return_value = 1001.1
                 restarted.process_once(client)
-                self.assertEqual(len(client.sent), 2)
+                self.assertEqual(len(client.sent), 1)  # Timer alone is not a new failed turn.
 
     def test_working_revisit_cannot_exceed_configured_poll_interval(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -418,6 +421,7 @@ class CodexReconnectRecoveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             client = FakeClient(payload, "\n".join(visible_lines(payload)))
             daemon = armed_daemon(directory, client)
+            self.bind_provider(daemon, HIGH_DEMAND_TEXT)
             with mock.patch.object(core.time, "time", return_value=1000) as clock:
                 daemon.process_once(client)
                 self.assertEqual(len(client.sent), 1)
@@ -426,7 +430,7 @@ class CodexReconnectRecoveryTests(unittest.TestCase):
                 client.text = "\n".join(visible_lines(payload))
                 clock.return_value = 1002
                 daemon.process_once(client)
-                self.assertEqual(len(client.sent), 2)
+                self.assertEqual(len(client.sent), 1)  # Echo is not evidence of another failed turn.
 
     def test_live_d365940f_echo_and_sparse_spinner_stay_current(self):
         payload = grid_payload([" "] * 20, columns=100)
@@ -444,6 +448,7 @@ class CodexReconnectRecoveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             client = FakeClient(payload, "\n".join(visible_lines(payload)))
             daemon = armed_daemon(directory, client)
+            self.bind_provider(daemon, HIGH_DEMAND_TEXT)
             daemon.process_once(client)
             self.assertEqual(len(client.sent), 1)
 
@@ -470,6 +475,7 @@ class CodexReconnectRecoveryTests(unittest.TestCase):
                 payload = covered_prompt_payload(prefix)
                 client = FakeClient(payload, "\n".join(visible_lines(payload)))
                 daemon = armed_daemon(directory, client)
+                self.bind_provider(daemon, HIGH_DEMAND_TEXT)
                 daemon.process_once(client)
                 self.assertEqual(len(client.sent), 1)
 

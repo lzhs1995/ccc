@@ -4,6 +4,7 @@ import unittest
 
 import cmux_codex_watch as watch
 from tests.test_watch import FakeClient, HIGH_DEMAND_TEXT, armed_daemon, grid_payload
+from tests.native_failure_fixture import bind_native_failure
 
 
 class ViewportPaddingTests(unittest.TestCase):
@@ -20,6 +21,7 @@ class ViewportPaddingTests(unittest.TestCase):
         client = FakeClient(payload, "\n".join(grid.lines))
         with tempfile.TemporaryDirectory() as directory:
             daemon = armed_daemon(directory, client)
+            bind_native_failure(daemon, HIGH_DEMAND_TEXT)
             self.addCleanup(daemon._process_snapshots.close)
             daemon.process_once(client)
             self.assertEqual(len(client.sent), 1)
@@ -31,6 +33,7 @@ class ViewportPaddingTests(unittest.TestCase):
                 grid = watch.Grid.from_rpc(payload, "surface-uuid")
                 client = FakeClient(payload, "\n".join(grid.lines))
                 daemon = armed_daemon(directory, client)
+                bind_native_failure(daemon, HIGH_DEMAND_TEXT)
                 self.addCleanup(daemon._process_snapshots.close)
                 daemon.process_once(client)
                 self.assertEqual(client.sent, [])

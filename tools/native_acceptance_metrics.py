@@ -2,6 +2,68 @@
 import math
 
 
+def evaluate_native_completion(records, session_id, rounds):
+    """Validate a frozen fixture transcript, not a live run or cleanup claim.
+
+    The fixture deliberately fails exactly `rounds` tasks before one final OK.
+    Every completion must close its own started turn; a later start invalidates
+    a previously successful completion. Input files and process identity remain
+    the caller's responsibility.
+    """
+    errors, completed, seen = [], [], set()
+    active, pending_input = None, False
+    if (not isinstance(records, list) or not records
+            or type(rounds) is not int or rounds < 1
+            or not isinstance(session_id, str) or not session_id):
+        return {'passed': False, 'errors': ['invalid_completion_inputs']}
+    metadata = records[0]
+    payload = metadata.get('payload', {}) if isinstance(metadata, dict) else {}
+    if (not isinstance(metadata, dict) or metadata.get('type') != 'session_meta'
+            or not isinstance(payload, dict)
+            or payload.get('session_id', payload.get('id')) != session_id):
+        errors.append('original_session_mismatch')
+    for index, record in enumerate(records):
+        if not isinstance(record, dict) or not isinstance(record.get('payload'), dict):
+            errors.append('malformed_record')
+            continue
+        if record.get('type') == 'session_meta' and index:
+            errors.append('repeated_session_metadata')
+        if record.get('type') != 'event_msg':
+            continue
+        event = record['payload']
+        kind, turn = event.get('type'), event.get('turn_id')
+        if kind == 'task_started':
+            pending_input = False
+            if active is not None or not isinstance(turn, str) or not turn or turn in seen:
+                errors.append('overlapping_or_duplicate_start')
+            if isinstance(turn, str):
+                seen.add(turn)
+            active = turn
+        elif kind == 'task_complete':
+            if active is None or turn != active:
+                errors.append('unmatched_completion')
+            completed.append(event)
+            active = None
+        elif kind == 'turn_aborted':
+            errors.append('aborted_task')
+        elif kind == 'user_message' and completed and active is None:
+            # A submitted/echoed followup without its start is not final quiescence.
+            # Earlier between-round inputs are allowed if a later task starts.
+            pending_input = True
+    if active is not None or pending_input:
+        errors.append('unfinished_tail')
+    if len(completed) != rounds + 1:
+        errors.append('incorrect_completed_rounds')
+    if any(not row.get('error') for row in completed[:-1]):
+        errors.append('unexpected_early_success')
+    last = completed[-1] if completed else {}
+    if not last or last.get('error') or last.get('last_agent_message') != 'OK':
+        errors.append('missing_final_success')
+    return {'passed': not errors, 'errors': errors, 'session_id': session_id,
+            'completed_turns': len(completed), 'final_turn_id': last.get('turn_id'),
+            'scope': 'frozen fixture lifecycle only; not live identity, cleanup or run terminal'}
+
+
 def _finite(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
