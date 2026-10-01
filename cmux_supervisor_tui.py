@@ -389,6 +389,12 @@ class Candidate:
         return SESSION_UNMEASURED
 
     @property
+    def api_key_text(self) -> str:
+        # A file read is not a read of the running provider's credential.
+        key = self.session.api_key_config
+        return f"配置:{key}" if key else "未确认"
+
+    @property
     def surface_id(self) -> str:
         return self.record["surface_id"]
 
@@ -892,6 +898,9 @@ class SessionResult:
     measured_at: float = 0.0
     pid: int = 0
     generation: str = ""
+    api_key_config: str = field(default="", repr=False)
+    api_key_source: str = ""
+    api_key_note: str = "运行态 Key 未确认"
 
     @property
     def ok(self) -> bool:
@@ -1351,6 +1360,9 @@ class SessionResolver:
                 lsof_runner=self._lsof_runner,
                 grok_path=self._grok_path, grok_loader=self._grok_loader,
             )
+            result = resolved[surface_id]
+            if result.ok and result.agent_kind == "codex":
+                observe_configured_api_key(result)
         with self._lock:
             # A pass that started before a newer one is discarded rather than
             # written: late results would otherwise resurrect ids for processes
@@ -1359,6 +1371,53 @@ class SessionResolver:
                 return
             self._results = resolved
             self._fetched_at = now
+
+
+def observe_configured_api_key(result: SessionResult) -> None:
+    """Read a process's user config on the worker, never infer loaded auth.
+
+    Deliberately labelled configuration-only, even when its mtime predates the
+    process. Config layers, provider snapshots and server-side routing prevent
+    treating that timestamp (or a masked error token) as credential proof.
+    """
+    try:
+        import ccc_guard_scope as scope
+        try:
+            import tomllib
+        except ImportError:
+            import tomli as tomllib
+        before = scope.birth(result.pid, codex=True)
+        if before is None:
+            return
+        argv, env = scope.arguments(result.pid)
+        # Only attach the observation to the exact resumed session we resolved.
+        if "resume" not in argv or result.session_id not in argv:
+            return
+        home = env.get("CODEX_HOME") or str(Path(env["HOME"]) / ".codex")
+        path = Path(home) / "config.toml"
+        if not path.is_absolute():
+            return
+        with path.open("rb") as stream:
+            raw = stream.read(1024 * 1024 + 1)
+        if len(raw) > 1024 * 1024:
+            return
+        config = tomllib.loads(raw.decode("utf-8"))
+        provider = config.get("model_providers", {}).get(config.get("model_provider"), {})
+        key = provider.get("experimental_bearer_token")
+        env_key = provider.get("env_key")
+        if isinstance(env_key, str) and env_key:
+            key = env.get(env_key)
+        with path.open("rb") as stream:
+            after_raw = stream.read(1024 * 1024 + 1)
+        if scope.birth(result.pid, codex=True) != before or after_raw != raw:
+            return
+        result.api_key_source = str(path)
+        result.api_key_note = "仅用户配置；运行态/项目覆盖未确认，Switch 切换不代表现有会话已换 Key"
+        if isinstance(key, str) and 0 < len(key) <= 512 and all(32 < ord(c) < 127 for c in key):
+            result.api_key_config = key
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError, ImportError):
+        # Credentials are optional diagnostics, never an input/send gate.
+        return
 
 
 # ---------------------------------------------------------------------------
@@ -1845,6 +1904,7 @@ def _row_text(
     session: str = "",
     collab: str | None = None,
     visible_columns: tuple[tuple[str, int, str], ...] | None = None,
+    api_key: str = "",
 ) -> str:
     """One table row with responsive column layout.
 
@@ -1877,7 +1937,13 @@ def _row_text(
     # 口，于是"放不下 id"变成"连行都画坏"。完整 id 由焦点行给出。
     if cell is None:
         return head.rstrip()
-    return f"{head} {cell}".rstrip()
+    row = f"{head} {cell}"
+    # Keep the full credential (including its configuration-only label) or
+    # omit the entire column. Never present a clipped key as copyable auth.
+    if api_key and display_width(row) + 1 + 72 <= width:
+        value = api_key if display_width(api_key) <= 72 else "配置 Key 过长，见详情"
+        row += " " + pad(value, 72)
+    return row.rstrip()
 
 
 def header_text(width: int | None = None, collab: str | None = None, visible_columns: tuple[tuple[str, int, str], ...] | None = None) -> str:
@@ -1890,6 +1956,7 @@ def header_text(width: int | None = None, collab: str | None = None, visible_col
     return _row_text(
         "     ", tuple(name for name, _, _ in columns), "标题",
         width, "session", collab, visible_columns,
+        api_key="api-key(配置，非运行态)",
     )
 
 
@@ -2029,6 +2096,10 @@ def focus_summary(candidate: Candidate | None, workspace_ref: str = "") -> str:
     # generated command is built here from the validated ID -- never from the
     # possibly-clipped cell.
     facts.append(session_detail(candidate))
+    if candidate.agent_kind == "codex":
+        facts.append(f"api-key {candidate.api_key_text}（{candidate.session.api_key_note}）")
+        if candidate.session.api_key_source:
+            facts.append(candidate.session.api_key_source)
     return "  |  ".join(facts)
 
 
@@ -4254,7 +4325,7 @@ def view_row_attr(row: ViewRow) -> int:
     return row_attr(row.candidate) if row.candidate else 0
 
 
-GLOBAL_KEYS_1 = "↑↓ jk 移动  Tab 折/展  z/Z 全折/展  [ ] 跳 workspace  / 查找  c 清除  y 复制ID（也可点击ID）"
+GLOBAL_KEYS_1 = "K API-key详情  ↑↓ jk 移动  Tab 折/展  z/Z 全折/展  [ ] 跳 workspace  / 查找  c 清除  y 复制ID"
 GLOBAL_KEYS_2 = "N 原生50·节费暂缓  b 空目录50  f 筛选 R 刷新 G 存储 v 三件套 e 配置 A 开启发 S 停发 d 观察 q 退出"
 
 
@@ -4287,6 +4358,66 @@ def _draw_compact(stdscr: Any, model: SupervisorModel, rows: list[ViewRow],
         if row_index >= height:
             return
         _safe_addnstr(stdscr, row_index, 0, text, clip, style)
+
+
+def api_key_detail_lines(candidate: Candidate, width: int) -> list[str]:
+    """Wrap the complete observation by terminal cells, including long keys."""
+    width = max(2, width)
+    values = ["API-key：用户配置，非运行态", candidate.session.session_id,
+              candidate.session.api_key_note, "", "配置 Key：",
+              candidate.session.api_key_config or "未确认", "",
+              candidate.session.api_key_source]
+    lines = []
+    for value in values:
+        line = ""
+        for char in str(value):
+            if char == "\n":
+                lines.append(line)
+                line = ""
+                continue
+            if display_width(line + char) > width:
+                lines.append(line)
+                line = ""
+            line += char
+        lines.append(line)
+    return lines
+
+
+def _api_key_page(stdscr: Any, candidate: Candidate) -> None:
+    # Read-only snapshot: never refresh credentials, send input, or change auth.
+    offset = 0
+    message = ""
+    while True:
+        height, width = stdscr.getmaxyx()
+        clip = max(1, width - 1)
+        lines = api_key_detail_lines(candidate, clip)
+        visible = max(1, height - 2)
+        offset = min(offset, max(0, len(lines) - visible))
+        stdscr.erase()
+        for y, line in enumerate(lines[offset:offset + visible]):
+            _safe_addnstr(stdscr, y, 0, line, clip)
+        if height >= 2:
+            _safe_addnstr(stdscr, height - 2, 0, message, clip)
+            _safe_addnstr(stdscr, height - 1, 0, "↑↓滚动 y复制配置Key q返回", clip)
+        stdscr.refresh()
+        key = stdscr.getch()
+        if key in (27, ord("q"), ord("Q"), ord("K")):
+            return
+        if key in (curses.KEY_DOWN, ord("j")):
+            offset = min(offset + 1, max(0, len(lines) - visible))
+        elif key in (curses.KEY_UP, ord("k")):
+            offset = max(0, offset - 1)
+        elif key in (ord("y"), ord("Y")):
+            if not candidate.session.api_key_config:
+                message = "配置 Key 未确认，未复制"
+                continue
+            try:
+                result = subprocess.run(["/usr/bin/pbcopy"],
+                                        input=candidate.session.api_key_config,
+                                        text=True, capture_output=True, timeout=2)
+                message = "已复制配置 Key（非运行态证明）" if result.returncode == 0 else "复制失败"
+            except (OSError, subprocess.TimeoutExpired):
+                message = "复制失败"
 
 
 def _draw(
@@ -4472,6 +4603,7 @@ def _draw(
                 candidate.session_text,
                 collab_cells.get(row.key, "") if show_collab else None,
                 visible_columns,
+                api_key=candidate.api_key_text,
             )
         style = curses.A_REVERSE if selected else view_row_attr(row)
         _safe_addnstr(stdscr, at["first_row"] + row_index, 0, label, clip, style)
@@ -5066,6 +5198,13 @@ def _run(stdscr: Any, model: SupervisorModel) -> None:
         status = next_status_after_key(key, status)
         if key in (ord("q"), ord("Q")):
             return
+        if key == ord("K"):
+            candidate = rows[index].candidate if rows else None
+            if candidate is not None and candidate.agent_kind == "codex":
+                _api_key_page(stdscr, candidate)
+            else:
+                status = "请选择一个 Codex 会话查看配置 Key"
+            continue
         if key == ord("G"):
             # The storage page owns its own keys while it is open, which is why
             # p/c/r there act on the janitor without changing what they mean
