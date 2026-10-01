@@ -90,7 +90,7 @@ class ManagerTests(unittest.TestCase):
             return True
         self.manager.authorized = authorized
         result = self.activate()
-        self.assertEqual(result['delivery']['acknowledged_inputs'], 50)
+        self.assertEqual(result['delivery']['acknowledged_inputs'], 50, result['delivery'])
         self.assertEqual(len(self.sent), 50)
 
     def test_lost_readiness_does_not_revive(self):

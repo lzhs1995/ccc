@@ -1,5 +1,6 @@
 """Offline lifecycle failure points; no native, controller or model requests."""
 import copy
+from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
 import tempfile
@@ -295,6 +296,33 @@ class StandbyLedgerTests(unittest.TestCase):
         self.assertFalse(thread.is_alive())
         self.assertEqual(len(errors), 1)
         self.assertFalse(self.sent)
+
+    def test_independent_slots_authorize_concurrently_before_claim(self):
+        self.ready()
+        self.activate()
+        barrier = threading.Barrier(2)
+        calls = [0, 0]
+        def authorized(index):
+            calls[index] += 1
+            if calls[index] == 1:
+                barrier.wait(timeout=2)
+            return True
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(self.deliver, i, authorized=authorized) for i in range(2)]
+            self.assertEqual([f.result(timeout=5) for f in futures], [True, True])
+        self.assertEqual(len(self.sent), 2)
+
+    def test_competing_same_slot_claims_only_send_once(self):
+        self.ready()
+        self.activate()
+        barrier = threading.Barrier(2)
+        def attempt():
+            barrier.wait(timeout=2)
+            return self.deliver(0)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(attempt) for _ in range(2)]
+            self.assertEqual(sorted(f.result(timeout=5) for f in futures), [False, True])
+        self.assertEqual(len(self.sent), 1)
 
     def test_invalidation_after_preflight_but_before_transport_write_is_rejected(self):
         self.ready()

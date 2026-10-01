@@ -302,7 +302,11 @@ class StandbyLedger:
             evidence_current()  # Callbacks may block while another slot invalidates the cohort.
 
         claim = self.directory / f'input-{index}.json'
-        with core.FileLock(self.directory / 'ledger.lock', timeout_sec=5):
+        # Activation is already durably committed. Only competing claims for
+        # this slot need exclusion; a slow authorization for another original
+        # must not exhaust this slot's lock wait. Cohort invalidation is still
+        # checked after callbacks and ordered against the final guarded write.
+        with core.FileLock(self.directory / f'input-{index}.lock', timeout_sec=5):
             if index in self._attempted or os.path.lexists(claim):
                 return False
             try:
