@@ -330,18 +330,36 @@ class StandbyLedger:
         @contextlib.contextmanager
         def write_guard():
             nonlocal used
-            with self._write_lock:
-                try:
-                    # Both connection setup and lock admission may wait.
-                    # Observe after admission, immediately before the write.
+            acquired = False
+            try:
+                while not acquired:
+                    # Connected reads for independent originals may run in
+                    # parallel. Never carry their result across a lock wait:
+                    # a contended admission discards it and checks again.
                     check()
-                    if used or claim.is_symlink() or claim.read_bytes() != payload:
-                        raise ValueError('standby transport permit consumed or changed')
-                    used = True
-                    yield
-                except Exception as exc:
-                    self._invalidate(exc)
-                    raise
+                    acquired = self._write_lock.acquire(blocking=False)
+                    if not acquired:
+                        with self._write_lock:
+                            pass
+                # check() just re-read all immutable evidence, after callbacks;
+                # successful nonblocking admission introduced no lock wait.
+                # Recheck the state that this lock protects before bytes. A
+                # second full roster read here would serialize independent
+                # slots again. External files were never protected by this
+                # process-local lock; every contended admission still repeats
+                # their full validation above.
+                if self._invalid or os.path.lexists(self.directory / 'invalidated.json'):
+                    raise ValueError('standby activation invalidated')
+                if used or claim.is_symlink() or claim.read_bytes() != payload:
+                    raise ValueError('standby transport permit consumed or changed')
+                used = True
+                yield
+            except Exception as exc:
+                self._invalidate(exc)
+                raise
+            finally:
+                if acquired:
+                    self._write_lock.release()
 
         send(copy.deepcopy(expected), activation['prompt'], json.loads(payload)['input_id'],
              write_guard=write_guard)

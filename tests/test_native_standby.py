@@ -312,6 +312,44 @@ class StandbyLedgerTests(unittest.TestCase):
             self.assertEqual([f.result(timeout=5) for f in futures], [True, True])
         self.assertEqual(len(self.sent), 2)
 
+    def test_independent_final_authorization_checks_overlap(self):
+        self.ready()
+        self.activate()
+        barrier = threading.Barrier(2)
+        calls = [0, 0]
+        def authorized(index):
+            calls[index] += 1
+            if calls[index] == 3:
+                barrier.wait(timeout=2)
+            return True
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(self.deliver, i, authorized=authorized) for i in range(2)]
+            self.assertEqual([f.result(timeout=5) for f in futures], [True, True])
+        self.assertEqual(len(self.sent), 2)
+
+    def test_invalidation_during_final_authorization_prevents_write(self):
+        self.ready()
+        self.activate()
+        waiting, resume = threading.Event(), threading.Event()
+        calls = 0
+        def authorized(index):
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                waiting.set()
+                self.assertTrue(resume.wait(2))
+            return True
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(self.deliver, 0, authorized=authorized)
+            try:
+                self.assertTrue(waiting.wait(2))
+                self.ledger._invalidate('revoked during connected read')
+            finally:
+                resume.set()
+            with self.assertRaises(ValueError):
+                pending.result(timeout=3)
+        self.assertFalse(self.sent)
+
     def test_competing_same_slot_claims_only_send_once(self):
         self.ready()
         self.activate()
@@ -323,6 +361,42 @@ class StandbyLedgerTests(unittest.TestCase):
             futures = [pool.submit(attempt) for _ in range(2)]
             self.assertEqual(sorted(f.result(timeout=5) for f in futures), [False, True])
         self.assertEqual(len(self.sent), 1)
+
+    def test_invalidation_between_final_check_and_admission_prevents_write(self):
+        self.ready()
+        self.activate()
+        ledger = self.ledger
+        real_lock = ledger._write_lock
+        class RevokeOnAdmission:
+            def acquire(self, *args, **kwargs):
+                acquired = real_lock.acquire(*args, **kwargs)
+                if acquired:
+                    ledger._invalidate('revoked at admission')
+                return acquired
+            def release(self):
+                real_lock.release()
+            def __enter__(self):
+                return real_lock.__enter__()
+            def __exit__(self, *args):
+                return real_lock.__exit__(*args)
+        ledger._write_lock = RevokeOnAdmission()
+        with self.assertRaises(ValueError):
+            self.deliver()
+        self.assertFalse(self.sent)
+
+    def test_final_authorization_can_invalidate_reentrantly(self):
+        self.ready()
+        self.activate()
+        calls = 0
+        def authorized(index):
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                self.ledger._invalidate('caller revoked')
+            return True
+        with self.assertRaises(ValueError):
+            self.deliver(authorized=authorized)
+        self.assertFalse(self.sent)
 
     def test_invalidation_after_preflight_but_before_transport_write_is_rejected(self):
         self.ready()

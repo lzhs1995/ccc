@@ -139,6 +139,10 @@ class StandbyTransportTests(unittest.TestCase):
                 reached = threading.Event()
                 real_lock = self.state.ledger._write_lock
                 class GatedLock:
+                    def acquire(self, *args, **kwargs):
+                        return real_lock.acquire(*args, **kwargs)
+                    def release(self):
+                        return real_lock.release()
                     def __enter__(self):
                         reached.set()
                         return real_lock.__enter__()

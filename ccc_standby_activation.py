@@ -83,10 +83,10 @@ class ActivationOwner:
         return self.preparation.job['slots'][index]
 
     def authorized(self, index, *, topology=True):
-        """Reapply the caller's live input guard inside the ledger write lock.
+        """Reapply the caller's live input guard at final write admission.
 
         CmuxClient also invokes this thread's input guard on connection
-        admission. Repeating it here covers time spent waiting for that lock;
+        admission. The ledger repeats it after any wait for its write lock;
         the original preparation permission and generation follow the read.
         """
         try:

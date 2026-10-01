@@ -62,7 +62,7 @@ class StandbyManager:
         # input_guard here, not just workspace.enabled from a cached config.
         value = self.authorized(index) is True
         # Authorization can block on connected reads. Check generation/boot
-        # again on its return, including inside the ledger's actual write lock.
+        # again on its return, including the ledger's final write admission.
         self._current()
         return value
 
