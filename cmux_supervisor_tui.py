@@ -390,6 +390,10 @@ class Candidate:
 
     @property
     def api_key_text(self) -> str:
+        if self.session.api_key_observation_historical:
+            return "历史请求（K查看完整值）"
+        if self.session.api_key_observed:
+            return self.session.api_key_observed
         # The row represents this running session. Repeating a shared mutable
         # TOML value here falsely suggests all loaded sessions use that key.
         return "未核实（K查看配置）" if self.session.api_key_config else "未核实"
@@ -901,6 +905,9 @@ class SessionResult:
     api_key_config: str = field(default="", repr=False)
     api_key_source: str = ""
     api_key_note: str = "运行态 Key 未确认"
+    api_key_observed: str = field(default="", repr=False)
+    api_key_observation_historical: bool = False
+    api_key_observation_note: str = ""
 
     @property
     def ok(self) -> bool:
@@ -1363,6 +1370,7 @@ class SessionResolver:
             result = resolved[surface_id]
             if result.ok and result.agent_kind == "codex":
                 observe_configured_api_key(result)
+                observe_request_api_key(result)
         with self._lock:
             # A pass that started before a newer one is discarded rather than
             # written: late results would otherwise resurrect ids for processes
@@ -1371,6 +1379,163 @@ class SessionResolver:
                 return
             self._results = resolved
             self._fetched_at = now
+
+
+def request_observation_directory_matches(env: dict, directory: Path) -> bool:
+    """Bind opt-in to the writer's home, never the inspector's global config."""
+    import os
+    import stat
+    explicit = env.get("CODEX_CREDENTIAL_OBSERVATIONS_DIR")
+    if explicit is not None:
+        return explicit == str(directory)
+    home = env.get("CODEX_HOME")
+    if home is None:
+        base = env.get("HOME")
+        if not base:
+            return False
+        home = str(Path(base) / ".codex")
+    home = Path(home)
+    def identity(s):
+        return (s.st_dev, s.st_ino, s.st_mode, s.st_uid,
+                s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+    try:
+        hs = home.lstat()
+        ds = directory.lstat()
+        if (not home.is_absolute() or directory != home / "credential-observations"
+                or not stat.S_ISDIR(hs.st_mode) or not stat.S_ISDIR(ds.st_mode)
+                or hs.st_uid != os.getuid() or ds.st_uid != hs.st_uid
+                or ds.st_mode & 0o077):
+            return False
+        marker = directory / "enabled-v1"
+        fd = os.open(marker, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as stream:
+            before = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(before.st_mode) or before.st_uid != ds.st_uid
+                    or before.st_mode & 0o077 or before.st_size != 27):
+                return False
+            raw = stream.read(28)
+            after = os.fstat(stream.fileno())
+        return (raw == b"ccc-request-credentials-v1\n"
+                and identity(before) == identity(after) == identity(marker.lstat())
+                and identity(ds) == identity(directory.lstat())
+                and identity(hs) == identity(home.lstat()))
+    except (OSError, ValueError):
+        return False
+
+
+def observe_request_api_key(result: SessionResult, directory: Path | None = None) -> None:
+    """Project native send-boundary records; never fall back to configuration.
+
+    This is the most recent observed attempt for a thread, not a promise about
+    a future request. A live Codex writer, matching opt-in path, private files,
+    and a timestamp after its birth are required. Ambiguous writers are refused.
+    """
+    import os
+    import stat
+    import ccc_guard_scope as scope
+    from ccc_request_key_binding import connected_writer
+    def identity(info):
+        return (info.st_dev, info.st_ino, info.st_mode, info.st_uid,
+                info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+    result.api_key_observed = ""
+    result.api_key_observation_historical = False
+    result.api_key_observation_note = ""
+    directory = directory or Path.home() / ".codex" / "credential-observations"
+    if not result.ok or result.agent_kind != "codex":
+        return
+    cli_birth = scope.birth(result.pid, codex=True)
+    if cli_birth is None:
+        return
+    try:
+        root = directory.lstat()
+        if (not directory.is_absolute() or not stat.S_ISDIR(root.st_mode)
+                or root.st_uid != os.getuid() or root.st_mode & 0o077):
+            return
+        records = []
+        for index, path in enumerate(directory.iterdir()):
+            if index >= 4096:
+                return
+            if not path.name.endswith(f"-{result.session_id}-request_attempt.json"):
+                continue
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, "rb") as stream:
+                before = os.fstat(stream.fileno())
+                if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
+                        or before.st_mode & 0o077 or before.st_size > 16384):
+                    continue
+                raw = stream.read(16385)
+                after = os.fstat(stream.fileno())
+            if len(raw) > 16384 or identity(before) != identity(after):
+                continue
+            data = json.loads(raw)
+            if (not isinstance(data, dict) or type(data.get("schema")) is not int
+                    or data.get("schema") != 1 or data.get("thread_id") != result.session_id
+                    or data.get("purpose") != "request_attempt"
+                    or data.get("transport") not in ("http", "websocket")
+                    or not is_session_uuid(data.get("observer_epoch"))):
+                continue
+            pid = data.get("pid")
+            if type(pid) is not int or pid <= 0:
+                continue
+            if path.name != f"{data['observer_epoch']}-{result.session_id}-request_attempt.json":
+                continue
+            birth = scope.birth(pid, codex=True)
+            if birth is None:
+                continue
+            stamp = data.get("observed_at_ms")
+            if (type(stamp) is not int or stamp < birth[0] * 1000 + birth[1] / 1000
+                    or stamp > time.time() * 1000 + 1000):
+                continue
+            argv, env = scope.arguments(pid)
+            if (not argv or not request_observation_directory_matches(env, directory)
+                    or scope.birth(pid, codex=True) != birth):
+                continue
+            if not connected_writer(result.pid, pid, cli_birth, birth):
+                continue
+            authorization = data.get("authorization")
+            key = data.get("api_key")
+            # Count every bound writer, including a writer whose latest request
+            # has no observable credential. Otherwise an older/different writer
+            # with a key could masquerade as the sole request identity.
+            records.append((data, "", birth))
+            if data.get("credential_scope", "request_headers") != "request_headers":
+                continue
+            if isinstance(authorization, str):
+                scheme, separator, token = authorization.partition(" ")
+                if separator and scheme.lower() == "bearer":
+                    if key and key != token:
+                        continue
+                    key = token
+            if not isinstance(key, str) or not 0 < len(key) <= 4096 or not all(32 < ord(c) < 127 for c in key):
+                continue
+            records[-1] = (data, key, birth)
+        # Two live backends using the same thread are not one credential identity.
+        if len(records) != 1 or identity(directory.lstat()) != identity(root):
+            return
+        data, key, birth = records[0]
+        if not connected_writer(result.pid, data["pid"], cli_birth, birth):
+            return
+        if not key:
+            result.api_key_observation_note = (
+                "最近请求发生库内部重定向，末跳认证头未暴露；已清除首跳 Key。"
+                if data.get("credential_scope") == "opaque_redirect" else
+                "最近请求未记录可确认的 API Key；已清除先前显示。"
+            )
+            return
+        result.api_key_observed = key
+        when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(data["observed_at_ms"] / 1000))
+        result.api_key_observation_note = (
+            f"原生最近请求尝试 {when}；{data['transport']}；{data.get('endpoint', '')}；"
+            f"后台 PID {data['pid']}。来自实际认证请求头，不代表服务端接受或下一次请求。"
+        )
+        if data["observed_at_ms"] < cli_birth[0] * 1000 + cli_birth[1] / 1000:
+            result.api_key_observation_historical = True
+            result.api_key_observation_note += (
+                "此记录早于当前 CLI 启动，仅为该会话历史请求；尚未观察到本次启动后的请求。"
+            )
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+        return
 
 
 def observe_configured_api_key(result: SessionResult) -> None:
@@ -1945,7 +2110,7 @@ def _row_text(
     # Keep the full credential (including its configuration-only label) or
     # omit the entire column. Never present a clipped key as copyable auth.
     if api_key and display_width(row) + 1 + 72 <= width:
-        value = api_key if display_width(api_key) <= 72 else "配置 Key 过长，见详情"
+        value = api_key if display_width(api_key) <= 72 else "Key 过长，见详情"
         row += " " + pad(value, 72)
     return row.rstrip()
 
@@ -1960,7 +2125,7 @@ def header_text(width: int | None = None, collab: str | None = None, visible_col
     return _row_text(
         "     ", tuple(name for name, _, _ in columns), "标题",
         width, "session", collab, visible_columns,
-        api_key="api-key(实际未核实)",
+        api_key="api-key(最近请求)",
     )
 
 
@@ -4283,6 +4448,24 @@ def row_focus_summary(row: ViewRow | None) -> str:
     return focus_summary(row.candidate, row.workspace_ref)
 
 
+def row_request_key_summary(row: ViewRow | None, width: int) -> str:
+    """Show the selected session's observed request key on the focus separator."""
+    if row is None or row.candidate is None or row.candidate.agent_kind != "codex":
+        return rule("-", width)
+    candidate = row.candidate
+    if candidate.session.api_key_observation_historical:
+        return "历史请求 Key：本次启动后尚未核实；K 查看完整值"
+    prefix = f"s{_ref_digits(candidate.record.get('ref'))} 最近请求 Key: "
+    key = candidate.session.api_key_observed
+    if not key:
+        return prefix + "未核实；K 查看详情"
+    value = prefix + key
+    if display_width(value) <= width:
+        return value
+    # Never present a partial credential as a complete value.
+    return "最近请求 Key：K 查看完整值"
+
+
 def row_action_hint(row: ViewRow | None) -> str:
     if row is None:
         return "/ 搜索   f 切换筛选"
@@ -4367,10 +4550,28 @@ def _draw_compact(stdscr: Any, model: SupervisorModel, rows: list[ViewRow],
 def api_key_detail_lines(candidate: Candidate, width: int) -> list[str]:
     """Wrap the complete observation by terminal cells, including long keys."""
     width = max(2, width)
-    values = ["API-key：实际请求未核实", candidate.session.session_id,
+    observed = candidate.session.api_key_observed
+    configured = candidate.session.api_key_config
+    comparison = ""
+    if observed and configured:
+        comparison = (
+            "最近请求 Key 与当前磁盘配置不同。混合配置时可以正常存在；是否符合预期取决于此会话的目标 Key。"
+            if observed != configured else
+            "最近请求 Key 与当前磁盘配置相同；这不证明其他会话或下一次请求使用同一 Key。"
+        )
+    heading = ("API-key：历史请求（早于当前 CLI 启动）"
+               if candidate.session.api_key_observation_historical else
+               "API-key：最近实际请求" if observed else "API-key：实际请求未核实")
+    values = [heading,
+              candidate.session.api_key_observed or (
+                  "最近请求无可展示 Key" if candidate.session.api_key_observation_note
+                  else "尚无原生请求记录"),
+              candidate.session.api_key_observation_note, candidate.session.session_id,
               candidate.session.api_key_note, "", "当前磁盘配置 Key（非运行态）：",
               candidate.session.api_key_config or "未确认", "",
-              candidate.session.api_key_source]
+              candidate.session.api_key_source, "", comparison,
+              "Codex 连接共享后台时，重新进入 CLI 可能复用仍加载的原会话及旧凭据。",
+              "真正冷重载需确认原会话已卸载，再恢复同一 session；不能仅以 CLI 已退出判断。"]
     lines = []
     for value in values:
         line = ""
@@ -4402,7 +4603,7 @@ def _api_key_page(stdscr: Any, candidate: Candidate) -> None:
             _safe_addnstr(stdscr, y, 0, line, clip)
         if height >= 2:
             _safe_addnstr(stdscr, height - 2, 0, message, clip)
-            _safe_addnstr(stdscr, height - 1, 0, "↑↓滚动 y复制配置Key q返回", clip)
+            _safe_addnstr(stdscr, height - 1, 0, "↑↓滚动 y复制当前详情Key q返回", clip)
         stdscr.refresh()
         key = stdscr.getch()
         if key in (27, ord("q"), ord("Q"), ord("K")):
@@ -4412,14 +4613,16 @@ def _api_key_page(stdscr: Any, candidate: Candidate) -> None:
         elif key in (curses.KEY_UP, ord("k")):
             offset = max(0, offset - 1)
         elif key in (ord("y"), ord("Y")):
-            if not candidate.session.api_key_config:
+            copy_key = candidate.session.api_key_observed or candidate.session.api_key_config
+            if not copy_key:
                 message = "配置 Key 未确认，未复制"
                 continue
             try:
                 result = subprocess.run(["/usr/bin/pbcopy"],
-                                        input=candidate.session.api_key_config,
+                                        input=copy_key,
                                         text=True, capture_output=True, timeout=2)
-                message = "已复制配置 Key（非运行态证明）" if result.returncode == 0 else "复制失败"
+                label = "已复制最近请求 Key" if candidate.session.api_key_observed else "已复制配置 Key（非运行态证明）"
+                message = label if result.returncode == 0 else "复制失败"
             except (OSError, subprocess.TimeoutExpired):
                 message = "复制失败"
 
@@ -4614,7 +4817,7 @@ def _draw(
 
     # Everything about the cursor lives below the table, never above it.
     focus = rows[index] if rows else None
-    _safe_addnstr(stdscr, at["focus_rule"], 0, rule("-", clip), clip, attr("rule"))
+    _safe_addnstr(stdscr, at["focus_rule"], 0, row_request_key_summary(focus, clip), clip, attr("rule"))
     focus_line = row_focus_summary(focus)
     if focus is not None and focus.candidate is not None:
         note = collab_focus_note(focus.candidate, collab_by_uuid)
