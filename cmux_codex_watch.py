@@ -1537,9 +1537,9 @@ CLAUDE_LIVE_BANNER_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 CLAUDE_CLIENT_RETRY_RE = re.compile(
-    r"\s*[✻※✶✳✢✽●◐◑]\s+(?:API error\b|[45]\d{2}\b)[^\r\n]*?"
-    r"\bRetrying in\s+\d+(?:\.\d+)?s"
-    r"\s*·\s*attempt\s+[1-9]\d*/[1-9]\d*\s*", re.IGNORECASE,
+    r"\s*(?:[✻※✶✳✢✽●◐◑]\s+)?(?:API error\b|[45]\d{2}\b)[^\r\n]*?"
+    r"\bRetrying in\s+\d+(?:\.\d+)?\s*(?:seconds?|s)"
+    r"\s*(?:·|…|\.\.\.)\s*\(?attempt\s+[1-9]\d*/[1-9]\d*\)?\s*", re.IGNORECASE,
 )
 # Live Claude API/stream chrome.  Anchored at the start of a line so a recap
 # sentence that *mentions* an API Error is not a send trigger.  Optional
@@ -3107,6 +3107,9 @@ class ClaudeHookHistory:
         key = (str(target.get("surface_id") or ""),
                str(target.get("workspace_id") or ""), int(observation.get("pid") or 0))
         row = self._entries.get(key, {})
+        launch_workspace = observation.get("launch_workspaces", {}).get(key[2])
+        if not row and key[2] in observation.get("identity_verified_pids", []) and launch_workspace:
+            row = self._entries.get((key[0], launch_workspace, key[2]), {})
         start, latest = row.get("start", {}), row.get("latest", {})
         if (started > 0 and start and latest
                 and started <= start["created_at"] <= latest["created_at"] <= now
@@ -3231,7 +3234,7 @@ class ClaudeEventLedger:
             row = self.events.get(str(event["event_id"]))
             if not isinstance(row, Mapping):
                 return CLAUDE_TERMINAL_CONFLICT
-            rejected = row.get("status") == "unmapped" and row.get("detail") == "surface is not authorized"
+            rejected = observation_health.registration_rejection(row)
             interrupted = row.get("status") == "handling" and bool(row.get("registration_revalidated_at"))
             if not (rejected or interrupted):
                 return CLAUDE_TERMINAL_CONFLICT
@@ -3241,7 +3244,7 @@ class ClaudeEventLedger:
             )):
                 return CLAUDE_HISTORICAL_ID_COLLISION
             updated = dict(row)
-            updated.setdefault("original_rejection", {"status": "unmapped", "detail": "surface is not authorized",
+            updated.setdefault("original_rejection", {"status": row.get("status"), "detail": row.get("detail"),
                                                        "handled_at": row.get("handled_at")})
             updated.update(self._row_from_event(event, status="handling", detail="registration revalidated"))
             updated["registration_revalidated_at"] = time.time()
@@ -4795,9 +4798,15 @@ def classify_surface_processes(top: Mapping[str, Any]) -> dict[str, dict[str, An
         summaries[key]["identity_verified_pids"] = [
             p["pid"] for p in processes if type(p.get("pid")) is int
             and p.get("cmux_surface_id") == key
-            and (not workspace_id or p.get("cmux_workspace_id") == workspace_id)
+            # Workspace environment is a launch snapshot; moving the same
+            # surface does not update it. Foreign roots were filtered above.
         ]
         summaries[key]["process_snapshot_present"] = isinstance(item.get("processes"), list)
+        summaries[key]["launch_workspaces"] = {
+            p["pid"]: p["cmux_workspace_id"] for p in processes
+            if type(p.get("pid")) is int and p.get("cmux_surface_id") == key
+            and p.get("cmux_workspace_id")
+        }
         summaries[key]["identity_conflicts"] = conflicts
     return summaries
 
@@ -5958,7 +5967,11 @@ class WatchDaemon:
             sid = str(target["surface_id"])
             runtime = state.get(sid, {})
             explicit_owner = process_owners.get(runtime.get("claude_process_pid"))
-            if explicit_owner and explicit_owner != (sid, str(target["workspace_id"])):
+            # Workspace environment is fixed at launch; moving the live
+            # surface does not update it. This is only a liveness diagnostic,
+            # not permission to send: even an exact surface still needs the
+            # persisted process generation below to survive PID reuse.
+            if explicit_owner and explicit_owner[0] != sid:
                 owner = False
             else:
                 # A saved PID can now belong to a different process, including
@@ -6067,7 +6080,7 @@ class WatchDaemon:
         with self._surface_lock(surface_id), self.claude_event_ledger._lock:
             rows = copy.deepcopy(self.claude_event_ledger.events)
         possible = any(r.get("surface_id") == surface_id and r.get("event_name") in {"Stop", "StopFailure"}
-                       and (r.get("status") == "unmapped" or
+                       and (observation_health.registration_rejection(r) or
                             (r.get("status") == "handling" and r.get("registration_revalidated_at")))
                        for r in rows.values())
         if not possible:
@@ -6089,6 +6102,7 @@ class WatchDaemon:
             root_observation = inspect_claude_process(int(process.get("agent_pid") or 0))
             event_observation = inspect_claude_process(int(latest.get("agent_pid") or 0))
             inspected = {**root_observation, "identity_verified_pids": process.get("identity_verified_pids", []),
+                         "launch_workspaces": process.get("launch_workspaces", {}),
                          "event_pid_started_epoch": event_observation.get("started_epoch", 0)}
         except (CmuxError, OSError, ValueError, TypeError):
             return True
@@ -6213,6 +6227,8 @@ class WatchDaemon:
         inspected["agent_kind"] = "claude"
         inspected["surface_id"] = target.get("surface_id")
         inspected["workspace_id"] = target.get("workspace_id")
+        inspected["identity_verified_pids"] = label.get("identity_verified_pids", [])
+        inspected["launch_workspaces"] = label.get("launch_workspaces", {})
         return inspected
 
     def _live_claude_hook_identity_matches(self, runtime, observation) -> bool:
@@ -8288,13 +8304,48 @@ class WatchDaemon:
         client: CmuxClient,
         *,
         reason: str,
+        input_check=None,
     ) -> bool:
         """Submit only the already verified watchdog text with an explicit key."""
 
         surface_id = str(target["surface_id"])
         try:
-            client.send_key(str(target["workspace_id"]), surface_id, "enter")
-        except (CmuxError, RuntimeError) as exc:
+            base = client.client if isinstance(client, SnapshotClient) else client
+            if input_check is None:
+                expected_pid = runtime.claude_process_pid
+                expected_generation = runtime.claude_process_generation
+
+                def input_check():
+                    current = self._event_target(surface_id)
+                    if (current != target or self.stop_requested or self.config.get("mode") != "armed"
+                            or self.config.get("global_paused") or not self.config.get("claude_enabled")
+                            or current.get("paused") or not current.get("enabled", True)
+                            or runtime.claude_completed_latched or not expected_pid or not expected_generation):
+                        return False
+                    record = find_main_surface(base.tree(), surface_id)
+                    live = surface_process_label(
+                        classify_surface_processes(base.top(str(target["workspace_id"]))), target)
+                    identity = self._claude_send_process_identity(expected_pid)
+                    return (record.get("workspace_id") == target["workspace_id"]
+                            and live.get("agent_kind") == "claude" and live.get("agent_pid") == expected_pid
+                            and bool(identity.get("started_epoch"))
+                            and identity.get("generation") == expected_generation)
+
+            identity_check = input_check
+
+            def submit_check():
+                if not identity_check():
+                    return False
+                frame = Grid.from_rpc(base.replay(str(target["workspace_id"]), surface_id), surface_id)
+                state = classify_claude_grid(frame, claude_message=str(self.config.get("claude_message") or CLAUDE_MESSAGE))
+                return state.kind == "composer_busy" and state.watchdog_echo and identity_check()
+
+            if not submit_check():
+                raise CmuxError("Claude live identity changed before Enter")
+            guard = (base.input_guard(submit_check) if hasattr(base, "input_guard") else contextlib.nullcontext())
+            with guard:
+                client.send_key(str(target["workspace_id"]), surface_id, "enter")
+        except (CmuxError, RuntimeError, OSError, ValueError, TypeError) as exc:
             runtime.claude_submit_last_reason = f"enter failed: {exc}"
             self.logger.warning(
                 "surface=%s Claude submit Enter failed phase=%s reason=%s",
@@ -8481,6 +8532,9 @@ class WatchDaemon:
         runtime.state = "claude_submit_pending"
         return True
 
+    def _claude_send_process_identity(self, pid):
+        return inspect_claude_process(pid)
+
     def _send_claude_event(
         self,
         event: Mapping[str, Any],
@@ -8540,6 +8594,39 @@ class WatchDaemon:
         _stage("process_ms")
         if process.get("agent_kind") != "claude":
             return False, f"process is {process.get('agent_kind') or 'unknown'}"
+        base = client.client if isinstance(client, SnapshotClient) else client
+        try:
+            pinned_pid = int(process.get("agent_pid") or 0)
+            pinned_identity = self._claude_send_process_identity(pinned_pid)
+        except (OSError, ValueError, TypeError, CmuxError):
+            return False, "process is unverified before preflight"
+
+        def live_input_check():
+            # Do not reuse the discovery cache after viewport or socket I/O.
+            try:
+                record = find_main_surface(base.tree(), surface_id)
+                if record.get("workspace_id") != target["workspace_id"]:
+                    return False
+                labels = classify_surface_processes(base.top(str(target["workspace_id"])))
+                live = surface_process_label(labels, target)
+                if live.get("agent_kind") != "claude" or int(live.get("agent_pid") or 0) != pinned_pid:
+                    return False
+                identity = self._claude_send_process_identity(pinned_pid)
+                if (not pinned_identity.get("started_epoch") or not identity.get("started_epoch")
+                        or not pinned_identity.get("generation")
+                        or identity.get("generation") != pinned_identity["generation"]):
+                    return False
+                current = self._event_target(surface_id)
+                return (current == target and not self.stop_requested
+                        and self.config.get("mode") == "armed"
+                        and not self.config.get("global_paused")
+                        and self.config.get("claude_enabled")
+                        and not current.get("paused") and current.get("enabled", True)
+                        and not runtime.claude_completed_latched
+                        and (not event.get("_registration_revalidation")
+                             or self._registration_stop_is_latest(event)))
+            except (OSError, ValueError, TypeError, CmuxError):
+                return False
         try:
             _, focused_before, first, first_signature = self._claude_event_snapshot(target, client)
             _stage("frame1_ms")
@@ -8596,7 +8683,12 @@ class WatchDaemon:
         runtime.claude_orphan_enter_at = 0.0
         _submit_stage("transaction_init_ms")
         try:
-            client.send_text(str(target["workspace_id"]), surface_id, message)
+            if not live_input_check():
+                raise CmuxError("Claude live identity changed before text")
+            guard = (base.input_guard(live_input_check) if hasattr(base, "input_guard")
+                     else contextlib.nullcontext())
+            with guard:
+                client.send_text(str(target["workspace_id"]), surface_id, message)
         except (CmuxError, RuntimeError) as exc:
             self._clear_claude_submit(runtime, reason=f"text failed: {exc}")
             return False, f"cmux send text failed after reservation: {exc}"
@@ -8648,7 +8740,8 @@ class WatchDaemon:
         # A newline passed to ``cmux send`` is not a reliable submission on
         # every cmux/Claude combination. Always issue an explicit Enter now;
         # later polls retry only this key while the exact watchdog echo stays.
-        entered = self._send_claude_enter(target, runtime, client, reason="initial_submit")
+        entered = self._send_claude_enter(target, runtime, client, reason="initial_submit",
+                                         input_check=live_input_check)
         _submit_stage("enter_ms")
         if not entered:
             # Nothing was submitted, so nothing can echo: restore the previous

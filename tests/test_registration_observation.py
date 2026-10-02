@@ -1,4 +1,5 @@
 import copy
+import contextlib
 import json
 import subprocess
 import tempfile
@@ -13,7 +14,7 @@ import ccc_observation as observation
 import cmux_codex_watch as core
 from tests.test_watch import (
     FakeClient, claude_armed_daemon, claude_grid_payload, claude_hook_event,
-    process_fixture_with_pid, claude_idle_screen,
+    process_fixture_with_pid, claude_idle_screen, claude_wrapped_composer_payload,
 )
 
 
@@ -80,6 +81,53 @@ class RegistrationRecoveryTests(unittest.TestCase):
         self.assertEqual(row["original_rejection"]["status"], "unmapped")
         self.assertEqual(set(self.daemon.claude_event_ledger.events), {"original-stop"})
 
+    def moved_events(self, *, status="unmapped", detail="surface is not authorized"):
+        process = self.client.top_data["windows"][0]["workspaces"][0]["surfaces"][0]["processes"][0]
+        process["cmux_workspace_id"] = "launch-workspace"
+        for event in self.events:
+            event["workspace_id"] = "launch-workspace"
+        self.journal()
+        self.daemon.claude_event_ledger.mark(self.stop, status, detail=detail)
+
+    def test_moved_surface_recovers_original_unauthorized_stop(self):
+        self.moved_events()
+        self.reconcile()
+        self.assertEqual(len(self.client.sent_text), 1)
+        row = self.daemon.claude_event_ledger.events["original-stop"]
+        self.assertEqual(row["workspace_id"], "launch-workspace")
+        self.assertEqual(row["status"], "sent")
+
+    def test_moved_surface_recovers_original_process_conflict(self):
+        self.moved_events(status="process_conflict", detail="surface root process is not Claude")
+        self.reconcile()
+        self.assertEqual(len(self.client.sent_text), 1)
+        row = self.daemon.claude_event_ledger.events["original-stop"]
+        self.assertEqual(row["original_rejection"]["status"], "process_conflict")
+        self.reconcile()
+        self.assertEqual(len(self.client.sent_text), 1)
+
+    def test_moved_surface_rejects_unrelated_workspace_and_foreign_surface(self):
+        self.moved_events()
+        self.events[-1]["workspace_id"] = "unrelated-workspace"
+        self.journal()
+        self.reconcile()
+        self.assertEqual(self.client.sent_text, [])
+        self.events[-1]["workspace_id"] = "launch-workspace"
+        self.journal()
+        process = self.client.top_data["windows"][0]["workspaces"][0]["surfaces"][0]["processes"][0]
+        process["cmux_surface_id"] = "foreign-surface"
+        self.reconcile()
+        self.assertEqual(self.client.sent_text, [])
+
+    def test_history_lookup_requires_verified_launch_identity(self):
+        self.moved_events()
+        history = core.ClaudeHookHistory(self.daemon.claude_event_inbox.journal_path)
+        observed = {"pid": 1234, "started_epoch": self.now - 120,
+                    "identity_verified_pids": [1234], "launch_workspaces": {1234: "launch-workspace"}}
+        self.assertIsNotNone(history.lookup(self.target, observed))
+        observed["identity_verified_pids"] = []
+        self.assertIsNone(history.lookup(self.target, observed))
+
     def test_repeated_check_and_daemon_restart_do_not_retype(self):
         self.reconcile()
         self.reconcile()
@@ -107,6 +155,97 @@ class RegistrationRecoveryTests(unittest.TestCase):
         self.client.read_screen = new_prompt
         self.reconcile()
         self.assertEqual(self.client.sent, [])
+
+    def test_process_exit_during_read_screen_never_writes(self):
+        read = self.client.read_screen
+        def exiting(*args, **kwargs):
+            result = read(*args, **kwargs)
+            self.client.top_data["windows"][0]["workspaces"][0]["surfaces"][0]["processes"] = []
+            return result
+        self.client.read_screen = exiting
+        self.reconcile()
+        self.assertEqual(self.client.sent_text, [])
+        self.assertEqual(self.client.sent, [])
+
+    def test_process_exit_after_text_never_enters(self):
+        send = self.client.send_text
+        def exiting(*args, **kwargs):
+            result = send(*args, **kwargs)
+            self.client.top_data["windows"][0]["workspaces"][0]["surfaces"][0]["processes"] = []
+            return result
+        self.client.send_text = exiting
+        self.reconcile()
+        self.assertEqual(len(self.client.sent_text), 1)
+        self.assertEqual(self.daemon.runtime["surface-uuid"].send_count, 0)
+        self.assertNotEqual(self.daemon.runtime["surface-uuid"].claude_submit_phase, "enter_sent")
+
+    def test_connection_guard_rejects_exit_before_paste(self):
+        @contextlib.contextmanager
+        def connection(check):
+            self.client.top_data["windows"][0]["workspaces"][0]["surfaces"][0]["processes"] = []
+            if not check():
+                raise core.CmuxError("identity lost after connection")
+            yield
+        self.client.input_guard = connection
+        self.reconcile()
+        self.assertEqual(self.client.sent_text, [])
+
+    def test_connection_guard_rechecks_composer_and_authorization_before_enter(self):
+        calls = []
+        @contextlib.contextmanager
+        def connection(check):
+            calls.append(True)
+            if len(calls) == 2:
+                self.client._submit_echo = False
+                self.client.payload = claude_wrapped_composer_payload("human draft")
+            if not check():
+                raise core.CmuxError("changed after connection")
+            yield
+        self.client.input_guard = connection
+        self.reconcile()
+        self.assertEqual(len(self.client.sent_text), 1)
+        self.assertEqual(self.client.sent_keys, [])
+
+    def test_pending_enter_rejects_exit_during_final_replay(self):
+        runtime = self.daemon.runtime.setdefault("surface-uuid", core.TargetRuntime())
+        runtime.claude_process_pid = 1234
+        runtime.claude_process_generation = "fixture-birth-1234"
+        self.client.payload = claude_wrapped_composer_payload()
+        replay = self.client.replay
+        def exiting(*args):
+            frame = replay(*args)
+            self.client.top_data["windows"][0]["workspaces"][0]["surfaces"][0]["processes"] = []
+            return frame
+        self.client.replay = exiting
+        self.assertFalse(self.daemon._send_claude_enter(self.target, runtime, self.client, reason="pending"))
+        self.assertEqual(self.client.sent_keys, [])
+
+    def test_pending_enter_rejects_pause_after_connection(self):
+        runtime = self.daemon.runtime.setdefault("surface-uuid", core.TargetRuntime())
+        runtime.claude_process_pid = 1234
+        runtime.claude_process_generation = "fixture-birth-1234"
+        self.client.payload = claude_wrapped_composer_payload()
+        @contextlib.contextmanager
+        def connection(check):
+            self.daemon.config["global_paused"] = True
+            if not check():
+                raise core.CmuxError("paused after connection")
+            yield
+        self.client.input_guard = connection
+        self.assertFalse(self.daemon._send_claude_enter(self.target, runtime, self.client, reason="pending"))
+        self.assertEqual(self.client.sent_keys, [])
+
+    def test_birth_change_during_viewport_rejects_same_pid(self):
+        read = self.client.read_screen
+        def reused(*args, **kwargs):
+            value = read(*args, **kwargs)
+            self.daemon._claude_send_process_identity = lambda pid: {
+                "pid": pid, "started_epoch": self.now, "generation": "reused-pid",
+            }
+            return value
+        self.client.read_screen = reused
+        self.reconcile()
+        self.assertEqual(self.client.sent_text, [])
 
     def test_interrupted_handling_can_resume_but_reserved_cannot(self):
         self.daemon.claude_event_ledger.claim_registration(self.stop)
@@ -149,6 +288,12 @@ class RegistrationRecoveryTests(unittest.TestCase):
         self.stop["completed"] = False
         self.journal()
         self.daemon.claude_event_ledger.mark(self.stop, "ignored_paused")
+        self.reconcile()
+        self.assertEqual(self.client.sent, [])
+
+    def test_moved_registration_preserves_native_retry_countdown(self):
+        self.moved_events(status="process_conflict", detail="surface root process is not Claude")
+        self.client.payload = claude_grid_payload(error="API Error: 503 Retrying in 5 seconds… (attempt 3/3)")
         self.reconcile()
         self.assertEqual(self.client.sent, [])
 
@@ -353,10 +498,31 @@ class ObservationCoverageTests(unittest.TestCase):
         self.assertEqual(result["agent_pids"], [])
         self.assertEqual(result["identity_conflicts"], 2)
 
-    def test_foreign_workspace_is_excluded_even_with_matching_surface(self):
+    def test_moved_surface_keeps_launch_workspace_and_verified_identity(self):
         top = claude_processes()
-        top["windows"][0]["workspaces"][0]["surfaces"][0]["processes"][0]["cmux_workspace_id"] = "foreign"
+        top["windows"][0]["workspaces"][0]["surfaces"][0]["processes"][0]["cmux_workspace_id"] = "previous-workspace"
+        result = core.classify_surface_processes(top)["surface-uuid"]
+        self.assertEqual(result["agent_pids"], [1234])
+        self.assertEqual(result["identity_verified_pids"], [1234])
+        self.assertEqual(result["identity_conflicts"], 0)
+
+    def test_workspace_mismatch_without_surface_proof_still_rejects(self):
+        top = claude_processes()
+        process = top["windows"][0]["workspaces"][0]["surfaces"][0]["processes"][0]
+        process.pop("cmux_surface_id")
+        process["cmux_workspace_id"] = "foreign"
         self.assertEqual(core.classify_surface_processes(top)["surface-uuid"]["agent_pids"], [])
+
+    def test_matching_child_cannot_override_foreign_root_on_reused_tty(self):
+        top = claude_processes()
+        surface = top["windows"][0]["workspaces"][0]["surfaces"][0]
+        surface["processes"][0]["cmux_surface_id"] = "foreign"
+        surface["processes"].append(dict(kind="process", name="claude", pid=1235,
+            ppid=1234, cmux_surface_id="surface-uuid", cmux_workspace_id="previous-workspace"))
+        result = core.classify_surface_processes(top)["surface-uuid"]
+        self.assertEqual(result["agent_pids"], [])
+        self.assertEqual(result["identity_verified_pids"], [])
+        self.assertEqual(result["identity_conflicts"], 2)
 
     def test_unknown_and_stale_cannot_report_ok(self):
         row = self.row()

@@ -443,7 +443,12 @@ def armed_daemon(directory, client, extra_targets=None):
         "targets": targets,
     }
     config_path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
-    return WatchDaemon(config_path, state_path, client=client)
+    daemon = WatchDaemon(config_path, state_path, client=client)
+    if isinstance(client, FakeClient) and any(p.get("name") == "claude"
+           for s, _ in core.observation_health.surface_entries(client.top_data)
+           for p in s.get("processes", [])):
+        bind_fake_claude_process_identity(daemon, client)
+    return daemon
 
 
 def discovery_fixture():
@@ -485,6 +490,23 @@ def discovery_fixture():
     return tree, top
 
 
+def bind_fake_claude_process_identity(daemon, client):
+    """Supply explicit fake birth evidence; never inspect host PIDs in send tests."""
+    if client.tree_data.get("windows") == []:
+        client.tree_data["windows"] = [{"workspaces": [{"id": "workspace-uuid", "panes": [{
+            "id": "pane-uuid", "surfaces": [{"id": "surface-uuid", "ref": "surface:1", "type": "terminal"}],
+        }]}]}]
+    for surface, _ in core.observation_health.surface_entries(client.top_data):
+        for process in surface.get("processes", []):
+            if process.get("kind") == "process":
+                process.setdefault("pid", 1234)
+    daemon._claude_send_process_identity = lambda pid: {
+        "pid": pid, "started_epoch": 1.0, "generation": f"fixture-birth-{pid}",
+    }
+    daemon._inspect_process_cached = daemon._claude_send_process_identity
+    return daemon
+
+
 def claude_armed_daemon(directory, client, **extra):
     """Module-level twin of WatchTests._claude_armed_daemon.
 
@@ -510,7 +532,7 @@ def claude_armed_daemon(directory, client, **extra):
     }
     config.update(extra)
     config_path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
-    return WatchDaemon(config_path, root / "state.json", client=client)
+    return bind_fake_claude_process_identity(WatchDaemon(config_path, root / "state.json", client=client), client)
 
 
 def process_fixture(*surfaces):
@@ -2797,7 +2819,7 @@ class WatchTests(unittest.TestCase):
         }
         config.update(extra)
         config_path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
-        return WatchDaemon(config_path, root / "state.json", client=client)
+        return bind_fake_claude_process_identity(WatchDaemon(config_path, root / "state.json", client=client), client)
 
     def test_classify_claude_grid_sends_on_live_503_not_on_working_or_question(self):
         error = classify_claude_grid(Grid.from_rpc(claude_grid_payload(
@@ -3252,6 +3274,7 @@ class WatchTests(unittest.TestCase):
                 top=process_fixture(("surface-uuid", "claude")),
             )
             daemon = self._claude_armed_daemon(directory, client)
+            daemon.process_once(client)  # Observe this process birth before its Hook.
             daemon._handle_claude_event(claude_hook_event("done-1", completed=True), client)
             runtime = daemon.runtime["surface-uuid"]
             self.assertTrue(runtime.claude_completed_latched)
@@ -3633,6 +3656,7 @@ class WatchTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as directory:
             daemon = self._claude_armed_daemon(directory, client)
+            daemon.process_once(client)  # Observe this process birth before its Hook.
             daemon._handle_claude_event(claude_hook_event("done-screen", completed=True), client)
             self.assertEqual(client.sent, [])
             self.assertTrue(daemon.runtime["surface-uuid"].claude_completed_latched)
@@ -4554,9 +4578,12 @@ class WatchTests(unittest.TestCase):
 
     def test_claude_pending_retries_only_enter_when_exact_echo_remains(self):
         with tempfile.TemporaryDirectory() as directory:
-            client = FakeClient(claude_grid_payload(), claude_idle_screen())
+            client = FakeClient(claude_wrapped_composer_payload(), claude_idle_screen(),
+                                top=process_fixture(("surface-uuid", "claude")))
             daemon = self._claude_armed_daemon(directory, client)
             runtime = daemon.runtime.setdefault("surface-uuid", TargetRuntime())
+            runtime.claude_process_pid = 1234
+            runtime.claude_process_generation = "fixture-birth-1234"
             runtime.claude_submit_event_id = "event-1"
             runtime.claude_submit_since = time.time()
             runtime.claude_submit_last_attempt_at = time.time() - 2
@@ -7255,6 +7282,8 @@ class OrphanWatchdogSubmitRecoveryTests(unittest.TestCase):
         )
         daemon = claude_armed_daemon(directory, client, **extra)
         runtime = daemon.runtime.setdefault("surface-uuid", core.TargetRuntime())
+        runtime.claude_process_pid = 1234
+        runtime.claude_process_generation = "fixture-birth-1234"
         runtime.claude_session_id = "session-uuid"
         runtime.claude_hook_health = "healthy"
         return daemon, client, runtime
@@ -7488,6 +7517,8 @@ class OrphanEnterBudgetTests(unittest.TestCase):
         )
         daemon = claude_armed_daemon(directory, client, **extra)
         runtime = daemon.runtime.setdefault("surface-uuid", core.TargetRuntime())
+        runtime.claude_process_pid = 1234
+        runtime.claude_process_generation = "fixture-birth-1234"
         runtime.claude_session_id = "session-uuid"
         runtime.claude_hook_health = "healthy"
         return daemon, client, runtime
