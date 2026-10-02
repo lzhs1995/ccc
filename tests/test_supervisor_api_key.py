@@ -11,6 +11,18 @@ SID = "01a0e7c1-dbf1-7c23-a186-ce9af424ed55"
 
 
 class CredentialDisplayTests(unittest.TestCase):
+    def test_shared_config_is_not_repeated_as_each_sessions_actual_key(self):
+        sessions = [tui.SessionResult(session_id=sid, api_key_config="sk-shared-current")
+                    for sid in (SID, "another-session")]
+        for session in sessions:
+            candidate = SimpleNamespace(session=session)
+            text = tui.Candidate.api_key_text.fget(candidate)
+            self.assertIn("未核实", text)
+            self.assertNotIn("sk-shared-current", text)
+            detail = "".join(tui.api_key_detail_lines(candidate, 30))
+            self.assertIn("sk-shared-current", detail)
+            self.assertIn("非运行态", detail)
+
     def detail_candidate(self, key):
         return SimpleNamespace(session=tui.SessionResult(
             session_id=SID, api_key_config=key, api_key_note="运行态未确认",

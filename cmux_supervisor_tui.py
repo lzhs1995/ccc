@@ -390,9 +390,9 @@ class Candidate:
 
     @property
     def api_key_text(self) -> str:
-        # A file read is not a read of the running provider's credential.
-        key = self.session.api_key_config
-        return f"配置:{key}" if key else "未确认"
+        # The row represents this running session. Repeating a shared mutable
+        # TOML value here falsely suggests all loaded sessions use that key.
+        return "未核实（K查看配置）" if self.session.api_key_config else "未核实"
 
     @property
     def surface_id(self) -> str:
@@ -1412,7 +1412,11 @@ def observe_configured_api_key(result: SessionResult) -> None:
         if scope.birth(result.pid, codex=True) != before or after_raw != raw:
             return
         result.api_key_source = str(path)
-        result.api_key_note = "仅用户配置；运行态/项目覆盖未确认，Switch 切换不代表现有会话已换 Key"
+        result.api_key_note = (
+            "仅当前磁盘配置；运行态/项目覆盖未确认。多个会话可能共用此文件，"
+            "显示相同不代表实际使用相同 Key，也不能判断混合配置是否生效。"
+            "Switch 切换不代表现有会话已换 Key。"
+        )
         if isinstance(key, str) and 0 < len(key) <= 512 and all(32 < ord(c) < 127 for c in key):
             result.api_key_config = key
     except (OSError, ValueError, KeyError, TypeError, RuntimeError, ImportError):
@@ -1956,7 +1960,7 @@ def header_text(width: int | None = None, collab: str | None = None, visible_col
     return _row_text(
         "     ", tuple(name for name, _, _ in columns), "标题",
         width, "session", collab, visible_columns,
-        api_key="api-key(配置，非运行态)",
+        api_key="api-key(实际未核实)",
     )
 
 
@@ -4363,8 +4367,8 @@ def _draw_compact(stdscr: Any, model: SupervisorModel, rows: list[ViewRow],
 def api_key_detail_lines(candidate: Candidate, width: int) -> list[str]:
     """Wrap the complete observation by terminal cells, including long keys."""
     width = max(2, width)
-    values = ["API-key：用户配置，非运行态", candidate.session.session_id,
-              candidate.session.api_key_note, "", "配置 Key：",
+    values = ["API-key：实际请求未核实", candidate.session.session_id,
+              candidate.session.api_key_note, "", "当前磁盘配置 Key（非运行态）：",
               candidate.session.api_key_config or "未确认", "",
               candidate.session.api_key_source]
     lines = []
