@@ -22,7 +22,11 @@ def read_foreground(pid, opt_in, directory=None):
     and survives panel restarts without relying on this module's seen cache.
     """
     generation = scope.birth(pid, codex=True)
-    key = (pid, tuple(generation or ()))
+    # A failed identity read is not evidence of PID reuse or a legacy client.
+    # Otherwise a missing record can revive the startup thread and its Key.
+    if generation is None:
+        return "invalid", None, None
+    key = (pid, tuple(generation))
     try:
         argv, env = scope.arguments(pid)
         required = env.get("CODEX_CLIENT_THREAD_OBSERVER")

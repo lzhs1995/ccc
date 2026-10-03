@@ -104,6 +104,23 @@ class ForegroundTests(unittest.TestCase):
         self.path.unlink()
         self.assertEqual(self.read(), ('invalid', None, None))
 
+    def test_unmeasured_birth_cannot_restore_startup_session(self):
+        self.publish()
+        self.assertEqual(self.resolve().session_id, self.new)
+        self.path.unlink()
+        with patch.object(binding.scope, 'birth', return_value=None):
+            self.assertEqual(self.read(), ('invalid', None, None))
+            self.assertEqual(self.resolve().status, 'unknown')
+        # Recovery of the original identity does not authorize argv fallback.
+        self.assertEqual(self.resolve().status, 'unknown')
+        self.publish()
+        self.assertEqual(self.resolve().session_id, self.new)
+
+    def test_unmeasured_birth_without_history_is_not_legacy_absence(self):
+        with patch.object(binding.scope, 'birth', return_value=None):
+            self.assertEqual(self.read(), ('invalid', None, None))
+            self.assertEqual(self.resolve().status, 'unknown')
+
     def test_reused_pid_managed_client_still_requires_its_own_record(self):
         self.publish()
         self.assertEqual(self.read()[0], 'ok')
