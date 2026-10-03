@@ -1,4 +1,5 @@
 """Read native request records without mistaking shared configuration for auth."""
+from contextlib import ExitStack
 import json
 import os
 import shutil
@@ -18,6 +19,8 @@ OTHER = "01a0e96a-68dd-7210-8ef0-d83c89dca4d8"
 
 class NativeRequestKeyTests(unittest.TestCase):
     def setUp(self):
+        contexts = ExitStack()
+        self.addCleanup(contexts.close)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.directory = Path(self.temp.name)
@@ -25,7 +28,7 @@ class NativeRequestKeyTests(unittest.TestCase):
         self.born = [int(time.time()) - 60, 0]
         self.epoch = str(uuid.uuid4())
         self.foreground_sid = SID
-        self.foreground = self.enterContext(patch(
+        self.foreground = contexts.enter_context(patch(
             "ccc_client_thread_observation.read_foreground",
             side_effect=lambda *args: ("ok", self.foreground_sid, ("test-native-proof",))))
 

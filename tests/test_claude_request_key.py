@@ -1,3 +1,4 @@
+from contextlib import ExitStack
 import json
 import os
 from pathlib import Path
@@ -12,6 +13,8 @@ import ccc_claude_request_key as reader
 
 class ClaudeRequestKeyTests(unittest.TestCase):
     def setUp(self):
+        contexts = ExitStack()
+        self.addCleanup(contexts.close)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
@@ -27,8 +30,8 @@ class ClaudeRequestKeyTests(unittest.TestCase):
                          credential_scope='first_hop_headers', authorization=None,
                          api_key='fake-pinned')
         self.write()
-        self.birth_mock = self.enterContext(patch.object(reader.scope, 'birth', return_value=self.birth))
-        self.args_mock = self.enterContext(patch.object(reader.scope, 'arguments', return_value=self.args))
+        self.birth_mock = contexts.enter_context(patch.object(reader.scope, 'birth', return_value=self.birth))
+        self.args_mock = contexts.enter_context(patch.object(reader.scope, 'arguments', return_value=self.args))
 
     def write(self):
         self.path.write_text(json.dumps(self.data))
