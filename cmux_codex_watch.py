@@ -69,6 +69,8 @@ DEFAULT_RUNTIME_ROOT = DEFAULT_APP_DIR / "runtime"
 RUNTIME_FILES = ("cmux_codex_watch.py", "ccc_provider_retry.py", "claude_ccc_protocol.py", "claude_ccc_event_hook.py", "ccc_observation.py", "ccc_scheduling.py", "ccc_native_lanes.py", "ccc_delivery.py", "ccc_codex_queue.py", "ccc_codex_goal.py", "ccc_workspace_batch.py", "ccc_private_check.py", "ccc_inventory.py", "ccc_batch_guard.py", "ccc_guard_transport.py", "ccc_guard_watchdog.py", "ccc_guard_scope.py", "ccc_guard_migration.py", "ccc_codex_launcher.py", "ccc_network_client.py", "ccc_network_guard.py", "ccc_mihomo.py", "ccc_native_processes.py", "ccc_access_budget.py", "ccc_access_gateway.py", "ccc_access_service.py", "ccc_batch_timing.py")
 RUNTIME_FILES += ("ccc_native_standby.py", "ccc_standby_identity.py", "ccc_standby_transport.py", "ccc_standby_launch.py")
 RUNTIME_FILES += ("ccc_standby_generation.py", "ccc_standby_manager.py")
+RUNTIME_FILES += ("ccc_client_thread_observation.py", "ccc_request_key_binding.py",
+                  "ccc_request_observation_policy.py", "ccc_shared_codex_turn.py")
 RUNTIME_FILES += ("ccc_standby_sources.py", "ccc_standby_rollouts.py", "ccc_standby_readiness.py",
                   "ccc_standby_bootstrap.py", "ccc_standby_prepare.py", "ccc_standby_activation.py",
                   "ccc_standby_acceptance.py", "ccc_standby_timing.py",
@@ -10862,7 +10864,7 @@ class WatchDaemon:
         phase = "working" if turn.get("kind") in {"task_started", "user_message"} else "awaiting_transition"
         self._record_state(str(target["surface_id"]), runtime, ScreenState(
             phase, message_kind="codex", error_type=state.error_type,
-            reason="waiting for native Codex failed-turn completion before submitting continuation",
+            reason=turn.get("reason") or "waiting for native Codex failed-turn completion before submitting continuation",
         ))
         return False
 

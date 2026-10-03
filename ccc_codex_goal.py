@@ -34,7 +34,15 @@ def provider_for_turn(target, turn):
                 or abs(process['birth'][0] + process['birth'][1] / 1e6
                        - float(turn['process_start'])) >= 1):
             return None
-        files = native.process_writable_files(pid, identities=True)
+        shared = None
+        writer_pid = pid
+        if turn.get('shared_writer'):
+            from ccc_shared_codex_turn import binding_for_turn
+            shared = binding_for_turn(target, turn)
+            if shared is None:
+                return None
+            writer_pid = shared['writer_pid']
+        files = native.process_writable_files(writer_pid, identities=True)
         # Child threads retain their own writer locks in the same process.
         # Select only the independently bound primary session; never choose
         # whichever lock happens to be returned first by the OS.
@@ -56,8 +64,9 @@ def provider_for_turn(target, turn):
         if (len(rows) != 1 or not isinstance(rows[0][0], str)
                 or not rows[0][0].strip() or len(rows[0][0]) > 1024 or read() != rows):
             return None
-        current = native.process_writable_files(pid, identities=True)
-        if scope.process(pid) != process or any(current.get(p) != files[p] or p.is_symlink() or not linked(p, files[p]) for p in paths):
+        current = native.process_writable_files(writer_pid, identities=True)
+        if ((shared is not None and binding_for_turn(target, turn) is None)
+                or scope.process(pid) != process or any(current.get(p) != files[p] or p.is_symlink() or not linked(p, files[p]) for p in paths)):
             return None
         return rows[0][0]
     except (OSError, ValueError, KeyError, TypeError, sqlite3.Error):
@@ -140,7 +149,15 @@ def blocked_goal(target, pid, *, current_turn=None):
         if (not process or process["surface_id"] != target["surface_id"]
                 or process["environment_workspace_id"] != target["workspace_id"]):
             return None
-        files = native.process_writable_files(pid, identities=True)
+        shared = None
+        writer_pid, writer_birth = pid, process['birth']
+        if current_turn and current_turn.get('shared_writer'):
+            from ccc_shared_codex_turn import binding_for_turn
+            shared = binding_for_turn(target, current_turn)
+            if shared is None:
+                return None
+            writer_pid, writer_birth = shared['writer_pid'], shared['writer_birth']
+        files = native.process_writable_files(writer_pid, identities=True)
         locks = [p for p in files if p.parent.name == "thread-writer-locks" and p.suffix == ".lock"]
         if current_turn is not None:
             if (current_turn.get('pid') != pid
@@ -184,11 +201,11 @@ def blocked_goal(target, pid, *, current_turn=None):
                 "AND instr(feedback_log_body,': Turn error: ')>0) OR "
                 "(target='codex_core::session::handlers' AND instr(feedback_log_body,'Submission sub=')>0)) "
                 "ORDER BY ts DESC,ts_nanos DESC,id DESC LIMIT 65")
-        params = (sid, max(process["birth"][0], int(goal[2] / 1000) - 30))
+        params = (sid, max(process["birth"][0], writer_birth[0], int(goal[2] / 1000) - 30))
         with closing(sqlite3.connect(logs[0].as_uri() + "?mode=ro", uri=True, timeout=.05)) as db:
             rows = db.execute(query, params).fetchall()
         row = next((r for r in rows if r[5] == 'codex_core::session::turn'), None)
-        if not row or not str(row[4]).startswith(f"pid:{pid}:"):
+        if not row or not str(row[4]).startswith(f"pid:{writer_pid}:"):
             return None
         error = re.search(r": Turn error: ([^\n]+)$", row[3] or "")
         turn = re.search(r"(?:^|[\s{])turn\.id=([0-9a-f-]{36})(?:\s|})", row[3] or "")
@@ -212,8 +229,9 @@ def blocked_goal(target, pid, *, current_turn=None):
         with closing(sqlite3.connect(logs[0].as_uri() + "?mode=ro", uri=True, timeout=.05)) as db:
             if db.execute(query, params).fetchall() != rows:
                 return None
-        current_files = native.process_writable_files(pid, identities=True)
+        current_files = native.process_writable_files(writer_pid, identities=True)
         if (scope.process(pid) != process
+                or (shared is not None and binding_for_turn(target, current_turn) is None)
                 or any(current_files.get(p) != files[p] for p in held_paths)
                 or any(not linked(p, files[p]) or p.is_symlink() for p in paths)):
             return None

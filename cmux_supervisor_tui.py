@@ -1397,6 +1397,9 @@ class SessionResolver:
             result = resolved[surface_id]
             if result.ok and result.agent_kind == "codex":
                 observe_request_api_key(result)
+            elif result.ok and result.agent_kind == "claude":
+                from ccc_claude_request_key import observe
+                observe(result)
         with self._lock:
             # A pass that started before a newer one is discarded rather than
             # written: late results would otherwise resurrect ids for processes
@@ -1407,49 +1410,7 @@ class SessionResolver:
             self._fetched_at = now
 
 
-def request_observation_directory_matches(env: dict, directory: Path) -> bool:
-    """Bind opt-in to the writer's home, never the inspector's global config."""
-    import os
-    import stat
-    explicit = env.get("CODEX_CREDENTIAL_OBSERVATIONS_DIR")
-    if explicit is not None:
-        return explicit == str(directory)
-    home = env.get("CODEX_HOME")
-    if home is None:
-        base = env.get("HOME")
-        if not base:
-            return False
-        home = str(Path(base) / ".codex")
-    home = Path(home)
-    def identity(s):
-        return (s.st_dev, s.st_ino, s.st_mode, s.st_uid,
-                s.st_size, s.st_mtime_ns, s.st_ctime_ns)
-    try:
-        hs = home.lstat()
-        ds = directory.lstat()
-        if (not home.is_absolute() or directory != home / "credential-observations"
-                or not stat.S_ISDIR(hs.st_mode) or not stat.S_ISDIR(ds.st_mode)
-                or hs.st_uid != os.getuid() or ds.st_uid != hs.st_uid
-                or ds.st_mode & 0o077):
-            return False
-        marker = directory / "enabled-v1"
-        fd = os.open(marker, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-        with os.fdopen(fd, "rb") as stream:
-            before = os.fstat(stream.fileno())
-            if (not stat.S_ISREG(before.st_mode) or before.st_uid != ds.st_uid
-                    or before.st_mode & 0o077 or before.st_size != 27):
-                return False
-            raw = stream.read(28)
-            after = os.fstat(stream.fileno())
-        return (raw == b"ccc-request-credentials-v1\n"
-                and identity(before) == identity(after) == identity(marker.lstat())
-                # Other sessions publish requests and update files under HOME.
-                # Their directory timestamps/sizes are not identity changes.
-                # The opt-in file itself still requires the complete identity.
-                and identity(ds)[:4] == identity(directory.lstat())[:4]
-                and identity(hs)[:4] == identity(home.lstat())[:4])
-    except (OSError, ValueError):
-        return False
+from ccc_request_observation_policy import request_observation_directory_matches
 
 
 def observe_request_api_key(result: SessionResult, directory: Path | None = None) -> None:
@@ -1599,6 +1560,9 @@ def observe_request_api_key(result: SessionResult, directory: Path | None = None
                 if data.get("credential_scope") == "opaque_redirect" else
                 "最近请求未记录可确认的 API Key；已清除先前显示。"
             )
+            return
+        if result.foreground_evidence is None:
+            result.api_key_observation_note = "当前前台会话尚未取得原生证明；不能用启动时的 session 显示请求 Key。"
             return
         if result.foreground_evidence is not None:
             from ccc_client_thread_observation import read_foreground
@@ -4537,7 +4501,7 @@ def row_focus_summary(row: ViewRow | None) -> str:
 
 def row_request_key_summary(row: ViewRow | None, width: int) -> str:
     """Show the selected session's observed request key on the focus separator."""
-    if row is None or row.candidate is None or row.candidate.agent_kind != "codex":
+    if row is None or row.candidate is None or row.candidate.agent_kind not in {"codex", "claude"}:
         return rule("-", width)
     candidate = row.candidate
     if candidate.session.api_key_observation_historical:

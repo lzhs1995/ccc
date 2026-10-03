@@ -24,6 +24,10 @@ class NativeRequestKeyTests(unittest.TestCase):
         self.directory.chmod(0o700)
         self.born = [int(time.time()) - 60, 0]
         self.epoch = str(uuid.uuid4())
+        self.foreground_sid = SID
+        self.foreground = self.enterContext(patch(
+            "ccc_client_thread_observation.read_foreground",
+            side_effect=lambda *args: ("ok", self.foreground_sid, ("test-native-proof",))))
 
     def write(self, sid=SID, key="fake-a", **changes):
         data = dict(schema=1, observer_epoch=self.epoch, pid=123,
@@ -38,13 +42,30 @@ class NativeRequestKeyTests(unittest.TestCase):
         return path
 
     def observe(self, sid=SID, births=None, env=None):
+        self.foreground_sid = sid
         result = tui.SessionResult(status="ok", agent_kind="codex", session_id=sid, pid=123,
-                                   api_key_config="fake-global-current")
+                                   api_key_config="fake-global-current",
+                                   foreground_evidence=("test-native-proof",))
         with patch("ccc_guard_scope.birth", side_effect=births, return_value=self.born), \
              patch("ccc_guard_scope.arguments", return_value=(["codex", "app-server"], env or {
                  "CODEX_CREDENTIAL_OBSERVATIONS_DIR": str(self.directory)})):
             tui.observe_request_api_key(result, self.directory)
         return result
+
+    def test_startup_session_without_foreground_proof_is_not_displayed(self):
+        self.write()
+        result = tui.SessionResult(status="ok", agent_kind="codex", session_id=SID, pid=123)
+        with patch("ccc_guard_scope.birth", return_value=self.born), patch(
+                "ccc_guard_scope.arguments", return_value=(["codex"], {
+                    "CODEX_CREDENTIAL_OBSERVATIONS_DIR": str(self.directory)})):
+            tui.observe_request_api_key(result, self.directory)
+        self.assertEqual(result.api_key_observed, "")
+        self.assertIn("前台会话", result.api_key_observation_note)
+
+    def test_foreground_switch_before_publish_is_not_displayed(self):
+        self.write()
+        self.foreground.side_effect = lambda *args: ("ok", OTHER, ("new-proof",))
+        self.assertEqual(self.observe().api_key_observed, "")
 
     def test_persistent_marker_uses_writer_home_and_actual_record(self):
         home = self.directory
@@ -158,6 +179,7 @@ class NativeRequestKeyTests(unittest.TestCase):
              patch("ccc_guard_scope.arguments", return_value=(["codex", "app-server"], {
                  "CODEX_CREDENTIAL_OBSERVATIONS_DIR": str(self.directory)})):
             for result in (second, first):
+                self.foreground_sid = result.session_id
                 result.api_key_config = "fake-new-global"
                 tui.observe_request_api_key(result, self.directory)
         self.assertEqual((first.api_key_observed, second.api_key_observed),
@@ -173,7 +195,8 @@ class NativeRequestKeyTests(unittest.TestCase):
             return ["codex"], {"CODEX_CREDENTIAL_OBSERVATIONS_DIR": str(self.directory)}
         with patch("ccc_guard_scope.arguments", side_effect=arguments), \
              patch("ccc_guard_scope.birth", return_value=self.born):
-            result = tui.SessionResult(status="ok", agent_kind="codex", session_id=SID, pid=123)
+            result = tui.SessionResult(status="ok", agent_kind="codex", session_id=SID, pid=123,
+                                       foreground_evidence=("test-native-proof",))
             tui.observe_request_api_key(result, self.directory)
         self.assertEqual(result.api_key_observed, "fake-a")
 

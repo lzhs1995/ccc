@@ -55,9 +55,10 @@ class FocusKeyTests(unittest.TestCase):
         self.assertIn(self.rows[1].candidate.session.api_key_observed,
                       ''.join(tui.api_key_detail_lines(self.rows[1].candidate, 88)))
 
-    def test_small_windows_and_non_codex(self):
+    def test_small_windows_and_claude(self):
         for width in (30, 50, 70, 89, 120):
             self.draw(1, width)
         self.rows[1].candidate.agent_kind = 'claude'
-        self.assertNotIn('sk-fake', self.draw(1, 89))
+        self.rows[1].candidate.session.agent_kind = 'claude'
+        self.assertIn('sk-fake', self.draw(1, 89))
         self.assertNotIn('sk-fake', self.draw(0, 89))

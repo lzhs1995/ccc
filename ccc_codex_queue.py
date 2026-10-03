@@ -776,6 +776,18 @@ class QueueRecovery:
                         "turn_id": guarded.get("turn_id"), "at": guarded.get("at", 0),
                         "error": guarded.get("turn_error"),
                         "signature": [guarded.get("start_id"), guarded.get("turn_id"), guarded.get("at")]}
+        # A native foreground observation outranks historical Hook bindings:
+        # /resume can change selection without changing the client's PID.
+        if self.process_lookup is not None:
+            from ccc_client_thread_observation import read_foreground
+            from ccc_request_observation_policy import request_observation_directory_matches
+            label = self.process_lookup(target)
+            pids = label.get('agent_pids', [])
+            if label.get('agent_kind') == 'codex' and len(pids) == 1:
+                status, _, _ = read_foreground(pids[0], request_observation_directory_matches)
+                if status != 'absent':
+                    from ccc_shared_codex_turn import current_turn
+                    return current_turn(target, pids[0], self.sessions_root)
         try:
             records = self.records()
         except FileNotFoundError:
@@ -913,6 +925,9 @@ class QueueRecovery:
                 return {"kind": "unknown"}
             files = process_writable_files(pid, identities=True)
             locks = [p for p in files if p.parent.name == "thread-writer-locks" and p.suffix == ".lock"]
+            if not locks:
+                from ccc_shared_codex_turn import current_turn
+                return current_turn(target, pid, self.sessions_root)
             if len(locks) != 1:
                 return {"kind": "unknown"}
             lock = locks[0]

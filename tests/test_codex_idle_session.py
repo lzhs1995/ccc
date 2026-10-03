@@ -35,6 +35,8 @@ class IdleSessionTests(unittest.TestCase):
                                           self.sessions, "continue")
         self.queue.process_lookup = lambda _: {"agent_kind": "codex", "agent_pids": [123]}
         for fixture in (
+            patch("ccc_client_thread_observation.read_foreground", return_value=('absent', None, None)),
+            patch("ccc_shared_codex_turn.read_foreground", return_value=('absent', None, None)),
             patch("ccc_codex_queue.process_placement_start", return_value=100),
             patch("ccc_guard_scope.process", side_effect=lambda _: dict(self.process)),
             patch("ccc_guard_scope.arguments", return_value=(["/native/codex"], {})),
@@ -79,7 +81,9 @@ class IdleSessionTests(unittest.TestCase):
         self.files[second] = self.identity(second)
         self.assertEqual(self.queue.current_turn(self.target), {"kind": "unknown"})
         self.files.clear()
-        self.assertEqual(self.queue.current_turn(self.target), {"kind": "unknown"})
+        turn = self.queue.current_turn(self.target)
+        self.assertEqual(turn['kind'], 'unknown')
+        self.assertIn('foreground observation missing', turn['reason'])
 
     def test_lock_path_replacement_and_foreign_native_home_are_rejected(self):
         self.files[self.lock]["inode"] += 1

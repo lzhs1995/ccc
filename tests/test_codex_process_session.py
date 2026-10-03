@@ -11,6 +11,9 @@ from ccc_codex_queue import QueueRecovery
 
 class ProcessSessionTests(unittest.TestCase):
     def setUp(self):
+        legacy = patch('ccc_client_thread_observation.read_foreground', return_value=('absent', None, None))
+        legacy.start()
+        self.addCleanup(legacy.stop)
         files = patch('ccc_codex_queue._proc_pidfdinfo', None)
         files.start()
         self.addCleanup(files.stop)
