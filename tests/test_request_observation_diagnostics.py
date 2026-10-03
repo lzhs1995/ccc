@@ -58,3 +58,32 @@ class RequestObservationDiagnosticsTests(unittest.TestCase):
         self.assertEqual(result.api_key_observation_status, "observed")
         self.assertEqual(result.api_key_observed, "fake-request-not-global")
         self.assertIn("实际认证请求头", result.api_key_observation_note)
+
+    def test_only_exited_old_writer_explains_missing_current_key(self):
+        self.fixture.write(pid=456, observed_at_ms=(self.fixture.born[0] - 1) * 1000)
+        result = self.fixture.observe(births=lambda pid, **_: self.fixture.born if pid == 123 else None)
+        self.assertEqual(result.api_key_observation_status, "previous_process")
+        self.assertEqual(result.api_key_observed, "")
+        candidate = SimpleNamespace(session=result)
+        self.assertEqual(tui.Candidate.api_key_text.fget(candidate), "仅旧进程记录")
+        self.assertIn("PID 456", result.api_key_observation_note)
+        self.assertIn("无需重启", result.api_key_observation_note)
+        self.assertNotIn("fake-a", "".join(tui.api_key_detail_lines(candidate, 89)))
+        self.fixture.write(key="fake-current-request")
+        self.assertEqual(self.fixture.observe().api_key_observed, "fake-current-request")
+
+    def test_mixed_bad_record_or_identity_change_is_not_only_old_records(self):
+        import uuid
+        self.fixture.write(pid=456, observed_at_ms=(self.fixture.born[0] - 1) * 1000)
+        bad = self.fixture.write(observer_epoch=str(uuid.uuid4()), schema=2)
+        result = self.fixture.observe(births=lambda pid, **_: self.fixture.born if pid == 123 else None)
+        self.assertEqual(result.api_key_observation_status, "unverified")
+        bad.unlink()
+        result = self.fixture.observe(births=[self.fixture.born, None, None])
+        self.assertEqual(result.api_key_observation_status, "unverified")
+        self.assertEqual(result.api_key_observed, "")
+
+    def test_recent_unbound_record_is_not_labelled_previous_process(self):
+        self.fixture.write(pid=456)
+        result = self.fixture.observe(births=lambda pid, **_: self.fixture.born if pid == 123 else None)
+        self.assertEqual(result.api_key_observation_status, "unverified")

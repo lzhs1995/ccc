@@ -396,6 +396,8 @@ class Candidate:
             return self.session.api_key_observed
         if self.session.api_key_observation_status == "absent":
             return "暂无请求记录"
+        if self.session.api_key_observation_status == "previous_process":
+            return "仅旧进程记录"
         # The row represents this running session. Repeating a shared mutable
         # TOML value here falsely suggests all loaded sessions use that key.
         return "未核实"
@@ -1472,6 +1474,8 @@ def observe_request_api_key(result: SessionResult, directory: Path | None = None
             result.api_key_observation_note = "请求记录目录的类型、属主或权限未通过核验。"
             return
         records = []
+        previous_processes = set()
+        previous_records = 0
         before_records = session_records()
         if before_records is None:
             return
@@ -1501,6 +1505,11 @@ def observe_request_api_key(result: SessionResult, directory: Path | None = None
                 continue
             birth = scope.birth(pid, codex=True)
             if birth is None:
+                stamp = data.get("observed_at_ms")
+                if (type(stamp) is int and 0 < stamp <
+                        cli_birth[0] * 1000 + cli_birth[1] / 1000):
+                    previous_processes.add(pid)
+                    previous_records += 1
                 continue
             stamp = data.get("observed_at_ms")
             if (type(stamp) is not int or stamp < birth[0] * 1000 + birth[1] / 1000
@@ -1541,6 +1550,17 @@ def observe_request_api_key(result: SessionResult, directory: Path | None = None
                 )
             elif len(records) > 1:
                 result.api_key_observation_note = "存在多个与该会话关联的请求进程，暂不能确定唯一来源。"
+            elif (before_records and previous_records == len(before_records)
+                    and scope.birth(result.pid, codex=True) == cli_birth
+                    and session_records() == before_records
+                    and identity(directory.lstat())[:4] == identity(root)[:4]):
+                result.api_key_observation_status = "previous_process"
+                result.api_key_observation_note = (
+                    "仅有早于当前客户端启动的旧进程请求记录（PID "
+                    + ", ".join(str(pid) for pid in sorted(previous_processes))
+                    + "）；旧请求进程已退出或不再匹配 Codex 身份。"
+                    "尚未采集到当前客户端的请求 Key，下一次自然请求后自动更新，无需重启。"
+                )
             else:
                 result.api_key_observation_note = "请求记录缺失、读取期间改变或未通过格式及进程身份核验。"
             return
@@ -4604,7 +4624,10 @@ def api_key_detail_lines(candidate: Candidate, width: int) -> list[str]:
     observed = candidate.session.api_key_observed
     heading = ("API-key：历史请求（早于当前 CLI 启动）"
                if candidate.session.api_key_observation_historical else
-               "API-key：最近实际请求" if observed else "API-key：实际请求未核实")
+               "API-key：最近实际请求" if observed else
+               "API-key：仅旧进程记录" if candidate.session.api_key_observation_status == "previous_process" else
+               "API-key：暂无请求记录" if candidate.session.api_key_observation_status == "absent" else
+               "API-key：实际请求未核实")
     values = [heading,
               candidate.session.api_key_observed or (
                   "最近请求无可展示 Key" if candidate.session.api_key_observation_note
