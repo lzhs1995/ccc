@@ -1453,11 +1453,16 @@ def observe_request_api_key(result: SessionResult, directory: Path | None = None
                 or root.st_uid != os.getuid() or root.st_mode & 0o077):
             return
         records = []
-        for index, path in enumerate(directory.iterdir()):
-            if index >= 4096:
-                return
+        matched_records = 0
+        for path in directory.iterdir():
             if not path.name.endswith(f"-{result.session_id}-request_attempt.json"):
                 continue
+            # The directory is shared by all threads and observer epochs.
+            # Bound file reads for this session, not unrelated filenames.
+            matched_records += 1
+            if matched_records > 4096:
+                result.api_key_observation_note = "该会话请求记录过多，无法完整核验实际 Key。"
+                return
             fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
             with os.fdopen(fd, "rb") as stream:
                 before = os.fstat(stream.fileno())

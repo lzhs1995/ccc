@@ -78,6 +78,16 @@ class NativeRequestKeyTests(unittest.TestCase):
             self.assertIn("最近实际请求", "".join(tui.api_key_detail_lines(candidate, 30)))
             self.assertNotIn(expected, repr(result))
 
+    def test_unrelated_observations_do_not_hide_mixed_thread_keys(self):
+        for index in range(5000):
+            (self.directory / f"unrelated-{index}-request_attempt.json").touch()
+        self.write(SID, "fake-a")
+        self.write(OTHER, "fake-b")
+        self.assertEqual(
+            [self.observe(sid).api_key_observed for sid in (SID, OTHER)],
+            ["fake-a", "fake-b"],
+        )
+
     def test_one_thread_key_changes_without_changing_other_thread_display(self):
         self.write(SID, "fake-a")
         self.write(OTHER, "fake-b")
