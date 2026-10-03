@@ -55,7 +55,7 @@ class NativeFileTests(unittest.TestCase):
             return result
         with patch.object(native, '_proc_pidinfo', side_effect=self.descriptors), \
                 patch.object(native, '_proc_pidfdinfo', side_effect=changing):
-            with self.assertRaises(OSError):
+            with self.assertRaises(native.VnodeInventoryChanged):
                 native.process_writable_files(123)
         self.entries = [(3, 1)]
         self.files[3] = (3, b'')
@@ -74,6 +74,35 @@ class NativeFileTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 native.process_writable_files(123)
 
+    def test_short_vnode_records_fd_phase_count_and_current_errno(self):
+        self.entries = [(3, 1)]
+        for phase, fail_at in [('initial', 1), ('verification', 2)]:
+            calls = 0
+            def short(*args):
+                nonlocal calls
+                calls += 1
+                if calls == fail_at:
+                    ctypes.set_errno(9)
+                    return 0
+                return self.vnode(*args)
+            with self.subTest(phase=phase), \
+                    patch.object(native, '_proc_pidinfo', side_effect=self.descriptors), \
+                    patch.object(native, '_proc_pidfdinfo', side_effect=short):
+                with self.assertRaises(OSError) as caught:
+                    native.process_writable_files(123, identities=True)
+                self.assertEqual(caught.exception.errno, 9)
+                self.assertIn(f'pid=123 fd=3 phase={phase} returned=0 expected=1200', str(caught.exception))
+                self.assertEqual(calls, fail_at)
+
+    def test_short_vnode_without_errno_does_not_report_stale_errno(self):
+        ctypes.set_errno(13)
+        with patch.object(native, '_proc_pidinfo', side_effect=self.descriptors), \
+                patch.object(native, '_proc_pidfdinfo', return_value=1199):
+            with self.assertRaises(OSError) as caught:
+                native.process_writable_files(123)
+            self.assertEqual(caught.exception.errno, 0)
+            self.assertIn('returned=1199 expected=1200', str(caught.exception))
+
     def test_reused_descriptor_number_cannot_supply_stale_writer(self):
         self.entries = [(3, 1)]
         def reused(*args):
@@ -82,7 +111,7 @@ class NativeFileTests(unittest.TestCase):
             return result
         with patch.object(native, '_proc_pidinfo', side_effect=self.descriptors), \
                 patch.object(native, '_proc_pidfdinfo', side_effect=reused):
-            with self.assertRaises(OSError):
+            with self.assertRaises(native.VnodeInventoryChanged):
                 native.process_writable_files(123)
 
 

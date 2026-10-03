@@ -170,6 +170,136 @@ class HookIdentityReconciliationTests(unittest.TestCase):
                     self.assertEqual(result[disposition + '_unverified'], ['surface:1'])
 
 
+class LiveHookClockRollbackTests(unittest.TestCase):
+    setUp = HookIdentityReconciliationTests.setUp
+
+    def accept(self, source='socket', **changes):
+        future = self.now + 40000
+        self.observation.update(started_epoch=future,
+            started_at=core.dt.datetime.fromtimestamp(future).isoformat(),
+            surface_id=self.sid, workspace_id=self.target['workspace_id'])
+        self.runtime.claude_process_started_at = self.observation['started_at']
+        self.born = [int(future), 123456]
+        event = claude_hook_event('clock-' + source, 'UserPromptSubmit', prompt_kind='human')
+        event.update(agent_pid=1234, surface_id=self.sid,
+                     workspace_id=self.target['workspace_id'], session_id='clock-session',
+                     _inbox_source=source, _inbox_monotonic=time.monotonic(),
+                     _inbox_process_birth=self.born)
+        event.update(changes)
+        with mock.patch.object(core, 'inspect_claude_process', return_value=self.observation), \
+                mock.patch('ccc_guard_scope.birth', return_value=self.born):
+            self.daemon._handle_claude_event(event, self.client)
+        return event
+
+    def matches(self, **changes):
+        with mock.patch('ccc_guard_scope.birth', return_value=self.born):
+            return self.daemon._live_claude_hook_identity_matches(
+                self.runtime, {**self.observation, **changes})
+
+    def test_live_event_survives_backward_wall_clock_without_sending(self):
+        self.accept()
+        with mock.patch('ccc_guard_scope.birth', return_value=self.born):
+            self.daemon._apply_claude_process_observation(self.runtime, self.observation)
+        self.assertTrue(self.matches())
+        self.assertLess(self.runtime.claude_last_hook_at, self.observation['started_epoch'])
+        self.assertEqual(self.runtime.claude_hook_health, 'healthy')
+        self.assertEqual(self.client.sent, [])
+
+    def test_replay_deferred_and_unstamped_events_cannot_mint_receipt(self):
+        for source in ('journal_replay', 'registration_revalidation', 'deferred', 'fallback', ''):
+            with self.subTest(source=source):
+                self.accept(source)
+                self.assertFalse(self.matches())
+        self.assertEqual(self.client.sent, [])
+
+    def test_rejected_event_and_invalid_monotonic_cannot_mint_receipt(self):
+        for index, changes in enumerate(({'agent_pid':9999}, {'session_id':''},
+                {'surface_id':'foreign'}, {'process_generation':'foreign'},
+                {'_inbox_monotonic':float('nan')}, {'_inbox_monotonic':float('inf')},
+                {'_inbox_monotonic':-1}, {'_inbox_monotonic':time.monotonic()+1000})):
+            with self.subTest(changes=changes):
+                self.accept(event_id='invalid-clock-' + str(index), **changes)
+                self.assertFalse(self.matches())
+        self.assertEqual(self.client.sent, [])
+
+    def test_pid_birth_session_surface_workspace_and_generation_must_stay_bound(self):
+        self.accept()
+        for changes in ({'pid':1235}, {'generation':'new'}, {'surface_id':'other'},
+                        {'workspace_id':'other'}):
+            with self.subTest(changes=changes):
+                self.assertFalse(self.matches(**changes))
+        self.runtime.claude_session_id = 'other-session'
+        self.assertFalse(self.matches())
+        self.runtime.claude_session_id = 'clock-session'
+        for born in (None, [self.born[0], self.born[1]+1]):
+            with mock.patch('ccc_guard_scope.birth', return_value=born):
+                self.assertFalse(self.daemon._live_claude_hook_identity_matches(
+                    self.runtime, self.observation))
+        with mock.patch('ccc_guard_scope.birth', side_effect=OSError('unavailable')):
+            self.assertFalse(self.daemon._live_claude_hook_identity_matches(self.runtime, self.observation))
+
+    def test_receipt_cannot_survive_runtime_reload_or_daemon_replacement(self):
+        self.accept()
+        saved = core.dataclasses.asdict(self.runtime)
+        self.assertNotIn('_live_claude_hook_identity', saved)
+        other = claude_armed_daemon(str(self.root), self.client)
+        other.runtime[self.sid] = self.runtime
+        with mock.patch('ccc_guard_scope.birth', return_value=self.born):
+            self.assertFalse(other._live_claude_hook_identity_matches(self.runtime, self.observation))
+        self.runtime = core.TargetRuntime(**saved)
+        self.daemon.runtime[self.sid] = self.runtime
+        self.assertFalse(self.matches())
+
+    def test_identity_change_during_inspection_and_negative_elapsed_are_rejected(self):
+        event = self.accept()
+        del self.runtime._live_claude_hook_identity
+        with mock.patch.object(core, 'inspect_claude_process', return_value=self.observation), \
+                mock.patch('ccc_guard_scope.birth', side_effect=[self.born, [1, 2]]):
+            self.daemon._record_live_claude_hook_identity(self.runtime, event, self.target)
+        self.assertFalse(self.matches())
+        self.accept(event_id='clock-again')
+        with mock.patch.object(core.time, 'monotonic', return_value=-1):
+            self.assertFalse(self.matches())
+
+    def test_file_based_coverage_does_not_reconstruct_live_receipt(self):
+        self.accept()
+        record = dict(self.target, ref='surface:1')
+        result = core.claude_hook_coverage_from_inventory(
+            {self.sid:core.dataclasses.asdict(self.runtime)}, [record],
+            {self.sid:{'agent_kind':'claude', 'agent_pid':1234}},
+            {self.sid:self.target}, lambda pid:self.observation)
+        self.assertEqual(result['verified'], 0)
+        self.assertEqual(result['needs_verification'], ['surface:1'])
+        self.assertEqual(result['targets'][0]['hook_health'], 'unverified')
+
+    def test_session_roundtrip_requires_new_live_event(self):
+        self.accept()
+        self.assertTrue(self.matches())
+        self.accept('journal_replay', event_id='session-b', session_id='session-b')
+        self.assertFalse(self.matches())
+        self.accept('journal_replay', event_id='session-a-again')
+        self.assertFalse(self.matches())
+        self.accept(event_id='fresh-live-session-a')
+        self.assertTrue(self.matches())
+        self.assertEqual(self.client.sent, [])
+
+    def test_observed_identity_roundtrip_cannot_revive_receipt(self):
+        for field, value in (('pid', 9999), ('generation', 'other'),
+                             ('surface_id','other'), ('workspace_id','other')):
+            with self.subTest(field=field):
+                self.accept(event_id='new-live-' + field)
+                self.assertTrue(self.matches())
+                self.assertFalse(self.matches(**{field:value}))
+                self.assertFalse(self.matches())
+
+    def test_pid_reused_between_enqueue_and_processing_cannot_mint_receipt(self):
+        for index, queued_birth in enumerate((None, [int(self.now+40000), 1], [1, 2])):
+            with self.subTest(queued_birth=queued_birth):
+                self.accept(event_id='old-queued-' + str(index), _inbox_process_birth=queued_birth)
+                self.assertFalse(self.matches())
+        self.assertEqual(self.client.sent, [])
+
+
 class ClaudeModelBlockTests(unittest.TestCase):
     def test_http_retry_banners_keep_client_ownership_through_final_attempt(self):
         banners = (

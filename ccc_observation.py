@@ -96,13 +96,19 @@ def attributable_processes(surface: Mapping[str, Any], workspace_id: str = ""):
 
     TTY reuse can put another terminal's entire process tree under an old slot.
     Missing identity remains advisory; it never becomes explicit ownership.
+    A surface can move between workspaces without restarting its processes.
+    Its stable surface identity therefore outranks the launch-time workspace
+    environment, but only inside this surface's current process inventory.
     """
     sid = str(surface.get("id") or surface.get("surface_id") or "")
     processes = [p for p in objects(surface.get("processes", [])) if p.get("kind") == "process"]
     rejected = set()
     for p in processes:
         psid, pwid = p.get("cmux_surface_id"), p.get("cmux_workspace_id")
-        if (psid and sid and psid != sid) or (pwid and workspace_id and pwid != workspace_id):
+        surface_matches = bool(sid and psid == sid)
+        if (psid and sid and psid != sid) or (
+            pwid and workspace_id and pwid != workspace_id and not surface_matches
+        ):
             rejected.add(p.get("pid"))
     changed = True
     while changed:
@@ -325,6 +331,13 @@ def continuation_report(targets, runtime, *, now, poll_interval=1.0, observation
             "observed_at": now, "scope": "authorized_targets", "counts": counts, "targets": rows}
 
 
+def registration_rejection(row):
+    return (row.get("status"), row.get("detail")) in {
+        ("unmapped", "surface is not authorized"),
+        ("process_conflict", "surface root process is not Claude"),
+    }
+
+
 def registration_candidate(events, target, observation, runtime, ledger, *, now, max_age):
     """Return one original, genuine Stop; no evidence is synthesized here."""
     sid, wid = target["surface_id"], target["workspace_id"]
@@ -341,10 +354,12 @@ def registration_candidate(events, target, observation, runtime, ledger, *, now,
     latest = max(enumerate(relevant), key=lambda item: (item[1]["created_at"], item[0]))[1]
     if latest.get("event_name") not in {"Stop", "StopFailure"} or latest.get("completed"):
         return None, "latest_event_not_unfinished_stop"
-    if latest.get("workspace_id") != wid or now - latest["created_at"] > max_age:
+    launch_workspace = observation.get("launch_workspaces", {}).get(latest.get("agent_pid"))
+    if (latest.get("workspace_id") not in {wid, launch_workspace}
+            or not latest.get("workspace_id") or now - latest["created_at"] > max_age):
         return None, "stop_identity_or_age_mismatch"
     row = ledger.get(latest.get("event_id"), {})
-    rejected = row.get("status") == "unmapped" and row.get("detail") == "surface is not authorized"
+    rejected = registration_rejection(row)
     interrupted = row.get("status") == "handling" and bool(row.get("registration_revalidated_at"))
     if not (rejected or interrupted):
         return None, "stop_not_rejected_for_authorization"
@@ -359,7 +374,7 @@ def registration_candidate(events, target, observation, runtime, ledger, *, now,
     if not session or runtime.get("claude_session_id") not in (None, "", session):
         return None, "stop_session_mismatch"
     starts = [e for e in relevant if e.get("event_name") == "SessionStart"
-              and e.get("session_id") == session and e.get("workspace_id") == wid
+              and e.get("session_id") == session and e.get("workspace_id") == latest.get("workspace_id")
               and e.get("agent_pid") == pid and started <= e["created_at"] <= latest["created_at"]]
     if not starts:
         return None, "session_start_unverified"

@@ -194,6 +194,7 @@ class SessionClipboardTests(unittest.TestCase):
                                  getch=lambda: next(key_iter), getmaxyx=lambda: (40, 180))
         with mock.patch.object(tui.curses, "curs_set"), mock.patch.object(tui, "init_colors"), \
              mock.patch.object(tui, "_draw"), mock.patch.object(tui.curses, "getmouse", return_value=mouse), \
+             mock.patch.object(tui.batch_timing, "stamp", return_value={"wall": 1, "monotonic": 1, "boot_id": "test"}), \
              mock.patch.object(tui.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as run:
             tui._run(screen, model)
         return results, run

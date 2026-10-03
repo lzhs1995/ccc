@@ -11,6 +11,9 @@ from ccc_codex_queue import QueueRecovery
 
 class ProcessSessionTests(unittest.TestCase):
     def setUp(self):
+        legacy = patch('ccc_client_thread_observation.read_foreground', return_value=('absent', None, None))
+        legacy.start()
+        self.addCleanup(legacy.stop)
         files = patch('ccc_codex_queue._proc_pidfdinfo', None)
         files.start()
         self.addCleanup(files.stop)
@@ -67,6 +70,26 @@ class ProcessSessionTests(unittest.TestCase):
     def test_unreadable_process_is_unknown(self):
         with patch("ccc_codex_queue.subprocess.run", side_effect=subprocess.TimeoutExpired("ps", 2)):
             self.assertEqual(self.queue.current_turn(self.target), {"kind": "unknown"})
+
+    def test_missing_sessions_directory_cannot_allow_viewport_only_resume(self):
+        import cmux_codex_watch as core
+        daemon = core.WatchDaemon.__new__(core.WatchDaemon)
+        daemon.codex_queue_recovery = self.queue
+        daemon._network_turn_ready = lambda *_: True
+        daemon._record_state = lambda *_: None
+        state = core.ScreenState('recoverable_error', message_kind='codex', error_type='rate_limit')
+        for shape in ('missing', 'regular_file', 'removed_directory'):
+            with self.subTest(shape=shape):
+                root = self.root / shape
+                if shape == 'regular_file':
+                    root.write_text('not a sessions directory')
+                elif shape == 'removed_directory':
+                    root.mkdir()
+                    root.rmdir()
+                self.queue.sessions_root = root
+                runtime = core.TargetRuntime()
+                self.assertFalse(daemon._codex_turn_ready(self.target, runtime, state))
+                self.assertEqual(self.queue.current_turn(self.target), {'kind': 'unknown'})
 
     def test_process_refresh_gap_cannot_be_treated_as_a_legacy_client(self):
         for label in ({"agent_kind": "unknown", "summary": "process refresh pending"},

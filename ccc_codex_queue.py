@@ -7,7 +7,10 @@ proves the turn ended. Every key is write-ahead recorded; ambiguity stops here.
 from __future__ import annotations
 
 from datetime import datetime
+from collections import OrderedDict
+import copy
 import ctypes
+import fcntl
 import hashlib
 import json
 import os
@@ -39,45 +42,83 @@ def writable_open_files(output):
     return paths
 
 
+_task_snapshots = OrderedDict()
+_task_snapshot_lock = threading.Lock()
+
+
+def _task_stamp(info):
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+
 def task_snapshot(path, session_id):
     """Read the original thread's latest lifecycle event, with a stable file."""
     path = Path(path)
     before = path.stat()
+    key, signature = (str(path), session_id), _task_stamp(before)
+    with _task_snapshot_lock:
+        cached = _task_snapshots.get(key)
+        if cached and cached[0] == signature:
+            _task_snapshots.move_to_end(key)
+    if cached and cached[0] == signature:
+        return copy.deepcopy(cached[1]) if _task_stamp(path.stat()) == signature else None
     with path.open("rb") as handle:
         first = json.loads(handle.readline())
         if first.get("type") != "session_meta" or first.get("payload", {}).get("id") != session_id:
             return None
-        handle.seek(max(0, before.st_size - 1024 * 1024))
-        tail = handle.read().decode("utf-8", errors="replace")
-    latest = None
-    for line in reversed(tail.splitlines()):
-        try:
-            event = json.loads(line)
-        except ValueError:
-            continue
-        payload = event.get("payload", {})
-        if event.get("type") == "event_msg" and payload.get("type") in {
-            "task_started", "task_complete", "turn_aborted", "user_message",
-        }:
-            latest = event
-            break
+        if _task_stamp(os.fstat(handle.fileno())) != signature:
+            return None
+        latest, limit = None, min(before.st_size, 16384)
+        while latest is None:
+            offset = max(0, before.st_size - limit)
+            handle.seek(offset)
+            lines = handle.read(limit).splitlines()
+            if offset:
+                lines = lines[1:]
+            for line in reversed(lines):
+                try:
+                    event = json.loads(line)
+                except (ValueError, UnicodeError):
+                    continue
+                payload = event.get("payload", {})
+                if event.get("type") == "event_msg" and payload.get("type") in {
+                    "task_started", "task_complete", "turn_aborted", "user_message",
+                }:
+                    latest = event
+                    break
+            if limit >= min(before.st_size, 1024 * 1024):
+                break
+            limit = min(before.st_size, 1024 * 1024, max(1, limit * 4))
     if not latest:
         return None
     after = path.stat()
-    if (after.st_ino, after.st_size, after.st_mtime_ns) != (before.st_ino, before.st_size, before.st_mtime_ns):
+    if _task_stamp(after) != signature:
         return None
     try:
         at = epoch(latest.get("timestamp"))
     except (TypeError, ValueError):
         return None
-    return {**({"model_provider": first["payload"]["model_provider"]} if first["payload"].get("model_provider") else {}),
+    snapshot = {**({"model_provider": first["payload"]["model_provider"]} if first["payload"].get("model_provider") else {}),
             "kind": latest["payload"]["type"], "at": at,
             "turn_id": latest["payload"].get("turn_id"), "error": latest["payload"].get("error"),
+            "last_agent_message": latest["payload"].get("last_agent_message"),
             "signature": [after.st_ino, after.st_size, after.st_mtime_ns]}
+    with _task_snapshot_lock:
+        _task_snapshots[key] = (signature, snapshot)
+        _task_snapshots.move_to_end(key)
+        if len(_task_snapshots) > 8192:
+            _task_snapshots.popitem(last=False)
+    return copy.deepcopy(snapshot)
 
 
 def _retryable_completed_message(message):
     normalized = " ".join(message.lower().split())
+    compact = re.sub(r'\s+', '', normalized)
+    if (('"error":{' in compact and '"insufficient_quota"' in compact)
+            or 'invalid_encrypted_content' in normalized
+            or re.search(r'(?:unexpected\s+status(?:\s+code)?|unknown\s+status\s+code|http(?:/\d(?:\.\d)?)?|last\s+status)\s*[:=]?\s*(?:400|401|403)\b', normalized)
+            or '401' in normalized and any(x in normalized for x in (
+                '额度已用尽', 'remainquota', 'insufficient_quota', 'quota exceeded'))):
+        return False
     return (any(x in normalized for x in ("currently experiencing high demand", "rate limit exceeded",
                                           "temporarily unavailable", "stream disconnected before completion"))
             or normalized == "connection failed: error sending request")
@@ -134,7 +175,7 @@ if sys.platform == "darwin":
         _proc_listpids = ctypes.CDLL("/usr/lib/libproc.dylib").proc_listpids
         _proc_listpids.argtypes = [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_int]
         _proc_listpids.restype = ctypes.c_int
-        _proc_pidfdinfo = ctypes.CDLL("/usr/lib/libproc.dylib").proc_pidfdinfo
+        _proc_pidfdinfo = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True).proc_pidfdinfo
         _proc_pidfdinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int,
                                    ctypes.c_void_p, ctypes.c_int]
         _proc_pidfdinfo.restype = ctypes.c_int
@@ -149,6 +190,14 @@ if sys.platform == "darwin":
         _procargs_bytes = os.sysconf("SC_ARG_MAX")
     except (OSError, AttributeError):
         pass
+
+
+class IncompleteVnodeRead(OSError):
+    """A vnode observation failed; no partial inventory is usable."""
+
+
+class VnodeInventoryChanged(OSError):
+    """Two complete reads disagreed; neither is stable identity evidence."""
 
 
 def process_writable_files(pid, *, identities=False):
@@ -181,13 +230,17 @@ def process_writable_files(pid, *, identities=False):
             raise OSError("truncated process descriptor inventory")
         return frozenset(e.fd for e in entries[:count // item_size] if e.kind == 1)
 
-    def vnodes(fds):
+    def vnodes(fds, phase):
         result = {}
         for fd in fds:
             info = _VnodeFdInfo()
             size = ctypes.sizeof(info)
-            if _proc_pidfdinfo(pid, fd, 2, ctypes.byref(info), size) != size:
-                raise OSError("incomplete vnode descriptor")
+            ctypes.set_errno(0)
+            returned = _proc_pidfdinfo(pid, fd, 2, ctypes.byref(info), size)
+            native_errno = ctypes.get_errno()
+            if returned != size:
+                raise IncompleteVnodeRead(native_errno, "incomplete vnode descriptor: "
+                    f"pid={pid} fd={fd} phase={phase} returned={returned} expected={size}")
             # Access mode, path, device and inode also detect reuse of an FD
             # number between the two inventories. Ignore changing timestamps.
             vnode = bytes(info.vnode)
@@ -195,9 +248,9 @@ def process_writable_files(pid, *, identities=False):
         return result
 
     before = descriptors()
-    files = vnodes(before)
-    if descriptors() != before or vnodes(before) != files:
-        raise OSError("process vnode descriptors changed")
+    files = vnodes(before, 'initial')
+    if descriptors() != before or vnodes(before, 'verification') != files:
+        raise VnodeInventoryChanged("process vnode descriptors changed")
     paths = {} if identities else set()
     for flags, name, _device, _inode in files.values():
         if flags & 2:  # Kernel FWRITE, not userspace O_WRONLY.
@@ -365,7 +418,9 @@ def process_placement_start(pid, target):
         if length.value > len(buffer):
             return None
         try:
-            placement = _process_placement_args(buffer.raw[:length.value])
+            # Copy only bytes returned by sysctl. buffer.raw first copies the
+            # full ARG_MAX allocation (1 MiB here) on every identity check.
+            placement = _process_placement_args(ctypes.string_at(buffer, length.value))
         except UnicodeError:
             return None
         if placement is None or any(placement.get(name) != str(target[key]) for name, key in (
@@ -390,11 +445,14 @@ class NativeCompletionWatcher:
     This watcher has no terminal-input operation.
     """
     def __init__(self, sources, wake, *, interval=0.25, tail_bytes=16384,
-                 retry_needed=None, clock=time.monotonic):
+                 retry_needed=None, clock=time.monotonic, retry_interval=1.0,
+                 on_failure=None, daemon_threads=True):
         self.sources, self.wake = sources, wake
         self.interval, self.tail_bytes = interval, tail_bytes
         self.signatures, self.seen_turns = {}, {}
         self.pending, self.retry_needed, self.clock = {}, retry_needed, clock
+        self.retry_interval, self.on_failure = retry_interval, on_failure
+        self.daemon_threads = daemon_threads
         self.lifecycle, self.coverage = {}, {}
         self.scan_seconds = 0.0
         self.coverage_seconds = max(1, 3 * interval)
@@ -422,7 +480,7 @@ class NativeCompletionWatcher:
                     if pending and self.retry_needed and self.clock() >= pending[1]:
                         if self.retry_needed(key[0], key[1], pending[0]):
                             self.wake(key[0], key[1])
-                        self.pending[key] = (pending[0], self.clock() + 1)
+                        self.pending[key] = (pending[0], self.clock() + self.retry_interval)
                     continue
                 with path.open("rb") as handle:
                     offset = max(0, before.st_size - self.tail_bytes)
@@ -447,13 +505,26 @@ class NativeCompletionWatcher:
                     }:
                         latest = event
                         break
+                if latest is None:
+                    # New native builds append large world/turn context after
+                    # task_started. A fixed tail may contain no lifecycle even
+                    # though the original task is working. Use the existing
+                    # bounded, session-checked snapshot reader in that case.
+                    snapshot = task_snapshot(path, source["session_id"])
+                    if snapshot and snapshot.get("signature") == [after.st_ino, after.st_size, after.st_mtime_ns]:
+                        latest = {"timestamp":datetime.fromtimestamp(snapshot["at"]).astimezone().isoformat(),
+                            "payload":{"type":snapshot["kind"], "turn_id":snapshot.get("turn_id"),
+                                       "error":snapshot.get("error")}}
                 if latest and latest["payload"].get("type") == "task_complete" and latest["payload"].get("error"):
                     turn = (latest["payload"].get("turn_id"), latest.get("timestamp"))
                     if self.seen_turns.get(key) != turn:
+                        failed_at = epoch(latest.get("timestamp"))
+                        if self.on_failure is not None:
+                            self.on_failure(key[0], key[1], key[2], turn[0], failed_at)
                         if not self.wake(key[0], key[1]):
                             continue  # The scheduler may still be discovering this UUID.
                         self.seen_turns[key] = turn
-                        self.pending[key] = (epoch(latest.get("timestamp")), self.clock() + 1)
+                        self.pending[key] = (failed_at, self.clock() + self.retry_interval)
                 elif latest:
                     self.pending.pop(key, None)
                 if latest:
@@ -488,7 +559,13 @@ class NativeCompletionWatcher:
         A failed source falls back on that scan; a stalled scanner loses its
         bounded lease. Native failures still request an immediate priority read.
         """
-        checked = self.coverage.get((str(target["surface_id"]), str(target["workspace_id"])))
+        identity = (str(target["surface_id"]), str(target["workspace_id"]))
+        # Live retries are painted before task_complete. A covered transcript
+        # cannot replace fast viewport reads while a turn is active or aborted.
+        kinds = [kind for key, kind in self.lifecycle.items() if key[:2] == identity]
+        if not kinds or any(kind != "task_complete" for kind in kinds):
+            return fallback
+        checked = self.coverage.get(identity)
         if checked is not None and 0 <= self.clock() - checked <= self.coverage_seconds:
             return max(fallback, 10.0)
         return fallback
@@ -496,12 +573,13 @@ class NativeCompletionWatcher:
     def start(self):
         def run():
             while not self.stop.is_set():
+                started = self.clock()
                 try:
                     self.scan()
                 except (OSError, ValueError, TypeError, AttributeError, KeyError):
                     pass  # A hint failure cannot disable regular viewport scans.
-                self.stop.wait(self.interval)
-        self.thread = threading.Thread(target=run, name="ccc-native-wakeup", daemon=True)
+                self.stop.wait(max(0, self.interval - (self.clock() - started)))
+        self.thread = threading.Thread(target=run, name="ccc-native-wakeup", daemon=self.daemon_threads)
         self.thread.start()
 
     def close(self):
@@ -598,6 +676,7 @@ class QueueRecovery:
         self.wakeup_process_cache = (0.0, frozenset(), {})
         self.wakeup_root_cache = (None, None)
         self.wakeup_path_cache = {}
+        self._ledger_seen = self.ledger.exists()
         try:
             self.attempts = json.loads(self.ledger.read_text())
         except FileNotFoundError:
@@ -697,6 +776,18 @@ class QueueRecovery:
                         "turn_id": guarded.get("turn_id"), "at": guarded.get("at", 0),
                         "error": guarded.get("turn_error"),
                         "signature": [guarded.get("start_id"), guarded.get("turn_id"), guarded.get("at")]}
+        # A native foreground observation outranks historical Hook bindings:
+        # /resume can change selection without changing the client's PID.
+        if self.process_lookup is not None:
+            from ccc_client_thread_observation import read_foreground
+            from ccc_request_observation_policy import request_observation_directory_matches
+            label = self.process_lookup(target)
+            pids = label.get('agent_pids', [])
+            if label.get('agent_kind') == 'codex' and len(pids) == 1:
+                status, _, _ = read_foreground(pids[0], request_observation_directory_matches)
+                if status != 'absent':
+                    from ccc_shared_codex_turn import current_turn
+                    return current_turn(target, pids[0], self.sessions_root)
         try:
             records = self.records()
         except FileNotFoundError:
@@ -730,8 +821,13 @@ class QueueRecovery:
         The current process must belong to this exact workspace and surface,
         and hold exactly one original rollout open. No Hook is synthesized.
         """
-        if self.process_lookup is None or not self.sessions_root.is_dir():
+        if self.process_lookup is None:
             return None
+        # A configured native reader losing its sessions directory is not a
+        # legacy client. None permits viewport-only dispatch downstream and
+        # could submit while the original turn is still reconnecting.
+        if not self.sessions_root.is_dir():
+            return {"kind": "unknown"}
         label = self.process_lookup(target)
         hint_started = None
         hint_source = None
@@ -829,6 +925,9 @@ class QueueRecovery:
                 return {"kind": "unknown"}
             files = process_writable_files(pid, identities=True)
             locks = [p for p in files if p.parent.name == "thread-writer-locks" and p.suffix == ".lock"]
+            if not locks:
+                from ccc_shared_codex_turn import current_turn
+                return current_turn(target, pid, self.sessions_root)
             if len(locks) != 1:
                 return {"kind": "unknown"}
             lock = locks[0]
@@ -925,19 +1024,64 @@ class QueueRecovery:
         with self.lock:
             if self.attempts is None:
                 raise RuntimeError("queue recovery ledger unreadable")
-            self.attempts[key] = record
-            temp = self.ledger.with_name(f".{self.ledger.name}.{os.getpid()}.tmp")
-            temp.write_text(json.dumps(self.attempts) + "\n")
-            temp.replace(self.ledger)
+            # Separate native lanes share this historical ledger. Merge the
+            # current file under an OS lock, never overwrite another lane's
+            # input intent with an old in-memory snapshot.
+            self.ledger.parent.mkdir(parents=True, exist_ok=True)
+            with self.ledger.with_name(self.ledger.name + ".lock").open("a+b") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                try:
+                    self._refresh_attempts()
+                    if self.attempts is None:
+                        raise RuntimeError("queue recovery ledger unreadable")
+                    updated = {**self.attempts, key: record}
+                    from cmux_codex_watch import atomic_write_json
+                    atomic_write_json(self.ledger, updated)
+                    self.attempts, self._ledger_seen = updated, True
+                finally:
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+
+    def _refresh_attempts(self):
+        try:
+            value = json.loads(self.ledger.read_bytes())
+            if not isinstance(value, dict) or any(not isinstance(r, dict) for r in value.values()):
+                raise ValueError("invalid queue recovery ledger")
+            self.attempts, self._ledger_seen = value, True
+        except FileNotFoundError:
+            if self._ledger_seen:
+                self.attempts = None
+        except (OSError, ValueError, TypeError):
+            self.attempts = None
 
     def has_pending_draft(self, sid):
         with self.lock:
+            self._refresh_attempts()
             return bool(self.attempts and any(r.get("surface_id") == sid and r.get("phase") in {"edited", "unconfirmed"}
                                              for r in self.attempts.values()))
 
-    def recover(self, target, runtime, *, read_view, edit_queued, enter, authorized):
+    def blocks_turn(self, target, turn):
+        """A queue key already attempted for this turn also consumes goal retry.
+
+        Includes ambiguous edits/Enter and survives daemon restart. Transport
+        acknowledgement does not mean native lifecycle has caught up yet.
+        """
+        with self.lock:
+            self._refresh_attempts()
+            return self.attempts is None or any(
+                r.get('surface_id') == target['surface_id']
+                and r.get('workspace_id') == target['workspace_id']
+                and r.get('session_id') == turn.get('session_id')
+                and r.get('turn_id') == turn.get('turn_id')
+                for r in self.attempts.values())
+
+    def recover(self, target, runtime, *, read_view, edit_queued, enter, authorized, message=None, read_evidence=None):
+        # Each invocation owns its exact text. Never mutate the shared default
+        # while other B/b/N surfaces are recovering their own queued inputs.
+        message = self.message if message is None else message
+        evidence_now = (lambda: self.evidence(target)) if read_evidence is None else read_evidence
         sid = target["surface_id"]
         with self.lock:
+            self._refresh_attempts()
             if self.attempts is None or time.monotonic() < self.next_probe.get(sid, 0):
                 return ""
             self.next_probe[sid] = time.monotonic() + 5
@@ -946,20 +1090,24 @@ class QueueRecovery:
                 or target.get("paused") or not target.get("enabled", True)):
             return ""
         try:
-            evidence = self.evidence(target)
+            evidence = evidence_now()
             if not evidence:
                 return ""
             turn = {k: evidence.get(k) for k in ("session_id", "pid", "process_start", "completed_at", "turn_id")}
             key = hashlib.sha256(json.dumps([sid, turn], sort_keys=True).encode()).hexdigest()
             with self.lock:
                 previous = self.attempts.get(key)
+            if previous is None and self.blocks_turn(target, evidence):
+                return "queue_recovery_unconfirmed"
             if previous:
+                if previous.get("message", self.message) != message:
+                    return "queue_recovery_unconfirmed"
                 # An acknowledged edit with no Enter attempted can be finished
                 # from its exact draft. A lost Enter acknowledgement cannot.
                 if previous["phase"] in {"edited", "unconfirmed"}:
                     view = read_view()
-                    if (not view.get("busy") and not view.get("queued") and view.get("draft") == self.message
-                            and authorized() and self.evidence(target) == evidence):
+                    if (not view.get("busy") and not view.get("queued") and view.get("draft") == message
+                            and authorized() and evidence_now() == evidence):
                         record = previous
                         self.write_attempt(key, {**record, "phase": "submitting"})
                         enter()
@@ -968,19 +1116,19 @@ class QueueRecovery:
                 return "queue_recovery_unconfirmed" if previous["phase"] != "submitted" else ""
             view = read_view()
             if (not view.get("empty") or view.get("busy") or not view.get("editable")
-                    or view.get("queued") != [self.message] or not authorized()):
+                    or view.get("queued") != [message] or not authorized()):
                 return ""
-            if self.evidence(target) != evidence:
+            if evidence_now() != evidence:
                 return ""
             record = {"surface_id": sid, "workspace_id": target["workspace_id"],
-                      **evidence, "phase": "editing", "at": time.time()}
+                      **evidence, "message": message, "phase": "editing", "at": time.time()}
             self.write_attempt(key, record)
             edit_queued()
             self.write_attempt(key, {**record, "phase": "edited"})
             time.sleep(0.15)
             view = read_view()
-            if (view.get("busy") or view.get("queued") or view.get("draft") != self.message
-                    or not authorized() or self.evidence(target) != evidence):
+            if (view.get("busy") or view.get("queued") or view.get("draft") != message
+                    or not authorized() or evidence_now() != evidence):
                 self.write_attempt(key, {**record, "phase": "unconfirmed"})
                 return "queue_recovery_unconfirmed"
             self.write_attempt(key, {**record, "phase": "submitting"})

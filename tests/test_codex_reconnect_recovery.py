@@ -5,6 +5,7 @@ import unittest
 from unittest import mock
 
 import cmux_codex_watch as core
+from ccc_provider_retry import ProviderRetryStore
 from tests.test_watch import (
     FakeClient, HIGH_DEMAND_TEXT, armed_daemon, grid_payload,
     reconnect_payload, span, visible_lines,
@@ -27,6 +28,248 @@ def covered_prompt_payload(prefix="  "):
 
 
 class CodexReconnectRecoveryTests(unittest.TestCase):
+    PEAK_LOAD = (
+        "rate limit exceeded: The system is currently experiencing high demand "
+        "and cannot process your request. Your request exceeds the maximum usage "
+        "size allowed during peak load. For improved capacity reliability, "
+        "consider switching to Provisioned Throughput."
+    )
+
+    def test_peak_load_banner_complete_and_wrapped(self):
+        for prefix in ('■ ', '└ ', '■ rate limit exceeded: '):
+            for width in (19, 53, 1000):
+                banner = prefix + self.PEAK_LOAD
+                wrapped = '\n'.join(banner[i:i+width] for i in range(0, len(banner), width))
+                with self.subTest(prefix=prefix, width=width):
+                    self.assertEqual(core._match_error_block(wrapped), 'rate_limit')
+        for text in ('■ documentation: ' + self.PEAK_LOAD,
+                     '■ example: ' + self.PEAK_LOAD,
+                     '■ ' + self.PEAK_LOAD + ' This is a quoted example.',
+                     '■ ' + self.PEAK_LOAD[:-20]):
+            self.assertIsNone(core._match_error_block(text))
+
+    def test_peak_load_waits_then_sends_once(self):
+        payload = self.peak_load_payload()
+        state = core.classify_grid(core.Grid.from_rpc(payload, 'surface-uuid'))
+        self.assertEqual((state.kind, state.error_type), ('recoverable_error', 'rate_limit'))
+        with tempfile.TemporaryDirectory() as directory:
+            client = FakeClient(payload, '\n'.join(visible_lines(payload)))
+            daemon = armed_daemon(directory, client)
+            now, _ = self.bind_provider(daemon, self.PEAK_LOAD, ready=False)
+            daemon.process_once(client)
+            self.assertEqual(len(client.sent), 0)
+            now[0] += 15
+            daemon.process_once(client)
+            self.assertEqual(len(client.sent), 1)
+            daemon.process_once(client)
+            self.assertEqual(len(client.sent), 1)
+
+    def test_terminal_rate_limit_dispatch_at_quarter_second_without_replay(self):
+        errors = (self.PEAK_LOAD,
+                  "rate limit exceeded: Your requests to gpt-6-astra for gpt-6-astra in eastus2 have exceeded token rate limit.")
+        for error in errors:
+            with self.subTest(error=error), tempfile.TemporaryDirectory() as directory:
+                payload = grid_payload([], error=error, columns=500)
+                client = FakeClient(payload, "\n".join(visible_lines(payload)))
+                daemon = armed_daemon(directory, client)
+                now, _ = self.bind_provider(daemon, error, ready=False)
+                daemon.process_once(client)
+                self.assertEqual(client.sent, [])
+                now[0] = 200.249
+                daemon.process_once(client)
+                self.assertEqual(client.sent, [])
+                now[0] = 200.25
+                daemon.process_once(client)
+                self.assertEqual(len(client.sent), 1)
+                for later in (200.5, 201.0, 260.0):
+                    now[0] = later
+                    daemon.process_once(client)
+                    self.assertEqual(len(client.sent), 1)
+
+    def test_peak_load_native_tips_preserve_recovery_and_dedup(self):
+        for tip in ('└ Tip: Press ctrl+g to edit your current draft in an external editor.',
+                    '└ Tip: Run /review to get a code review of your current changes.'):
+            with self.subTest(tip=tip), tempfile.TemporaryDirectory() as directory:
+                payload = self.peak_load_payload()
+                row = payload['render_grid']['cursor']['row']
+                payload['render_grid']['row_spans'].append(span(row - 3, 0, tip, 3))
+                client = FakeClient(payload, '\n'.join(visible_lines(payload)))
+                daemon = armed_daemon(directory, client)
+                now, _ = self.bind_provider(daemon, self.PEAK_LOAD, ready=False)
+                self.assertEqual(core.classify_grid(core.Grid.from_rpc(payload, 'surface-uuid')).error_type, 'rate_limit')
+                daemon.process_once(client)
+                self.assertEqual(len(client.sent), 0)
+                now[0] += 15
+                daemon.process_once(client)
+                daemon.process_once(client)
+                self.assertEqual(len(client.sent), 1)
+        for suffix in ('└ Tip: arbitrary output.', '└ Tip: Run /review',
+                       '└ Tip: Run /review to get a code review of your current changes. extra'):
+            self.assertIsNone(core._match_error_block('■ ' + self.PEAK_LOAD + '\n' + suffix))
+
+    def rotating_tip_payload(self, tip):
+        payload = grid_payload([' '] * 20, columns=120)
+        row = payload['render_grid']['cursor']['row']
+        error = '└ ' + self.PEAK_LOAD
+        card = ['• Reconnecting... 5/5(5m 20s • esc to interrupt)'] + [
+            error[i:i+110] for i in range(0, len(error), 110)] + tip.split('\n')
+        for index, text in enumerate(card):
+            payload['render_grid']['row_spans'].append(
+                span(row - len(card) - 2 + index, 0, text, 3))
+        return payload
+
+    def test_rotating_reconnect_tip_waits_and_recovers_once(self):
+        for tip in ('└ Tip: Use /skills to list available skills or ask Codex to use one.',
+                    '└ Tip: A future native suggestion.',
+                    '└ Tip: Use /skills to list available skills\n  or ask Codex to use one.'):
+            with self.subTest(tip=tip), tempfile.TemporaryDirectory() as directory:
+                payload = self.rotating_tip_payload(tip)
+                state = core.classify_grid(core.Grid.from_rpc(payload, 'surface-uuid'))
+                self.assertEqual((state.kind, state.error_type), ('recoverable_error', 'rate_limit'))
+                client = FakeClient(payload, '\n'.join(visible_lines(payload)))
+                daemon = armed_daemon(directory, client)
+                now, _ = self.bind_provider(daemon, self.PEAK_LOAD, ready=False)
+                daemon.process_once(client)
+                self.assertEqual(client.sent, [])
+                now[0] += 15
+                daemon.process_once(client)
+                daemon.process_once(client)
+                self.assertEqual(len(client.sent), 1)
+
+    def test_rotating_tip_keeps_newer_output_and_input_guards(self):
+        for expected, text in (('working', '• Working (4s • esc to interrupt)'),
+                               ('composer_busy', 'unfinished draft'),
+                               ('menu', 'Implement this plan?')):
+            payload = self.rotating_tip_payload('└ Tip: Use /skills to list available skills.')
+            row = payload['render_grid']['cursor']['row']
+            payload['render_grid']['row_spans'].append(
+                span(row, 30, text, 0) if expected == 'composer_busy'
+                else span(row - 1, 0, text, 0))
+            self.check_without_send(payload, expected)
+        lines = ['• Reconnecting... 5/5(5s • esc to interrupt)',
+                 '└ ' + self.PEAK_LOAD, '└ Tip: Use /skills.', '', '• New response']
+        self.assertTrue(core._find_last_error(lines).superseded)
+        self.assertIsNone(core._find_last_error([lines[0], '└ ' + self.PEAK_LOAD[:-20], lines[2]]))
+        self.assertIsNone(core._find_last_error(['■ ' + self.PEAK_LOAD, lines[2]]))
+
+    def test_peak_load_does_not_override_working_or_draft(self):
+        for expected, text in (('working', '• Working (4s • esc to interrupt)'),
+                               ('composer_busy', 'unfinished draft'),
+                               ('menu', 'Implement this plan?')):
+            payload = self.peak_load_payload()
+            row = payload['render_grid']['cursor']['row']
+            payload['render_grid']['row_spans'].append(
+                span(row, 30, text, 0) if expected == 'composer_busy'
+                else span(row - 2, 0, text, 0))
+            self.check_without_send(payload, expected)
+
+    def peak_load_payload(self):
+        payload = grid_payload([' '] * 20, columns=82)
+        row = payload['render_grid']['cursor']['row']
+        text = '■ ' + self.PEAK_LOAD
+        chunks = [text[i:i+80] for i in range(0, len(text), 80)]
+        for index, chunk in enumerate(chunks):
+            payload['render_grid']['row_spans'].append(
+                span(row - len(chunks) - 3 + index, 0 if index == 0 else 2,
+                     chunk, 3, len(chunk)))
+        return payload
+
+    def bind_provider(self, daemon, error='HTTP 429 Too Many Requests', *, ready=True):
+        now = [1000.0 if ready else 200.0]
+        turn = {'kind': 'task_complete', 'session_id': 'original', 'turn_id': 'failed',
+                'at': 200.0, 'model_provider': 'synthetic-provider', 'error': {'message': error}}
+        daemon.codex_queue_recovery.current_turn = lambda _: dict(turn)
+        daemon._provider_retry = ProviderRetryStore(daemon._provider_retry.path,
+            clock=lambda: now[0], jitter=lambda: 0)
+        daemon._provider_retry.observe('original', 'synthetic-provider', 'failed',
+            core._match_error_block(error), error, 200.0)
+        if ready:
+            now[0] += 15
+        self.addCleanup(daemon._process_snapshots.close)
+        return now, turn
+
+    def test_provider_status_precedes_stream_wrapper(self):
+        cases = {
+            'HTTP 400 Bad Request': 'http_400',
+            'HTTP 502 Bad Gateway': 'http_502',
+            'HTTP 503 Unavailable': 'http_503',
+            'HTTP 504 Gateway Timeout': 'http_504',
+            'unexpected status 401 Unauthorized': 'http_401',
+            'unexpected status 401: insufficient_quota': 'token_exhausted',
+            'unexpected status 403 Forbidden': 'http_403',
+            'HTTP 429 Too Many Requests': 'rate_limit',
+            'HTTP 500 Internal Server Error': 'http_500',
+            'unexpected status 524 A timeout occurred': 'http_524',
+            'unknown status code: 524': 'http_524',
+            'HTTP 429 {"error":{"code":"insufficient_quota"}}': 'token_exhausted',
+            'HTTP 200 data: {"error":{"code":"rate_limit_exceeded"}}': 'rate_limit',
+        }
+        for error, expected in cases.items():
+            with self.subTest(error=error):
+                self.assertEqual(core._match_error_block(
+                    'stream disconnected before completion: ' + error), expected)
+        self.assertIsNone(core._match_error_block('documentation: rate_limit_exceeded'))
+
+    def test_success_resolves_original_provider_before_refunding_budget(self):
+        with tempfile.TemporaryDirectory() as directory:
+            daemon = armed_daemon(directory, FakeClient(covered_prompt_payload()))
+            now, turn = self.bind_provider(daemon)
+            store = daemon._provider_retry
+            evidence = store.observe('original', 'synthetic-provider', 'failed',
+                                     'rate_limit', 'HTTP 429 Too Many Requests', 200.0)
+            for index in range(4):
+                now[0] += 200
+                evidence = store.observe('original', 'synthetic-provider', f'failed-{index}',
+                                         'rate_limit', 'HTTP 429 Too Many Requests', 200.0 + index)
+                self.assertTrue(store.reserve(evidence, str(index)))
+            now[0] += 200
+            self.assertFalse(store.ready(evidence))
+            turn.update(turn_id='answered', at=300.0, error=None, last_agent_message='Actual answer')
+            turn.pop('model_provider')
+            target = {'surface_id': 'surface-uuid', 'workspace_id': 'workspace-uuid'}
+            with mock.patch('ccc_codex_goal.provider_for_turn', return_value=None):
+                daemon._provider_retry_success(target)
+            self.assertFalse(store.ready(evidence))
+            with mock.patch('ccc_codex_goal.provider_for_turn', return_value='synthetic-provider') as lookup:
+                daemon._provider_retry_success(target)
+                lookup.assert_called_once_with(target, turn)
+            self.assertIsNone(store.observe('original', 'synthetic-provider', 'failed',
+                                           'rate_limit', 'HTTP 429 Too Many Requests', 200.0))
+            fresh = store.observe('original', 'synthetic-provider', 'new-failure',
+                                  'rate_limit', 'HTTP 429 Too Many Requests', 301.0)
+            now[0] += 15
+            # A later completed answer permits the next original failure.
+            self.assertTrue(store.reserve(fresh, 'after-success'))
+
+    def test_provider_auth_and_permission_do_not_send(self):
+        for status in (400, 401, 403):
+            payload = grid_payload([], error=f'unexpected status {status} Unknown error')
+            self.check_without_send(payload, 'provider_blocked')
+
+    def test_provider_budget_waits_and_stops_after_four_remedies_across_turns(self):
+        for error in ('HTTP 500 Internal Server Error',
+                      'HTTP 524 A timeout occurred'):
+            with self.subTest(error=error), tempfile.TemporaryDirectory() as directory:
+                payload = grid_payload([], error=error)
+                client = FakeClient(payload, '\n'.join(visible_lines(payload)))
+                daemon = armed_daemon(directory, client)
+                now, turn = self.bind_provider(daemon, error, ready=False)
+                daemon.process_once(client)
+                self.assertEqual(len(client.sent), 0)
+                runtime = daemon.runtime['surface-uuid']
+                for i in range(4):
+                    now[0] += 200
+                    daemon.process_once(client)
+                    self.assertEqual(len(client.sent), i + 1)
+                    runtime.awaiting, runtime.last_send_at = False, 0
+                    turn.update(turn_id=f'failed-{i}', at=201.0 + i)
+                    daemon.process_once(client)
+                    self.assertEqual(len(client.sent), i + 1)
+                now[0] += 200
+                daemon.process_once(client)
+                self.assertEqual(len(client.sent), 4)
+                self.assertIn('shared retry slot' if '429' in error else 'four-remedy budget', runtime.paused_reason)
+
     def test_typographic_apostrophe_recovers_but_preserves_input_guards(self):
         error = HIGH_DEMAND_TEXT.replace("'", "’")
         for options, expected in (({}, 'recoverable_error'), ({'composer': 'busy'}, 'composer_busy'),
@@ -36,6 +279,7 @@ class CodexReconnectRecoveryTests(unittest.TestCase):
                 text = '\n'.join(visible_lines(payload))
                 client = FakeClient(payload, text)
                 daemon = armed_daemon(directory, client)
+                self.bind_provider(daemon, error)
                 self.addCleanup(daemon._process_snapshots.close)
                 self.assertEqual(core.classify_grid(core.Grid.from_rpc(payload, 'surface-uuid')).kind, expected)
                 daemon.process_once(client)
@@ -70,6 +314,7 @@ class CodexReconnectRecoveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             client = FakeClient(payload, "\n".join(visible_lines(payload)))
             daemon = armed_daemon(directory, client)
+            self.bind_provider(daemon, HIGH_DEMAND_TEXT)
             with mock.patch.object(core.time, "time", return_value=1000) as clock:
                 daemon.process_once(client)
                 self.assertEqual(len(client.sent), 1)
@@ -89,11 +334,12 @@ class CodexReconnectRecoveryTests(unittest.TestCase):
                 self.assertNotEqual(first_fingerprint, latest.fingerprint)
                 daemon.save()
                 restarted = core.WatchDaemon(daemon.config_path, daemon.state_path, client=client)
+                self.bind_provider(restarted, HIGH_DEMAND_TEXT)
                 restarted.process_once(client)
                 self.assertEqual(len(client.sent), 1)
                 clock.return_value = 1001.1
                 restarted.process_once(client)
-                self.assertEqual(len(client.sent), 2)
+                self.assertEqual(len(client.sent), 1)  # Timer alone is not a new failed turn.
 
     def test_working_revisit_cannot_exceed_configured_poll_interval(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -175,6 +421,7 @@ class CodexReconnectRecoveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             client = FakeClient(payload, "\n".join(visible_lines(payload)))
             daemon = armed_daemon(directory, client)
+            self.bind_provider(daemon, HIGH_DEMAND_TEXT)
             with mock.patch.object(core.time, "time", return_value=1000) as clock:
                 daemon.process_once(client)
                 self.assertEqual(len(client.sent), 1)
@@ -183,7 +430,7 @@ class CodexReconnectRecoveryTests(unittest.TestCase):
                 client.text = "\n".join(visible_lines(payload))
                 clock.return_value = 1002
                 daemon.process_once(client)
-                self.assertEqual(len(client.sent), 2)
+                self.assertEqual(len(client.sent), 1)  # Echo is not evidence of another failed turn.
 
     def test_live_d365940f_echo_and_sparse_spinner_stay_current(self):
         payload = grid_payload([" "] * 20, columns=100)
@@ -201,6 +448,7 @@ class CodexReconnectRecoveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             client = FakeClient(payload, "\n".join(visible_lines(payload)))
             daemon = armed_daemon(directory, client)
+            self.bind_provider(daemon, HIGH_DEMAND_TEXT)
             daemon.process_once(client)
             self.assertEqual(len(client.sent), 1)
 
@@ -227,6 +475,7 @@ class CodexReconnectRecoveryTests(unittest.TestCase):
                 payload = covered_prompt_payload(prefix)
                 client = FakeClient(payload, "\n".join(visible_lines(payload)))
                 daemon = armed_daemon(directory, client)
+                self.bind_provider(daemon, HIGH_DEMAND_TEXT)
                 daemon.process_once(client)
                 self.assertEqual(len(client.sent), 1)
 
@@ -271,7 +520,7 @@ class CodexReconnectRecoveryTests(unittest.TestCase):
                 payload["render_grid"]["row_spans"].append(
                     span(row - 2, 0, f"■ unexpected status {status} Unknown error", 3))
                 state = core.classify_grid(core.Grid.from_rpc(payload, "surface-uuid"))
-                self.assertEqual(state.kind, "error_superseded")
+                self.assertEqual(state.kind, "provider_blocked" if status in (400, 401, 403) else "error_superseded")
 
     def test_old_working_above_new_error_waits_for_native_completion_then_recovers(self):
         payload = covered_prompt_payload()
@@ -383,6 +632,7 @@ class CodexReconnectRecoveryTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as directory:
                     client = FakeClient(payload, "\n".join(visible_lines(payload)))
                     daemon = armed_daemon(directory, client)
+                    self.bind_provider(daemon)
                     daemon.process_once(client)
                     self.assertEqual(len(client.sent), 1)
                     self.assertEqual(client.sent[0][-1], core.MESSAGE)
@@ -415,6 +665,7 @@ class CodexReconnectRecoveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             client = FakeClient(payload, "\n".join(visible_lines(payload)))
             daemon = armed_daemon(directory, client)
+            self.bind_provider(daemon)
             daemon.process_once(client)
             self.assertEqual(len(client.sent), 1)
             self.assertEqual(client.sent[0][-1], core.MESSAGE)
@@ -434,6 +685,7 @@ class CodexReconnectRecoveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             client = FakeClient(payload, "\n".join(visible_lines(payload)))
             daemon = armed_daemon(directory, client)
+            self.bind_provider(daemon)
             daemon.process_once(client)
             self.assertEqual(len(client.sent), 1)
             self.assertEqual(client.sent[0][-1], core.MESSAGE)

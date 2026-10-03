@@ -4,6 +4,7 @@ import unittest
 
 import cmux_codex_watch as core
 from tests.test_codex_status_chrome import ERRORS, status_payload, visible_text
+from tests.provider_retry_fixture import bind_ready_provider
 from tests.test_watch import FakeClient, armed_daemon, span
 
 
@@ -26,6 +27,7 @@ class HookTimeoutTests(unittest.TestCase):
                     self.assertEqual((state.kind, state.error_type), ("recoverable_error", error))
                     client = FakeClient(payload, visible_text(payload))
                     daemon = armed_daemon(directory, client)
+                    bind_ready_provider(self, daemon, ERRORS.get(error, error))
                     self.addCleanup(daemon._process_snapshots.close)
                     daemon.process_once(client)
                     daemon.process_once(client)
@@ -53,6 +55,7 @@ class HookTimeoutTests(unittest.TestCase):
                 self.assertTrue({47, 48}.issubset(state.ignored_chrome_rows))
                 client = FakeClient(payload, visible_text(payload))
                 daemon = armed_daemon(directory, client)
+                bind_ready_provider(self, daemon, ERRORS.get(error, error))
                 self.addCleanup(daemon._process_snapshots.close)
                 daemon.process_once(client)
                 daemon.process_once(client)

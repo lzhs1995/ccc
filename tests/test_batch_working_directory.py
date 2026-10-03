@@ -76,7 +76,7 @@ class BatchWorkingDirectoryTests(unittest.TestCase):
     def test_slot_roots_are_empty_separate_and_outside_state_and_database(self):
         (self.job_dir / "job.json").write_text("historical state")
         database = batch.sqlite_home(self.config, self.job["id"], 0)
-        database.mkdir()
+        database.mkdir(parents=True)
         (database / "logs.sqlite").write_text("do not touch")
         first = batch.prepare_working_directory(self.config, self.job, 0)
         last = batch.prepare_working_directory(self.config, self.job, 49)

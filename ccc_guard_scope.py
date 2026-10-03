@@ -16,12 +16,19 @@ import uuid
 import ccc_codex_queue as native
 
 
-def birth(pid, *, codex=False):
+def birth(pid, *, codex=False, observation=None):
     if native._proc_pidinfo is None or type(pid) is not int or not 1 < pid < 2**31:
+        if observation is not None:
+            observation.update(available=native._proc_pidinfo is not None, valid_pid=False)
         return None
     info = native._BsdInfo()
     size = ctypes.sizeof(info)
-    if (native._proc_pidinfo(pid, 3, 0, ctypes.byref(info), size) != size
+    result = native._proc_pidinfo(pid, 3, 0, ctypes.byref(info), size)
+    if observation is not None:
+        observation.update(returned_bytes=result, expected_bytes=size,
+            pid=info.pid, status=info.status, start_sec=info.start_sec,
+            start_usec=info.start_usec, name=(info.name or info.comm).decode('utf-8', 'replace'))
+    if (result != size
             or info.pid != pid or info.status == 5 or not info.start_sec
             or (codex and (info.name or info.comm) != b"codex")):
         return None

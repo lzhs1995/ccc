@@ -3933,7 +3933,10 @@ class SessionFallbackConflictTests(unittest.TestCase):
                 222: {"command": "codex", "started_at": "2026-08-29T20:13:34",
                       "ppid": "1"}}
 
-    def test_two_pids_with_different_rollouts_conflict(self):
+    # These are synthetic legacy PIDs. Do not probe the host's unrelated
+    # processes or observer files before exercising the mocked lsof fallback.
+    @mock.patch("ccc_client_thread_observation.read_foreground", return_value=("absent", None, None))
+    def test_two_pids_with_different_rollouts_conflict(self, foreground):
         import cmux_supervisor_tui as tui
 
         result = tui.resolve_surface_session(
@@ -3945,7 +3948,8 @@ class SessionFallbackConflictTests(unittest.TestCase):
         self.assertEqual(result.resume_command(), "")
         self.assertIn("2", result.reason)
 
-    def test_two_pids_agreeing_on_one_id_is_not_a_conflict(self):
+    @mock.patch("ccc_client_thread_observation.read_foreground", return_value=("absent", None, None))
+    def test_two_pids_agreeing_on_one_id_is_not_a_conflict(self, foreground):
         """A parent/child pair sharing one rollout must still resolve."""
 
         import cmux_supervisor_tui as tui
@@ -3988,7 +3992,8 @@ class SessionWorkerSurvivalTests(unittest.TestCase):
             grok_path=Path("/nonexistent"),
             grok_loader=lambda *_: [])
 
-    def test_unparseable_agent_pid_does_not_abort_the_pass(self):
+    @mock.patch("ccc_client_thread_observation.read_foreground", return_value=("absent", None, None))
+    def test_unparseable_agent_pid_does_not_abort_the_pass(self, foreground):
         import cmux_supervisor_tui as tui
 
         resolver = self._resolver()
@@ -4124,9 +4129,13 @@ class SessionResolverTests(unittest.TestCase):
         table = tui.parse_ps_table(_ps_line(300, f"codex --session-id {SID_A}"))
         lsof = (f"codex 300 lzhs 1u REG 1,14 1 1 "
                 f"/a/rollout-2026-07-05T07-55-57-{SID_B}.jsonl")
-        result = tui.resolve_surface_session(
-            "codex", [300], table, {}, now=time.time(),
-            lsof_runner=_fake_run(lsof))
+        # This is the legacy argv/lsof ordering contract. Native foreground
+        # precedence is covered with real private records in its own tests.
+        from unittest.mock import patch
+        with patch("ccc_client_thread_observation.read_foreground", return_value=("absent", None, None)):
+            result = tui.resolve_surface_session(
+                "codex", [300], table, {}, now=time.time(),
+                lsof_runner=_fake_run(lsof))
         self.assertEqual(result.session_id, SID_A)
         self.assertEqual(result.tier, "session-id")
 
@@ -4593,7 +4602,8 @@ class SessionNoRawRetentionTests(unittest.TestCase):
         self.assertNotIn(".jsonl", str(found))
         self.assertNotIn("secret-project", str(found))
 
-    def test_the_resolved_record_contains_no_path_or_raw_text(self):
+    @mock.patch("ccc_client_thread_observation.read_foreground", return_value=("absent", None, None))
+    def test_the_resolved_record_contains_no_path_or_raw_text(self, foreground):
         import dataclasses
 
         import cmux_supervisor_tui as tui
@@ -4777,7 +4787,8 @@ class SessionModelWiringTests(unittest.TestCase):
         self.assertEqual(list(payload[0]["agent_pids"]), [4242],
                          "agent_pids lost: the ref fallback was not used")
 
-    def test_a_ref_keyed_surface_resolves_end_to_end(self):
+    @mock.patch("ccc_client_thread_observation.read_foreground", return_value=("absent", None, None))
+    def test_a_ref_keyed_surface_resolves_end_to_end(self, foreground):
         """And the id actually lands, not merely the pids."""
 
         import cmux_supervisor_tui as tui

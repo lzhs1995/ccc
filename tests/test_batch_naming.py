@@ -16,6 +16,7 @@ class BatchNamingTests(unittest.TestCase):
 
     def fresh(self):
         self.initial_name = ''
+        self.worker.job['name_policy'] = 'before-first-turn-v1'
         self.worker.job['slots'] = self.worker.job['slots'][:1]
         self.worker.save()
         self.worker.step()
