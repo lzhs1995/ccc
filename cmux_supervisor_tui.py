@@ -394,9 +394,11 @@ class Candidate:
             return "历史请求（K查看完整值）"
         if self.session.api_key_observed:
             return self.session.api_key_observed
+        if self.session.api_key_observation_status == "absent":
+            return "暂无请求记录"
         # The row represents this running session. Repeating a shared mutable
         # TOML value here falsely suggests all loaded sessions use that key.
-        return "未核实（K查看配置）" if self.session.api_key_config else "未核实"
+        return "未核实"
 
     @property
     def surface_id(self) -> str:
@@ -908,6 +910,9 @@ class SessionResult:
     api_key_observed: str = field(default="", repr=False)
     api_key_observation_historical: bool = False
     api_key_observation_note: str = ""
+    api_key_observation_status: str = "unverified"
+    foreground_evidence: tuple | None = field(default=None, repr=False)
+    foreground_observations: tuple = field(default=(), repr=False)
 
     @property
     def ok(self) -> bool:
@@ -1184,6 +1189,28 @@ def resolve_surface_session(
         base.reason = "没有可用的进程 PID"
         return base
 
+    if agent_kind == "codex":
+        from ccc_client_thread_observation import read_foreground
+        observed = [(pid, read_foreground(pid, request_observation_directory_matches)) for pid in live]
+        present = [(pid, value) for pid, value in observed if value[0] != "absent"]
+        if present:
+            base.tier = "codex-foreground"
+            base.foreground_observations = tuple(observed)
+            if any(value[0] != "ok" for _, value in present):
+                base.reason = "当前客户端会话记录失效，不能沿用启动时 session"
+                return base
+            if len({value[1] for _, value in present}) != 1:
+                base.status, base.reason = "conflict", "当前客户端会话记录冲突"
+                return base
+            pid, (_, thread, evidence) = present[0]
+            base.pid, base.foreground_evidence = pid, evidence
+            if thread is None:
+                base.reason = "客户端当前未选择会话"
+                return base
+            base.status, base.session_id = "ok", thread
+            base.generation = session_generation(pid, str((ps_table.get(pid) or {}).get("started_at") or ""))
+            return base
+
     commands = [str((ps_table.get(pid) or {}).get("command") or "") for pid in live]
     status, session_id, note = resolve_from_argv(commands)
     if status == "ok":
@@ -1369,7 +1396,6 @@ class SessionResolver:
             )
             result = resolved[surface_id]
             if result.ok and result.agent_kind == "codex":
-                observe_configured_api_key(result)
                 observe_request_api_key(result)
         with self._lock:
             # A pass that started before a newer one is discarded rather than
@@ -1417,8 +1443,11 @@ def request_observation_directory_matches(env: dict, directory: Path) -> bool:
             after = os.fstat(stream.fileno())
         return (raw == b"ccc-request-credentials-v1\n"
                 and identity(before) == identity(after) == identity(marker.lstat())
-                and identity(ds) == identity(directory.lstat())
-                and identity(hs) == identity(home.lstat()))
+                # Other sessions publish requests and update files under HOME.
+                # Their directory timestamps/sizes are not identity changes.
+                # The opt-in file itself still requires the complete identity.
+                and identity(ds)[:4] == identity(directory.lstat())[:4]
+                and identity(hs)[:4] == identity(home.lstat())[:4])
     except (OSError, ValueError):
         return False
 
@@ -1438,31 +1467,54 @@ def observe_request_api_key(result: SessionResult, directory: Path | None = None
         return (info.st_dev, info.st_ino, info.st_mode, info.st_uid,
                 info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
+    def session_records():
+        found = {}
+        for path in directory.iterdir():
+            if path.name.endswith(f"-{result.session_id}-request_attempt.json"):
+                if len(found) >= 4096:
+                    result.api_key_observation_note = "该会话请求记录过多，无法完整核验实际 Key。"
+                    return None
+                found[path] = identity(path.lstat())
+        return found
+
     result.api_key_observed = ""
     result.api_key_observation_historical = False
     result.api_key_observation_note = ""
-    directory = directory or Path.home() / ".codex" / "credential-observations"
+    result.api_key_observation_status = "unverified"
     if not result.ok or result.agent_kind != "codex":
+        result.api_key_observation_note = "尚未关联可核实的 Codex 会话。"
         return
     cli_birth = scope.birth(result.pid, codex=True)
     if cli_birth is None:
+        result.api_key_observation_note = "原客户端进程已退出或身份无法核实。"
         return
     try:
+        if directory is None:
+            # Resolve the observed client's directory, not this panel's HOME.
+            # A different CODEX_HOME is common with per-session credentials.
+            cli_argv, cli_env = scope.arguments(result.pid)
+            if not cli_argv or scope.birth(result.pid, codex=True) != cli_birth:
+                return
+            explicit = cli_env.get("CODEX_CREDENTIAL_OBSERVATIONS_DIR")
+            if explicit is not None:
+                directory = Path(explicit)
+            else:
+                home = cli_env.get("CODEX_HOME")
+                if home is None:
+                    if not cli_env.get("HOME"):
+                        return
+                    home = str(Path(cli_env["HOME"]) / ".codex")
+                directory = Path(home) / "credential-observations"
         root = directory.lstat()
         if (not directory.is_absolute() or not stat.S_ISDIR(root.st_mode)
                 or root.st_uid != os.getuid() or root.st_mode & 0o077):
+            result.api_key_observation_note = "请求记录目录的类型、属主或权限未通过核验。"
             return
         records = []
-        matched_records = 0
-        for path in directory.iterdir():
-            if not path.name.endswith(f"-{result.session_id}-request_attempt.json"):
-                continue
-            # The directory is shared by all threads and observer epochs.
-            # Bound file reads for this session, not unrelated filenames.
-            matched_records += 1
-            if matched_records > 4096:
-                result.api_key_observation_note = "该会话请求记录过多，无法完整核验实际 Key。"
-                return
+        before_records = session_records()
+        if before_records is None:
+            return
+        for path, expected_identity in before_records.items():
             fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
             with os.fdopen(fd, "rb") as stream:
                 before = os.fstat(stream.fileno())
@@ -1471,7 +1523,8 @@ def observe_request_api_key(result: SessionResult, directory: Path | None = None
                     continue
                 raw = stream.read(16385)
                 after = os.fstat(stream.fileno())
-            if len(raw) > 16384 or identity(before) != identity(after):
+            if (len(raw) > 16384 or identity(before) != identity(after)
+                    or identity(before) != expected_identity):
                 continue
             data = json.loads(raw)
             if (not isinstance(data, dict) or type(data.get("schema")) is not int
@@ -1516,10 +1569,29 @@ def observe_request_api_key(result: SessionResult, directory: Path | None = None
                 continue
             records[-1] = (data, key, birth)
         # Two live backends using the same thread are not one credential identity.
-        if len(records) != 1 or identity(directory.lstat()) != identity(root):
+        if len(records) != 1:
+            if (not before_records and scope.birth(result.pid, codex=True) == cli_birth
+                    and session_records() == before_records
+                    and identity(directory.lstat())[:4] == identity(root)[:4]):
+                result.api_key_observation_status = "absent"
+                result.api_key_observation_note = (
+                    "未采集到该会话的请求记录；不能据此判断它使用哪一个 Key。"
+                    "此检查只读，不会为探测 Key 发起模型请求。"
+                )
+            elif len(records) > 1:
+                result.api_key_observation_note = "存在多个与该会话关联的请求进程，暂不能确定唯一来源。"
+            else:
+                result.api_key_observation_note = "请求记录缺失、读取期间改变或未通过格式及进程身份核验。"
             return
         data, key, birth = records[0]
         if not connected_writer(result.pid, data["pid"], cli_birth, birth):
+            return
+        # Atomic publications by OTHER threads change the directory's times
+        # and size. They do not invalidate this thread's request identity.
+        # Recheck its entire record set (including replacements/new writers),
+        # plus the directory inode/owner/type/mode, before publishing a key.
+        if (session_records() != before_records
+                or identity(directory.lstat())[:4] != identity(root)[:4]):
             return
         if not key:
             result.api_key_observation_note = (
@@ -1528,7 +1600,17 @@ def observe_request_api_key(result: SessionResult, directory: Path | None = None
                 "最近请求未记录可确认的 API Key；已清除先前显示。"
             )
             return
+        if result.foreground_evidence is not None:
+            from ccc_client_thread_observation import read_foreground
+            expected = result.foreground_observations or (
+                (result.pid, ("ok", result.session_id, result.foreground_evidence)),)
+            current = tuple((pid, read_foreground(pid, request_observation_directory_matches))
+                            for pid, _ in expected)
+            if current != expected:
+                result.api_key_observation_note = "读取期间当前会话改变，等待重新关联。"
+                return
         result.api_key_observed = key
+        result.api_key_observation_status = "observed"
         when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(data["observed_at_ms"] / 1000))
         result.api_key_observation_note = (
             f"原生最近请求尝试 {when}；{data['transport']}；{data.get('endpoint', '')}；"
@@ -1539,7 +1621,8 @@ def observe_request_api_key(result: SessionResult, directory: Path | None = None
             result.api_key_observation_note += (
                 "此记录早于当前 CLI 启动，仅为该会话历史请求；尚未观察到本次启动后的请求。"
             )
-    except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError) as exc:
+        result.api_key_observation_note = f"请求记录读取或核验失败（{type(exc).__name__}），不是已确认没有请求。"
         return
 
 
@@ -2271,9 +2354,8 @@ def focus_summary(candidate: Candidate | None, workspace_ref: str = "") -> str:
     # possibly-clipped cell.
     facts.append(session_detail(candidate))
     if candidate.agent_kind == "codex":
-        facts.append(f"api-key {candidate.api_key_text}（{candidate.session.api_key_note}）")
-        if candidate.session.api_key_source:
-            facts.append(candidate.session.api_key_source)
+        note = candidate.session.api_key_observation_note or "尚无可核实的原生请求记录"
+        facts.append(f"api-key（最近请求） {candidate.api_key_text}（{note}）")
     return "  |  ".join(facts)
 
 
@@ -4463,7 +4545,7 @@ def row_request_key_summary(row: ViewRow | None, width: int) -> str:
     prefix = f"s{_ref_digits(candidate.record.get('ref'))} 最近请求 Key: "
     key = candidate.session.api_key_observed
     if not key:
-        return prefix + "未核实；K 查看详情"
+        return prefix + candidate.api_key_text + "；K 查看详情"
     value = prefix + key
     if display_width(value) <= width:
         return value
@@ -4556,14 +4638,6 @@ def api_key_detail_lines(candidate: Candidate, width: int) -> list[str]:
     """Wrap the complete observation by terminal cells, including long keys."""
     width = max(2, width)
     observed = candidate.session.api_key_observed
-    configured = candidate.session.api_key_config
-    comparison = ""
-    if observed and configured:
-        comparison = (
-            "最近请求 Key 与当前磁盘配置不同。混合配置时可以正常存在；是否符合预期取决于此会话的目标 Key。"
-            if observed != configured else
-            "最近请求 Key 与当前磁盘配置相同；这不证明其他会话或下一次请求使用同一 Key。"
-        )
     heading = ("API-key：历史请求（早于当前 CLI 启动）"
                if candidate.session.api_key_observation_historical else
                "API-key：最近实际请求" if observed else "API-key：实际请求未核实")
@@ -4572,11 +4646,8 @@ def api_key_detail_lines(candidate: Candidate, width: int) -> list[str]:
                   "最近请求无可展示 Key" if candidate.session.api_key_observation_note
                   else "尚无原生请求记录"),
               candidate.session.api_key_observation_note, candidate.session.session_id,
-              candidate.session.api_key_note, "", "当前磁盘配置 Key（非运行态）：",
-              candidate.session.api_key_config or "未确认", "",
-              candidate.session.api_key_source, "", comparison,
-              "Codex 连接共享后台时，重新进入 CLI 可能复用仍加载的原会话及旧凭据。",
-              "真正冷重载需确认原会话已卸载，再恢复同一 session；不能仅以 CLI 已退出判断。"]
+              "", "本页仅展示该会话实际请求记录，不读取全局配置 Key。",
+              "请求记录不保证下一次请求使用同一 Key。"]
     lines = []
     for value in values:
         line = ""
@@ -4618,15 +4689,16 @@ def _api_key_page(stdscr: Any, candidate: Candidate) -> None:
         elif key in (curses.KEY_UP, ord("k")):
             offset = max(0, offset - 1)
         elif key in (ord("y"), ord("Y")):
-            copy_key = candidate.session.api_key_observed or candidate.session.api_key_config
+            copy_key = candidate.session.api_key_observed
             if not copy_key:
-                message = "配置 Key 未确认，未复制"
+                message = "尚无已核实的请求 Key，未复制"
                 continue
             try:
                 result = subprocess.run(["/usr/bin/pbcopy"],
                                         input=copy_key,
                                         text=True, capture_output=True, timeout=2)
-                label = "已复制最近请求 Key" if candidate.session.api_key_observed else "已复制配置 Key（非运行态证明）"
+                label = ("已复制历史请求 Key" if candidate.session.api_key_observation_historical
+                         else "已复制最近请求 Key")
                 message = label if result.returncode == 0 else "复制失败"
             except (OSError, subprocess.TimeoutExpired):
                 message = "复制失败"

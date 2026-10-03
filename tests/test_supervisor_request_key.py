@@ -1,6 +1,7 @@
 """Read native request records without mistaking shared configuration for auth."""
 import json
 import os
+import shutil
 import tempfile
 import time
 import unittest
@@ -78,6 +79,60 @@ class NativeRequestKeyTests(unittest.TestCase):
             self.assertIn("最近实际请求", "".join(tui.api_key_detail_lines(candidate, 30)))
             self.assertNotIn(expected, repr(result))
 
+    def test_default_directory_allows_unrelated_publications(self):
+        home = self.directory
+        self.directory = home / "credential-observations"
+        self.directory.mkdir(mode=0o700)
+        marker = self.directory / "enabled-v1"
+        marker.write_bytes(b"ccc-request-credentials-v1\n")
+        marker.chmod(0o600)
+        self.write()
+        original = Path.lstat
+        for publication in ("other_request", "home_file"):
+            with self.subTest(publication=publication):
+                def lstat(path, *args, **kwargs):
+                    if path == marker:
+                        if publication == "other_request":
+                            self.write(OTHER, "fake-b")
+                        else:
+                            (home / "unrelated-log").write_text("updated")
+                    return original(path, *args, **kwargs)
+                with patch.object(Path, "lstat", lstat):
+                    result = self.observe(env={"CODEX_HOME": str(home)})
+                self.assertEqual(result.api_key_observed, "fake-a")
+
+    def test_default_directory_still_rejects_identity_changes(self):
+        for mutation in ("directory_mode", "directory_replace", "home_replace", "marker_replace"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temp:
+                home = Path(temp) / "home"
+                home.mkdir(mode=0o700)
+                directory = home / "credential-observations"
+                directory.mkdir(mode=0o700)
+                marker = directory / "enabled-v1"
+                marker.write_bytes(b"ccc-request-credentials-v1\n")
+                marker.chmod(0o600)
+                original = Path.lstat
+                def lstat(path, *args, **kwargs):
+                    if path == marker:
+                        if mutation == "directory_mode":
+                            directory.chmod(0o755)
+                        elif mutation == "directory_replace":
+                            directory.rename(home / "old")
+                            directory.mkdir(mode=0o700)
+                            shutil.copy2(home / "old/enabled-v1", marker)
+                        elif mutation == "home_replace":
+                            home.rename(Path(temp) / "old")
+                            shutil.copytree(Path(temp) / "old", home)
+                        else:
+                            replacement = directory / "replacement"
+                            replacement.write_bytes(marker.read_bytes())
+                            replacement.chmod(0o600)
+                            replacement.replace(marker)
+                    return original(path, *args, **kwargs)
+                with patch.object(Path, "lstat", lstat):
+                    self.assertFalse(tui.request_observation_directory_matches(
+                        {"CODEX_HOME": str(home)}, directory))
+
     def test_unrelated_observations_do_not_hide_mixed_thread_keys(self):
         for index in range(5000):
             (self.directory / f"unrelated-{index}-request_attempt.json").touch()
@@ -110,6 +165,41 @@ class NativeRequestKeyTests(unittest.TestCase):
         for result, expected in ((first, "fake-c"), (second, "fake-b")):
             self.assertEqual(tui.Candidate.api_key_text.fget(
                 SimpleNamespace(session=result)), expected)
+
+    def test_other_thread_publication_during_read_does_not_clear_key(self):
+        self.write()
+        def arguments(pid):
+            self.write(OTHER, "fake-b")
+            return ["codex"], {"CODEX_CREDENTIAL_OBSERVATIONS_DIR": str(self.directory)}
+        with patch("ccc_guard_scope.arguments", side_effect=arguments), \
+             patch("ccc_guard_scope.birth", return_value=self.born):
+            result = tui.SessionResult(status="ok", agent_kind="codex", session_id=SID, pid=123)
+            tui.observe_request_api_key(result, self.directory)
+        self.assertEqual(result.api_key_observed, "fake-a")
+
+    def test_same_thread_publication_during_read_is_not_stale_or_ambiguous(self):
+        for publication in ("replace", "second_writer", "root_replace"):
+            with self.subTest(publication=publication):
+                self.write()
+                def arguments(pid):
+                    if publication == "replace":
+                        self.write(key="fake-new")
+                    elif publication == "second_writer":
+                        self.write(observer_epoch=str(uuid.uuid4()), pid=124)
+                    else:
+                        moved = self.directory.with_name(self.directory.name + "-old")
+                        self.directory.rename(moved)
+                        self.addCleanup(shutil.rmtree, moved)
+                        self.directory.mkdir(mode=0o700)
+                        self.write()
+                    return ["codex"], {"CODEX_CREDENTIAL_OBSERVATIONS_DIR": str(self.directory)}
+                with patch("ccc_guard_scope.arguments", side_effect=arguments), \
+                     patch("ccc_guard_scope.birth", return_value=self.born):
+                    result = tui.SessionResult(status="ok", agent_kind="codex", session_id=SID, pid=123)
+                    tui.observe_request_api_key(result, self.directory)
+                self.assertEqual(result.api_key_observed, "")
+                for path in self.directory.iterdir():
+                    path.unlink()
 
     def test_reused_pid_or_dead_writer_is_rejected(self):
         self.write()
@@ -202,7 +292,9 @@ class NativeRequestKeyTests(unittest.TestCase):
         self.assertEqual(result.api_key_observed, "fake-a")
         with patch("ccc_guard_scope.birth", return_value=None):
             tui.observe_request_api_key(result, self.directory)
-        self.assertEqual((result.api_key_observed, result.api_key_observation_note), ("", ""))
+        self.assertEqual(result.api_key_observed, "")
+        self.assertEqual(result.api_key_observation_status, "unverified")
+        self.assertIn("进程已退出", result.api_key_observation_note)
 
     def test_same_thread_from_unconnected_backend_is_not_displayed(self):
         self.write(pid=124)

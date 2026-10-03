@@ -11,6 +11,18 @@ SID = "01a0e7c1-dbf1-7c23-a186-ce9af424ed55"
 
 
 class CredentialDisplayTests(unittest.TestCase):
+    def test_live_resolver_does_not_read_configured_credentials(self):
+        resolver = tui.SessionResolver()
+        result = tui.SessionResult(status="ok", session_id=SID, pid=123, agent_kind="codex")
+        with patch.object(resolver, "read_ps_table", return_value={}), \
+             patch.object(tui, "resolve_surface_session", return_value=result), \
+             patch.object(tui, "observe_configured_api_key", side_effect=AssertionError("config read")), \
+             patch.object(tui, "observe_request_api_key") as observe:
+            resolver._resolve_once([{"surface_id": "surface-test", "agent_pids": [123],
+                                     "agent_kind": "codex"}], {}, 0)
+        observe.assert_called_once_with(result)
+        self.assertIs(resolver.snapshot()["surface-test"], result)
+
     def test_shared_config_is_not_repeated_as_each_sessions_actual_key(self):
         sessions = [tui.SessionResult(session_id=sid, api_key_config="sk-shared-current")
                     for sid in (SID, "another-session")]
@@ -20,12 +32,13 @@ class CredentialDisplayTests(unittest.TestCase):
             self.assertIn("未核实", text)
             self.assertNotIn("sk-shared-current", text)
             detail = "".join(tui.api_key_detail_lines(candidate, 30))
-            self.assertIn("sk-shared-current", detail)
-            self.assertIn("非运行态", detail)
+            self.assertNotIn("sk-shared-current", detail)
+            self.assertNotIn("K查看配置", text)
 
     def detail_candidate(self, key):
         return SimpleNamespace(session=tui.SessionResult(
-            session_id=SID, api_key_config=key, api_key_note="运行态未确认",
+            session_id=SID, api_key_observed=key, api_key_config="fake-global-must-not-copy",
+            api_key_note="运行态未确认",
             api_key_source="/tmp/用户/config.toml"))
 
     def test_detail_wrap_preserves_complete_long_key_at_narrow_widths(self):
@@ -34,7 +47,7 @@ class CredentialDisplayTests(unittest.TestCase):
             lines = tui.api_key_detail_lines(self.detail_candidate(key), width)
             self.assertIn(key, "".join(lines))
             self.assertTrue(all(tui.display_width(line) <= width for line in lines))
-            self.assertIn("非运行态", "".join(lines))
+            self.assertIn("最近实际请求", "".join(lines))
 
     def test_detail_real_draw_exposes_every_key_segment_via_scroll(self):
         key = "sk-" + "0123456789abcdef" * 30
@@ -63,7 +76,7 @@ class CredentialDisplayTests(unittest.TestCase):
         screen = SimpleNamespace(getmaxyx=lambda:(24,80), erase=lambda:None,
                                  refresh=lambda:None, addnstr=lambda *args:None)
         for key, calls in (("sk-full-test-key", 1), ("", 0)):
-            candidate.session.api_key_config = key
+            candidate.session.api_key_observed = key
             keys = iter([ord("y"), ord("q")])
             screen.getch = lambda: next(keys)
             with patch.object(tui.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as run:
