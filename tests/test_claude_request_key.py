@@ -114,6 +114,8 @@ class ClaudeRequestKeyTests(unittest.TestCase):
         self.args_mock.return_value = (['/test/claude'], {'ANTHROPIC_API_KEY': 'fake-global'})
         reader.observe(self.result)
         self.assertEqual(self.result.api_key_observed, '')
+        self.assertEqual(self.result.api_key_observation_status, 'not_instrumented')
+        self.assertIn('继续请求不会自动补出', self.result.api_key_observation_note)
 
 
 if __name__ == '__main__':

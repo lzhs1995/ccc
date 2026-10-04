@@ -46,6 +46,17 @@ class ClaudeLauncherTests(unittest.TestCase):
             launcher.observation_environment({}, self.observer, self.directory)
         self.assertEqual(self.directory.stat().st_mode & 0o777, 0o755)
 
+    def test_old_shell_and_new_entry_load_one_observer_preserving_other_options(self):
+        old = self.root / 'older observer.cjs'
+        old.write_text('')
+        env = launcher.observation_environment({'BUN_OPTIONS': '--smol --preload /other.cjs'},
+                                               old, self.directory)
+        actual = launcher.observation_environment(env, self.observer, self.directory)
+        self.assertNotIn('older\\ observer.cjs', actual['BUN_OPTIONS'])
+        self.assertTrue(actual['BUN_OPTIONS'].startswith('--smol --preload /other.cjs'))
+        self.assertEqual(actual['BUN_OPTIONS'].count('--preload'), 2)
+        self.assertEqual(launcher.observation_environment(actual, self.observer, self.directory), actual)
+
     def test_symlink_observer_or_directory_rejected(self):
         link = self.root / 'link'
         link.symlink_to(self.observer)
@@ -92,6 +103,42 @@ class ClaudeLauncherTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(completed.stdout.splitlines(),
                          [str(fake), '--resume', 'original sid', str(pinned), '--settings', profile])
+
+    def test_absolute_entry_preserves_credentials_arguments_and_selected_binary(self):
+        selected = self.root / 'selected binary'
+        selected.write_text('#!' + sys.executable + '\nimport os,sys,json\n'
+            'print(json.dumps(dict(argv=sys.argv, key=os.getenv("ANTHROPIC_API_KEY"), '
+            'observer=os.getenv("CCC_CLAUDE_REQUEST_OBSERVER"), '
+            'bun=os.getenv("BUN_OPTIONS"))))\n')
+        selected.chmod(0o700)
+        entry = self.root / 'Claude'
+        entry.write_text(launcher.render_entry(sys.executable, Path(launcher.__file__).resolve(), selected))
+        entry.chmod(0o700)
+        env = dict(os.environ, ANTHROPIC_API_KEY='fake-fixed',
+                   CCC_CLAUDE_REQUEST_OBSERVATIONS_DIR=str(self.directory))
+        args = ['--settings', '/profile $(false); one.json', '--resume', 'original sid']
+        completed = subprocess.run([str(entry), *args], env=env, capture_output=True, text=True, timeout=5)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        data = json.loads(completed.stdout)
+        self.assertEqual(data['argv'], [str(selected), *args])
+        self.assertEqual(data['key'], 'fake-fixed')
+        self.assertIn('--preload ', data['bun'])
+        self.assertTrue(data['observer'].endswith('ccc_claude_request_observer.cjs'))
+
+    @unittest.skipUnless(Path('/bin/zsh').exists(), 'zsh integration')
+    def test_uppercase_shell_entry_observes_request(self):
+        selected = self.root / 'claude'
+        selected.write_text('#!/bin/sh\nprintf "%s\\n" "$CCC_CLAUDE_REQUEST_OBSERVER" "$@"\n')
+        selected.chmod(0o700)
+        shell = self.root / 'observed.zsh'
+        shell.write_text(launcher.render_shell(sys.executable, Path(launcher.__file__).resolve()))
+        env = dict(os.environ, PATH=str(self.root) + ':/usr/bin:/bin',
+                   CCC_CLAUDE_REQUEST_OBSERVATIONS_DIR=str(self.directory))
+        completed = subprocess.run(['/bin/zsh', '-f', '-c', 'source "$1"; Claude --resume "$2"',
+            'fixture', str(shell), 'same session'], env=env, capture_output=True, text=True, timeout=5)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.splitlines()[1:], ['--resume', 'same session'])
+        self.assertTrue(completed.stdout.splitlines()[0].endswith('ccc_claude_request_observer.cjs'))
 
 
 if __name__ == '__main__':

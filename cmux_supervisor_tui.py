@@ -398,6 +398,8 @@ class Candidate:
             return "暂无请求记录"
         if self.session.api_key_observation_status == "previous_process":
             return "仅旧进程记录"
+        if self.session.api_key_observation_status == "not_instrumented":
+            return "未接入采集（K查看）"
         # The row represents this running session. Repeating a shared mutable
         # TOML value here falsely suggests all loaded sessions use that key.
         return "未核实"
@@ -4627,6 +4629,7 @@ def api_key_detail_lines(candidate: Candidate, width: int) -> list[str]:
                "API-key：最近实际请求" if observed else
                "API-key：仅旧进程记录" if candidate.session.api_key_observation_status == "previous_process" else
                "API-key：暂无请求记录" if candidate.session.api_key_observation_status == "absent" else
+               "API-key：本进程未接入请求采集" if candidate.session.api_key_observation_status == "not_instrumented" else
                "API-key：实际请求未核实")
     values = [heading,
               candidate.session.api_key_observed or (

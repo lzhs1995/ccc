@@ -26,7 +26,14 @@ def observe(result):
         before = scope.birth(pid)
         argv, env = scope.arguments(pid)
         directory = env.get('CCC_CLAUDE_REQUEST_OBSERVATIONS_DIR')
-        if not before or not argv or not directory:
+        if not before or not argv:
+            return
+        if not directory:
+            result.api_key_observation_status = 'not_instrumented'
+            result.api_key_observation_note = (
+                '此 Claude 启动时未接入请求采集；继续请求不会自动补出 Key。'
+                '已修复标准启动入口；可在本会话空闲时从新入口恢复原会话，'
+                '无需重配 Key。现有进程不会被自动重启，全局配置不会代填。')
             return
         directory = Path(directory)
         root = directory.lstat()

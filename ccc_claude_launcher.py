@@ -5,6 +5,7 @@ Only this new process receives the preload; existing processes are untouched.
 """
 import os
 from pathlib import Path
+import re
 import shlex
 import stat
 import sys
@@ -25,7 +26,18 @@ claude() {{
   [[ -n "$executable" ]] || return 127
   _ccc_claude_observed "$executable" "$@"
 }}
+Claude() {{ claude "$@"; }}
 '''
+
+
+def render_entry(python, launcher, executable):
+    """Wrap one selected executable; direct paths and old shells use it too."""
+    paths = (python, launcher, executable)
+    if any(not Path(p).is_absolute() or any(c in str(p) for c in '\n\r\x00')
+           for p in paths):
+        raise ValueError('entry paths must be absolute single-line paths')
+    return '#!/bin/sh\nexec ' + ' '.join(shlex.quote(str(p)) for p in
+        (python, '-B', launcher, '--', executable)) + ' "$@"\n'
 
 
 def observation_environment(environment, observer, directory):
@@ -51,6 +63,13 @@ def observation_environment(environment, observer, directory):
     escaped = ''.join('\\' + c if c in '\\ \t\'"' else c for c in str(observer))
     option = '--preload ' + escaped
     previous = env.get('BUN_OPTIONS', '')
+    prior = env.get('CCC_CLAUDE_REQUEST_OBSERVER')
+    if prior and prior != str(observer):
+        # An older sourced shell may wrap a newly installed absolute entry.
+        # Replace only the exact CCC option it added; retain all other options.
+        old_escaped = ''.join('\\' + c if c in '\\ \t\'"' else c for c in prior)
+        previous = re.sub(r'(?<!\S)' + re.escape('--preload ' + old_escaped) +
+                          r'(?=\s|$)', '', previous, count=1).strip()
     if env.get('CCC_CLAUDE_REQUEST_OBSERVER') != str(observer) or option not in previous:
         env['BUN_OPTIONS'] = (previous + ' ' + option).strip()
     env['CCC_CLAUDE_REQUEST_OBSERVER'] = str(observer)
