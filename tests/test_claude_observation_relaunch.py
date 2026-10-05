@@ -14,7 +14,10 @@ from tools import claude_observation_resume as resume
 from tools import prepare_claude_observation_resume as capture
 
 
-WRAPPER = Path('/Applications/cmux.app/Contents/Resources/bin/cmux-claude-wrapper')
+# CI supplies the hash-verified upstream fixture; local runs can exercise the
+# installed wrapper. Never skip these handoff tests when cmux is absent.
+WRAPPER = Path(os.environ.get('CCC_TEST_CLAUDE_WRAPPER',
+    '/Applications/cmux.app/Contents/Resources/bin/cmux-claude-wrapper'))
 
 
 class ClaudeObservationRelaunchTests(unittest.TestCase):
