@@ -407,6 +407,10 @@ class IncompatibleError(CmuxError):
     """The connected cmux does not expose the required protocol shape."""
 
 
+class UnanchoredFrameError(IncompatibleError):
+    """This frame cannot authorize input; a later read may recover."""
+
+
 class GlobalIncompatibleError(IncompatibleError):
     """The cmux protocol version is incompatible for every surface."""
 
@@ -4283,7 +4287,7 @@ class CmuxClient:
                 if isinstance(render_grid, Mapping) and render_grid.get("surface_id") and render_grid["surface_id"] != surface_id:
                     raise IncompatibleError("render grid surface identity mismatch")
                 if live and (not isinstance(render_grid, Mapping) or render_grid.get("anchor") != "screen"):
-                    raise IncompatibleError("native live frame did not confirm screen anchoring")
+                    raise UnanchoredFrameError("native live frame did not confirm screen anchoring")
         return value
 
     def workspace_tree(self, workspace_id: str) -> Mapping[str, Any]:
@@ -7452,6 +7456,10 @@ class WatchDaemon:
             with self._surface_lock(surface_id):
                 if not current(fresh=True):
                     return None
+                if isinstance(exc, UnanchoredFrameError):
+                    self._record_state(surface_id, runtime, ScreenState(
+                        "viewport_unanchored", reason=str(exc)))
+                    return None
                 # A raised IncompatibleError is the same parser blind spot as
                 # a returned ``incompatible`` state, but it used to skip the
                 # clock entirely: this branch pauses the target, and a paused
@@ -7541,6 +7549,10 @@ class WatchDaemon:
                 except IncompatibleError as retry_exc:
                     with self._surface_lock(surface_id):
                         if not current(fresh=True):
+                            return None
+                        if isinstance(retry_exc, UnanchoredFrameError):
+                            self._record_state(surface_id, runtime, ScreenState(
+                                "viewport_unanchored", reason=str(retry_exc)))
                             return None
                         # Same blind spot, reached after a workspace refresh.
                         # Tagged distinctly so an audit can tell a first-read
