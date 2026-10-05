@@ -33,6 +33,25 @@ jobs:
         run: |
           python -B scripts/fetch_cmux_test_wrapper.py --output "$RUNNER_TEMP/ccc-test-claude-wrapper"
           echo "CCC_TEST_CLAUDE_WRAPPER=$RUNNER_TEMP/ccc-test-claude-wrapper" >> "$GITHUB_ENV"
+      - name: Secure runner-owned handoff dependencies
+        run: |
+          python -B - <<'PYTHON'
+          import os
+          from pathlib import Path
+          import stat
+          import sys
+          paths = [Path('tools/claude_observation_resume.py'),
+                   Path('tools/prepare_claude_observation_resume.py'),
+                   Path('ccc_claude_launcher.py'), Path(sys.executable).resolve()]
+          for path in paths:
+              before = path.stat()
+              print(f'{path}: uid={before.st_uid} mode={stat.S_IMODE(before.st_mode):04o}', flush=True)
+              if before.st_mode & 0o022:
+                  if before.st_uid != os.getuid():
+                      raise RuntimeError(f'cannot secure non-owned dependency: {path}')
+                  path.chmod(stat.S_IMODE(before.st_mode) & ~0o022)
+              assert not path.stat().st_mode & 0o022
+          PYTHON
       - name: Full regression suite
         run: python -B -m unittest discover -s tests -p 'test_*.py'
       - name: Standalone stack contract tests
