@@ -1,4 +1,4 @@
-"""Observe closed, unactivated preparations; never terminate native work."""
+"""Observe closed preparations, including incomplete activations; never stop work."""
 import os
 from pathlib import Path
 import time
@@ -13,10 +13,38 @@ from tools.standby_completion_evidence import ObservationBudget
 from tools.standby_job_terminal import runner_evidence
 from tools.standby_preparation_inventory import inventory
 from tools.standby_run_manifest import directory_identity
+from tools.standby_partial_activation import evidence as partial_evidence
+
+
+def activation_evidence(config_path, job_id, partial):
+    if type(partial) is not bool:
+        raise ValueError('explicit partial activation mode required')
+    if partial:
+        return partial_evidence(config_path, job_id)
+    directory = batch.job_path(Path(config_path), job_id).parent / 'standby'
+    if any(os.path.lexists(directory / name) for name in
+           ('activation-ui.json', 'activation-attempt.json', 'activation.json', 'submission-settled.json')):
+        raise ValueError('activated preparation requires explicit activation cleanup path')
+    return None
+
+
+def bind_activation(activation, original, closed_at, boot_id):
+    if activation is None:
+        return
+    _elapsed(activation['event'], closed_at, boot_id)
+    rows = original['rows']
+    if len(rows) != len(activation['originals']):
+        raise ValueError('partial activation inventory coverage differs')
+    for row, native in zip(rows, activation['originals']):
+        if (row['state'] != 'identified' or any(row[k] != native[k]
+                for k in ('index', 'launch_id', 'surface_id'))
+                or row['process_identity'] != [native['pid'], *native['birth']]):
+            raise ValueError('partial activation original process differs from inventory')
 
 
 def capture(config_path, job_id, directory, *, runner_directory, preparation_directory,
-            baseline_path, client, clock=stamp, seconds=30.0, monotonic=time.monotonic):
+            baseline_path, client, clock=stamp, seconds=30.0, monotonic=time.monotonic,
+            partial_activation=False):
     directory = Path(directory)
     identity = directory_identity(directory)
     target = directory / 'preparation-cleanup.json'
@@ -46,11 +74,9 @@ def capture(config_path, job_id, directory, *, runner_directory, preparation_dir
              'monotonic': intent['started_monotonic']}
     _elapsed(baseline['started'], baseline['finished'], selected['boot_id'])
     _elapsed(baseline['finished'], start, selected['boot_id'])
-    activation = job_path.parent/'standby'/'activation-ui.json'
-    activation_attempt = job_path.parent/'standby'/'activation-attempt.json'
-    if any(os.path.lexists(p) for p in (activation, activation_attempt)):
-        raise ValueError('activated preparation requires job completion path')
+    activation = activation_evidence(config_path, job_id, partial_activation)
     original = inventory(config_path, job_id, preparation_directory)
+    bind_activation(activation, original, closed_at, selected['boot_id'])
     known = [r for r in original['rows'] if r['state'] == 'identified']
     for row in known:
         pid, sec, usec = row['process_identity']
@@ -88,7 +114,7 @@ def capture(config_path, job_id, directory, *, runner_directory, preparation_dir
     pinned += [(job_path, job_raw), (Path(baseline_path), baseline_raw), (spec, spec_raw)]
     if (any(_read(p)[1] != b for p, b in pinned)
             or inventory(config_path, job_id, preparation_directory) != original
-            or any(os.path.lexists(p) for p in (activation, activation_attempt))
+            or activation_evidence(config_path, job_id, partial_activation) != activation
             or directory_identity(directory) != identity):
         raise ValueError('preparation cleanup originals changed')
     finished = clock()
@@ -107,7 +133,9 @@ def capture(config_path, job_id, directory, *, runner_directory, preparation_dir
         'started': started, 'finished': finished, 'passes': passes,
         'unresolved_slots': unresolved, 'passed': passed,
         'job_terminal': False, 'run_terminal': False,
-        'scope': 'closed unactivated preparation; two non-atomic cleanup samples only'}
+        'scope': 'closed preparation; two non-atomic cleanup samples only'}
+    if partial_activation:
+        result['activation'] = activation
     budget.check()
     write_once(target, result)
     return result
@@ -153,6 +181,10 @@ def verify(config_path, job_id, observation_path):
                         (record['started'], record['finished'])):
         _elapsed(first, last, selected['boot_id'])
     original = inventory(config_path, job_id, record['preparation_directory'])
+    activation = activation_evidence(config_path, job_id, 'activation' in record)
+    if record.get('activation') != activation:
+        raise ValueError('partial activation originals changed')
+    bind_activation(activation, original, closed_at, selected['boot_id'])
     if (original != record['inventory'] or record.get('unresolved_slots') != []
             or any(r['state'] in ('unknown_ack', 'unknown_process') for r in original['rows'])):
         raise ValueError('preparation inventory unresolved or changed')
@@ -196,12 +228,14 @@ def verify(config_path, job_id, observation_path):
         if any(r['surface_id'] in {k['surface_id'] for k in known}
                for r in sample['recognized_processes']):
             raise ValueError('preparation process remains recognized')
-    if (any(os.path.lexists(job_path.parent/'standby'/name)
-            for name in ('activation-ui.json', 'activation-attempt.json'))
+    if (activation_evidence(config_path, job_id, 'activation' in record) != activation
             or any(_read(p)[1] != b for p, b in pinned)
             or inventory(config_path, job_id, record['preparation_directory']) != original
             or _read(observation_path)[1] != raw):
         raise ValueError('preparation cleanup originals changed')
-    return {'observation_path': str(observation_path), 'observation_sha256': _sha(raw),
+    result = {'observation_path': str(observation_path), 'observation_sha256': _sha(raw),
             'job_id': job_id, 'started': record['started'], 'finished': record['finished'],
             'scope': 'historical two-sample preparation cleanup only'}
+    if activation is not None:
+        result['activation'] = activation
+    return result

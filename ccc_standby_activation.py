@@ -9,11 +9,13 @@ from __future__ import annotations
 import copy
 import contextlib
 import threading
+import time
 
 import cmux_codex_watch as core
 from ccc_batch_timing import boot_id
-from ccc_native_standby import COUNT, fresh, original
+from ccc_native_standby import COUNT, ObservationExpired, fresh, original
 from ccc_standby_manager import StandbyManager
+from ccc_standby_identity import ObservationPending
 from ccc_standby_transport import send_initial
 
 
@@ -27,6 +29,7 @@ class ActivationOwner:
         self._invalid = threading.Event()
         self._originals = {}
         self._lock = threading.RLock()
+        self._failure = None
         self._operation_guard = None
         self._operation_active = False
         self._selected = copy.deepcopy(preparation.selected)
@@ -66,15 +69,30 @@ class ActivationOwner:
             check = self._operation_guard
         return check is None or check() is True
 
-    def _current(self):
-        if self._invalid.is_set():
-            raise ValueError('activation owner permanently invalidated')
-        value = self.preparation._current()
-        if (value != self._selected['generation']
-                or self.preparation.selected != self._selected
-                or self._invalid.is_set()):
+    def _invalidate(self, reason):
+        # Concurrent observations may notice invalidation before the failing
+        # slot's future is collected. Preserve the first cause for the durable
+        # manager failure instead of replacing it with that secondary error.
+        with self._lock:
+            if not self._invalid.is_set():
+                self._failure = f'{type(reason).__name__}: {reason}'
             self._invalid.set()
-            raise ValueError('activation preparation generation changed')
+
+    def _check_valid(self):
+        with self._lock:
+            if self._invalid.is_set():
+                detail = f': {self._failure}' if self._failure else ''
+                raise ValueError('activation owner permanently invalidated' + detail)
+
+    def _current(self):
+        self._check_valid()
+        value = self.preparation._current()
+        self._check_valid()
+        if (value != self._selected['generation']
+                or self.preparation.selected != self._selected):
+            error = ValueError('activation preparation generation changed')
+            self._invalidate(error)
+            raise error
         return value
 
     def _index(self, index):
@@ -96,24 +114,56 @@ class ActivationOwner:
             if not sid:
                 return False
             if not self._caller_authorized():
-                self._invalid.set()
+                self._invalidate(ValueError('activation caller authorization refused'))
                 return False
             check = getattr(self.client._input_guard_local, 'guards', {}).get(id(self.client))
             if check is not None and check != self._caller_authorized and check() is not True:
-                self._invalid.set()
+                self._invalidate(ValueError('activation worker authorization refused'))
                 return False
             allowed = self.preparation._authorized(index, surface_id=sid,
                 connected=self.client if topology else None)
             self._current()
             if allowed is not True:
-                self._invalid.set()
+                self._invalidate(ValueError('activation original authorization refused'))
                 return False
             return True
-        except BaseException:
-            self._invalid.set()
+        except BaseException as exc:
+            self._invalidate(exc)
             raise
 
     def observe(self, index):
+        # Never return a stale/absent proof for a previously ready original.
+        # Only verified transient FD reads may wait; every attempt recreates
+        # the connected proof and final authorization callbacks from scratch.
+        deadline = None
+        try:
+            while True:
+                try:
+                    row = self._observe_once(index)
+                    if deadline is not None and time.monotonic() >= deadline:
+                        raise TimeoutError('activation observation unavailable for 30 seconds')
+                    return row
+                except (ObservationPending, ObservationExpired) as pending:
+                    # Age alone may trigger a full new read only before the
+                    # activation is consumed. Delivery never gets a retry.
+                    if isinstance(pending, ObservationExpired) and self.ledger._consumed():
+                        raise
+                    if deadline is None:
+                        deadline = time.monotonic() + 30.0
+                    if not self.authorized(index):
+                        raise ValueError('pending activation no longer authorized')
+                    if isinstance(pending, ObservationPending):
+                        pending.recheck()
+                    self._current()
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError('activation observation unavailable for 30 seconds')
+                    self._invalid.wait(min(0.02, remaining))
+        except BaseException as exc:
+            self._invalidate(exc)
+            raise
+
+    def _observe_once(self, index):
         """Bind a separately established ready proof to the fresh original.
 
         Proofs must describe the same original and current observation window;
@@ -179,15 +229,16 @@ class ActivationOwner:
                     or checked[0][2] != row.get('return_receipt_sha256')
                     or row.get('index') != index or row.get('job_id') != selected['job_id']):
                 raise ValueError('activation inspection skipped or changed connected proof')
-            if self._invalid.is_set():
-                raise ValueError('activation invalidated during observation')
+            self._check_valid()
             if not checked[0][1]:
                 return None
             ready = {**row, 'readiness_proven': True, 'model_request_count': 0}
             fresh(ready, selected['boot_id'], self.ledger.clock())
             return ready
-        except BaseException:
-            self._invalid.set()
+        except (ObservationPending, ObservationExpired):
+            raise
+        except BaseException as exc:
+            self._invalidate(exc)
             raise
 
     def send(self, row, prompt, input_id, *, write_guard):

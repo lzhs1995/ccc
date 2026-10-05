@@ -30,7 +30,7 @@ def _sha(data):
 
 
 class _Preparing(Exception):
-    """No control was consumed; a later complete observation may progress."""
+    """A later complete observation may progress without another input."""
 
 
 def pwd_visible(grid, cwd):
@@ -89,6 +89,7 @@ class StandbyRefreshBarrier:
         self._last_clock = -1.0
         self._observation_deadline = None
         self._attempt_deadline = None
+        self._return_deadline = None
         self._index = expected['index']
         self._expected = copy.deepcopy(expected)
         self.intent = self.directory / f'prepare-control-{self._index}.json'
@@ -130,27 +131,45 @@ class StandbyRefreshBarrier:
                 write_once(self.invalid_receipt, {'reason': type(reason).__name__,
                     'index': self._index, 'generation': self._generation, 'boot_id': self._boot})
 
-    def _screen(self, row):
+    def _control_draft_pending(self, grid):
+        # terminal.paste's ACK confirms the terminal operation, not that the
+        # native event loop has consumed Enter. Only observe this exact local
+        # command's intermediate rendering; never clear it or send again.
+        row = grid.cursor.row
+        return (self._ack and self._receipt is None and self._write_entered
+                and grid.raw.get('full') is True and grid.cursor.visible
+                and grid.cursor.column == 6 and row >= 2
+                and core.classify_grid(grid).kind == 'composer_busy'
+                and core._composer_status(grid) == ('composer_busy', row)
+                and grid.lines[row].rstrip() == '› /pwd'
+                and grid.lines[row - 2].rstrip() == '› /pwd  show the current working directory'
+                and not grid.lines[row - 1].strip()
+                and not core._queued_followup_present(grid.lines, row))
+
+    def _screen(self, row, *, allow_control_pending=False):
         payload = self.client.replay(row['workspace_id'], row['surface_id'], live=True)
         if any(payload.get(k) != row[k] for k in ('workspace_id', 'surface_id')):
             raise ValueError('preparation replay target changed')
         grid = core.Grid.from_rpc(payload, row['surface_id'])
         if (core.classify_grid(grid).kind != 'idle' or core._composer_status(grid)[0] != 'empty'
                 or core._queued_followup_present(grid.lines, grid.cursor.row)):
-            raise ValueError('preparation composer/queue is not empty and idle')
+            if not (allow_control_pending and self._control_draft_pending(grid)):
+                raise ValueError('preparation composer/queue is not empty and idle')
         return grid
 
     def _check_observation_deadline(self):
+        if self._return_deadline is not None and self._now() >= self._return_deadline:
+            raise TimeoutError('acknowledged preparation control did not return within 30 seconds')
         deadlines = [d for d in (self._observation_deadline, self._attempt_deadline)
                      if d is not None]
         if deadlines and self._now() >= min(deadlines):
             raise TimeoutError('original vnode observation unavailable for 30 seconds')
 
-    def _inspect(self, *, before_write=False):
+    def _inspect(self, *, before_write=False, pending_for_activation=False, **callbacks):
         if not self._consumed or self._ack or before_write:
             self._check_observation_deadline()
         try:
-            observation = self.inspect()
+            observation = self.inspect(**callbacks)
         except StartupPending as pending:
             observation = pending.observation
         except ObservationPending as pending:
@@ -168,6 +187,11 @@ class StandbyRefreshBarrier:
                 self._observation_deadline = now + 30.0
             if now >= self._observation_deadline:
                 raise TimeoutError('original vnode observation unavailable for 30 seconds')
+            if pending_for_activation:
+                # The outer activation owner must rebuild its proof/final
+                # callbacks too. A second FD read may fail after the first
+                # callback was already consumed; do not retry it in place.
+                raise
             raise _Preparing('original vnode observation pending') from pending
         # A complete identity inspection already brackets two stable native
         # inventories and PID/writer/prefix checks. It ends this unavailable
@@ -225,7 +249,7 @@ class StandbyRefreshBarrier:
         self._prefix, self._original = data, identity
         if reloads:
             self._reloads = reloads
-        grid = self._screen(row)
+        grid = self._screen(row, allow_control_pending=not before_control and not before_write)
         if before_control and any('Current working directory:' in line for line in grid.lines):
             raise ValueError('preexisting local output cannot identify a fresh control')
         if self.authorized(self.client, row) is not True:
@@ -237,7 +261,19 @@ class StandbyRefreshBarrier:
         if original(after, row['workspace_id']) != identity:
             raise ValueError('preparation identity changed after connected reads')
         after_data, after_reloads = self._events(after)
-        if not after_data.startswith(data) or after_reloads != reloads:
+        if not after_data.startswith(data):
+            raise ValueError('preparation events changed during connected reads')
+        if after_reloads != reloads:
+            if (not self._consumed and self._reloads is None
+                    and not reloads and len(after_reloads) == 1):
+                # Startup may dispatch its first refresh while replay blocks.
+                # Bind the observed event, then repeat all reads on a later
+                # prepare call. This screen cannot authorize a control; any
+                # subsequent refresh must still invalidate the bound event.
+                self._live()
+                self._prefix, self._original = after_data, identity
+                self._reloads = after_reloads
+                raise _Preparing('first skills refresh arrived during connected reads')
             raise ValueError('preparation events changed during connected reads')
         self._live()
         self._prefix, self._original = after_data, identity
@@ -246,6 +282,11 @@ class StandbyRefreshBarrier:
                 raise ValueError('original skills refresh evidence disappeared')
             raise _Preparing('original force-reload dispatch not yet observed')
         self._reloads = reloads
+        self._check_observation_deadline()
+        if self._control_draft_pending(grid):
+            # All authorization, identity and event checks above still apply
+            # to this intermediate frame. It supplies no readiness witness.
+            raise _Preparing('acknowledged local control is still being rendered')
         return after, grid
 
     @contextlib.contextmanager
@@ -292,6 +333,7 @@ class StandbyRefreshBarrier:
                 self._live()
                 self._ack_at = self._now()
                 self._ack = True
+                self._return_deadline = self._ack_at + 30.0
                 # A known ACK starts an observation-only phase. An unknown
                 # ACK never reaches here and must never permit a retry.
                 self._observation_deadline = None
@@ -328,6 +370,8 @@ class StandbyRefreshBarrier:
                     raw = write_once(self.return_receipt, value)
                     self._receipt = raw
                     self._check()  # Include changes while persisting the witness.
+                self._check_observation_deadline()
+                self._return_deadline = None
                 if self.return_receipt.is_symlink() or self.return_receipt.read_bytes() != self._receipt:
                     raise ValueError('preparation return receipt changed')
                 self._check_observation_deadline()
@@ -366,6 +410,12 @@ class StandbyRefreshBarrier:
                 return None
             try:
                 self._live()
+                self._check_observation_deadline()
+                if self._return_deadline is not None:
+                    # Persistence precedes the final observation, which can
+                    # still be pending. Only observe() may finish that phase;
+                    # a durable receipt alone cannot authorize activation.
+                    return None
                 if (self.return_receipt.is_symlink()
                         or self.return_receipt.read_bytes() != self._receipt):
                     raise ValueError('preparation return receipt changed')
@@ -404,7 +454,8 @@ class StandbyRefreshBarrier:
                         raise ValueError('activation authorization changed during identity read')
                     self._live()
 
-                row = self.inspect(connected_check=connected, final_check=final)
+                row = self._inspect(pending_for_activation=True,
+                    connected_check=connected, final_check=final)
                 if (len(checked) != 1 or row.get('startup_observed') is not True
                         or any(row.get(k) != value for k, value in self._expected.items())
                         or original(row, row['workspace_id']) != self._original):
@@ -425,6 +476,10 @@ class StandbyRefreshBarrier:
                     'screen_signature': checked[0][2], 'preparation_control_count': 1,
                     'control_receipt_sha256': _sha(self._intent_raw),
                     'return_receipt_sha256': _sha(self._receipt)}
+            except ObservationPending:
+                # Validated by _inspect; provides no readiness or input
+                # authority. Retain the original fixed outage deadline.
+                raise
             except Exception as exc:
                 self.invalidate(exc)
                 raise

@@ -133,9 +133,14 @@ class _Response(BaseHTTPRequestHandler):
                             status='in_progress', output=[])
             events = [dict(type='response.created', response=response)]
             if not turn:
+                # Codex prepends "rate limit exceeded: " to this SSE error.
+                # Use the actual provider banner so the acceptance fixture
+                # reaches CCC's strict terminal classifier without broadening
+                # production matching to arbitrary mentions of rate limits.
                 events.append(dict(type='response.failed', response={**response,
                     'status': 'failed', 'error': {'code': 'rate_limit_exceeded',
-                    'message': 'rate limit exceeded: local acceptance fixture'}}))
+                    'message': ('Your requests to gpt-6-astra for gpt-6-astra '
+                                'in eastus2 have exceeded token rate limit.')}}))
             else:
                 item = dict(id='msg_'+uuid.uuid4().hex, type='message', role='assistant',
                             status='completed', content=[dict(type='output_text', text='OK', annotations=[])])

@@ -157,7 +157,9 @@ class FirstTaskObserver:
             if (not stat.S_ISREG(info.st_mode) or [info.st_dev, info.st_ino] != expected
                     or final_files.get(path) != dict(zip(('device', 'inode'), expected))):
                 raise ValueError('first-task writer changed during final process read')
-        return root, files
+        # Discovery must use the inventory checked at the end of this read.
+        # The earlier snapshot can contain a rollout that has since closed.
+        return root, final_files
 
     def _submission(self, claim, hook):
         data, submitted = batch._initial_event_prefix(claim, require_turn=True)

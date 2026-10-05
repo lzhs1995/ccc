@@ -58,6 +58,8 @@ class StandbyLaunchTests(unittest.TestCase):
         claim = json.loads(launch.claim_path(self.config, self.worker.job['id'], 0).read_bytes())
         self.assertEqual(claim['argv'], argv)
         self.assertEqual(claim['policy'], standby.POLICY)
+        self.assertEqual(claim['requested_environment']['CODEX_CLIENT_THREAD_OBSERVER'], '1')
+        self.assertEqual(self.exec_mock.call_args.args[2]['CODEX_CLIENT_THREAD_OBSERVER'], '1')
         self.assertNotIn(batch.PROMPT, argv)
         self.assertNotIn(batch.LEGACY_PROMPT, argv)
         self.assertFalse((self.worker.path.parent / 'initial-argv-0.json').exists())
@@ -75,7 +77,8 @@ class StandbyLaunchTests(unittest.TestCase):
     def test_standby_preserves_original_skill_feature_selection(self):
         for options in ([], ['--enable', 'skill_search'],
                         ['--disable', 'skill_search'],
-                        ['-c', 'features.skill_search=true']):
+                        ['-c', 'features.skill_search=true'],
+                        ['-c', 'tui.show_tooltips=true', '--enable', 'skill_search']):
             with self.subTest(options=options):
                 job = copy.deepcopy(self.worker.job)
                 job['standby_target'] = {
@@ -87,6 +90,8 @@ class StandbyLaunchTests(unittest.TestCase):
                 self.assertEqual(argv[1:1 + len(options)], options)
                 skill_options = [v for v in argv if 'skill_search' in v]
                 self.assertEqual(skill_options, [v for v in options if 'skill_search' in v])
+                tooltip_options = [v for v in argv if v.startswith('tui.show_tooltips=')]
+                self.assertEqual(tooltip_options[-1], 'tui.show_tooltips=false')
         self.exec_mock.assert_not_called()
 
     def membership_sequence(self, values):

@@ -24,6 +24,14 @@ def _identity(info):
     return info.st_dev, info.st_ino, info.st_mode, info.st_uid
 
 
+class RolloutObservationPending(OSError):
+    """Directory activity exhausted this read's rounds, not its inventory.
+
+    This provides no absence evidence. The owner must repeat the complete
+    observation; it must never substitute a cached negative result.
+    """
+
+
 class RolloutInventory:
     """One in-memory monitor shared by all slots using a native home.
 
@@ -68,7 +76,12 @@ class RolloutInventory:
                     self._scan_tree(path, self.max_entries)
             # Watches precede each readdir. Drain all registration-window
             # events before publishing any negative observation.
-            self._refresh()
+            try:
+                self._refresh()
+            except RolloutObservationPending:
+                # No negative result is published by construction. Keep the
+                # armed inventory so absent() can drain subsequent activity.
+                pass
         except BaseException:
             self.close()
             raise
@@ -188,7 +201,7 @@ class RolloutInventory:
                             remaining -= self._scan_tree(root, remaining)
                 else:
                     remaining -= self._scan_tree(path, remaining)
-        raise ValueError('rollout inventory did not settle within update bound')
+        raise RolloutObservationPending('rollout inventory did not settle within update bound')
 
     def absent(self, sessions_root, session_id):
         with self._lock:
@@ -200,6 +213,10 @@ class RolloutInventory:
                 session_id = str(uuid.UUID(session_id))
                 self._refresh()
                 return session_id not in self._sessions
+            except RolloutObservationPending:
+                # All consumed events were validated and inventoried. Only
+                # quiescence is missing; retain watches, never return absence.
+                raise
             except BaseException:
                 self._invalid = True
                 raise

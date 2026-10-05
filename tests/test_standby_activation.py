@@ -5,6 +5,7 @@ readiness premises; these tests certify delivery/authorization, not readiness.
 """
 import contextlib
 import copy
+import json
 import threading
 import unittest
 import uuid
@@ -155,6 +156,24 @@ class ActivationTests(unittest.TestCase):
             self.assertFalse(requests)
             self.assertFalse(owner._operation_active)
 
+    def test_ready_manager_rechecks_transient_before_returning_ready(self):
+        from ccc_standby_identity import ObservationPending
+        with server(lambda *_: self.fail('refresh cannot send input')) as (transport, requests):
+            owner = self.owner(transport)
+            with self.client.input_guard(self.guard):
+                self.assertEqual(owner.manager.refresh()['ready_originals'], 50)
+                failures = []
+                def observe(index, **kwargs):
+                    if index == 0 and not failures:
+                        failures.append(index)
+                        raise ObservationPending(self.rows[0], lambda: None)
+                    return self.observe(index, **kwargs)
+                owner.preparation.observe_for_activation = observe
+                self.assertEqual(owner.manager.refresh()['ready_originals'], 50)
+            self.assertEqual(failures, [0])
+            self.assertFalse(owner._invalid.is_set())
+            self.assertFalse(requests)
+
     def test_nonzero_model_proof_is_rejected(self):
         with server(lambda *_: self.fail('already used native')) as (transport, requests):
             owner = self.owner(transport)
@@ -193,6 +212,29 @@ class ActivationTests(unittest.TestCase):
                 with self.assertRaises(ValueError): future.result(3)
             self.assertFalse(owner._operation_active)
             self.assertIsNone(owner._operation_guard)
+            self.assertFalse(requests)
+
+    def test_later_slot_failure_survives_earlier_slot_invalidation(self):
+        # Results are collected in slot order. Force slot 49 to fail first,
+        # then let slot 0 notice the cohort invalidation before it returns.
+        with server(lambda *_: self.fail('failed refresh sends nothing')) as (transport, requests):
+            owner = self.owner(transport)
+            def observe(index, **kwargs):
+                if index == 49:
+                    raise OSError('slot 49 original inventory unavailable')
+                if index == 0:
+                    self.assertTrue(owner._invalid.wait(3))
+                    owner._current()
+                return None
+            owner.preparation.observe_for_activation = observe
+            with self.client.input_guard(self.guard):
+                with self.assertRaisesRegex(ValueError, 'slot 49 original inventory unavailable'):
+                    owner.manager.refresh()
+            saved = json.loads((self.ledger.directory / 'invalidated.json').read_text())
+            self.assertIn('slot 49 original inventory unavailable', saved['reason'])
+            with self.assertRaisesRegex(ValueError, 'slot 49 original inventory unavailable'):
+                owner._current()
+            self.assertEqual(owner.manager.status()['state'], 'invalidated')
             self.assertFalse(requests)
 
     def test_partial_submission_also_drains_existing_workers(self):

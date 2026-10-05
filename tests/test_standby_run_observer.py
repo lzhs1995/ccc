@@ -54,9 +54,19 @@ class ObserverTests(unittest.TestCase):
     def test_activated_missing_settlement_cannot_fall_back_to_attempt(self):
         standby = self.root/'standby'; standby.mkdir()
         self.put(standby/'activation-attempt.json', {})
-        with patch.object(subject.RunManifest, 'bind', side_effect=ValueError('settlement missing')), \
+        with patch.object(subject.preparation, 'capture', side_effect=ValueError('original activation missing')) as capture, \
+             patch.object(subject.attempt_terminal, 'capture') as terminal:
+            with self.assertRaisesRegex(ValueError, 'original activation missing'): self.settle()
+            self.assertTrue(capture.call_args.kwargs['partial_activation'])
+            terminal.assert_not_called()
+
+    def test_existing_corrupt_settlement_never_falls_back_to_partial(self):
+        standby = self.root/'standby'; standby.mkdir()
+        self.put(standby/'activation-ui.json', {})
+        self.put(standby/'submission-settled.json', {})
+        with patch.object(subject.RunManifest, 'bind', side_effect=ValueError('corrupt settlement')), \
              patch.object(subject.preparation, 'capture') as capture:
-            with self.assertRaisesRegex(ValueError, 'settlement missing'): self.settle()
+            with self.assertRaisesRegex(ValueError, 'corrupt settlement'): self.settle()
             capture.assert_not_called()
 
 

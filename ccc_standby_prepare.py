@@ -20,7 +20,7 @@ import ccc_standby_launch as launch
 from ccc_batch_timing import boot_id
 from ccc_native_standby import identifier, write_once
 from ccc_standby_bootstrap import GenerationBridge
-from ccc_standby_identity import inspect_original
+from ccc_standby_identity import inspect_original, ObservationPending
 from ccc_standby_readiness import StandbyRefreshBarrier
 from ccc_standby_rollouts import RolloutInventory
 from ccc_standby_environment import template, signature
@@ -103,17 +103,28 @@ class PreparationOwner:
             raise
 
     def _current(self):
+        def lifetime(*, final=False):
+            if self._closed.is_set():
+                return 'owner closed'
+            if self._failed.is_set():
+                return 'owner previously failed'
+            if not self._lifetime_allowed():
+                return 'service lifetime guard refused'
+            if final and boot_id() != self.selected['boot_id']:
+                return 'boot identity changed'
+            if self.jobfile.is_symlink() or self.jobfile.read_bytes() != self._job_raw:
+                return 'original job changed'
+            if not final and boot_id() != self.selected['boot_id']:
+                return 'boot identity changed'
+            return None
         try:
-            if (self._closed.is_set() or self._failed.is_set()
-                    or not self._lifetime_allowed()
-                    or self.jobfile.is_symlink() or self.jobfile.read_bytes() != self._job_raw
-                    or boot_id() != self.selected['boot_id']
-                    or self.source_pin.current() != self.selected['generation']
-                    or self._closed.is_set() or self._failed.is_set()
-                    or not self._lifetime_allowed()
-                    or boot_id() != self.selected['boot_id']
-                    or self.jobfile.is_symlink() or self.jobfile.read_bytes() != self._job_raw):
-                raise ValueError('original preparation lifetime changed')
+            reason = lifetime()
+            if reason is None and self.source_pin.current() != self.selected['generation']:
+                reason = 'source generation changed'
+            if reason is None:
+                reason = lifetime(final=True)
+            if reason is not None:
+                raise ValueError('original preparation lifetime changed: ' + reason)
             return self.selected['generation']
         except BaseException:
             self._failed.set()
@@ -143,7 +154,14 @@ class PreparationOwner:
         if not self._permission(index, surface_id):
             return False
         if surface_id is not None and connected is not None:
-            tree = (self._topology() if connected is self.client else
+            connection = getattr(getattr(connected, 'viewport_socket', None),
+                                 '_connection_local', None)
+            borrowed = (isinstance(connection, threading.local)
+                        and callable(getattr(connection, 'read_rpc', None)))
+            # An admitted input guard already owns a connection slot. A
+            # coalesced reader may be waiting for that very slot, so borrow
+            # the guard's connection for a fresh read instead of joining it.
+            tree = (self._topology() if connected is self.client and not borrowed else
                     connected.workspace_tree(self.job['workspace_id']))
             target = core.find_main_surface(tree, surface_id)
             if target.get('workspace_id') != self.job['workspace_id']:
@@ -342,6 +360,10 @@ class PreparationOwner:
                     return barrier.observe_for_activation()
                 return barrier.observe_for_activation(connected_check=connected_check,
                                                       final_check=final_check)
+            except ObservationPending:
+                # The barrier validated this temporary read failure. Only
+                # the activation owner may retry its complete observation.
+                raise
             except BaseException:
                 self._failed.set()
                 raise

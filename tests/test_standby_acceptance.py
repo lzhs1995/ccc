@@ -187,6 +187,19 @@ class FirstTaskTests(unittest.TestCase):
         with patch.object(Path, 'rglob', side_effect=AssertionError('no history scan')):
             self.assertTrue(self.observer.poll(0)['confirmation']['confirmed'])
 
+    def test_live_discovery_uses_final_writable_inventory(self):
+        row, claim, hook = self.observer._bind(0)
+        initial = copy.deepcopy(self.files)
+        initial[self.transcript] = dict(device=self.transcript.stat().st_dev,
+                                       inode=self.transcript.stat().st_ino)
+        final = {p: value for p, value in initial.items() if p != self.transcript}
+        with patch.object(acceptance, 'process_writable_files', side_effect=[initial, final]):
+            root, files = self.observer._live(row, claim, hook)
+        self.assertNotIn(self.transcript, files)
+        self.assertIsNone(self.observer._transcript_path(row, {**hook, 'transcript': None}, root, files))
+        self.assertTrue(self.hold())
+        self.assertFalse(self.result_path.exists())
+
     def test_wrong_action_does_not_observe_old_activation(self):
         with self.assertRaises(ValueError):
             acceptance.FirstTaskObserver(self.config, self.worker.job['id'], str(uuid.uuid4()), client=self.client)

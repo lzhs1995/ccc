@@ -114,6 +114,38 @@ class NativeFileTests(unittest.TestCase):
             with self.assertRaises(native.VnodeInventoryChanged):
                 native.process_writable_files(123)
 
+    def test_duplicate_descriptors_resolve_twice_per_observation_without_cache_reuse(self):
+        self.entries = [(fd, 1) for fd in range(3, 67)]
+        self.files = {fd: (3, b'/tmp/current.jsonl') for fd, _ in self.entries}
+        with patch.object(native, '_proc_pidinfo', side_effect=self.descriptors), \
+                patch.object(native, '_proc_pidfdinfo', side_effect=self.vnode) as vnode, \
+                patch.object(Path, 'resolve', return_value=Path('/private/tmp/current.jsonl')) as resolve:
+            for _ in range(2):
+                self.assertEqual(native.process_writable_files(123, identities=True),
+                                 {Path('/private/tmp/current.jsonl'): {'device': 0, 'inode': 0}})
+            self.assertEqual(resolve.call_count, 4)
+            self.assertEqual(vnode.call_count, 256)
+
+    def test_canonical_path_drift_is_rejected(self):
+        with patch.object(native, '_proc_pidinfo', side_effect=self.descriptors), \
+                patch.object(native, '_proc_pidfdinfo', side_effect=self.vnode), \
+                patch.object(Path, 'resolve', side_effect=[Path('/a'), Path('/b')]):
+            with self.assertRaises(native.VnodeInventoryChanged):
+                native.process_writable_files(123)
+
+    def test_canonical_collision_with_distinct_inode_is_rejected(self):
+        self.files[4] = (3, b'/tmp/alias.jsonl')
+        def distinct(*args):
+            size = self.vnode(*args)
+            info = ctypes.cast(args[3], ctypes.POINTER(native._VnodeFdInfo)).contents
+            info.vnode[8] = args[1]
+            return size
+        with patch.object(native, '_proc_pidinfo', side_effect=self.descriptors), \
+                patch.object(native, '_proc_pidfdinfo', side_effect=distinct), \
+                patch.object(Path, 'resolve', return_value=Path('/same')):
+            with self.assertRaises(native.VnodeInventoryChanged):
+                native.process_writable_files(123, identities=True)
+
 
 if __name__ == '__main__':
     unittest.main()

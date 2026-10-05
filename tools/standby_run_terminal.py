@@ -67,7 +67,8 @@ def collect(manifest, terminals, *, clock=stamp):
         pinned.append((path, raw))
         rows.append(dict(batch_id=bid, attempt_sha256=registered_row['attempt_sha256'],
                          terminal_path=str(path), terminal_sha256=_sha(raw),
-                         outcome=proof['outcome'], activated=terminal['kind']=='standby_job_terminal'))
+                         outcome=proof['outcome'], activated=(terminal['kind']=='standby_job_terminal'
+                                                              or terminal.get('activated') is True)))
     if set(manifest.directory.glob('batch-*.json')) != bindings:
         raise ValueError('activation binding set differs from terminal coverage')
     if (manifest.attempts() != registered

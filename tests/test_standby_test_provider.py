@@ -69,6 +69,11 @@ class ProviderTests(unittest.TestCase):
             self.assertFalse(any(row.get('recovered_turn') for row in rows))
 
     def test_real_https_preserves_reconnect_until_terminal_and_new_turn(self):
+        import cmux_codex_watch as core
+        from ccc_provider_retry import ProviderRetryStore
+        from tests.test_codex_status_chrome import status_payload, visible_text
+        from tests.test_watch import FakeClient, armed_daemon, span, visible_lines
+
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)
             sid = str(uuid.uuid4())
@@ -101,10 +106,54 @@ class ProviderTests(unittest.TestCase):
                 self.assertEqual(status, 200)
                 self.assertIn(b'response.failed', data)
                 self.assertNotIn(b'response.completed', data)
+                # Parse the actual HTTPS bytes, then apply Codex's native
+                # error prefix and feed the real prefilter + structural pass.
+                # Checking just the SSE code missed the native154 join defect.
+                events = [json.loads(line[6:]) for line in data.decode().splitlines()
+                          if line.startswith('data: ')]
+                error = next(row['response']['error'] for row in events
+                             if row['type'] == 'response.failed')
+                self.assertEqual(error['code'], 'rate_limit_exceeded')
+                banner = 'rate limit exceeded: ' + error['message']
+                for columns in (80, 126):
+                    payload = status_payload(banner, columns=columns)
+                    self.assertEqual(core.classify_text_prefilter(visible_text(payload)).kind,
+                                     'candidate')
+                    state = core.classify_grid(core.Grid.from_rpc(payload, 'surface-uuid'))
+                    self.assertEqual((state.kind, state.error_type),
+                                     ('recoverable_error', 'rate_limit'))
+            # A reconnect card may be an error candidate. Only native terminal
+            # evidence can authorize delivery; an old error under a live turn
+            # must never trigger either text or Enter.
+            payload = status_payload(banner, columns=126)
+            row = min(s['row'] for s in payload['render_grid']['row_spans'])
+            payload['render_grid']['row_spans'].append(
+                span(row - 1, 0, '• Reconnecting... 1/10 (1s • esc to interrupt)'))
+            client = FakeClient(payload, '\n'.join(visible_lines(payload)))
+            (root/'daemon').mkdir()
+            daemon = armed_daemon(root/'daemon', client)
+            self.addCleanup(daemon._process_snapshots.close)
+            now = [1000.0]
+            turn = dict(kind='task_started', session_id=sid, turn_id='first', at=200.0,
+                        model_provider='synthetic-provider')
+            daemon.codex_queue_recovery.current_turn = lambda _: dict(turn)
+            daemon._provider_retry = ProviderRetryStore(
+                daemon._provider_retry.path, clock=lambda: now[0], jitter=lambda: 0)
+            for offset in (0.0, 1.0, 60.0):
+                now[0] = 1000.0 + offset
+                daemon.process_once(client)
+                self.assertEqual(client.sent, [])
             event('error', message='rate limit exceeded', will_retry=True)
             self.assertIn(b'response.failed', request()[1])
             event('task_complete', turn_id='first', error=dict(codex_error_info='rate_limit_exceeded'))
             self.assertIn(b'response.failed', request()[1])
+            turn.update(kind='task_complete', error=dict(message=banner))
+            daemon.process_once(client)
+            now[0] += 0.25
+            daemon.process_once(client)
+            self.assertEqual(len(client.sent), 1)
+            daemon.process_once(client)
+            self.assertEqual(len(client.sent), 1)
             event('task_started', turn_id='second')
             self.assertIn(b'response.completed', request()[1])
             self.assertEqual(request(str(uuid.uuid4()))[0], 400)

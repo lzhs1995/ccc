@@ -36,7 +36,7 @@ class PreparationCleanupTests(unittest.TestCase):
         path.write_text(json.dumps(value))
         path.chmod(0o600)
 
-    def capture(self, pids=(), birth=None, changed=False):
+    def capture(self, pids=(), birth=None, changed=False, partial=False):
         original = {'rows': self.rows}
         ticks = iter([self.clock(6), self.clock(7)])
         with patch.object(subject.batch, 'job_path', return_value=self.root/'job.json'), \
@@ -48,7 +48,8 @@ class PreparationCleanupTests(unittest.TestCase):
              patch.object(subject.cleanup.scope, 'birth', return_value=birth):
             return subject.capture(self.root/'config.json', self.uid, self.root,
                 runner_directory=self.root, preparation_directory=self.root,
-                baseline_path=self.baseline, client=self.client, clock=lambda: next(ticks))
+                baseline_path=self.baseline, client=self.client, clock=lambda: next(ticks),
+                partial_activation=partial)
 
     def test_absent_identified_process_observed_without_terminal(self):
         result = self.capture()
@@ -93,6 +94,31 @@ class PreparationCleanupTests(unittest.TestCase):
         self.write(self.baseline, value)
         with self.assertRaisesRegex(ValueError, 'clock order'):
             self.capture()
+
+    def test_partial_activation_preserved_in_cleanup_and_reverification(self):
+        self.rows[0]['launch_id'] = self.uid
+        activation = {'activated': True, 'event': self.clock(4.5),
+            'originals': [dict(index=0, launch_id=self.uid, surface_id=self.uid,
+                               pid=123, birth=[4, 0])]}
+        with patch.object(subject, 'partial_evidence', return_value=activation):
+            record = self.capture(partial=True)
+            self.assertEqual(record['activation'], activation)
+            with patch.object(subject.batch, 'job_path', return_value=self.root/'job.json'), \
+                 patch.object(subject.launch, 'policy', return_value={'boot_id': self.uid}), \
+                 patch.object(subject, 'runner_evidence', return_value=(self.clock(5), [])), \
+                 patch.object(subject, 'inventory', return_value={'rows': self.rows}):
+                checked = subject.verify(self.root/'config.json', self.uid,
+                                         self.root/'preparation-cleanup.json')
+                self.assertEqual(checked['activation'], activation)
+
+    def test_partial_activation_change_prevents_cleanup_receipt(self):
+        self.rows[0]['launch_id'] = self.uid
+        activation = {'event': self.clock(4.5), 'originals': [dict(index=0,
+            launch_id=self.uid, surface_id=self.uid, pid=123, birth=[4, 0])]}
+        with patch.object(subject, 'partial_evidence', side_effect=[activation, {}]):
+            with self.assertRaisesRegex(ValueError, 'originals changed'):
+                self.capture(partial=True)
+        self.assertFalse((self.root/'preparation-cleanup.json').exists())
 
     def reverify(self, mutate=None):
         record = self.capture()

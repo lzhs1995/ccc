@@ -409,8 +409,9 @@ class SupervisorTests(unittest.TestCase):
             self.assertEqual(len(calls), 2)
             self.assertIn("ws11-p24-s59", calls[0])
             self.assertIn("ws11-p24-s60", calls[1])
-            # The waiver is only reachable through an explicit warning.
-            self.assertIn("不是 Codex", confirm_prompt("add", rows["surface:60"]))
+            # Claude is supported directly, with no non-Codex waiver.
+            self.assertNotIn("--allow-non-codex", calls[1])
+            self.assertIn("确认只登记", confirm_prompt("add", rows["surface:60"]))
 
     def test_workspace_action_accepts_a_non_codex_row(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -673,12 +674,11 @@ class SupervisorTests(unittest.TestCase):
         self.assertIn("x 删掉这一路登记", keys)
         self.assertIn("等 Codex 回来", keys)
 
-        # A registered Claude pane is also 空转, and the wording must not claim
-        # Codex "exited" from a pane that never ran it.
+        # A registered live Claude pane is supported and has normal controls.
         claude = Candidate({"surface_id": "s", "ref": "surface:104", "workspace_ref": "workspace:18",
                             "pane_ref": "pane:39"}, "explicit", "idle", "-", 0, False,
                            agent_kind="claude", process_summary="Claude")
-        self.assertIn("没有 Codex 可救", selected_action_hint(claude))
+        self.assertIn("p 暂停这一路", selected_action_hint(claude))
         self.assertNotIn("已退出", selected_action_hint(claude))
 
         # A live Codex target keeps the plain hint: nothing to explain away.
@@ -932,12 +932,11 @@ class ColumnContractTests(unittest.TestCase):
         row.state, row.error_type, row.send_count = "recoverable_error", "rate_limit", 7
         self.assertEqual(self.row(row), ("监控中", "Codex", "待续跑", "429", "7"))
 
-    def test_registered_but_a_different_cli_is_running(self):
+    def test_registered_claude_is_monitored(self):
         row = _cand(18, 39, 104, "explicit", kind="claude")
         row.state, row.error_type, row.send_count = "idle", "high_demand", 3
-        # Claude stays visible; 画面 goes quiet because the fingerprint only
-        # means something for a Codex UI; the error history is kept.
-        self.assertEqual(self.row(row), ("空转", "Claude", "—", "高需求", "3"))
+        # Claude is supported; preserve its error history and live screen state.
+        self.assertEqual(self.row(row), ("监控中", "Claude", "空闲", "高需求", "3"))
 
     def test_registered_but_the_cli_exited(self):
         row = _cand(1, 1, 4, "explicit", kind="shell")
@@ -1215,7 +1214,7 @@ class GroupedViewTests(unittest.TestCase):
         # A registered Claude pane must still read as Claude, not as a state.
         claude = _cand(18, 39, 104, "explicit", kind="claude")
         self.assertEqual(program_label(claude), "Claude")
-        self.assertEqual(watch_label(claude), "空转")
+        self.assertEqual(watch_label(claude), "监控中")
 
         # A pool member whose Codex exited counts as idling, and a paused target
         # is reported as paused rather than idling.

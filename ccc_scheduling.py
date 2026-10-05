@@ -202,10 +202,11 @@ class SurfaceScheduler:
                     current = slot.enabled and (slot.key, slot.revision) == slot.submitted_key
                     try:
                         result = None if future.cancelled() else future.result()
-                    except Exception as exc:
+                    except Exception:
+                        # Errors are reported by the bounded worker itself.
+                        # Never wait for a callback's surface/runtime lock while
+                        # holding the fleet scheduler lock.
                         result = None
-                        if current and self.on_error:
-                            self.on_error(slot.target, previous_phase, exc)
                     if current and previous_phase == "observe" and result is not None:
                         slot.candidate, slot.ready_at, slot.phase = result, now, "ready"
                     else:
@@ -264,27 +265,25 @@ class SurfaceScheduler:
     def _submit(self, sid, slot, phase, now):
         key = (slot.key, slot.revision)
         current = lambda: self._current(sid, key)
-        if self.on_dispatch:
-            due = slot.due if phase in {"observe", "event"} else slot.ready_at
-            dispatch = "observe" if phase == "event" else "send" if phase == "event_send" else phase
-            self.on_dispatch(slot.target, dispatch, max(0, now - due))
+        due = slot.due if phase in {"observe", "event"} else slot.ready_at
+        delay = max(0, now - due)
         slot.phase, slot.submitted_key = phase, key
         slot.completed_at = None
         if phase == "event":
             slot.urgent_at = None
             slot.started = now
-            slot.future = self._event_pool.submit(self._execute, self._react, slot, dict(slot.target), current)
+            slot.future = self._event_pool.submit(self._execute, self._react, slot, phase, delay, dict(slot.target), current)
         elif phase == "event_send":
             slot.urgent_at = None
             candidate, slot.candidate = slot.candidate, None
-            slot.future = self._event_pool.submit(self._execute, self.send, slot, dict(slot.target), candidate, current)
+            slot.future = self._event_pool.submit(self._execute, self.send, slot, phase, delay, dict(slot.target), candidate, current)
         elif phase == "observe":
             slot.urgent_at = None
             slot.started = now
-            slot.future = self._observe_pool.submit(self._execute, self.observe, slot, dict(slot.target), current)
+            slot.future = self._observe_pool.submit(self._execute, self.observe, slot, phase, delay, dict(slot.target), current)
         else:
             candidate, slot.candidate = slot.candidate, None
-            slot.future = self._send_pool.submit(self._execute, self.send, slot, dict(slot.target), candidate, current)
+            slot.future = self._send_pool.submit(self._execute, self.send, slot, phase, delay, dict(slot.target), candidate, current)
         slot.future.add_done_callback(lambda _: self.wakeup.set())
 
     def _react(self, target, current):
@@ -296,9 +295,23 @@ class SurfaceScheduler:
                 self.on_dispatch(target, "send", 0.0)
             self.send(target, candidate, current)
 
-    def _execute(self, operation, slot, *args):
+    def _execute(self, operation, slot, phase, delay, *args):
+        # Callbacks share this slot's bounded worker, not the deadline thread.
+        # A slow callback consumes only that slot's capacity and cannot lock
+        # health snapshots, ownership checks or other surfaces' scheduling.
+        target, current = args[0], args[-1]
         try:
-            return operation(*args)
+            if not current():
+                return None
+            if self.on_dispatch:
+                dispatch = "observe" if phase == "event" else "send" if phase == "event_send" else phase
+                self.on_dispatch(target, dispatch, delay)
+            if current():
+                return operation(*args)
+        except Exception as exc:
+            if current() and self.on_error:
+                self.on_error(target, phase, exc)
+            return None
         finally:
             # Capture completion before Future.done() becomes visible. The
             # scheduler may consume that future late; consumption time is not

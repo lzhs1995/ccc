@@ -12,6 +12,7 @@ import uuid
 import ccc_workspace_batch as batch
 from ccc_native_standby import POLICY, identifier
 from ccc_standby_environment import signature
+from ccc_standby_rollouts import RolloutObservationPending
 
 
 class StartupPending(ValueError):
@@ -137,6 +138,17 @@ def inspect_original(claim_path, *, claim_sha256, expected, expected_argv,
         error.process_observation = None if not before else {k: before.get(k) for k in
             ('pid', 'birth', 'argv', 'remote', 'surface_id', 'environment_workspace_id', 'cwd')}
         raise error
+    def observation_pending(exc):
+        def recheck():
+            if (process_reader(pid, launch=True) != before
+                    or _private_file(claim_path) != claim_identity
+                    or claim_path.read_bytes() != raw):
+                raise ValueError('standby original changed during unavailable observation')
+            _idle_prefix(claim)
+        recheck()
+        raise ObservationPending({**expected, 'pid': pid,
+            'birth': list(before['birth'])}, recheck) from exc
+
     def read_files():
         from ccc_codex_queue import IncompleteVnodeRead, VnodeInventoryChanged
         try:
@@ -144,15 +156,13 @@ def inspect_original(claim_path, *, claim_sha256, expected, expected_argv,
         except (IncompleteVnodeRead, VnodeInventoryChanged) as exc:
             if isinstance(exc, IncompleteVnodeRead) and exc.errno != errno.EBADF:
                 raise
-            def recheck():
-                if (process_reader(pid, launch=True) != before
-                        or _private_file(claim_path) != claim_identity
-                        or claim_path.read_bytes() != raw):
-                    raise ValueError('standby original changed during unavailable observation')
-                _idle_prefix(claim)
-            recheck()
-            raise ObservationPending({**expected, 'pid': pid,
-                'birth': list(before['birth'])}, recheck) from exc
+            observation_pending(exc)
+
+    def read_rollout_absence(root, session):
+        try:
+            return rollout_absent(root, session)
+        except RolloutObservationPending as exc:
+            observation_pending(exc)
     files = read_files()
     root = Path(sessions_root).resolve(strict=True)
     native_home = root.parent
@@ -170,7 +180,7 @@ def inspect_original(claim_path, *, claim_sha256, expected, expected_argv,
     def rollout_open(paths):
         return any((p.name.endswith('.jsonl') or p.name.endswith('.jsonl.zst'))
                    and any(p.is_relative_to(r) for r in rollout_roots) for p in paths)
-    if rollout_open(files) or rollout_absent(root, session) is not True:
+    if rollout_open(files) or read_rollout_absence(root, session) is not True:
         raise ValueError('standby session already owns a rollout')
     tui = Path(claim['tui_log'])
     if (files.get(tui) != {'device': claim['tui_log_identity'][0], 'inode': claim['tui_log_identity'][1]}
@@ -206,7 +216,7 @@ def inspect_original(claim_path, *, claim_sha256, expected, expected_argv,
         raise ValueError('standby original changed during observation')
     after_data, after_sent = _idle_prefix(claim)
     if (after_sent or not after_data.startswith(event_data)
-            or rollout_absent(root, session) is not True):
+            or read_rollout_absence(root, session) is not True):
         raise ValueError('standby native received input during observation')
     events = [json.loads(line) for line in after_data.splitlines()]
     starts = sum(e.get('variant') == 'StartupThreadStarted' for e in events)

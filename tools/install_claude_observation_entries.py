@@ -37,6 +37,14 @@ def snapshot(path):
                 target_sha256=digest(target))
 
 
+def sync_directory(path):
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def atomic_bytes(path, raw, mode=0o600):
     temporary = path.with_name('.' + path.name + '-' + uuid.uuid4().hex)
     try:
@@ -47,15 +55,21 @@ def atomic_bytes(path, raw, mode=0o600):
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
+        sync_directory(path.parent)
     finally:
         temporary.unlink(missing_ok=True)
 
 
-def replace_link(path, target):
+def replace_link(path, target, *, staged=None):
+    if staged is not None:
+        os.replace(staged, path)
+        sync_directory(path.parent)
+        return
     temporary = path.with_name('.' + path.name + '-' + uuid.uuid4().hex)
     try:
         temporary.symlink_to(target)
         os.replace(temporary, path)
+        sync_directory(path.parent)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -64,28 +78,77 @@ def save(journal, data):
     atomic_bytes(journal, (json.dumps(data, indent=2) + '\n').encode())
 
 
-def restore(journal):
-    data = json.loads(journal.read_bytes())
-    if data['state'] not in ('committed', 'prepared'):
-        raise ValueError('journal is not an active install')
+def matches_intent(current, intent):
+    if not intent:
+        return False
+    expected = intent['snapshot']
+    # Renaming our pre-recorded symlink changes ctime on some filesystems.
+    # Its device/inode/owner/mtime, link bytes, and executable identity must
+    # still match; a newly created external symlink does not qualify.
+    return (current['identity'][:4] == expected['identity'][:4]
+            and all(current[key] == expected[key] for key in expected if key != 'identity'))
+
+
+def recorded_replace(row, phase, target, expected, journal, data):
+    path = Path(row['path'])
+    intent = row.get(phase)
+    if intent:
+        staged = Path(intent['staged'])
+        if snapshot(staged) != intent['snapshot']:
+            raise ValueError('prepared link changed before replacement')
+    else:
+        staged = path.with_name('.' + path.name + '-' + uuid.uuid4().hex)
+        staged.symlink_to(target)
+        sync_directory(path.parent)
+        intent = dict(staged=str(staged), snapshot=snapshot(staged))
+        row[phase] = intent
+        # The link identity is durable before the atomic rename. Recovery can
+        # recognize it even if the process exits before the after snapshot.
+        save(journal, data)
+    if snapshot(path) != expected or snapshot(staged) != intent['snapshot']:
+        raise ValueError('entry changed before replacement')
+    replace_link(path, target, staged=staged)
+    after = snapshot(path)
+    if not matches_intent(after, intent):
+        raise ValueError('entry changed during replacement')
+    return after
+
+
+def restore_rows(journal, data, *, only_installed=False):
     selected = []
     for row in data['entries']:
+        if only_installed and not row.get('after') and not row.get('install_intent'):
+            continue
         path = Path(row['path'])
-        # The recorded after identity protects later user/package-manager edits.
         current = snapshot(path)
         if current == row['before']:
             continue
-        if current != row.get('after'):
+        if current == row.get('restored') or matches_intent(current, row.get('restore_intent')):
+            row['restored'] = current
+            continue
+        if current != row.get('after') and not matches_intent(current, row.get('install_intent')):
             raise ValueError('entry changed after installation: ' + str(path))
-        selected.append(row)
-    for row in reversed(selected):
+        selected.append((row, current))
+    data['state'] = 'rolling_back'
+    save(journal, data)
+    for row, current in reversed(selected):
         path = Path(row['path'])
-        if snapshot(path) != row['after']:
+        if snapshot(path) != current:
             raise ValueError('entry changed during rollback')
-        replace_link(path, row['before']['link'])
+        row['restored'] = recorded_replace(row, 'restore_intent', row['before']['link'],
+                                            current, journal, data)
+        save(journal, data)
     data['state'] = 'rolled_back'
+    data['errors'] = []
     save(journal, data)
     return data
+
+
+def restore(journal):
+    data = json.loads(journal.read_bytes())
+    if data['state'] not in ('committed', 'prepared', 'rolling_back', 'rollback_failed', 'rolled_back'):
+        raise ValueError('journal is not an active install')
+    return restore_rows(journal, data)
 
 
 def install(package, entries, journal, python=sys.executable, apply=False, prepared=None):
@@ -123,7 +186,6 @@ def install(package, entries, journal, python=sys.executable, apply=False, prepa
         raw = module.render_entry(python, package / 'ccc_claude_launcher.py', row['before']['target']).encode()
         atomic_bytes(Path(row['wrapper']), raw, 0o700)
     save(journal, data)
-    changed = []
     try:
         if prepared:
             prepared()
@@ -138,9 +200,8 @@ def install(package, entries, journal, python=sys.executable, apply=False, prepa
                 raise ValueError('prepared wrapper changed')
             if snapshot(path) != row['before']:
                 raise ValueError('entry changed before replacement')
-            replace_link(path, row['wrapper'])
-            changed.append(row)
-            row['after'] = snapshot(path)
+            row['after'] = recorded_replace(row, 'install_intent', row['wrapper'],
+                                             row['before'], journal, data)
             if row['after']['target_sha256'] != row['wrapper_sha256']:
                 raise ValueError('installed entry mismatch')
             save(journal, data)
@@ -148,17 +209,11 @@ def install(package, entries, journal, python=sys.executable, apply=False, prepa
         data['state'] = 'committed'
         save(journal, data)
     except BaseException:
-        errors = []
-        for row in reversed(changed):
-            try:
-                path = Path(row['path'])
-                if snapshot(path) != row.get('after'):
-                    raise ValueError('changed entry cannot be rolled back automatically')
-                replace_link(path, row['before']['link'])
-            except Exception as exc:
-                errors.append(str(exc))
-        data.update(state='rollback_failed' if errors else 'rolled_back', errors=errors)
-        save(journal, data)
+        try:
+            restore_rows(journal, data, only_installed=True)
+        except Exception as exc:
+            data.update(state='rollback_failed', errors=[str(exc)])
+            save(journal, data)
         raise
     return data
 

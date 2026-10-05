@@ -419,6 +419,155 @@ class RefreshBarrierTests(unittest.TestCase):
                          hashlib.sha256(self.barrier.return_receipt.read_bytes()).hexdigest())
         self.assertEqual(self.barrier.observe()['session_id'], self.native.session)
 
+    def pending_after_return_persistence(self):
+        self.assertTrue(self.prepare())
+        self.rendered()
+        unavailable = self.unavailable_files()
+        calls = []
+        def inspect():
+            calls.append(1)
+            return unavailable() if len(calls) == 3 else self.native.inspect()
+        self.barrier.inspect = inspect
+        self.assertIsNone(self.barrier.observe())
+        self.assertTrue(self.barrier.return_receipt.exists())
+        self.barrier.inspect = self.native.inspect
+
+    def test_activation_waits_for_post_persistence_return_check(self):
+        self.pending_after_return_persistence()
+        self.assertIsNone(self.barrier.observe_for_activation())
+        self.assertTrue(self.barrier.observe()['refresh_return_observed'])
+        self.assertTrue(self.barrier.observe_for_activation()['refresh_return_observed'])
+        self.assertEqual(len(self.writes), 1)
+
+    def test_activation_cannot_bypass_expired_post_persistence_check(self):
+        self.pending_after_return_persistence()
+        self.clock += 30
+        with self.assertRaises(TimeoutError):
+            self.barrier.observe_for_activation()
+        self.assertTrue(self.barrier.invalid_receipt.exists())
+        self.assertEqual(len(self.writes), 1)
+
+    def pending_control_screen(self, *, text='/pwd', menu=True):
+        def replay(*args, **kwargs):
+            payload = self.replay(*args, **kwargs)
+            grid = payload['render_grid']
+            row = grid['cursor']['row']
+            grid['full'] = True
+            grid['cursor']['column'] = len(text) + 2
+            grid['row_spans'] = [s for s in grid['row_spans']
+                                 if s['row'] != row or s['column'] < 2]
+            grid['row_spans'].append(span(row, 2, text))
+            if menu:
+                grid['row_spans'].append(span(row - 2, 0, '› /pwd  show the current working directory'))
+            return payload
+        self.client.replay.side_effect = replay
+
+    def test_acknowledged_control_draft_waits_then_returns_without_resend(self):
+        self.assertTrue(self.prepare())
+        self.pending_control_screen()
+        self.assertIsNone(self.barrier.observe())
+        self.assertFalse(self.barrier.return_receipt.exists())
+        self.assertFalse(self.prepare())
+        self.clock += 29
+        self.assertIsNone(self.barrier.observe())
+        self.client.replay.side_effect = self.replay
+        self.rendered()
+        self.assertTrue(self.barrier.observe()['refresh_return_observed'])
+        self.clock += 31
+        self.assertTrue(self.barrier.observe()['refresh_return_observed'])
+        self.assertEqual(len(self.writes), 1)
+
+    def test_control_return_deadline_starts_at_ack_and_never_extends(self):
+        self.assertTrue(self.prepare())
+        self.clock += 20
+        self.pending_control_screen()
+        self.assertIsNone(self.barrier.observe())
+        self.clock += 9
+        self.assertIsNone(self.barrier.observe())
+        self.client.replay.side_effect = self.replay
+        self.rendered()
+        self.clock += 1
+        with self.assertRaises(TimeoutError): self.barrier.observe()
+        self.assertTrue(self.barrier.invalid_receipt.exists())
+        self.assertFalse(self.prepare())
+        self.assertEqual(len(self.writes), 1)
+
+    def test_ack_without_output_also_has_bounded_wait(self):
+        self.assertTrue(self.prepare())
+        self.assertIsNone(self.barrier.observe())
+        self.clock += 30
+        with self.assertRaises(TimeoutError): self.barrier.observe()
+        self.assertEqual(len(self.writes), 1)
+
+    def test_control_draft_before_ack_is_never_treated_as_pending(self):
+        self.pending_control_screen()
+        with self.assertRaises(ValueError): self.prepare()
+        self.assertFalse(self.writes)
+        self.assertFalse(self.barrier.intent.exists())
+
+    def test_control_pending_rechecks_final_identity_authorization_and_events(self):
+        for change in ('birth', 'permission', 'reload', 'input', 'generation'):
+            with self.subTest(change=change):
+                f = RefreshBarrierTests()
+                f.setUp()
+                try:
+                    self.assertTrue(f.prepare())
+                    f.pending_control_screen()
+                    screen = f.client.replay.side_effect
+                    def changed(*args, **kwargs):
+                        payload = screen(*args, **kwargs)
+                        if change == 'birth': f.native.process['birth'][1] += 1
+                        if change == 'permission': f.allowed = False
+                        if change == 'reload': f.reload()
+                        if change == 'generation': f.generation = 'b' * 64
+                        if change == 'input':
+                            f.native.events.append(dict(dir='from_tui', kind='op', payload={
+                                'UserTurn': {'items': [{'type': 'text', 'text': 'user'}]}}))
+                            f.native.save_events()
+                        return payload
+                    f.client.replay.side_effect = changed
+                    with self.assertRaises((ValueError, RuntimeError)): f.barrier.observe()
+                    self.assertFalse(f.barrier.return_receipt.exists())
+                    self.assertTrue(f.barrier.invalid_receipt.exists())
+                    self.assertEqual(len(f.writes), 1)
+                finally:
+                    f.doCleanups()
+
+    def test_control_pending_rejects_other_draft_queue_and_incomplete_frame(self):
+        for change in ('text', 'menu', 'queue', 'full', 'working', 'approval'):
+            with self.subTest(change=change):
+                f = RefreshBarrierTests()
+                f.setUp()
+                try:
+                    self.assertTrue(f.prepare())
+                    f.pending_control_screen(text='/pwd x' if change == 'text' else '/pwd',
+                                             menu=change != 'menu')
+                    f.queue = change == 'queue'
+                    screen = f.client.replay.side_effect
+                    def changed(*args, **kwargs):
+                        payload = screen(*args, **kwargs)
+                        grid = payload['render_grid']
+                        if change == 'full': grid['full'] = False
+                        if change == 'working':
+                            grid['row_spans'].append(span(1, 0, 'Working (0s • esc to interrupt)'))
+                        if change == 'approval':
+                            grid['row_spans'].extend([span(1, 0, 'Implement this plan?'),
+                                span(2, 0, '1. Yes, implement this plan')])
+                        return payload
+                    f.client.replay.side_effect = changed
+                    with self.assertRaises(ValueError): f.barrier.observe()
+                    self.assertEqual(len(f.writes), 1)
+                finally:
+                    f.doCleanups()
+
+    def test_control_draft_after_return_witness_is_rejected(self):
+        self.assertTrue(self.prepare())
+        self.rendered()
+        self.assertTrue(self.barrier.observe()['refresh_return_observed'])
+        self.pending_control_screen()
+        with self.assertRaises(ValueError): self.barrier.observe()
+        self.assertEqual(len(self.writes), 1)
+
     def test_missing_reload_is_pending_without_consumption_then_progresses(self):
         self.native.events.pop(); self.native.save_events()
         self.assertFalse(self.prepare())
@@ -427,6 +576,95 @@ class RefreshBarrierTests(unittest.TestCase):
         self.reload()
         self.assertTrue(self.prepare())
         self.assertEqual(len(self.writes), 1)
+
+    def first_reload_during_replay(self, after_reload=None):
+        self.native.events.pop()
+        self.native.save_events()
+        def replay(*args, **kwargs):
+            self.client.replay.side_effect = self.replay
+            self.reload()
+            if after_reload:
+                after_reload()
+            return self.replay(*args, **kwargs)
+        self.client.replay.side_effect = replay
+
+    def test_first_reload_during_reads_rechecks_before_one_control(self):
+        self.first_reload_during_replay()
+        self.assertFalse(self.prepare())
+        self.assertFalse(self.barrier.intent.exists())
+        self.assertFalse(self.barrier.invalid_receipt.exists())
+        self.assertFalse(self.writes)
+        self.assertEqual(len(self.barrier._reloads), 1)
+        self.assertTrue(self.prepare())
+        self.assertFalse(self.prepare())
+        self.assertEqual(len(self.writes), 1)
+
+    def test_first_reload_pending_cannot_rebase_or_skip_fresh_guards(self):
+        for change in ('reload', 'draft', 'pause', 'birth', 'prefix'):
+            with self.subTest(change=change):
+                f = RefreshBarrierTests()
+                f.setUp()
+                try:
+                    f.first_reload_during_replay()
+                    self.assertFalse(f.prepare())
+                    if change == 'reload':
+                        f.reload()
+                    elif change == 'draft':
+                        f.composer = 'typed'
+                    elif change == 'pause':
+                        f.allowed = False
+                    elif change == 'birth':
+                        f.native.process['birth'][1] += 1
+                    else:
+                        f.native.events[1]['variant'] = 'InsertHistoryCell'
+                        f.native.save_events()
+                    with self.assertRaises(ValueError):
+                        f.prepare()
+                    self.assertTrue(f.barrier.invalid_receipt.exists())
+                    self.assertFalse(f.barrier.intent.exists())
+                    self.assertFalse(f.writes)
+                finally:
+                    f.doCleanups()
+
+    def test_first_reload_arrival_does_not_hide_dangerous_changes(self):
+        for change in ('second_reload', 'birth', 'pause', 'prefix', 'turn'):
+            with self.subTest(change=change):
+                f = RefreshBarrierTests()
+                f.setUp()
+                try:
+                    def mutate():
+                        if change == 'second_reload':
+                            f.reload()
+                        elif change == 'birth':
+                            f.native.process['birth'][1] += 1
+                        elif change == 'pause':
+                            f.allowed = False
+                        elif change == 'prefix':
+                            f.native.events[1]['variant'] = 'InsertHistoryCell'
+                            f.native.save_events()
+                        else:
+                            f.native.events.append(dict(dir='from_tui', kind='op', payload={
+                                'UserTurn': {'items': [{'type': 'text', 'text': 'test'}]}}))
+                            f.native.save_events()
+                    f.first_reload_during_replay(mutate)
+                    with self.assertRaises((ValueError, RuntimeError)):
+                        f.prepare()
+                    self.assertTrue(f.barrier.invalid_receipt.exists())
+                    self.assertFalse(f.barrier.intent.exists())
+                    self.assertFalse(f.writes)
+                finally:
+                    f.doCleanups()
+
+    def test_reload_during_consumed_write_remains_terminal(self):
+        def sender(*args, **kwargs):
+            self.client.replay.side_effect = lambda *a, **k: (self.reload(), self.replay(*a, **k))[1]
+            return self.send_control(*args, **kwargs)
+        with self.assertRaises(ValueError):
+            self.prepare(sender)
+        self.assertTrue(self.barrier.intent.exists())
+        self.assertTrue(self.barrier.invalid_receipt.exists())
+        self.assertFalse(self.writes)
+        self.assertFalse(self.prepare())
 
     def test_startup_pending_preserves_original_then_progresses_without_early_input(self):
         self.native.events = self.native.events[:2]

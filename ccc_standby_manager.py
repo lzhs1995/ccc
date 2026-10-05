@@ -11,8 +11,9 @@ import contextlib
 import os
 from concurrent.futures import ThreadPoolExecutor, wait
 import threading
+import time
 
-from ccc_native_standby import COUNT, identifier, write_once
+from ccc_native_standby import COUNT, ObservationExpired, identifier, original, write_once
 
 
 class StandbyManager:
@@ -88,14 +89,14 @@ class StandbyManager:
             self.state, self.ready_count = 'invalidated', 0
         self.ledger._invalidate(reason)
 
-    def _gather(self, callback):
+    def _gather(self, callback, indexes=range(COUNT)):
         # Keep this operation's live caller authorization installed until all
         # submitted callbacks have finished, including an early result error
         # or a partial submission failure. No old worker may inherit a later
         # button action's authorization.
         futures = []
         try:
-            for index in range(COUNT):
+            for index in indexes:
                 futures.append(self._executor.submit(callback, index))
             return [future.result() for future in futures]
         finally:
@@ -105,30 +106,45 @@ class StandbyManager:
         with self._operation, self.operation_context():
             return self._refresh_locked()
 
-    def _refresh_locked(self):
+    def _refresh_locked(self, *, deadline=None):
         """Refresh within the existing operation and caller authorization context."""
         if self.state in {'observation_only', 'activated', 'partial', 'invalidated', 'closed'}:
             return self.status()
+        if deadline is None:
+            deadline = time.monotonic() + 30.0
         try:
             self._current()
             rows = self._gather(self._observe)
-            self._current()
-            # These independent slot checks already run on workers during
-            # observation/delivery. Serial checks age out otherwise fresh
-            # observations as cohort size grows. Drain all futures before
-            # leaving the original caller authorization context.
-            if not all(self._gather(self._authorized)):
-                raise ValueError('standby workspace or original authorization changed')
-            ready_count = sum(row is not None for row in rows)
-            if ready_count != COUNT:
-                # Incomplete initial preparation is progress. Losing a
-                # previously complete cohort is permanent invalidation.
-                if self.state == 'ready':
-                    raise ValueError('standby readiness was lost')
-                self._publish('preparing', ready_count)
-                return self.status()
-            self.ledger.observe_ready(rows, config_generation=self.generation_current(),
-                boot_id=self.boot_current(), authorized=True)
+            while True:
+                self._current()
+                if not all(self._gather(self._authorized)):
+                    raise ValueError('standby workspace or original authorization changed')
+                ready_count = sum(row is not None for row in rows)
+                if ready_count != COUNT:
+                    if self.state == 'ready' or self.ledger._originals_raw is not None:
+                        raise ValueError('standby readiness was lost')
+                    self._publish('preparing', ready_count)
+                    return self.status()
+                if time.monotonic() >= deadline:
+                    raise TimeoutError('standby observations unavailable for 30 seconds')
+                try:
+                    self.ledger.observe_ready(rows, config_generation=self.generation_current(),
+                        boot_id=self.boot_current(), authorized=True)
+                    break
+                except ObservationExpired as expired:
+                    self._publish('preparing')
+                    # Reinspect only aged slots, preserving each original and
+                    # actual timestamp. All slot permissions are checked again
+                    # after the new reads, within the same caller context.
+                    replacements = self._gather(self._observe, expired.indexes)
+                    for index, row in zip(expired.indexes, replacements):
+                        before = rows[index]
+                        if row is None or original(row, self.ledger.manifest['workspace_id']) != original(
+                                before, self.ledger.manifest['workspace_id']):
+                            raise ValueError('standby original readiness or identity changed')
+                        if row['observed_monotonic'] <= before['observed_monotonic']:
+                            raise ValueError('standby observation time did not advance')
+                        rows[index] = row
             self._publish('ready', COUNT)
         except Exception as exc:
             self.invalidate(exc)
@@ -151,11 +167,21 @@ class StandbyManager:
             try:
                 # User confirmation may arrive long after preparation. Inspect
                 # the same native originals anew; never renew cached timestamps.
-                self._refresh_locked()
-                self._current()
-                permitted = all(self._gather(self._authorized))
-                consumed = self.ledger.consume_activation(action_id=action_id, mode=mode, prompt=prompt,
-                    config_generation=self.generation_current(), boot_id=self.boot_current(), authorized=permitted)
+                # Preparation and pre-consumption reinspection share one
+                # deadline. Moving to another phase cannot renew the budget.
+                deadline = time.monotonic() + 30.0
+                while True:
+                    self._refresh_locked(deadline=deadline)
+                    self._current()
+                    permitted = all(self._gather(self._authorized))
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError('standby activation observations unavailable for 30 seconds')
+                    try:
+                        consumed = self.ledger.consume_activation(action_id=action_id, mode=mode, prompt=prompt,
+                            config_generation=self.generation_current(), boot_id=self.boot_current(), authorized=permitted)
+                        break
+                    except ObservationExpired:
+                        self._publish('preparing')
                 if not consumed:
                     self._publish('observation_only')
                     return {'new_activation': False, **self.status()}
@@ -172,7 +198,15 @@ class StandbyManager:
                             observe=self._observe, authorized=self._authorized, send=self.sender)
                         return {'index': index, 'acknowledged': delivered, 'error': None}
                     except Exception as exc:
-                        return {'index': index, 'acknowledged': False, 'error': type(exc).__name__}
+                        # Keep bounded causal diagnostics. An error after a
+                        # write remains unknown delivery, never a retry permit.
+                        chain, seen, error = [], set(), exc
+                        while error is not None and id(error) not in seen and len(chain) < 4:
+                            seen.add(id(error))
+                            chain.append({'type': type(error).__name__, 'message': str(error)[:1024]})
+                            error = error.__cause__ or error.__context__
+                        return {'index': index, 'acknowledged': False, 'error': type(exc).__name__,
+                                'error_chain': chain, 'error_monotonic': time.monotonic()}
 
                 outcomes = self._gather(attempt)
                 self._result = {'action_id': identifier(action_id), 'cohort_id': self.ledger.manifest['cohort_id'],

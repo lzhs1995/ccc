@@ -56,6 +56,23 @@ class ManagerTests(unittest.TestCase):
         self.assertFalse(self.activate()['new_activation'])
         self.assertEqual(len({item[1] for item in self.sent}), 50)
 
+    def test_delivery_error_preserves_bounded_cause_without_retry(self):
+        self.manager.refresh()
+        def failed(*args, **kwargs):
+            try:
+                raise OSError('socket observation expired')
+            except OSError as cause:
+                raise ValueError('guard: ' + 'x' * 2048) from cause
+        self.manager.sender = failed
+        result = self.activate()['delivery']
+        row = next(r for r in result['outcomes'] if r['error'] == 'ValueError'
+                   and r['error_chain'][0]['message'].startswith('guard:'))
+        self.assertEqual(len(row['error_chain'][0]['message']), 1024)
+        self.assertEqual(row['error_chain'][1]['message'], 'socket observation expired')
+        self.assertFalse(row['acknowledged'])
+        self.assertFalse(self.activate()['new_activation'])
+        self.assertFalse(self.sent)
+
     def test_confirmation_after_idle_reobserves_originals_once(self):
         self.manager.refresh()
         self.now += 30

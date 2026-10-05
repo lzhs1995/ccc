@@ -26,6 +26,13 @@ COUNT = 50
 MAX_OBSERVATION_AGE = 2.0
 
 
+class ObservationExpired(ValueError):
+    """No input authority: reacquire observations before an unconsumed action."""
+    def __init__(self, message, indexes=()):
+        super().__init__(message)
+        self.indexes = tuple(indexes)
+
+
 def identifier(value):
     if not isinstance(value, str) or str(uuid.UUID(value)).lower() != value.lower():
         raise ValueError('invalid standby identity')
@@ -88,7 +95,7 @@ def fresh(observation, boot_id, now):
     at = observation.get('observed_monotonic')
     if (type(at) not in (int, float) or not math.isfinite(at)
             or type(now) not in (int, float) or not math.isfinite(now)
-            or at < 0 or not 0 <= now - at <= MAX_OBSERVATION_AGE
+            or at < 0 or now < at
             or observation.get('boot_id') != boot_id):
         valid_clock = (type(at) in (int, float) and math.isfinite(at)
                        and type(now) in (int, float) and math.isfinite(now))
@@ -106,6 +113,9 @@ def fresh(observation, boot_id, now):
             or observation.get('model_request_count') != 0
             or type(observation.get('model_request_count')) is not int):
         raise ValueError('standby is not an untouched idle native')
+    if now - at > MAX_OBSERVATION_AGE:
+        raise ObservationExpired(f'standby observation expired: age_seconds={now - at!r}, '
+                                 f'max_age_seconds={MAX_OBSERVATION_AGE}')
 
 
 def write_once(path, value):
@@ -148,6 +158,8 @@ class StandbyLedger:
         self._invalid = False
         self._attempted = set()
         self._write_lock = threading.RLock()
+        self._writes_drained = threading.Condition(self._write_lock)
+        self._active_writes = 0
         self._originals_raw = None
         if os.path.lexists(self.directory / 'originals.json'):
             if (self.directory / 'originals.json').is_symlink():
@@ -184,6 +196,10 @@ class StandbyLedger:
         with self._write_lock:
             self._invalid = True
             self._ready = None
+            # Close admission first. Already admitted socket writes precede
+            # this revocation; drain them before returning to its caller.
+            self._writes_drained.notify_all()
+            self._writes_drained.wait_for(lambda: self._active_writes == 0)
         try:
             write_once(self.directory / 'invalidated.json', {'reason': str(reason)})
         except FileExistsError:
@@ -206,9 +222,12 @@ class StandbyLedger:
                     raise ValueError('standby authorization or configuration changed')
                 if len(observations) != COUNT:
                     raise ValueError('standby cohort incomplete')
-                rows = []
+                rows, expired = [], []
                 for observation in observations:
-                    fresh(observation, self.manifest['boot_id'], self.clock())
+                    try:
+                        fresh(observation, self.manifest['boot_id'], self.clock())
+                    except ObservationExpired:
+                        expired.append(observation['index'])
                     if observation.get('generation') != self.manifest['generation']:
                         raise ValueError('standby original configuration changed')
                     rows.append(original(observation, self.manifest['workspace_id']))
@@ -220,10 +239,18 @@ class StandbyLedger:
                 rows.sort(key=lambda r: r['index'])
                 if self._originals_raw is not None and json.loads(self._originals_raw) != rows:
                     raise ValueError('standby original identity changed')
+                # Check every identity/config/idle premise before allowing a
+                # caller to reacquire aged observations. Expiration must not
+                # hide a different slot's permanent failure.
+                if expired:
+                    raise ObservationExpired('standby cohort observations expired', expired)
                 if self._originals_raw is None:
                     self._originals_raw = write_once(self.directory / 'originals.json', rows)
                 self._ready = {'originals': rows, 'observed_at': min(
                     observation['observed_monotonic'] for observation in observations)}
+            except ObservationExpired:
+                self._ready = None
+                raise
             except Exception as exc:
                 self._invalidate(exc)
                 raise
@@ -244,9 +271,13 @@ class StandbyLedger:
                 action_id = identifier(action_id)
                 if (mode != self.manifest['mode'] or prompt != self.manifest.get('prompt')
                         or generation(config_generation) != self.manifest['generation']
-                        or identifier(boot_id) != self.manifest['boot_id'] or authorized is not True
-                        or not 0 <= self.clock() - self._ready['observed_at'] <= MAX_OBSERVATION_AGE):
+                        or identifier(boot_id) != self.manifest['boot_id'] or authorized is not True):
                     raise ValueError('standby activation rejected')
+                age = self.clock() - self._ready['observed_at']
+                if not math.isfinite(age) or age < 0:
+                    raise ValueError('standby activation rejected')
+                if age > MAX_OBSERVATION_AGE:
+                    raise ObservationExpired('standby activation observations expired')
                 value = {**self.manifest, 'action_id': action_id, 'prompt': prompt,
                          'originals': self._ready['originals'], 'committed_monotonic': self.clock()}
                 write_once(self.directory / 'activation-attempt.json', {
@@ -256,6 +287,11 @@ class StandbyLedger:
                 self._activation = copy.deepcopy(value)
                 self._ready = None
                 return True
+            except ObservationExpired:
+                # Nothing has been consumed or written. Only a complete new
+                # observation may earn readiness again; never renew its time.
+                self._ready = None
+                raise
             except Exception as exc:
                 self._invalidate(exc)
                 raise
@@ -267,8 +303,8 @@ class StandbyLedger:
         is called once only after durable consumption and a second live check.
         Exceptions, false ACKs and process crashes never make a slot retryable.
         send must use its write_guard around the transport write only, not the
-        ACK wait. This orders actual writes against concurrent invalidation
-        without serializing all response waits.
+        ACK wait. Each slot earns a separate write permit; cohort invalidation
+        closes admission and drains all outstanding writes before returning.
         """
         if not hasattr(self, '_activation'):
             raise ValueError('activation is observation-only in this manager')
@@ -353,8 +389,26 @@ class StandbyLedger:
                 if used or claim.is_symlink() or claim.read_bytes() != payload:
                     raise ValueError('standby transport permit consumed or changed')
                 used = True
-                yield
-            except Exception as exc:
+                self._active_writes += 1
+                # Keep the cohort lock for admission only. A blocked sendall
+                # must not discard another slot's complete connected checks
+                # or consume that slot's control deadline with repeated reads.
+                self._write_lock.release()
+                acquired = False
+                try:
+                    yield
+                except BaseException:
+                    # Close new admission before dropping our permit. Do not
+                    # wait here: two failing writes must both be able to leave.
+                    with self._writes_drained:
+                        self._invalid = True
+                        self._ready = None
+                    raise
+                finally:
+                    with self._writes_drained:
+                        self._active_writes -= 1
+                        self._writes_drained.notify_all()
+            except BaseException as exc:
                 self._invalidate(exc)
                 raise
             finally:

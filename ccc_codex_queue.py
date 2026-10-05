@@ -249,21 +249,37 @@ def process_writable_files(pid, *, identities=False):
 
     before = descriptors()
     files = vnodes(before, 'initial')
-    if descriptors() != before or vnodes(before, 'verification') != files:
-        raise VnodeInventoryChanged("process vnode descriptors changed")
-    paths = {} if identities else set()
-    for flags, name, _device, _inode in files.values():
-        if flags & 2:  # Kernel FWRITE, not userspace O_WRONLY.
+    def resolved_writers():
+        # Cache only within this resolution pass. Duplicate descriptors are
+        # common; resolving each one amplifies filesystem work across slots.
+        writers = {(name, device, inode)
+                   for flags, name, device, inode in files.values() if flags & 2}
+        result = {}
+        raw = {}
+        for name, device, inode in writers:
             path = Path(name)
             if not path.is_absolute():
                 raise OSError("missing vnode path")
             path = path.resolve()
-            if identities:
-                paths[path] = {"device": int.from_bytes(_device, sys.byteorder),
-                               "inode": int.from_bytes(_inode, sys.byteorder)}
-            else:
-                paths.add(path)
-    return paths
+            identity = (device, inode)
+            if name in raw and raw[name] != (path, identity):
+                raise VnodeInventoryChanged("conflicting raw vnode identity")
+            raw[name] = (path, identity)
+            if path in result and result[path] != identity:
+                raise VnodeInventoryChanged("conflicting canonical vnode identity")
+            result[path] = identity
+        return result, raw
+
+    paths, raw = resolved_writers()
+    if descriptors() != before or vnodes(before, 'verification') != files:
+        raise VnodeInventoryChanged("process vnode descriptors changed")
+    if resolved_writers() != (paths, raw):
+        raise VnodeInventoryChanged("canonical vnode paths changed")
+    if identities:
+        return {path: {"device": int.from_bytes(device, sys.byteorder),
+                       "inode": int.from_bytes(inode, sys.byteorder)}
+                for path, (device, inode) in paths.items()}
+    return set(paths)
 
 
 def codex_process_starts(pids):

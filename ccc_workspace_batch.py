@@ -303,6 +303,8 @@ def authorize_workspace(config_path, selector, name=None, *, client=None):
             rule = core._workspace_rule_from_record(record, name)
             latest["workspace_rules"].append(rule)
         # w is idempotent. Only W can undo P; manual exclusions also survive.
+        with contextlib.suppress(ValueError):
+            latest.get("claude_excluded_workspace_ids", []).remove(record["workspace_id"])
         rule["batch_reconcile_requested_at"] = time.time()
         return dict(rule)
     _, rule, _ = store.mutate(authorize)

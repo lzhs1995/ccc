@@ -50,6 +50,14 @@ class EnvironmentTests(unittest.TestCase):
         for key in ('CODEX_THREAD_ID', 'CMUX_CODEX_PID', 'CMUX_AGENT_LAUNCH_ARGV_B64'):
             self.assertNotIn(key, result)
 
+    def test_direct_native_exec_keeps_observer_without_wrapper_environment(self):
+        for inherited in (None, '0', '1'):
+            with self.subTest(inherited=inherited):
+                if inherited is not None:
+                    self.base['CODEX_CLIENT_THREAD_OBSERVER'] = inherited
+                self.assertNotIn('CODEX_CLIENT_THREAD_OBSERVER', env.template(self.base))
+                self.assertEqual(self.compose()['CODEX_CLIENT_THREAD_OBSERVER'], '1')
+
     def test_wrong_or_missing_terminal_identity_is_rejected(self):
         for key in ('CMUX_SURFACE_ID', 'CMUX_WORKSPACE_ID'):
             original = self.child.pop(key)

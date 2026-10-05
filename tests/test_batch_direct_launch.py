@@ -28,16 +28,24 @@ class DirectBatchTests(unittest.TestCase):
         directory = self.root / 'Library/Application Support/cmux-codex-continue'
         directory.mkdir(parents=True)
         native = self.root / 'native codex'
-        native.write_text('#!' + sys.executable + '\nimport json,sys\nprint(json.dumps(sys.argv[1:]))\n')
-        native.chmod(0o700)
+        # The resolver now requires a native executable, not an arbitrary script.
+        # Keep both the installed entry and execution entirely in this fixture.
+        native.symlink_to(Path(sys.executable).resolve())
+        installed = self.root / 'installed-codex'
+        wrapper = directory / 'codex-guard'
+        wrapper.write_text('#!/bin/sh\nexit 94\n')
+        wrapper.chmod(0o700)
+        installed.symlink_to(wrapper)
         shim = self.root / 'codex'
         shim.write_text('#!/bin/sh\nexit 93\n')
         shim.chmod(0o700)
         (directory / 'codex-launcher.json').write_text(json.dumps({'native_binary': str(native)}))
         with patch.object(Path, 'home', return_value=self.root), \
-             patch.object(guard, 'native_binary', side_effect=resolve_native_binary):
+             patch.object(guard, 'native_binary', side_effect=lambda: resolve_native_binary(entrypoint=installed)):
             argv = batch.native_launch_argv(self.config, self.worker.job, slot['index'])
-        result = subprocess.run(argv, env={**os.environ, 'PATH': str(self.root)},
+        self.assertEqual(argv[0], str(Path(sys.executable).resolve()))
+        result = subprocess.run([argv[0], '-c', 'import json,sys; print(json.dumps(sys.argv[1:]))', *argv[1:]],
+                                env={**os.environ, 'PATH': str(self.root)},
                                 capture_output=True, text=True, timeout=15)
         self.assertEqual(result.returncode, 0, result.stderr)
         args = json.loads(result.stdout)
@@ -149,7 +157,7 @@ class DisabledLauncherTests(unittest.TestCase):
                 with self.subTest(value=value), patch.object(Path, 'home', return_value=home):
                     (app / 'codex-launcher.json').write_text(json.dumps({'native_binary': value}))
                     with self.assertRaisesRegex(RuntimeError, 'cannot be proved'):
-                        resolve_native_binary()
+                        resolve_native_binary(entrypoint=alias)
 
 
 if __name__ == '__main__':

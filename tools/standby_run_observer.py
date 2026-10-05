@@ -60,15 +60,16 @@ def settle(directory, batch_id, output, baseline_path, *, completion_path=None, 
                     ('activation-ui.json', 'activation-attempt.json'))
     if client is None:
         client = connect(invocation.value)
-    if activated:
+    settled = os.path.lexists(standby/'submission-settled.json')
+    if activated and settled:
         manifest.bind(batch_id, config, job_id)
         return job_terminal.capture(config, job_id, output, runner_directory=runner,
             completion_path=completion_path, baseline_path=baseline_path, client=client)
     if completion_path is not None:
-        raise ValueError('unactivated attempt cannot consume completion evidence')
+        raise ValueError('unactivated or unsettled attempt cannot consume completion evidence')
     preparation.capture(config, job_id, output, runner_directory=runner,
         preparation_directory=Path(opened['owner_spec_path']).parent,
-        baseline_path=baseline_path, client=client)
+        baseline_path=baseline_path, client=client, partial_activation=activated)
     return attempt_terminal.capture(directory, batch_id, config, job_id,
                                     Path(output)/'preparation-cleanup.json')
 

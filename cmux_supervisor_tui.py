@@ -30,6 +30,8 @@ import ccc_batch_timing as batch_timing
 
 
 SOURCE_LABELS = {
+    "claude_auto": "Claude自动",
+    "pane_follow": "同窗跟随",
     "untracked": "未登记",
     "explicit": "单路",
     "workspace_rule": "整池",
@@ -470,7 +472,7 @@ def is_idling(candidate: Candidate) -> bool:
         return True
     if candidate.paused or candidate.source == "workspace_excluded":
         return False
-    return candidate.agent_kind != "codex"
+    return candidate.agent_kind not in {"codex", "claude"}
 
 
 def program_label(candidate: Candidate) -> str:
@@ -492,9 +494,9 @@ def watch_kind(candidate: Candidate) -> str:
         return "excluded"
     if candidate.source in {"workspace_rule", "workspace_non_codex"}:
         return "pool_idling" if is_idling(candidate) else "pool"
-    if candidate.source == "explicit" and candidate.paused:
+    if candidate.source in SINGLE_SOURCES and candidate.paused:
         return "paused"
-    if candidate.source == "explicit":
+    if candidate.source in SINGLE_SOURCES:
         return "idling" if is_idling(candidate) else "watching"
     return "untracked"
 
@@ -2372,7 +2374,8 @@ def session_detail(candidate: Candidate) -> str:
     return "，".join(parts)
 
 
-MONITORED_SOURCES = {"explicit", "workspace_rule", "workspace_starting", "workspace_excluded", "workspace_non_codex"}
+SINGLE_SOURCES = {"explicit", "claude_auto", "pane_follow"}
+MONITORED_SOURCES = SINGLE_SOURCES | {"workspace_rule", "workspace_starting", "workspace_excluded", "workspace_non_codex"}
 POOL_SOURCES = {"workspace_rule", "workspace_starting", "workspace_excluded", "workspace_non_codex"}
 
 
@@ -2400,7 +2403,7 @@ def group_counts(candidates: list[Candidate]) -> dict[str, int]:
     idling = sum(1 for item in candidates if is_idling(item))
     return {
         "watching": sum(1 for item in candidates
-                        if item.source == "explicit" and not item.paused and not is_idling(item)),
+                        if item.source in SINGLE_SOURCES and not item.paused and not is_idling(item)),
         "idling": idling,
         "paused": sum(1 for item in candidates
                       if not is_idling(item)
@@ -2621,11 +2624,13 @@ def selected_action_hint(candidate: Candidate | None) -> str:
     """Only the keys that do something to the row under the cursor."""
     if candidate is None:
         return "/ 搜索  ·  f 切换筛选"
+    if candidate.record.get("claude_workspace_excluded"):
+        return f"已取消 {candidate.workspace_ref} 的 Claude 自动发现；w 重新授权整池"
     if candidate.source == "untracked":
         return f"a 只加这一路   w 授权整个 {candidate.workspace_ref}（以后新开的 Codex 也会跟）"
     if candidate.source == "workspace_non_codex":
         return f"u 取消整个 {candidate.workspace_ref} 授权   （这一路发不发由守护器读屏决定）"
-    if candidate.source == "explicit":
+    if candidate.source in SINGLE_SOURCES:
         if candidate.paused:
             if candidate.unreadable_sec > 0:
                 span = compact_duration(candidate.unreadable_sec)
@@ -2735,7 +2740,7 @@ def confirm_prompt(action: str, candidate: Candidate, *, live_codex: int | None 
         count = f"这一池现在有 {live_codex} 个活 Codex。" if live_codex is not None else ""
         return f"确认授权整个 {pool}？{count}之后该池新开的 Codex 也会自动续跑"
     if action == "add":
-        if candidate.agent_kind != "codex":
+        if candidate.agent_kind not in {"codex", "claude"}:
             kind = candidate.process_summary or agent_label(candidate.agent_kind)
             return f"{location} 看起来是 {kind}，不是 Codex。仍要登记这一路 UUID？"
         return f"确认只登记 {location}（{target_name(candidate.record)}）？只有这一路会自动续跑"
@@ -3032,6 +3037,10 @@ class SupervisorModel:
                 for item in self.config.get("targets", [])
                 if item.get("surface_id")
             }
+            # Reuse this refresh's inventory: the display must agree with the
+            # daemon without issuing another fleet RPC or granting input.
+            dynamic_by_id = {t["surface_id"]: t for t in core.discover_all_targets(
+                core.DiscoverySnapshot(self.client, tree=tree, top=top), self.config)}
             rules_by_workspace = {
                 str(rule.get("workspace_id")): rule
                 for rule in self.config.get("workspace_rules", [])
@@ -3042,7 +3051,10 @@ class SupervisorModel:
                 surface_id = record["surface_id"]
                 target = explicit_by_id.get(surface_id)
                 rule = rules_by_workspace.get(str(record.get("workspace_id") or ""))
-                record = {**record, "workspace_authorized": rule is not None}
+                record = {**record, "workspace_authorized": rule is not None or (
+                    self.config.get("claude_auto_discover") and self.config.get("claude_enabled")
+                    and str(record.get("workspace_id")) not in self.config.get("claude_excluded_workspace_ids", [])
+                    and core.surface_process_label(process_by_id, record).get("agent_kind") == "claude")}
                 process_info = core.surface_process_label(process_by_id, record)
                 agent_kind = str(process_info.get("agent_kind") or "unknown")
                 process_summary = str(process_info.get("summary") or "无进程信息")
@@ -3053,14 +3065,30 @@ class SupervisorModel:
                 hold = core.batch_start_hold(rule or {}, surface_id)
                 reason = (rule or {}).get("excluded_surface_reasons", {}).get(surface_id)
                 operator_excluded = surface_id in excluded and not (isinstance(reason, str) and reason.startswith("batch:"))
-                if hold and not operator_excluded and not (target and (target.get("paused") or not target.get("enabled", True))):
+                workspace_excluded = (agent_kind == "claude"
+                    and record.get("workspace_id") in self.config.get("claude_excluded_workspace_ids", [])
+                    and (target is None or target.get("source") in {"claude_auto", "pane_follow"}))
+                record = {**record, "claude_workspace_excluded": workspace_excluded}
+                policy_excluded = (surface_id in self.config.get("discovery_excluded_surface_ids", [])
+                    or workspace_excluded)
+                if policy_excluded:
+                    source = "workspace_excluded"
+                    target = {"paused": True, "paused_reason": (
+                        "已取消整池 Claude 自动发现；w 重新授权" if workspace_excluded else "此路已退出自动发现；r 重新纳入")}
+                elif hold and not operator_excluded and not (target and (target.get("paused") or not target.get("enabled", True))):
                     source = "workspace_starting"
                     target = {"paused": False}
                 elif target is not None:
-                    source = "explicit"
+                    source = target.get("source") if target.get("source") in SINGLE_SOURCES else "explicit"
+                    if not target.get("enabled", True) or (source in {"claude_auto", "pane_follow"}
+                            and not core.dynamic_target_authorized(self.config, target)):
+                        target = {**target, "paused": True, "paused_reason": "发现授权未启用"}
                 elif rule is not None and surface_id in excluded:
                     source = "workspace_excluded"
                     target = {"paused": True}
+                elif surface_id in dynamic_by_id:
+                    target = dynamic_by_id[surface_id]
+                    source = target["source"]
                 elif rule is not None and agent_kind == "codex":
                     source = "workspace_rule"
                     target = {"paused": False}
@@ -3204,7 +3232,7 @@ class SupervisorModel:
             # label only decides whether the waiver flag is attached; it never
             # decides which command runs.
             args = ["track-surface", surface_id, "--name", target_name(candidate.record)]
-            if candidate.agent_kind != "codex":
+            if candidate.agent_kind not in {"codex", "claude"}:
                 # The non-Codex warning was acknowledged in the confirm prompt.
                 args.append("--allow-non-codex")
             self.run_cli(args)
@@ -3224,12 +3252,14 @@ class SupervisorModel:
             else:
                 self.run_cli(["pause", surface_id])
         elif action == "resume":
+            if candidate.record.get("claude_workspace_excluded"):
+                raise RuntimeError("该 workspace 已退出 Claude 自动发现；请按 w 重新授权，单路恢复不会解除整池退出")
             if candidate.source in {"workspace_rule", "workspace_starting", "workspace_excluded"}:
                 self.run_cli(["include", surface_id])
             else:
                 self.run_cli(["resume", surface_id])
         elif action == "remove":
-            if candidate.source != "explicit":
+            if candidate.source not in SINGLE_SOURCES:
                 raise RuntimeError("只有单路登记能用 x 删除")
             self.run_cli(["remove", surface_id])
         elif action == "untrack_workspace":
@@ -5633,7 +5663,7 @@ def _run(stdscr: Any, model: SupervisorModel) -> None:
         if action in {"pause", "resume"} and candidate.source in {"untracked", "workspace_non_codex"}:
             status = "未登记候选不能暂停/恢复；先按 a 加单路，或按 w 授权其 workspace"
             continue
-        if action == "remove" and candidate.source != "explicit":
+        if action == "remove" and candidate.source not in SINGLE_SOURCES:
             if candidate.source == "untracked":
                 status = "未登记目标不用删。要监控请按 a，或按 w 授权整个 workspace"
             else:

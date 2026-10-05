@@ -25,7 +25,7 @@ SURFACE_KEYS = frozenset({
 PARENT_KEYS = frozenset({'CODEX_SESSION_ID', 'CODEX_THREAD_ID',
     'CMUX_CODEX_PID', 'CMUX_CODEX_INVOCATION_ID', 'PWD', 'OLDPWD', '_', 'SHLVL'})
 FIXED_KEYS = frozenset({'TOKIO_WORKER_THREADS', 'CODEX_TUI_RECORD_SESSION',
-                        'CODEX_TUI_SESSION_LOG_PATH'})
+                        'CODEX_TUI_SESSION_LOG_PATH', 'CODEX_CLIENT_THREAD_OBSERVER'})
 
 
 def _serialized(value):
@@ -69,7 +69,9 @@ def compose(environment, surface_environment, *, workspace_id, surface_id, cwd, 
         raise ValueError('absolute native working and event paths required')
     value.update({k: surface[k] for k in SURFACE_KEYS if k in surface})
     value.update(PWD=str(cwd), TOKIO_WORKER_THREADS='2', CODEX_TUI_RECORD_SESSION='1',
-                 CODEX_TUI_SESSION_LOG_PATH=str(tui_log))
+                 CODEX_TUI_SESSION_LOG_PATH=str(tui_log), CODEX_CLIENT_THREAD_OBSERVER='1')
+    # Standby execs the verified native binary directly. Retain the managed
+    # launcher's request observer even when the submitting shell lacks it.
     return _mapping(value)
 
 

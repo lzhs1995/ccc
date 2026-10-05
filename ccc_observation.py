@@ -53,6 +53,10 @@ def transient_observation_error(error: BaseException | str) -> bool:
         "connection aborted", "socket is not connected", "no live cmux socket found",
         "socket closed before reply", "connection closed before reply",
         "socket read error",
+        # Saturation can reject an observation before opening its socket.
+        # Keep polling; this classifier never retries terminal input.
+        "controller admission deadline exceeded before request",
+        "local controller connection deadline exceeded before request",
     ))
 
 

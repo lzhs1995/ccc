@@ -61,6 +61,10 @@ def launch_argv(config_path, job, index):
         '--launch-id', job['slots'][index]['launch_id']])
     # Preserve the selected native skill features, including explicit CLI
     # enable/disable choices. Readiness must observe the actual configuration.
+    # Native's model-availability tooltip persists a display counter to the
+    # user config during startup. A standby must not mutate its pinned sources;
+    # disable that UI prompt locally, without weakening source invalidation.
+    argv.extend(['-c', 'tui.show_tooltips=false'])
     argv.extend(batch.initial_hook_arguments(command))
     return argv  # No positional prompt, resume/fork, naming or probe request.
 

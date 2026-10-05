@@ -84,10 +84,10 @@ class ClaudeObservationEntryTests(unittest.TestCase):
         second = self.root / 'second'
         second.symlink_to(self.binary.name)
         replace = installer.replace_link
-        def failing(path, target):
+        def failing(path, target, **kwargs):
             if path == second:
                 raise OSError('injected replacement failure')
-            replace(path, target)
+            replace(path, target, **kwargs)
         with patch.object(installer, 'replace_link', side_effect=failing), \
                 self.assertRaisesRegex(OSError, 'replacement failure'):
             installer.install(self.package, [self.entry, second], self.journal, apply=True)

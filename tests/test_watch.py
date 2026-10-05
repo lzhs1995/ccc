@@ -2233,7 +2233,7 @@ class WatchTests(unittest.TestCase):
             config_path.write_text(json.dumps(core.default_config()), encoding="utf-8")
             base = ["--config", str(config_path), "track-surface"]
             with mock.patch.object(core, "CmuxClient", return_value=Client()):
-                with self.assertRaisesRegex(RuntimeError, "live codex process"):
+                with self.assertRaisesRegex(RuntimeError, "live Codex or Claude process"):
                     core.cli([*base, "shell-uuid"])
                 with redirect_stdout(io.StringIO()):
                     self.assertEqual(core.cli([*base, "shell-uuid", "--allow-non-codex", "--name", "ws9-p20-s47"]), 0)
@@ -5563,8 +5563,8 @@ class WatchdogEchoAttributionTests(unittest.TestCase):
             # And the surviving anchor is the pre-Enter one, not a later re-stamp.
             self.assertEqual(runtime.claude_last_submit_at, observed["anchor_at"])
 
-    def test_failed_enter_restores_the_previous_anchor(self):
-        # Nothing was submitted, so nothing can echo: a stale anchor would make
+    def test_proven_unsent_enter_restores_the_previous_anchor(self):
+        # Typed evidence proves nothing was submitted: a stale anchor would make
         # the *next* human paste look like our echo and suppress a real rescue.
         with tempfile.TemporaryDirectory() as directory:
             client = FakeClient(
@@ -5582,7 +5582,7 @@ class WatchdogEchoAttributionTests(unittest.TestCase):
             runtime.claude_last_submit_message_hash = "olderhash"
 
             def refuse_enter(workspace_id, surface_id, key):
-                raise CmuxError("send-key refused")
+                raise core.InputNotSentError("send-key refused before write")
 
             client.send_key = refuse_enter
             event = claude_hook_event("e-order-fail", "Stop")
@@ -6516,7 +6516,10 @@ class EnterFailureAccountingTests(unittest.TestCase):
             event = claude_hook_event("e-enter", "Stop")
             sent, detail = daemon._send_claude_event(event, target, runtime, client)
             self.assertFalse(sent)
-            self.assertIn("Enter failed", detail)
+            self.assertIn("Enter withheld or unconfirmed", detail)
+            self.assertTrue(runtime.claude_submit_write_unknown)
+            self.assertFalse(runtime.claude_submit_not_sent)
+            self.assertEqual(runtime.claude_last_submit_event_id, "e-enter")
             self.assertEqual(runtime.send_count, 0)
             self.assertEqual(runtime.last_send_at, 0.0)
             self.assertEqual(runtime.claude_hook_sla_miss_count, 0)

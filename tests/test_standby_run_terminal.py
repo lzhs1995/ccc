@@ -33,6 +33,24 @@ class RunTerminalTests(unittest.TestCase):
         self.assertEqual(result['planned_sessions'], 50)
         self.assertFalse(self.verify()['succeeded'])
 
+    def test_partial_activation_retains_identity_and_is_never_success(self):
+        (self.plan_directory / f'terminal-attempt-{self.batch_id}.json').unlink()
+        activation = dict(workspace_id=self.value['workspace_id'], mode='b',
+            job_id=self.batch_id, boot_id=self.boot,
+            action_id=str(uuid.uuid4()), cohort_id=str(uuid.uuid4()))
+        self.mock_verify.side_effect = lambda *a: {
+            'observation_sha256': subject._sha(self.cleanup.read_bytes()),
+            'finished': self.clock(5), 'activation': activation}
+        terminal = fixtures.TerminalTests.capture(self)
+        self.assertTrue(terminal['activated'])
+        self.assertFalse(terminal['submission_settled'])
+        self.assertEqual(terminal['action_id'], activation['action_id'])
+        result = self.capture()
+        self.assertTrue(result['batches'][0]['activated'])
+        self.assertTrue(result['run_terminal'])
+        self.assertFalse(result['succeeded'])
+        self.assertFalse(self.verify()['succeeded'])
+
     def test_missing_batch_rejected(self):
         self.paths.clear()
         with self.assertRaisesRegex(ValueError, 'every declared'): self.capture()

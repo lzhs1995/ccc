@@ -1,4 +1,4 @@
-"""Settle a registered, unactivated attempt using original cleanup evidence.
+"""Settle a registered incomplete attempt using original cleanup evidence.
 
 No input or process operation is performed. Missing runner admission records
 remain unresolved; absence of a record never establishes resource cleanup.
@@ -61,13 +61,23 @@ def evidence(manifest, batch_id, config_path, job_id, cleanup_path):
         raise ValueError('attempt originals changed')
     invocation.current()
     manifest.current()
-    return dict(version=1, kind='standby_attempt_terminal', run_id=manifest.plan['run_id'],
+    result = dict(version=1, kind='standby_attempt_terminal', run_id=manifest.plan['run_id'],
         plan_sha256=manifest.sha256, batch_id=batch_id, job_id=job_id,
         config_path=str(config_path), attempt_path=str(path), attempt_sha256=_sha(raw),
         cleanup_path=str(cleanup_path), cleanup_sha256=_sha(cleanup_raw),
         runner_intent_sha256=_sha(intent_raw), runner_closed_sha256=_sha(closed_raw),
         outcome=outcome, attempt_terminal=True, job_terminal=False, run_terminal=False,
         cleanup_finished=verified['finished'])
+    activation = verified.get('activation')
+    if activation is not None:
+        if (activation['workspace_id'] != attempt['workspace_id']
+                or activation['mode'] != attempt['mode']
+                or activation['job_id'] != job_id
+                or activation['boot_id'] != manifest.plan['boot_id']):
+            raise ValueError('partial activation differs from registered attempt')
+        result.update(activated=True, submission_settled=False,
+                      action_id=activation['action_id'], cohort_id=activation['cohort_id'])
+    return result
 
 
 def capture(run_directory, batch_id, config_path, job_id, cleanup_path, *, clock=stamp):
