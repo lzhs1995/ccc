@@ -33,12 +33,13 @@ jobs:
         run: |
           python -B scripts/fetch_cmux_test_wrapper.py --output "$RUNNER_TEMP/ccc-test-claude-wrapper"
           echo "CCC_TEST_CLAUDE_WRAPPER=$RUNNER_TEMP/ccc-test-claude-wrapper" >> "$GITHUB_ENV"
-      - name: Secure runner-owned handoff dependencies
+      - name: Secure isolated CI handoff dependencies
         run: |
           python -B - <<'PYTHON'
           import os
           from pathlib import Path
           import stat
+          import subprocess
           import sys
           paths = [Path('tools/claude_observation_resume.py'),
                    Path('tools/prepare_claude_observation_resume.py'),
@@ -47,9 +48,15 @@ jobs:
               before = path.stat()
               print(f'{path}: uid={before.st_uid} mode={stat.S_IMODE(before.st_mode):04o}', flush=True)
               if before.st_mode & 0o022:
-                  if before.st_uid != os.getuid():
+                  mode = stat.S_IMODE(before.st_mode) & ~0o022
+                  if before.st_uid == os.getuid():
+                      path.chmod(mode)
+                  elif (before.st_uid == 0 and path == Path(sys.executable).resolve()
+                        and os.environ.get('GITHUB_ACTIONS') == 'true'):
+                      # setup-python's macOS framework binary is root-owned 0775.
+                      subprocess.run(['sudo', '-n', 'chmod', f'{mode:o}', str(path)], check=True)
+                  else:
                       raise RuntimeError(f'cannot secure non-owned dependency: {path}')
-                  path.chmod(stat.S_IMODE(before.st_mode) & ~0o022)
               assert not path.stat().st_mode & 0o022
           PYTHON
       - name: Full regression suite
