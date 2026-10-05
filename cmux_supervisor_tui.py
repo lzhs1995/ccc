@@ -3103,6 +3103,19 @@ class SupervisorModel:
                 observed_error, observed_reason = runtime_observation(runtime)
                 exclusion = (rule or {}).get("excluded_surface_reasons", {}).get(surface_id, {})
                 exclusion_reason = str(exclusion.get("reason") or "") if isinstance(exclusion, Mapping) else ""
+                pause_detail = runtime.get("paused_reason")
+                # Historical automatic anchor exclusions can outlive inclusion
+                # in state.json. Show the new observation only after monitoring
+                # has resumed; retain all real pauses and provider wait reasons.
+                if (pause_detail == "incompatible: native live frame did not confirm screen anchoring"
+                        and source == "workspace_rule" and rule and rule.get("enabled", True)
+                        and not rule.get("paused") and not self.config.get("global_paused")
+                        and target and not target.get("paused")
+                        and surface_id not in excluded and not exclusion_reason
+                        and not (target or {}).get("paused_reason")
+                        and runtime.get("observed_state") in {"working", "queued_followup", "recoverable_error", "idle"}
+                        and runtime.get("observed_at") and observed_reason):
+                    pause_detail = None
                 rows.append(Candidate(
                     record=record,
                     source=source,
@@ -3111,7 +3124,7 @@ class SupervisorModel:
                     send_count=int(runtime.get("send_count") or 0),
                     paused=bool(target and target.get("paused")),
                     selected_hint=surface_id in {self.suggested_surface, str(self.suggested_surface)},
-                    status_detail=str(runtime.get("paused_reason") or (target or {}).get("paused_reason") or exclusion_reason or observed_reason),
+                    status_detail=str(pause_detail or (target or {}).get("paused_reason") or exclusion_reason or observed_reason),
                     agent_kind=agent_kind,
                     process_summary=process_summary,
                     **continuation_fields(
