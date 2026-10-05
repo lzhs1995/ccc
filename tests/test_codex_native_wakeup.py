@@ -28,6 +28,25 @@ class NativeWakeupTests(unittest.TestCase):
         self.woken.append((sid, wid))
         return True
 
+    def test_cadence_survives_lifecycle_publication_during_iteration(self):
+        class PublicationDuringIteration(dict):
+            def items(self):
+                iterator = iter(super().items())
+                first = next(iterator)
+                # Deterministically reproduce a scanner publication after
+                # the scheduler has opened its iterator.
+                self[("new-surface", "workspace", "new-session")] = "task_started"
+                yield first
+                yield from iterator
+
+        target = {"surface_id": "surface", "workspace_id": "workspace"}
+        self.watcher.lifecycle = PublicationDuringIteration({
+            ("surface", "workspace", "session"): "task_complete"})
+        self.watcher.coverage[("surface", "workspace")] = self.watcher.clock()
+        self.assertEqual(self.watcher.observation_interval(target, 1), 10)
+        self.watcher.lifecycle[("surface", "workspace", "session")] = "task_started"
+        self.assertEqual(self.watcher.observation_interval(target, 1), 1)
+
     def event(self, kind="task_complete", turn="turn", error=True):
         with self.path.open("a") as handle:
             handle.write(json.dumps({"type": "event_msg", "timestamp": "2026-09-22T10:00:00Z",

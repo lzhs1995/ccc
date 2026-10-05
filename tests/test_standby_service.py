@@ -218,13 +218,47 @@ class ServiceTests(unittest.TestCase):
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 future = pool.submit(self.owner._poll_preparation, 49)
+                deadline = time.monotonic() + 2
+                with self.owner._preparation_condition:
+                    while not self.owner._preparation_waiters:
+                        self.assertLess(time.monotonic(), deadline)
+                        self.owner._preparation_condition.wait(.01)
                 self.owner._cancel.set()
                 with self.assertRaisesRegex(ValueError, 'cancelled'):
                     future.result(timeout=1)
             self.assertEqual(self.activation.preparation.polled, [])
+            self.assertFalse(self.owner._preparation_waiters)
         finally:
             for _ in range(8):
                 self.owner._preparation_reads.release()
+
+    def test_preparation_waiters_take_capacity_in_arrival_order(self):
+        for _ in range(8):
+            self.owner._preparation_reads.acquire()
+        seen = []
+        self.activation.preparation.poll = lambda index: seen.append(index)
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+        futures = []
+        try:
+            for index in (47, 3, 28, 0):
+                futures.append(pool.submit(self.owner._poll_preparation, index))
+                deadline = time.monotonic() + 2
+                with self.owner._preparation_condition:
+                    while len(self.owner._preparation_waiters) < len(futures):
+                        self.assertLess(time.monotonic(), deadline)
+                        self.owner._preparation_condition.wait(.01)
+            # Exactly one permit keeps completion order observable; each
+            # reader returns it for the oldest still-waiting original.
+            self.owner._preparation_reads.release()
+            for future in futures:
+                future.result(timeout=2)
+            self.assertEqual(seen, [47, 3, 28, 0])
+            self.assertFalse(self.owner._preparation_waiters)
+        finally:
+            self.owner._cancel.set()
+            for _ in range(7):
+                self.owner._preparation_reads.release()
+            pool.shutdown(wait=True)
 
     def test_route_commit_follows_durable_timing_before_any_send(self):
         sequence = []

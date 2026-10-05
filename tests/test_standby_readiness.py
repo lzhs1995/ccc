@@ -117,6 +117,17 @@ class RefreshBarrierTests(unittest.TestCase):
         self.assertFalse(self.barrier.intent.exists())
         self.assertFalse(self.writes)
 
+    def test_timeout_reports_original_slot_and_exhausted_budget(self):
+        for kind in ('return', 'observation', 'attempt'):
+            with self.subTest(kind=kind):
+                for field in ('return', 'observation', 'attempt'):
+                    setattr(self.barrier, '_' + field + '_deadline',
+                            self.clock if field == kind else None)
+                with self.assertRaisesRegex(TimeoutError,
+                        f'index={self.barrier._index} deadline_kind={kind}'):
+                    self.barrier._check_observation_deadline()
+                self.assertFalse(self.writes)
+
     def test_complete_identity_ends_outage_before_second_pending(self):
         unavailable = self.unavailable_files()
         self.barrier.inspect = unavailable

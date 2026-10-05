@@ -96,7 +96,14 @@ def native_binary(*, entrypoint=None, metadata=None):
             binary = root / 'bin/codex'
             expected = ('#!/bin/sh\nexport CODEX_CLIENT_THREAD_OBSERVER=1\nexec '
                         + shlex.quote(str(binary)) + ' "$@"\n').encode()
-            if read_small(candidate) != expected or binary.resolve(strict=True) != binary:
+            # The packaged installer uses double quotes; accept that exact
+            # shell-safe spelling as well, without evaluating arbitrary shell.
+            double_path = str(binary)
+            for special in ('\\', '"', '$', '`'):
+                double_path = double_path.replace(special, '\\' + special)
+            double_expected = ('#!/bin/sh\nexport CODEX_CLIENT_THREAD_OBSERVER=1\nexec "'
+                               + double_path + '" "$@"\n').encode()
+            if read_small(candidate) not in (expected, double_expected) or binary.resolve(strict=True) != binary:
                 raise ValueError(error)
             candidate = binary
             with candidate.open('rb') as stream:

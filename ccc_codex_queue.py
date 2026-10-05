@@ -578,7 +578,11 @@ class NativeCompletionWatcher:
         identity = (str(target["surface_id"]), str(target["workspace_id"]))
         # Live retries are painted before task_complete. A covered transcript
         # cannot replace fast viewport reads while a turn is active or aborted.
-        kinds = [kind for key, kind in self.lifecycle.items() if key[:2] == identity]
+        # The native scanner publishes on another thread. Iterate an owned
+        # snapshot so publication cannot invalidate the scheduler's iterator.
+        # This is a cadence hint only; actual sends still revalidate evidence.
+        lifecycle = self.lifecycle.copy()
+        kinds = [kind for key, kind in lifecycle.items() if key[:2] == identity]
         if not kinds or any(kind != "task_complete" for kind in kinds):
             return fallback
         checked = self.coverage.get(identity)

@@ -158,12 +158,19 @@ class StandbyRefreshBarrier:
         return grid
 
     def _check_observation_deadline(self):
-        if self._return_deadline is not None and self._now() >= self._return_deadline:
-            raise TimeoutError('acknowledged preparation control did not return within 30 seconds')
-        deadlines = [d for d in (self._observation_deadline, self._attempt_deadline)
-                     if d is not None]
-        if deadlines and self._now() >= min(deadlines):
-            raise TimeoutError('original vnode observation unavailable for 30 seconds')
+        now = self._now()
+        # Keep the exhausted budget and original slot in the propagated error:
+        # the service records this error before tearing down its endpoint.
+        for kind, deadline, message in (
+                ('return', self._return_deadline,
+                 'acknowledged preparation control did not return within 30 seconds'),
+                ('observation', self._observation_deadline,
+                 'original vnode observation unavailable for 30 seconds'),
+                ('attempt', self._attempt_deadline,
+                 'preparation operation exceeded 30 seconds')):
+            if deadline is not None and now >= deadline:
+                raise TimeoutError(f'{message}; index={self._index} deadline_kind={kind} '
+                                   f'deadline={deadline:.6f} observed={now:.6f}')
 
     def _inspect(self, *, before_write=False, pending_for_activation=False, **callbacks):
         if not self._consumed or self._ack or before_write:
@@ -186,7 +193,7 @@ class StandbyRefreshBarrier:
             if self._observation_deadline is None:
                 self._observation_deadline = now + 30.0
             if now >= self._observation_deadline:
-                raise TimeoutError('original vnode observation unavailable for 30 seconds')
+                self._check_observation_deadline()
             if pending_for_activation:
                 # The outer activation owner must rebuild its proof/final
                 # callbacks too. A second FD read may fail after the first

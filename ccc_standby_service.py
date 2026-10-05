@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import copy
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 import hashlib
 import json
@@ -70,6 +71,8 @@ class CohortService:
         # readers prolong each snapshot while startup opens/closes files.
         # Bound preparation reads only; launch and activation retain COUNT.
         self._preparation_reads = threading.BoundedSemaphore(8)
+        self._preparation_waiters = deque()
+        self._preparation_condition = threading.Condition()
         self._started = False
         self._origin = self._action = self._action_guard = None
         self._future = None
@@ -107,13 +110,33 @@ class CohortService:
 
     def _poll_preparation(self, index):
         self._require_live()
-        while not self._preparation_reads.acquire(timeout=.05):
-            self._require_live()
+        ticket = object()
+        acquired = False
+        with self._preparation_condition:
+            self._preparation_waiters.append(ticket)
+        try:
+            while True:
+                self._require_live()
+                with self._preparation_condition:
+                    if (self._preparation_waiters[0] is ticket
+                            and self._preparation_reads.acquire(blocking=False)):
+                        acquired = True
+                        self._preparation_waiters.popleft()
+                        self._preparation_condition.notify_all()
+                        break
+                    self._preparation_condition.wait(.05)
+        finally:
+            if not acquired:
+                with self._preparation_condition:
+                    self._preparation_waiters.remove(ticket)
+                    self._preparation_condition.notify_all()
         try:
             self._require_live()
             return self.preparation.poll(index)
         finally:
-            self._preparation_reads.release()
+            with self._preparation_condition:
+                self._preparation_reads.release()
+                self._preparation_condition.notify_all()
 
     def status(self):
         with self._lock:

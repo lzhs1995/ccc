@@ -122,6 +122,26 @@ class DirectBatchTests(unittest.TestCase):
 
 
 class DisabledLauncherTests(unittest.TestCase):
+    def test_managed_double_quote_entry_and_injection_rejection(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve() / 'package space'
+            (root / 'bin').mkdir(parents=True)
+            binary = root / 'bin/codex'
+            binary.write_bytes(b'\x7fELFfixture')
+            binary.chmod(0o700)
+            (root / 'codex-package.json').write_text(json.dumps(
+                {'layoutVersion': 1, 'variant': 'codex', 'entrypoint': 'bin/codex'}))
+            entry = root / 'managed-codex'
+            valid = '#!/bin/sh\nexport CODEX_CLIENT_THREAD_OBSERVER=1\nexec "' + str(binary) + '" "$@"\n'
+            entry.write_text(valid)
+            self.assertEqual(resolve_native_binary(entrypoint=entry), str(binary))
+            for invalid in (valid + 'echo injected\n', valid.replace(str(binary), '/other/codex'),
+                            valid.replace('exec "', 'exec "$(id)')):
+                entry.write_text(invalid)
+                with self.assertRaises(RuntimeError):
+                    resolve_native_binary(entrypoint=entry)
+
     def test_disabled_launcher_is_transparent_without_migration_or_guard(self):
         with patch.object(guard, 'provenance', side_effect=AssertionError('must not adopt any session')), \
              patch.object(guard, '_arm') as arm, patch.object(guard, 'launch') as launch, \
