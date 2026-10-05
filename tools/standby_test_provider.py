@@ -93,6 +93,7 @@ class _Response(BaseHTTPRequestHandler):
 
     def do_POST(self):
         fixture = self.server.fixture
+        diagnostic = {}
         try:
             if self.path != '/v1/responses' or self.headers.get('Transfer-Encoding'):
                 raise ValueError('unexpected endpoint/framing')
@@ -111,14 +112,26 @@ class _Response(BaseHTTPRequestHandler):
             if len(raw) > 8 * 1024 * 1024:
                 raise ValueError('expanded body exceeds bound')
             body = json.loads(raw)
+            diagnostic['body_sha256'] = hashlib.sha256(raw).hexdigest()
             users = [r for r in body.get('input', []) if r.get('role') == 'user']
             text = '\n'.join(p.get('text', '') for p in users[-1].get('content', [])
                              if p.get('type') == 'input_text') if users else ''
             sid = self.headers.get('thread-id')
+            # Keep attribution without storing request text or authorization.
+            try:
+                diagnostic['session_id'] = str(uuid.UUID(sid))
+            except (ValueError, TypeError, AttributeError):
+                diagnostic['session_id'] = None
             with fixture.lock:
                 transcript = fixture.sessions.get(sid)
-                if transcript is None or text != fixture.prompt:
-                    raise ValueError('unbound session or unexpected prompt')
+                diagnostic.update(session_bound=transcript is not None,
+                                  prompt_matches=text == fixture.prompt)
+                if transcript is None:
+                    diagnostic['refusal_reason'] = 'unbound_session'
+                    raise ValueError('unbound session')
+                if text != fixture.prompt:
+                    diagnostic['refusal_reason'] = 'unexpected_prompt'
+                    raise ValueError('unexpected prompt')
                 fixture.counts[sid] += 1
                 if fixture.counts[sid] > 128:
                     raise ValueError('per-session request budget exhausted')
@@ -158,7 +171,7 @@ class _Response(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
         except Exception as exc:
-            fixture.record(error=type(exc).__name__+': '+str(exc))
+            fixture.record(error=type(exc).__name__+': '+str(exc), **diagnostic)
             self.send_error(400, 'fixture refused request')
 
 

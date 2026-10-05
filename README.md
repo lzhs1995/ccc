@@ -7,6 +7,7 @@ CCC is a macOS command-line toolkit for Claude Code and Codex operations:
 - `ccc_session_audit.py` prints audit summaries without changing sessions.
 - `janitor/src/` contains the quarantine-first cmux cleanup worker and guard.
 - `ccp_new.py` manages profiles interactively; credentials remain in a user-selected directory.
+- The `api-key` column shows verified recent-request credentials for each session; see [request Key states and client upgrades](docs/request-api-key.md).
 - `bin/cmux-stack` projects component status without merging the execution processes.
 - `ccc network` shares optional AnyRouter reachability checks and route failover across sessions. An explicit manual-failover policy can transfer a failed manual choice to a newly checked automatic route while retaining healthy manual choices; see [network guard setup](docs/network-guard.md).
 

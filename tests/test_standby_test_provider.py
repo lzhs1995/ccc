@@ -156,12 +156,27 @@ class ProviderTests(unittest.TestCase):
             self.assertEqual(len(client.sent), 1)
             event('task_started', turn_id='second')
             self.assertIn(b'response.completed', request()[1])
-            self.assertEqual(request(str(uuid.uuid4()))[0], 400)
+            foreign_sid = str(uuid.uuid4())
+            self.assertEqual(request(foreign_sid)[0], 400)
             self.assertEqual(request(prompt='other')[0], 400)
             with self.assertRaises(ValueError):
                 provider.bind(sid, transcript)
             rows = [json.loads(line) for line in (provider.directory/'requests.jsonl').read_text().splitlines()]
             self.assertEqual(len([row for row in rows if row.get('recovered_turn') == 'second']), 1)
+            refused = [row for row in rows if row.get('error')]
+            self.assertEqual(len(refused), 2)
+            self.assertEqual(
+                [(r['session_id'], r['refusal_reason'], r['session_bound'],
+                  r['prompt_matches']) for r in refused],
+                [(foreign_sid, 'unbound_session', False, True),
+                 (sid, 'unexpected_prompt', True, False)])
+            import hashlib
+            for row, prompt in zip(refused, ('Reply OK', 'other')):
+                raw = json.dumps(dict(input=[dict(role='user', content=[
+                    dict(type='input_text', text=prompt)])])).encode()
+                self.assertEqual(row['body_sha256'], hashlib.sha256(raw).hexdigest())
+                self.assertNotIn('authorization', row)
+                self.assertNotIn('body', row)
 
 
 if __name__ == '__main__':

@@ -51,6 +51,77 @@ class PTYTests(unittest.TestCase):
         self.assertEqual([r['key'] for r in rows if r['kind']=='input_intent'], ['b','y','q'])
         self.assertIn(b'bound workspace', (self.root/'ui/output.bin').read_bytes())
 
+    @unittest.skipUnless(sys.platform == 'darwin', 'Darwin process generation')
+    def test_resource_identity_is_original_real_child(self):
+        from ccc_guard_scope import birth
+        row = self.ui.resource_identity()
+        self.assertEqual(row, dict(pid=self.ui.child.pid, birth=birth(self.ui.child.pid)))
+        row['birth'][0] = 0
+        self.assertGreater(self.ui.resource_identity()['birth'][0], 0)
+
+    def test_resource_identity_never_rebases_missing_startup(self):
+        self.ui._resource_birth = None
+        with self.assertRaisesRegex(ValueError, 'original live'):
+            self.ui.resource_identity()
+
+    def test_resource_identity_rejects_generation_drift(self):
+        self.ui._resource_birth = [123, 456]
+        with patch('ccc_guard_scope.birth', return_value=[124, 456]):
+            with self.assertRaisesRegex(ValueError, 'original live'):
+                self.ui.resource_identity()
+
+    def test_resource_identity_rejects_replaced_child_handle(self):
+        original = self.ui.child
+        try:
+            self.ui.child = object()
+            with self.assertRaisesRegex(ValueError, 'original live'):
+                self.ui.resource_identity()
+        finally:
+            self.ui.child = original
+
+    def test_resource_identity_rejects_exit_during_read(self):
+        self.ui._resource_birth = [123, 456]
+        def exited(pid):
+            self.ui.child.kill()
+            self.ui.child.wait(timeout=5)
+            return [123, 456]
+        with patch('ccc_guard_scope.birth', side_effect=exited):
+            with self.assertRaisesRegex(ValueError, 'original live'):
+                self.ui.resource_identity()
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'Darwin resource observation')
+    def test_real_ui_auxiliary_rss_and_descriptors(self):
+        from ccc_guard_scope import birth
+        from tools.standby_resource_sample import capture
+        # The caller stands in for one native row; no Codex session is started.
+        # The UI itself is a real private PTY child, sampled through production
+        # ps/libproc readers rather than a synthetic PID/RSS fixture.
+        caller = dict(pid=os.getpid(), birth=birth(os.getpid()))
+        ui = self.ui.resource_identity()
+        result = capture([caller], self.root.resolve(), expected_count=1,
+                         auxiliaries=[ui])
+        row, = [r for r in result['processes'] if r['role'] == 'auxiliary']
+        self.assertEqual(row['pid'], ui['pid'])
+        self.assertEqual(row['birth'], ui['birth'])
+        self.assertGreater(row['rss_bytes'], 0)
+        self.assertGreaterEqual(row['fd_count'], 3)
+        self.assertEqual(result['auxiliary_process_count'], 1)
+        self.assertFalse(result['full_500_acceptance'])
+        self.assertFalse(result['peak_usage_proven'])
+        self.assertEqual(self.ui.resource_identity(), ui)
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'Darwin resource observation')
+    def test_ui_exits_after_binding_before_collector(self):
+        from ccc_guard_scope import birth
+        from tools.standby_resource_sample import capture
+        caller = dict(pid=os.getpid(), birth=birth(os.getpid()))
+        ui = self.ui.resource_identity()
+        self.ui.child.kill()
+        self.ui.child.wait(timeout=5)
+        with self.assertRaisesRegex(ValueError, 'generation changed'):
+            capture([caller], self.root.resolve(), expected_count=1,
+                    auxiliaries=[ui])
+
     def test_high_descriptor_pty_input_and_drain(self):
         high = fcntl.fcntl(self.ui.master, fcntl.F_DUPFD, 2048)
         os.close(self.ui.master)

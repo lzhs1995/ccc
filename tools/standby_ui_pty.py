@@ -66,6 +66,9 @@ class SupervisorPTY:
             self.child = subprocess.Popen(command, stdin=slave, stdout=slave, stderr=slave,
                 cwd=Path(__file__).resolve().parents[1],
                 env={**os.environ, 'TERM': 'xterm-256color'}, start_new_session=True)
+            self._original_child = self.child
+            from ccc_guard_scope import birth
+            self._resource_birth = birth(self.child.pid)
         except BaseException:
             os.close(self.master)
             self.output.close()
@@ -79,6 +82,25 @@ class SupervisorPTY:
             monotonic_ns=time.monotonic_ns(), **fields))+'\n')
         self.events.flush()
         os.fsync(self.events.fileno())
+
+    def resource_identity(self):
+        """Return the original live UI generation for fleet resource sampling.
+
+        Missing native inspection never turns into a new baseline. The retained
+        Popen handle and its startup generation must both still match. This is
+        a sequential observation; the resource collector must recheck birth.
+        """
+        from ccc_guard_scope import birth
+        child = self._original_child
+        generation = self._resource_birth
+        if (self.child is not child or child.poll() is not None
+                or not isinstance(generation, list) or len(generation) != 2
+                or any(type(x) is not int for x in generation)
+                or generation[0] <= 0 or not 0 <= generation[1] < 1000000
+                or birth(child.pid) != generation
+                or child.poll() is not None or self.child is not child):
+            raise ValueError('original live Supervisor generation required')
+        return dict(pid=child.pid, birth=list(generation))
 
     def poll(self, timeout=0):
         """Drain output without input. Timeout never implies child termination."""
