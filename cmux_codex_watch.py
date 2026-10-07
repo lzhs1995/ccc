@@ -1967,11 +1967,34 @@ def _claude_last_content_lines(
 
 
 def _claude_report_ready_task(lines, prompt_row, claude_message=CLAUDE_MESSAGE):
-    collected = _claude_last_content_lines(lines, prompt_row, claude_message, limit=32)
-    text = "\n".join(reversed(collected)).strip()
-    # Claude's response bullet is presentation, not part of the declaration.
-    if text.startswith("⏺"):
-        text = text[1:].lstrip()
+    # Keep the latest reply together, including fences and intervening blank
+    # lines. Searching only the last paragraph loses both prose-final reports
+    # and the code fence that makes a quoted declaration ineligible.
+    start = 0
+    for row in range(min(prompt_row, len(lines))):
+        if CLAUDE_PROMPT_RE.match(lines[row].strip()):
+            start = row + 1
+    reply = list(lines[start:prompt_row])
+    while reply and _claude_is_chrome_line(reply[-1]):
+        reply.pop()
+    # Recaps are UI text after the stopped-turn timer, not assistant output.
+    # Require the whole known wrapper; unknown trailing content still vetoes
+    # closeout. A declaration mentioned only inside a recap never qualifies.
+    if reply and reply[-1].rstrip().endswith('(disable recaps in /config)'):
+        for row in range(len(reply) - 1, -1, -1):
+            if reply[row].strip().startswith('※ recap:'):
+                before = row - 1
+                while before >= 0 and not reply[before].strip():
+                    before -= 1
+                if before >= 0 and CLAUDE_COMPLETED_RE.search(reply[before].strip()):
+                    reply = reply[:before]
+                break
+    while reply and _claude_is_chrome_line(reply[-1]):
+        reply.pop()
+    # Claude's response bullet is presentation. Retain other indentation so
+    # indented code does not become a declaration just because it is first.
+    text = "\n".join(line[1:].lstrip() if line.startswith('⏺') else line
+                     for line in reply)
     return report_ready_task(text)
 
 

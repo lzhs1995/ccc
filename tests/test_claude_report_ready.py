@@ -79,6 +79,21 @@ class ReportReadyTests(unittest.TestCase):
         self.assertNotIn('report_ready_task_id', event)
         self.assertEqual(event['error_kind'], 'claude_429')
 
+    def test_protocol_accepts_final_declaration_after_explanation(self):
+        for separator in ['\n', '\n\n']:
+            message = 'Report frozen; callback remains unconfirmed.' + separator + REPORT
+            self.assertEqual(protocol.report_ready_task(message), TASK)
+            event = protocol.build_event({'hook_event_name': 'Stop',
+                                          'last_assistant_message': message})
+            self.assertEqual(event['report_ready_task_id'], TASK)
+            self.assertFalse(event['completed'])
+
+    def test_final_declaration_must_be_outside_code_or_quote(self):
+        for prefix in ['```text\n\n', '~~~~\n\n', '> ', '    ', '\t']:
+            with self.subTest(prefix=prefix):
+                self.assertIsNone(protocol.report_ready_task('Explanation\n' + prefix + REPORT))
+        self.assertEqual(protocol.report_ready_task('```\nexample\n```\n' + REPORT), TASK)
+
     def test_hook_latches_report_pending_not_delivered(self):
         self.handle(self.event())
         self.assertTrue(self.runtime.claude_completed_latched)
@@ -200,6 +215,36 @@ class ReportReadyTests(unittest.TestCase):
             with self.subTest(lines=lines):
                 grid = core.Grid.from_rpc(claude_grid_payload(lines=lines, completed=True), 'surface-uuid')
                 self.assertEqual(core.classify_claude_grid(grid).kind, 'claude_stopped')
+
+    def test_final_report_with_rendered_recap_blocks_legacy_send(self):
+        lines = ['⏺ Report frozen. Waiting for the original callback.', '']
+        lines += wrapped(REPORT)
+        lines += ['', '✻ Churned for 4m 53s', '',
+                  '※ recap: Review complete; receipt still pending.',
+                  '  Wait for reconciliation. (disable recaps in /config)']
+        self.client.payload = claude_grid_payload(lines=lines, completed=False)
+        self.client.text = '\n'.join(lines) + '\n' + claude_idle_screen()
+        state = core.classify_claude_grid(core.Grid.from_rpc(self.client.payload, 'surface-uuid'))
+        self.assertEqual(state.kind, 'claude_report_ready')
+        with mock.patch.object(core, 'CLAUDE_EVENT_PREFLIGHT_SETTLE_SEC', 0):
+            self.handle(self.event('legacy-recap-stop', report_ready_task_id=None))
+        self.assert_no_input()
+
+    def test_recap_cannot_supply_report_or_hide_new_body_or_prompt(self):
+        recap = ['※ recap: Review complete. (disable recaps in /config)']
+        for lines in [
+            ['Unfinished', '✻ Worked for 1s'] + wrapped('※ recap: ' + REPORT + ' (disable recaps in /config)'),
+            wrapped(REPORT) + ['', 'New work pending', '✻ Worked for 1s'] + recap,
+            wrapped(REPORT) + ['', '❯ new human task', '✻ Worked for 1s'] + recap,
+            wrapped(REPORT) + ['', '※ recap: Unrecognized body without timing or terminator'],
+            ['```text', ''] + wrapped(REPORT),
+            ['~~~~', ''] + wrapped(REPORT),
+            ['Thought for 2s', '', '⏺ ```text', ''] + wrapped(REPORT),
+            ['    ' + line for line in wrapped(REPORT)],
+        ]:
+            with self.subTest(lines=lines):
+                grid = core.Grid.from_rpc(claude_grid_payload(lines=lines, completed=False), 'surface-uuid')
+                self.assertNotEqual(core.classify_claude_grid(grid).kind, 'claude_report_ready')
 
     def test_spinner_draft_menu_and_retry_have_priority_over_report(self):
         for kwargs, expected in [({'spinner': '✶ Thinking… (3s · ↓ 15 tokens)'}, 'working'),

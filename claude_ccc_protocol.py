@@ -47,7 +47,26 @@ def report_ready_task(value: str) -> str | None:
     This is a stop request, not proof of delivery or supervisor acceptance.
     Removing whitespace also accepts terminal wraps inside a task ID or path.
     """
-    compact = re.sub(r"\s+", "", value or "")
+    lines = (value or "").splitlines()
+    candidate = None
+    fence = None
+    for index, line in enumerate(lines):
+        stripped = line.lstrip()
+        marker = re.match(r"(`{3,}|~{3,})", stripped)
+        if marker:
+            token = marker.group(1)
+            if fence is None:
+                fence = token
+            elif token[0] == fence[0] and len(token) >= len(fence) and not stripped[len(token):].strip():
+                fence = None
+        # Only a declaration on its own line outside quoted/code content can
+        # close the reply. Earlier explanation is allowed; later prose is not.
+        if (fence is None and not line.startswith(('    ', '\t'))
+                and stripped.startswith('STATUS:')):
+            candidate = index
+    if candidate is None:
+        return None
+    compact = re.sub(r"\s+", "", "\n".join(lines[candidate:]))
     match = re.fullmatch(
         r"STATUS:REPORT_READYTASK_ID=([A-Za-z0-9][A-Za-z0-9._:-]{0,159})"
         r"CALLBACK_UNCONFIRMEDREPORT=(/[^\x00-\x1f]+)"
