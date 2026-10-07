@@ -41,6 +41,21 @@ def completion_reported(value: str) -> bool:
     return _compact(value).lower().endswith(COMPLETION_SUFFIX)
 
 
+def report_ready_task(value: str) -> str | None:
+    """Recognize the complete closeout declaration, never a quoted mention.
+
+    This is a stop request, not proof of delivery or supervisor acceptance.
+    Removing whitespace also accepts terminal wraps inside a task ID or path.
+    """
+    compact = re.sub(r"\s+", "", value or "")
+    match = re.fullmatch(
+        r"STATUS:REPORT_READYTASK_ID=([A-Za-z0-9][A-Za-z0-9._:-]{0,159})"
+        r"CALLBACK_UNCONFIRMEDREPORT=(/[^\x00-\x1f]+)"
+        r"supervisor_reconciliation_required", compact,
+    )
+    return match.group(1) if match else None
+
+
 def configured_claude_message(path: Path = CONFIG_PATH) -> str:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -95,6 +110,7 @@ def build_event(payload: Mapping[str, Any], environ: Mapping[str, str] | None = 
         event["prompt_kind"] = prompt_kind(prompt, configured_claude_message())
     elif event_name == "Stop":
         event["completed"] = completion_reported(assistant_message)
+        event["report_ready_task_id"] = report_ready_task(assistant_message)
         event["stop_hook_active"] = bool(payload.get("stop_hook_active"))
     else:
         event["completed"] = completion_reported(assistant_message)
