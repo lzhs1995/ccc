@@ -28,6 +28,10 @@ from ccc_standby_inventory import ProcessInventoryReader
 from ccc_standby_environment import template, signature
 
 
+class LifetimeUnavailable(ValueError):
+    """A live guard refused work, distinct from a read or persistence error."""
+
+
 class InventoryReader:
     """Bound complete FD reads without holding capacity during UI/RPC waits.
 
@@ -47,7 +51,7 @@ class InventoryReader:
 
     def _live(self):
         if self.allowed() is not True:
-            raise ValueError('inventory reader owner cancelled or closed')
+            raise LifetimeUnavailable('inventory reader owner cancelled or closed')
 
     def _head(self):
         if not self.waiters:

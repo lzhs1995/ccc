@@ -14,6 +14,7 @@ import uuid
 
 import cmux_codex_watch as core
 import ccc_standby_service as service
+from ccc_standby_prepare import InventoryReader, LifetimeUnavailable
 
 
 class Client:
@@ -403,6 +404,103 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(calls, [0])
         self.assertEqual(self.timing.finishes[-1]['outcome'], 'cancelled')
         self.assertEqual(self.owner.status()['first_tasks_confirmed'], 0)
+
+    def _cancel_inventory_observation(self, *, queued=False, read_error=False):
+        entered, release = threading.Event(), threading.Event()
+        reads = []
+        self.owner.observation_timeout = 5
+        def read(index):
+            reads.append(index)
+            entered.set()
+            if not release.wait(3):
+                raise TimeoutError('test inventory not released')
+            if read_error:
+                raise OSError('original inventory failed during cancellation')
+            return {'first_task': index}
+        reader = InventoryReader(read, self.owner._allowed, limit=1)
+        self.observer.poll = lambda index, **kw: reader(index)
+        with patch.object(service, 'COUNT', 2 if queued else 1), patch.object(
+                self.manager, 'invalidate', wraps=self.manager.invalidate) as invalidations:
+            worker = threading.Thread(target=self.owner._observe, args=(self.observer, self.timing))
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(2))
+                if queued:
+                    deadline = time.monotonic() + 2
+                    while True:
+                        with reader.condition:
+                            if len(reader.waiters) == 1:
+                                break
+                        if time.monotonic() >= deadline:
+                            self.fail('second observation never queued')
+                        time.sleep(.001)
+                self.owner.cancel()
+            finally:
+                release.set()
+                worker.join(3)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(len(reads), 1)
+            self.assertEqual(reader.capacity, 1)
+            self.assertEqual(len(reader.waiters), 0)
+            state = self.owner.status()
+            self.assertEqual(state['state'], 'cancelled')
+            self.assertEqual(state['first_tasks_confirmed'], 0)
+            self.assertEqual(self.manager.writes, 0)
+            if read_error:
+                self.assertIsNone(state['activation_terminal'])
+                self.assertIn('OSError: original inventory failed', state['observation_error'])
+                self.assertEqual(self.timing.finishes, [])
+                self.assertEqual(invalidations.call_count, 2)
+            else:
+                self.assertIsNone(state['observation_error'])
+                self.assertIsNone(state['error'])
+                self.assertEqual(state['activation_terminal']['outcome'], 'cancelled')
+                self.assertEqual(len(self.timing.finishes), 1)
+                self.assertEqual(invalidations.call_count, 1)
+
+    def test_cancel_during_inventory_read_finishes_cancelled(self):
+        self._cancel_inventory_observation()
+
+    def test_cancel_queued_inventory_read_finishes_cancelled(self):
+        self._cancel_inventory_observation(queued=True)
+
+    def test_real_read_error_survives_cancelled_inventory_waiter(self):
+        self._cancel_inventory_observation(queued=True, read_error=True)
+
+    def test_cancel_between_loop_and_live_check_finishes_cancelled(self):
+        require_live = self.owner._require_live
+        def cancel_then_check():
+            self.owner.cancel()
+            require_live()
+        with patch.object(service, 'COUNT', 1), patch.object(
+                self.owner, '_require_live', side_effect=cancel_then_check):
+            self.owner._observe(self.observer, self.timing)
+        self.assertEqual(self.observer.calls, [])
+        self.assertEqual(self.timing.finishes[-1]['outcome'], 'cancelled')
+        self.assertEqual(len(self.timing.finishes), 1)
+        self.assertIsNone(self.owner.status()['observation_error'])
+
+    def test_reader_refusal_with_live_service_remains_failure(self):
+        reader = InventoryReader(lambda: self.fail('refused read ran'), lambda: False)
+        self.observer.poll = lambda *a, **kw: reader()
+        with patch.object(service, 'COUNT', 1):
+            self.owner._observe(self.observer, self.timing)
+        self.assertEqual(self.owner.status()['state'], 'failed')
+        self.assertIn('LifetimeUnavailable', self.owner.status()['observation_error'])
+        self.assertEqual(self.timing.finishes, [])
+
+    def test_cancel_terminal_write_failure_remains_failure(self):
+        def poll(*args, **kwargs):
+            self.owner.cancel()
+            raise LifetimeUnavailable('inventory reader owner cancelled or closed')
+        self.observer.poll = poll
+        with patch.object(service, 'COUNT', 1), patch.object(
+                self.timing, 'finish', side_effect=OSError('cancel terminal disk full')) as finish:
+            self.owner._observe(self.observer, self.timing)
+        self.assertEqual(finish.call_count, 1)
+        self.assertEqual(finish.call_args.kwargs['outcome'], 'cancelled')
+        self.assertIsNone(self.owner.status()['activation_terminal'])
+        self.assertIn('OSError: cancel terminal disk full', self.owner.status()['observation_error'])
 
     def test_first_task_error_revokes_before_unrelated_read_finishes(self):
         entered, release = threading.Event(), threading.Event()

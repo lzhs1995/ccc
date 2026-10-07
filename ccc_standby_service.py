@@ -27,7 +27,7 @@ from ccc_native_standby import COUNT, identifier, write_once
 from ccc_standby_acceptance import FirstTaskObserver
 from ccc_standby_timing import ActivationTiming
 from ccc_standby_bootstrap import _identity, _encode
-from ccc_standby_prepare import FreshTopology
+from ccc_standby_prepare import FreshTopology, LifetimeUnavailable
 from ccc_standby_settlement import settle
 
 LIMIT = 256 * 1024
@@ -100,7 +100,7 @@ class CohortService:
 
     def _require_live(self):
         if not self._allowed():
-            raise ValueError('standby service action cancelled or closed')
+            raise LifetimeUnavailable('standby service action cancelled or closed')
 
     def _poll_preparation(self, index):
         self._require_live()
@@ -262,8 +262,19 @@ class CohortService:
                     # slow or changing inventory must not hold up their next
                     # live check or create a fresh observation budget.
                     while self._allowed() and time.monotonic() < deadline:
-                        self._require_live()
-                        result = observer.poll(index, release=True)
+                        try:
+                            self._require_live()
+                            result = observer.poll(index, release=True)
+                        except LifetimeUnavailable:
+                            # A cancellation can land inside the live check or
+                            # a queued/admitted inventory read. Drain that
+                            # worker normally so finish records cancellation.
+                            # A reader-only refusal with a still-live service
+                            # remains a failure. Never catch arbitrary errors:
+                            # failure handling itself sets the cancel event.
+                            if self._allowed():
+                                raise
+                            return None
                         # A fresh inventory/observation may span the remaining
                         # budget or a revocation. Retain its original evidence,
                         # but never turn a late result into timely confirmation.
