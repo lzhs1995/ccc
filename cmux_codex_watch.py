@@ -72,7 +72,7 @@ RUNTIME_FILES += ("ccc_standby_generation.py", "ccc_standby_manager.py")
 RUNTIME_FILES += ("ccc_client_thread_observation.py", "ccc_request_key_binding.py",
                   "ccc_request_observation_policy.py", "ccc_shared_codex_turn.py")
 RUNTIME_FILES += ("ccc_standby_sources.py", "ccc_standby_rollouts.py", "ccc_standby_readiness.py",
-                  "ccc_standby_bootstrap.py", "ccc_standby_prepare.py", "ccc_standby_activation.py",
+                  "ccc_standby_bootstrap.py", "ccc_standby_prepare.py", "ccc_standby_inventory.py", "ccc_standby_activation.py",
                   "ccc_standby_acceptance.py", "ccc_standby_timing.py",
                   "ccc_standby_service.py", "ccc_standby_entry.py", "ccc_standby_factory.py",
                   "ccc_standby_settlement.py",

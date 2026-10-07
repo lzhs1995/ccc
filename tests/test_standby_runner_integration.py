@@ -109,6 +109,40 @@ class RunnerIntegrationTests(unittest.TestCase):
         self.assertFalse((runtime / 'current').exists())
         self.assertFalse((self.output / 'runner-intent.json').exists())
 
+    def test_staged_preparation_starts_and_reaps_its_inventory_worker(self):
+        source = Path(runner.__file__).resolve().parent
+        runtime = self.root / 'runtime'
+        release = runner.core.stage_runtime_release(source_dir=source, runtime_root=runtime)
+        runner.core.validate_runtime_release(release)
+        # Help and daemon construction do not exercise preparation's lazy imports.
+        # Only staged siblings are available, including to the isolated worker.
+        script = '''
+from pathlib import Path
+import sys
+release = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(release))
+import ccc_standby_prepare as prepare
+import ccc_standby_inventory as inventory
+assert Path(prepare.__file__).parent == release
+assert Path(inventory.__file__).parent == release
+assert prepare.ProcessInventoryReader is inventory.ProcessInventoryReader
+reader = prepare.ProcessInventoryReader()
+child = reader._child
+try:
+    assert child.poll() is None
+finally:
+    reader.close()
+assert child.poll() is not None
+assert child.stdin.closed and child.stdout.closed
+print('staged preparation worker reaped')
+'''
+        result = subprocess.run([sys.executable, '-I', '-S', '-B', '-c', script,
+            str(release)], cwd=self.root, env={}, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), 'staged preparation worker reaped')
+        self.assertFalse((runtime / 'current').exists())
+        self.client.new_codex_surface.assert_not_called()
+
 
 if __name__ == '__main__':
     unittest.main()
