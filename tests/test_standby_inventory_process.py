@@ -23,7 +23,15 @@ class InventoryProcessTests(unittest.TestCase):
         self.root = Path(self.tmp.name).resolve()
         self.children = []
 
-    def fake(self, body, *, timeout=1, handshake=True):
+    def fake(self, body, *, timeout=1, handshake=True, high_fds=False):
+        if high_fds:
+            if os.name != 'posix':
+                self.skipTest('POSIX high pipe descriptors')
+            import fcntl
+            import resource
+            soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+            if soft != resource.RLIM_INFINITY and soft < 2060:
+                self.skipTest('requires existing FD limit >= 2060; never raises it')
         script = self.root / 'worker.py'
         prelude = 'import json, os, sys, time\n'
         if handshake:
@@ -33,6 +41,12 @@ class InventoryProcessTests(unittest.TestCase):
         def spawn(_args, **kwargs):
             child = real([sys.executable, '-I', '-S', '-B', str(script)], **kwargs)
             self.children.append(child)
+            if high_fds:
+                for name, mode in [('stdin', 'wb'), ('stdout', 'rb')]:
+                    stream = getattr(child, name)
+                    fd = fcntl.fcntl(stream.fileno(), fcntl.F_DUPFD_CLOEXEC, 2048)
+                    setattr(child, name, os.fdopen(fd, mode, buffering=0))
+                    stream.close()
             return child
         with patch.object(inventory.subprocess, 'Popen', side_effect=spawn) as launch:
             reader = inventory.ProcessInventoryReader(timeout=timeout)
@@ -270,6 +284,124 @@ _worker(read, sys.stdin.buffer, sys.stdout.buffer)
             with self.assertRaisesRegex(OSError, 'too large'):
                 reader(123)
         self.assertIsNone(reader._child)
+
+
+class InventoryHighFDTests(unittest.TestCase):
+    """Real high-numbered worker pipes without opening thousands of files."""
+    setUp = InventoryProcessTests.setUp
+    fake = InventoryProcessTests.fake
+
+    def worker(self, body, *, handshake=True, timeout=2):
+        reader, launch = self.fake(body, handshake=handshake, timeout=timeout, high_fds=True)
+        self.assertGreaterEqual(reader._child.stdin.fileno(), 2048)
+        self.assertGreaterEqual(reader._child.stdout.fileno(), 2048)
+        return reader, launch
+
+    def assert_reaped(self, reader, child):
+        self.assertIsNone(reader._child)
+        self.assertIsNotNone(child.poll())
+        self.assertTrue(child.stdin.closed and child.stdout.closed)
+
+    def block_writes(self, reader):
+        total = 0
+        while True:
+            try:
+                total += os.write(reader._child.stdin.fileno(), b'x' * 4096)
+            except BlockingIOError:
+                break
+            self.assertLess(total, 16 * 1024 * 1024, 'pipe never blocked')
+        self.assertGreater(total, 0)
+
+    def test_high_fd_handshake_and_fresh_worker_roundtrips(self):
+        root = str(Path(inventory.__file__).resolve().parent)
+        observed = self.root / 'observed'
+        observed.write_text('one')
+        reader, launch = self.worker(f"""sys.path.insert(0, {root!r})
+from pathlib import Path
+from ccc_standby_inventory import _worker
+path = Path({str(observed)!r})
+def read(pid, **kwargs):
+ if not path.exists(): return {{}}
+ info = path.stat()
+ return {{path: {{'device': info.st_dev, 'inode': info.st_ino}}}}
+_worker(read, sys.stdin.buffer, sys.stdout.buffer)
+""", handshake=False)
+        child = reader._child
+        info = observed.stat()
+        self.assertEqual(reader(os.getpid(), identities=True),
+                         {observed: {'device': info.st_dev, 'inode': info.st_ino}})
+        observed.unlink()
+        self.assertEqual(reader(os.getpid(), identities=True), {})
+        self.assertEqual(reader._sequence, 2)
+        self.assertEqual(launch.call_count, 1)
+        reader.close()
+        self.assert_reaped(reader, child)
+
+    def test_high_fd_read_deadline_closes_channel(self):
+        reader, launch = self.worker('time.sleep(10)\n')
+        child = reader._child
+        reader.timeout = .15
+        with self.assertRaisesRegex(TimeoutError, 'deadline elapsed'):
+            reader(123)
+        self.assert_reaped(reader, child)
+        self.assertEqual(launch.call_count, 1)
+        with self.assertRaisesRegex(OSError, 'closed'):
+            reader(123)
+
+    def test_high_fd_blocked_write_deadline_closes_channel(self):
+        reader, launch = self.worker("print(json.dumps({'protocol':1,'ready':os.getpid()}), flush=True)\ntime.sleep(10)\n", handshake=False)
+        child = reader._child
+        self.block_writes(reader)
+        reader.timeout = .15
+        with self.assertRaisesRegex(TimeoutError, 'deadline elapsed'):
+            reader(123)
+        self.assert_reaped(reader, child)
+        self.assertEqual(launch.call_count, 1)
+
+    def cancel_wait(self, *, writing):
+        reader, launch = self.worker("print(json.dumps({'protocol':1,'ready':os.getpid()}), flush=True)\ntime.sleep(10)\n", handshake=False)
+        child = reader._child
+        if writing:
+            self.block_writes(reader)
+        waiting, errors = threading.Event(), []
+        original = reader._wait
+        def wait(stream, deadline, **kwargs):
+            if kwargs.get('writing', False) == writing:
+                waiting.set()
+            return original(stream, deadline, **kwargs)
+        def observe():
+            try:
+                reader(123)
+            except BaseException as exc:
+                errors.append(exc)
+        reader._wait = wait
+        thread = threading.Thread(target=observe)
+        thread.start()
+        self.addCleanup(thread.join, 2)
+        try:
+            self.assertTrue(waiting.wait(1))
+        finally:
+            reader.close()
+            thread.join(1)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], OSError)
+        self.assertIn('closed', str(errors[0]))
+        self.assert_reaped(reader, child)
+        self.assertEqual(launch.call_count, 1)
+
+    def test_high_fd_read_cancellation_reaps_worker(self):
+        self.cancel_wait(writing=False)
+
+    def test_high_fd_write_cancellation_reaps_worker(self):
+        self.cancel_wait(writing=True)
+
+    def test_high_fd_startup_deadline_reaps_worker(self):
+        with self.assertRaisesRegex(TimeoutError, 'deadline elapsed'):
+            self.worker('time.sleep(10)\n', handshake=False, timeout=.3)
+        child = self.children[-1]
+        self.assertIsNotNone(child.poll())
+        self.assertTrue(child.stdin.closed and child.stdout.closed)
 
 
 if __name__ == '__main__':

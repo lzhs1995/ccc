@@ -10,7 +10,7 @@ import json
 import math
 import os
 from pathlib import Path
-import select
+import selectors
 import subprocess
 import sys
 import threading
@@ -64,14 +64,19 @@ class ProcessInventoryReader:
             raise OSError('inventory worker exited')
 
     def _wait(self, stream, deadline, *, writing=False):
-        while True:
-            self._check(deadline)
-            wait = min(.05, max(0.0, deadline - time.monotonic()))
-            readable, writable, _ = select.select(
-                [] if writing else [stream], [stream] if writing else [], [], wait)
-            self._check(deadline)
-            if readable or writable:
-                return
+        self._check(deadline)
+        # Source watchers can put these pipes above select()'s FD_SETSIZE.
+        # kqueue/epoll handle high descriptors; this wait owns and closes its
+        # selector on readiness, cancellation and every failure path.
+        with selectors.DefaultSelector() as selector:
+            selector.register(stream, selectors.EVENT_WRITE if writing else selectors.EVENT_READ)
+            while True:
+                self._check(deadline)
+                wait = min(.05, max(0.0, deadline - time.monotonic()))
+                events = selector.select(wait)
+                self._check(deadline)
+                if events:
+                    return
 
     def _send(self, value, deadline):
         data = json.dumps(value, separators=(',', ':')).encode('ascii') + b'\n'
