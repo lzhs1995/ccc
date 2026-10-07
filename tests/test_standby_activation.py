@@ -266,7 +266,7 @@ class ActivationTests(unittest.TestCase):
 
 
 class ActivationTailTests(unittest.TestCase):
-    def test_joined_observation_keeps_three_topology_boundaries_and_live_revocation(self):
+    def test_joined_observation_keeps_two_topology_boundaries_and_live_revocation(self):
         from ccc_standby_prepare import PreparationOwner, FreshTopology
         for mode in ('stable', 'proof_revoke', 'replay_revoke', 'last_tree_move'):
             with self.subTest(mode=mode):
@@ -281,7 +281,7 @@ class ActivationTailTests(unittest.TestCase):
                     trees = []
                     def tree(workspace):
                         trees.append(workspace)
-                        surfaces = [] if mode == 'last_tree_move' and len(trees) == 3 else [
+                        surfaces = [] if mode == 'last_tree_move' and len(trees) == 2 else [
                             {'id': sid, 'ref': 'surface:1', 'type': 'terminal'}]
                         return {'windows': [{'id': str(uuid.uuid4()), 'workspaces': [
                             {'id': wid, 'panes': [{'id': str(uuid.uuid4()), 'surfaces': surfaces}]}]}]}
@@ -319,15 +319,15 @@ class ActivationTailTests(unittest.TestCase):
                     owner.proof_reader = proof
                     if mode == 'stable':
                         self.assertTrue(owner.observe(0)['readiness_proven'])
-                        self.assertEqual(trees, [wid] * 3)
+                        self.assertEqual(trees, [wid] * 2)
                         self.assertTrue(owner.authorized(0))
-                        self.assertEqual(trees, [wid] * 4)  # send authorization still reads topology
+                        self.assertEqual(trees, [wid] * 3)  # send authorization still reads topology
                     else:
                         with self.assertRaises((ValueError, RuntimeError)):
                             owner.observe(0)
                         self.assertTrue(owner._invalid.is_set())
                         self.assertEqual(len(trees), {'proof_revoke': 0,
-                            'replay_revoke': 1, 'last_tree_move': 3}[mode])
+                            'replay_revoke': 1, 'last_tree_move': 2}[mode])
                     client.runner.assert_not_called()
                 finally:
                     native.doCleanups()

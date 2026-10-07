@@ -2,7 +2,7 @@
 import copy
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import cmux_codex_watch as core
 from tests import test_workspace_batch, test_batch_argv_initial
@@ -18,6 +18,35 @@ class BatchObservationHoldTests(unittest.TestCase):
 
     def held(self):
         return self.daemon._argv_startup_observation_held(self.target)
+
+    def test_standby_hint_skips_only_periodic_read_without_fabricating_observation(self):
+        hint = self.daemon._standby_periodic_hint = Mock()
+        hint.covered.return_value = True
+        runtime = self.daemon.runtime[self.target['surface_id']] = core.TargetRuntime()
+        previous = runtime.observation_completed_at
+        with patch.object(self.daemon, '_process_one_target') as process:
+            self.daemon._scheduled_observe(self.target, lambda: True)
+            process.assert_not_called()
+            self.assertEqual(runtime.observation_completed_at, previous)
+            hint.covered.return_value = False
+            self.daemon._scheduled_observe(self.target, lambda: True)
+            process.assert_called_once()
+
+    def test_native_failure_bypasses_even_a_positive_standby_hint(self):
+        hint = self.daemon._standby_periodic_hint = Mock()
+        hint.covered.return_value = True
+        runtime = self.daemon.runtime[self.target['surface_id']] = core.TargetRuntime()
+        runtime.native_failure_at = time.time()
+        with patch.object(self.daemon, '_process_one_target') as process:
+            self.daemon._scheduled_observe(self.target, lambda: True)
+            process.assert_called_once()
+            hint.covered.assert_not_called()
+        runtime.native_failure_at = 0
+        with patch.object(self.daemon, '_active_send_target', return_value=self.target), \
+                patch.object(self.daemon, '_process_one_target') as process:
+            self.daemon._scheduled_native(self.target, lambda: True)
+            process.assert_called_once()
+            hint.covered.assert_not_called()
 
     def test_common_observation_entry_skips_then_resumes_after_hold_release(self):
         with patch.object(self.daemon, '_observe_target_viewport', side_effect=AssertionError('read resumed')) as read:

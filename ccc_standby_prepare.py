@@ -7,6 +7,7 @@ surface after an unknown result, or reconstructs an old owner from disk.
 from __future__ import annotations
 
 from functools import partial
+from collections import deque
 import copy
 import hashlib
 import json
@@ -23,7 +24,82 @@ from ccc_standby_bootstrap import GenerationBridge
 from ccc_standby_identity import inspect_original, ObservationPending
 from ccc_standby_readiness import StandbyRefreshBarrier
 from ccc_standby_rollouts import RolloutInventory
+from ccc_standby_inventory import ProcessInventoryReader
 from ccc_standby_environment import template, signature
+
+
+class InventoryReader:
+    """Bound complete FD reads without holding capacity during UI/RPC waits.
+
+    Every caller performs its own fresh read. FIFO admission never shares a
+    snapshot; cancellation is checked again after admission and after reading.
+    Connected input checks may pass background reads, with at most four such
+    admissions before a waiting background read. FIFO holds within each class.
+    Capacity covers only the full FD read, never a terminal or RPC wait.
+    """
+    def __init__(self, read, allowed, limit=8, *, priority=None):
+        self.read, self.allowed = read, allowed
+        self.condition = threading.Condition()
+        self.waiters = deque()
+        self.capacity = limit
+        self.priority = priority or (lambda: False)
+        self.priority_burst = 0
+
+    def _live(self):
+        if self.allowed() is not True:
+            raise ValueError('inventory reader owner cancelled or closed')
+
+    def _head(self):
+        if not self.waiters:
+            return None
+        foreground = next((w for w in self.waiters if w.inventory_priority), None)
+        background = next((w for w in self.waiters if not w.inventory_priority), None)
+        if foreground is not None and (background is None or self.priority_burst < 4):
+            return foreground
+        return background
+
+    def _wake_head(self):
+        # Called under condition. Wake only the selected admission ticket.
+        head = self._head()
+        if head is not None and self.capacity:
+            head.set()
+
+    def __call__(self, *args, **kwargs):
+        self._live()
+        ticket = threading.Event()
+        ticket.inventory_priority = self.priority() is True
+        acquired = False
+        with self.condition:
+            self.waiters.append(ticket)
+            self._wake_head()
+        try:
+            while True:
+                self._live()
+                with self.condition:
+                    if self._head() is ticket and self.capacity:
+                        self.waiters.remove(ticket)
+                        self.priority_burst = self.priority_burst + 1 if ticket.inventory_priority else 0
+                        self.capacity -= 1
+                        acquired = True
+                        self._wake_head()
+                        break
+                    # Clear while holding admission lock: a subsequent release
+                    # cannot be lost between the predicate and the wait.
+                    ticket.clear()
+                ticket.wait(.05)
+            self._live()
+            result = self.read(*args, **kwargs)
+        finally:
+            with self.condition:
+                if acquired:
+                    self.capacity += 1
+                else:
+                    self.waiters.remove(ticket)
+                self._wake_head()
+        # The FD read is complete: later readers can use its capacity while
+        # this caller checks its result. Never return before this live check.
+        self._live()
+        return result
 
 
 class FreshTopology:
@@ -33,35 +109,57 @@ class FreshTopology:
     a new read, so a post-replay check cannot inherit a pre-replay snapshot.
     There is no cache, worker thread, or retry of failed reads.
     """
-    def __init__(self, read):
+    def __init__(self, read, *, collect=False):
+        self.collect = collect
         self.read = read
         self.condition = threading.Condition()
         self.pending = []
         self.active = False
 
     def __call__(self):
-        ticket = {}
+        ticket = {'wake': threading.Event()}
         with self.condition:
             self.pending.append(ticket)
-            while True:
+            if not self.active:
+                ticket['wake'].set()
+        while True:
+            ticket['wake'].wait()
+            with self.condition:
                 if ticket.get('done'):
-                    if 'error' in ticket:
-                        raise ticket['error']
-                    return copy.deepcopy(ticket['value'])
+                    result = ticket
+                    cohort = None
+                    break
                 if not self.active:
+                    # An awake caller can serve every pending ticket while
+                    # the signalled head is waiting to be scheduled. Detach
+                    # the entire cohort only when its new read begins; this
+                    # neither skips older callers nor reuses an earlier read.
                     self.active = True
+                    if self.collect:
+                        # Collect only before the actual read starts. The fixed
+                        # 2ms window is never renewed by incoming callers.
+                        # Post-start callers still require a newer snapshot.
+                        deadline = time.monotonic() + .002
+                        while time.monotonic() < deadline:
+                            self.condition.wait(max(0.0, deadline - time.monotonic()))
                     cohort, self.pending = self.pending, []
                     break
-                self.condition.wait()
-        try:
-            result = {'value': self.read()}
-        except BaseException as exc:
-            result = {'error': exc}
-        with self.condition:
-            for pending in cohort:
-                pending.update(result, done=True)
-            self.active = False
-            self.condition.notify_all()
+                ticket['wake'].clear()
+        if cohort is not None:
+            try:
+                result = {'value': self.read()}
+            except BaseException as exc:
+                result = {'error': exc}
+            with self.condition:
+                for pending in cohort:
+                    pending.update(result, done=True)
+                    pending['wake'].set()
+                self.active = False
+                # Wake the head when no caller is already running. A new
+                # arrival may lead, but must include all older pending tickets.
+                if self.pending:
+                    self.pending[0]['wake'].set()
+        # Copies stay outside admission; completed results are immutable.
         if 'error' in result:
             raise result['error']
         return copy.deepcopy(result['value'])
@@ -83,24 +181,59 @@ class PreparationOwner:
             raise ValueError('preparation environment differs from original job')
         self.directory = Path(directory)
         self.client, self.source_pin = client, source_pin
-        self._topology = FreshTopology(lambda: self.client.workspace_tree(self.job['workspace_id']))
+        # Source checks share one pin/lock across all originals. Coalesce only
+        # callers queued before a new check begins, just like topology reads;
+        # callers arriving during that check require the next fresh check.
+        # Per-caller lifetime checks below still bracket this shared read.
+        self._source_current = FreshTopology(lambda: self.source_pin.current())
+        # Each read serves only callers already queued when it begins.
+        # Post-source checks must join a later fresh read, never a cache.
+        # Slot, boot, owner and service lifetime checks remain per caller.
+        self._job_current = FreshTopology(lambda:
+            not self.jobfile.is_symlink() and self.jobfile.read_bytes() == self._job_raw)
+        # Only readers already waiting before load starts share its result.
+        # Later/final permission checks require a new disk read; no cache.
+        # Each caller still evaluates its own slot and live lifetime below.
+        self._permission_config = FreshTopology(
+            lambda: core.ConfigStore(self.config_path).load())
+        self._topology = FreshTopology(
+            lambda: self.client.workspace_tree(self.job['workspace_id']), collect=True)
+        # Keep admitted readers separate from readers acquiring a connection.
+        # The wave leader reads on its own thread-local admitted socket; late
+        # callers require a new wave, including every post-screen check.
+        self._connected_topology = FreshTopology(
+            lambda: self.client.workspace_tree(self.job['workspace_id']), collect=True)
         self.sessions_root = Path(sessions_root).resolve(strict=True)
         self._closed = threading.Event()
         self._failed = threading.Event()
         self._lifetime_guard = None
+        self._inventory_process = None
+        self._files_reader = InventoryReader(
+            lambda *args, **kwargs: self._inventory_process(
+                *args, writer_identity_only=True, **kwargs),
+            lambda: not self._closed.is_set() and not self._failed.is_set()
+                and self._lifetime_allowed(), limit=1, priority=self._inventory_priority)
         self._operations = [threading.Lock() for _ in self.job['slots']]
         self._consumed = set()
         self._surfaces, self._barriers = {}, {}
         self.bridge = self.rollouts = None
         try:
             self._current()
-            self.rollouts = RolloutInventory(self.sessions_root)
+            self._inventory_process = ProcessInventoryReader()
+            self.rollouts = RolloutInventory(self.sessions_root, refresh_coalescer=FreshTopology)
             self.bridge = GenerationBridge(self.directory, config_path=self.config_path,
                 job=self.job, current=self._current, authorized=self._authorized,
                 target_environment=self.target_environment)
         except BaseException:
             self.close()
             raise
+
+    def _inventory_priority(self):
+        # Only the current thread holding an admitted input connection qualifies.
+        connection = getattr(getattr(self.client, 'viewport_socket', None),
+                             '_connection_local', None)
+        return (isinstance(connection, threading.local)
+                and callable(getattr(connection, 'read_rpc', None)))
 
     def _current(self):
         def lifetime(*, final=False):
@@ -112,14 +245,14 @@ class PreparationOwner:
                 return 'service lifetime guard refused'
             if final and boot_id() != self.selected['boot_id']:
                 return 'boot identity changed'
-            if self.jobfile.is_symlink() or self.jobfile.read_bytes() != self._job_raw:
+            if not self._job_current():
                 return 'original job changed'
             if not final and boot_id() != self.selected['boot_id']:
                 return 'boot identity changed'
             return None
         try:
             reason = lifetime()
-            if reason is None and self.source_pin.current() != self.selected['generation']:
+            if reason is None and self._source_current() != self.selected['generation']:
                 reason = 'source generation changed'
             if reason is None:
                 reason = lifetime(final=True)
@@ -161,8 +294,10 @@ class PreparationOwner:
             # An admitted input guard already owns a connection slot. A
             # coalesced reader may be waiting for that very slot, so borrow
             # the guard's connection for a fresh read instead of joining it.
-            tree = (self._topology() if connected is self.client and not borrowed else
-                    connected.workspace_tree(self.job['workspace_id']))
+            if connected is self.client:
+                tree = (self._connected_topology() if borrowed else self._topology())
+            else:
+                tree = connected.workspace_tree(self.job['workspace_id'])
             target = core.find_main_surface(tree, surface_id)
             if target.get('workspace_id') != self.job['workspace_id']:
                 self._failed.set()
@@ -173,7 +308,7 @@ class PreparationOwner:
         return self._permission(index, surface_id)
 
     def _permission(self, index, surface_id):
-        config = core.ConfigStore(self.config_path).load()
+        config = self._permission_config()
         if not batch.allowed(config, self.job):
             self._failed.set()
             return False
@@ -245,7 +380,16 @@ class PreparationOwner:
         if not claim_path.exists():
             return None
         raw = claim_path.read_bytes()
-        claim = json.loads(raw)
+        try:
+            claim = json.loads(raw)
+        except json.JSONDecodeError:
+            # Exclusive creation publishes the path before write_once finishes.
+            # Its newline marks a complete publication. Keep incomplete bytes
+            # consumed and pending under the caller's existing deadline; never
+            # rewrite the claim or replay creation. Complete corruption fails.
+            if not raw.endswith(b'\n'):
+                return None
+            raise
         expected = {'job_id': self.job['id'], 'index': index,
             'launch_id': self.job['slots'][index]['launch_id'],
             'surface_id': self._surfaces[index], 'workspace_id': self.job['workspace_id']}
@@ -259,7 +403,6 @@ class PreparationOwner:
         # A claim precedes exec. Waiting for its native writer does not certify
         # identity or send input. The full helper performs all checks next.
         from ccc_guard_scope import process, birth
-        from ccc_codex_queue import process_writable_files
         def check_birth(stage):
             syscall = {}
             observed = birth(claim['bootstrap_pid'], observation=syscall)
@@ -282,7 +425,7 @@ class PreparationOwner:
         if not native:
             return None
         try:
-            paths = process_writable_files(claim['bootstrap_pid'], identities=True)
+            paths = self._files_reader(claim['bootstrap_pid'], identities=True)
         except OSError:
             # Startup can close/reuse descriptors between libproc reads. This
             # is unknown evidence, not a writer witness. Retry observation on
@@ -297,6 +440,7 @@ class PreparationOwner:
         inspect = partial(inspect_original, claim_path,
             claim_sha256=hashlib.sha256(raw).hexdigest(), expected=expected,
             expected_argv=argv, sessions_root=self.sessions_root,
+            files_reader=self._files_reader,
             rollout_absent=self.rollouts.absent,
             expected_environment_sha256=self.environment_sha256)
         barrier = StandbyRefreshBarrier(self.directory, claim_path,
@@ -338,7 +482,11 @@ class PreparationOwner:
                 if self.rollouts is not None:
                     self.rollouts.close()
             finally:
-                self.source_pin.close()
+                try:
+                    if self._inventory_process is not None:
+                        self._inventory_process.close()
+                finally:
+                    self.source_pin.close()
 
     def observe_for_activation(self, index, *, connected_check=None, final_check=None):
         """Observe an existing return witness without preparation or input.

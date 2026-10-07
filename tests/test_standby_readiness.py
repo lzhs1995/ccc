@@ -76,7 +76,83 @@ class RefreshBarrierTests(unittest.TestCase):
             if mutate:
                 mutate()
             raise IncompleteVnodeRead(errno, 'incomplete vnode descriptor')
-        return lambda: self.native.inspect(files_reader=read)
+        return lambda **callbacks: self.native.inspect(files_reader=read, **callbacks)
+
+    def test_write_check_uses_two_fresh_file_reads_around_screen(self):
+        import copy
+        self.barrier._check(before_control=True)
+        events = []
+        def files(*args, **kwargs):
+            events.append('files')
+            return copy.deepcopy(self.native.files)
+        def screen(*args, **kwargs):
+            events.append('screen')
+            return self.replay(*args, **kwargs)
+        self.client.replay.side_effect = screen
+        self.barrier.inspect = lambda **cb: self.native.inspect(files_reader=files, **cb)
+        self.barrier._check(before_control=True, before_write=True)
+        self.assertEqual(events, ['files', 'screen', 'files'])
+
+    def test_write_check_rejects_missing_or_duplicate_callbacks(self):
+        self.barrier._check(before_control=True)
+        for which in ('connected_check', 'final_check'):
+            for duplicate in (False, True):
+                with self.subTest(which=which, duplicate=duplicate):
+                    def inspect(**callbacks):
+                        callback = callbacks.pop(which)
+                        if duplicate:
+                            def twice(*args):
+                                callback(*args)
+                                callback(*args)
+                            callbacks[which] = twice
+                        return self.native.inspect(**callbacks)
+                    self.barrier.inspect = inspect
+                    with self.assertRaises(ValueError):
+                        self.barrier._check(before_control=True, before_write=True)
+                    self.assertFalse(self.writes)
+
+    def test_write_check_rejects_revocation_in_second_inventory(self):
+        import copy
+        self.barrier._check(before_control=True)
+        calls = []
+        def files(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 2:
+                self.allowed = False
+            return copy.deepcopy(self.native.files)
+        self.barrier.inspect = lambda **cb: self.native.inspect(files_reader=files, **cb)
+        with self.assertRaises(ValueError):
+            self.barrier._check(before_control=True, before_write=True)
+        self.assertEqual(len(calls), 2)
+        self.assertFalse(self.writes)
+
+    def test_write_check_rejects_post_screen_identity_and_prefix_changes(self):
+        for mutation in ('birth', 'writer', 'prefix'):
+            with self.subTest(mutation=mutation):
+                f = RefreshBarrierTests()
+                f.setUp()
+                try:
+                    f.barrier._check(before_control=True)
+                    hits = []
+                    def screen(*args, **kwargs):
+                        result = f.replay(*args, **kwargs)
+                        hits.append(mutation)
+                        if mutation == 'birth':
+                            f.native.process['birth'][1] += 1
+                        elif mutation == 'writer':
+                            f.native.lock.rename(f.native.lock.with_suffix('.retired'))
+                            f.native.lock.write_bytes(b'')
+                        else:
+                            f.native.events[1]['variant'] = 'InsertHistoryCell'
+                            f.native.save_events()
+                        return result
+                    f.client.replay.side_effect = screen
+                    with self.assertRaises(ValueError):
+                        f.barrier._check(before_control=True, before_write=True)
+                    self.assertEqual(hits, [mutation])
+                    self.assertFalse(f.writes)
+                finally:
+                    f.doCleanups()
 
     def test_unavailable_vnode_waits_without_intent_then_sends_once(self):
         self.barrier.inspect = self.unavailable_files()
@@ -95,7 +171,7 @@ class RefreshBarrierTests(unittest.TestCase):
             if mutate:
                 mutate()
             raise VnodeInventoryChanged('process vnode descriptors changed')
-        return lambda: self.native.inspect(files_reader=read)
+        return lambda **callbacks: self.native.inspect(files_reader=read, **callbacks)
 
     def test_changed_inventory_waits_for_complete_read_then_sends_once(self):
         self.barrier.inspect = self.changing_files()
@@ -168,23 +244,54 @@ class RefreshBarrierTests(unittest.TestCase):
         with self.assertRaises(ValueError): self.prepare()
         self.assertFalse(self.writes)
 
+    def test_intent_persistence_mutation_rejects_write_and_restart(self):
+        for change in ('birth', 'permission', 'generation', 'boot'):
+            with self.subTest(change=change):
+                f = RefreshBarrierTests()
+                f.setUp()
+                try:
+                    persist = readiness.write_once
+                    def changed(path, value):
+                        result = persist(path, value)
+                        if path == f.barrier.intent:
+                            if change == 'birth': f.native.process['birth'][1] += 1
+                            if change == 'permission': f.allowed = False
+                            if change == 'generation': f.generation = 'b' * 64
+                            if change == 'boot': f.boot = str(uuid.uuid4())
+                        return result
+                    with mock.patch.object(readiness, 'write_once', side_effect=changed):
+                        with self.assertRaises(ValueError): f.prepare()
+                    self.assertTrue(f.barrier.intent.exists())
+                    self.assertTrue(f.barrier.invalid_receipt.exists())
+                    self.assertFalse(f.writes)
+                    self.assertFalse(f.prepare())
+                    self.assertFalse(f.make().prepare())
+                finally:
+                    f.doCleanups()
+
     def test_changed_inventory_after_consumption_cannot_resend(self):
-        def sender(*args, **kwargs):
-            self.barrier.inspect = self.changing_files()
-            return self.send_control(*args, **kwargs)
-        with mock.patch.object(readiness.time, 'sleep', side_effect=lambda _: setattr(self, 'clock', self.clock + 30)):
-            with self.assertRaises(TimeoutError): self.prepare(sender)
+        persist = readiness.write_once
+        def changed(path, value):
+            result = persist(path, value)
+            if path == self.barrier.intent:
+                self.barrier.inspect = self.changing_files()
+            return result
+        with mock.patch.object(readiness, 'write_once', side_effect=changed):
+            with self.assertRaisesRegex(ValueError,
+                    'index=0.*_ObservationPreparing.*ObservationPending.*VnodeInventoryChanged'):
+                self.prepare()
         self.assertTrue(self.barrier.intent.exists())
         self.barrier.inspect = self.native.inspect
         self.assertFalse(self.prepare())
+        self.assertFalse(self.make().prepare())
         self.assertFalse(self.writes)
 
     def test_second_inspection_unavailable_does_not_consume(self):
         calls = []
         unavailable = self.unavailable_files()
-        def inspect():
+        def inspect(**callbacks):
             calls.append(1)
-            return unavailable() if len(calls) == 2 else self.native.inspect()
+            return unavailable(**callbacks) if len(calls) == 2 else self.native.inspect(**callbacks)
         self.barrier.inspect = inspect
         self.assertFalse(self.prepare())
         self.assertFalse(self.barrier.intent.exists())
@@ -210,13 +317,14 @@ class RefreshBarrierTests(unittest.TestCase):
         self.assertFalse(self.prepare())
         self.barrier.inspect = self.native.inspect
         def sender(*args, **kwargs):
-            def late():
+            def late(**callbacks):
                 self.clock = 131
-                return self.native.inspect()
+                return self.native.inspect(**callbacks)
             self.barrier.inspect = late
             return self.send_control(*args, **kwargs)
         with self.assertRaises(TimeoutError): self.prepare(sender)
-        self.assertTrue(self.barrier.intent.exists())
+        self.assertFalse(self.barrier.intent.exists())
+        self.assertTrue(self.barrier.invalid_receipt.exists())
         self.assertFalse(self.writes)
         self.assertFalse(self.prepare())
 
@@ -299,30 +407,32 @@ class RefreshBarrierTests(unittest.TestCase):
         self.assertTrue(self.barrier.invalid_receipt.exists())
 
     def test_consumed_vnode_failure_cannot_resend(self):
-        def send_with_failure(*args, **kwargs):
-            self.barrier.inspect = self.unavailable_files()
-            return self.send_control(*args, **kwargs)
-        with mock.patch.object(readiness.time, 'sleep', side_effect=lambda _: setattr(self, 'clock', self.clock + 30)):
-            with self.assertRaises(TimeoutError): self.prepare(send_with_failure)
+        persist = readiness.write_once
+        def changed(path, value):
+            result = persist(path, value)
+            if path == self.barrier.intent:
+                self.barrier.inspect = self.unavailable_files()
+            return result
+        with mock.patch.object(readiness, 'write_once', side_effect=changed):
+            with self.assertRaises(ValueError): self.prepare()
         self.assertTrue(self.barrier.intent.exists())
         self.assertTrue(self.barrier.invalid_receipt.exists())
         self.barrier.inspect = self.native.inspect
         self.assertFalse(self.prepare())
+        self.assertFalse(self.make().prepare())
         self.assertFalse(self.writes)
 
-    def test_prewrite_pending_waits_inside_one_transport_attempt(self):
-        sends = []
-        unavailable = self.unavailable_files()
+    def test_prewrite_pending_releases_transport_without_consuming_input(self):
         def sender(*args, **kwargs):
-            sends.append(1)
-            self.barrier.inspect = unavailable
+            self.barrier.inspect = self.unavailable_files()
             return self.send_control(*args, **kwargs)
-        def recover(_):
-            self.clock += .02
-            self.barrier.inspect = self.native.inspect
-        with mock.patch.object(readiness.time, 'sleep', side_effect=recover):
-            self.assertTrue(self.prepare(sender))
-        self.assertEqual(sends, [1])
+        with mock.patch.object(readiness.time, 'sleep', side_effect=AssertionError('must release transport')):
+            self.assertFalse(self.prepare(sender))
+        self.assertFalse(self.barrier.intent.exists())
+        self.assertFalse(self.barrier.invalid_receipt.exists())
+        self.assertFalse(self.writes)
+        self.barrier.inspect = self.native.inspect
+        self.assertTrue(self.prepare())
         self.assertEqual(len(self.writes), 1)
         self.assertFalse(self.prepare())
 
@@ -330,13 +440,13 @@ class RefreshBarrierTests(unittest.TestCase):
         def sender(*args, **kwargs):
             self.barrier.inspect = self.unavailable_files()
             return self.send_control(*args, **kwargs)
-        def revoke(_):
-            self.allowed = False
-        with mock.patch.object(readiness.time, 'sleep', side_effect=revoke):
-            with self.assertRaises(ValueError): self.prepare(sender)
+        self.assertFalse(self.prepare(sender))
+        self.allowed = False
+        self.barrier.inspect = self.native.inspect
+        with self.assertRaises(ValueError): self.prepare()
         self.assertFalse(self.writes)
         self.assertTrue(self.barrier.invalid_receipt.exists())
-        self.assertFalse(self.prepare())
+        self.assertFalse(self.make().prepare())
 
     def test_complete_vnodes_during_startup_end_missing_inventory_episode(self):
         self.barrier.inspect = self.unavailable_files()
@@ -405,13 +515,83 @@ class RefreshBarrierTests(unittest.TestCase):
         calls = []
         def inspect():
             calls.append(1)
-            return unavailable() if len(calls) == 3 else self.native.inspect()
+            return unavailable() if len(calls) in (3, 4) else self.native.inspect()
         self.barrier.inspect = inspect
         self.assertIsNone(self.barrier.observe())
         raw = self.barrier.return_receipt.read_bytes()
         self.barrier.inspect = self.native.inspect
         self.assertTrue(self.barrier.observe()['refresh_return_observed'])
         self.assertEqual(self.barrier.return_receipt.read_bytes(), raw)
+        self.assertEqual(len(self.writes), 1)
+
+    def test_ack_inventory_race_recovers_in_same_poll_without_resend(self):
+        for failure_call in (2, 4):
+            with self.subTest(failure_call=failure_call):
+                f = RefreshBarrierTests()
+                f.setUp()
+                try:
+                    self.assertTrue(f.prepare())
+                    f.rendered()
+                    unavailable = f.changing_files()
+                    calls = []
+                    def inspect():
+                        calls.append(1)
+                        return unavailable() if len(calls) == failure_call else f.native.inspect()
+                    f.barrier.inspect = inspect
+                    self.assertTrue(f.barrier.observe()['refresh_return_observed'])
+                    self.assertEqual(len(calls), 5)
+                    self.assertEqual(len(f.writes), 1)
+                    self.assertIsNone(f.barrier._return_deadline)
+                finally:
+                    f.doCleanups()
+
+    def test_ack_inventory_retry_is_bounded(self):
+        self.assertTrue(self.prepare())
+        inspect = mock.Mock(side_effect=self.unavailable_files())
+        self.barrier.inspect = inspect
+        self.assertIsNone(self.barrier.observe())
+        self.assertEqual(inspect.call_count, 2)
+        self.assertEqual(self.barrier._return_deadline, 130.0)
+        self.assertEqual(len(self.writes), 1)
+
+    def test_ack_retry_rechecks_changed_identity_permission_and_composer(self):
+        for change in ('birth', 'permission', 'composer', 'generation'):
+            with self.subTest(change=change):
+                f = RefreshBarrierTests()
+                f.setUp()
+                try:
+                    self.assertTrue(f.prepare())
+                    f.rendered()
+                    unavailable = f.unavailable_files()
+                    calls = []
+                    def inspect():
+                        calls.append(1)
+                        if len(calls) == 1:
+                            return unavailable()
+                        if change == 'birth':
+                            f.native.process['birth'][1] += 1
+                        elif change == 'permission':
+                            f.allowed = False
+                        elif change == 'composer':
+                            f.composer = 'user draft'
+                        else:
+                            f.generation = 'b' * 64
+                        return f.native.inspect()
+                    f.barrier.inspect = inspect
+                    with self.assertRaises(ValueError):
+                        f.barrier.observe()
+                    self.assertTrue(f.barrier.invalid_receipt.exists())
+                    self.assertEqual(len(f.writes), 1)
+                finally:
+                    f.doCleanups()
+
+    def test_ack_inventory_retry_cannot_extend_return_deadline(self):
+        self.assertTrue(self.prepare())
+        unavailable = self.unavailable_files(mutate=lambda: setattr(self, 'clock', 130.0))
+        self.barrier.inspect = unavailable
+        with self.assertRaises(TimeoutError):
+            self.barrier.observe()
+        self.assertTrue(self.barrier.invalid_receipt.exists())
         self.assertEqual(len(self.writes), 1)
 
     def test_one_control_and_current_return_witness_is_not_full_readiness(self):
@@ -437,7 +617,7 @@ class RefreshBarrierTests(unittest.TestCase):
         calls = []
         def inspect():
             calls.append(1)
-            return unavailable() if len(calls) == 3 else self.native.inspect()
+            return unavailable() if len(calls) in (3, 4) else self.native.inspect()
         self.barrier.inspect = inspect
         self.assertIsNone(self.barrier.observe())
         self.assertTrue(self.barrier.return_receipt.exists())
@@ -588,6 +768,32 @@ class RefreshBarrierTests(unittest.TestCase):
         self.assertTrue(self.prepare())
         self.assertEqual(len(self.writes), 1)
 
+    def test_cached_startup_catalog_prepares_and_observes_once(self):
+        self.native.events[-1]['payload']['ListSkills']['force_reload'] = False
+        self.native.save_events()
+        self.assertTrue(self.prepare())
+        self.rendered()
+        self.assertTrue(self.barrier.observe()['refresh_return_observed'])
+        self.assertFalse(self.prepare())
+        self.assertEqual(len(self.writes), 1)
+
+    def test_later_cached_dispatch_invalidates_consumed_control(self):
+        self.assertTrue(self.prepare())
+        self.reload()
+        self.native.events[-1]['payload']['ListSkills']['force_reload'] = False
+        self.native.save_events()
+        with self.assertRaises(ValueError):
+            self.barrier.observe()
+        self.assertEqual(len(self.writes), 1)
+
+    def test_cached_dispatch_wrong_cwd_cannot_authorize_control(self):
+        self.native.events[-1]['payload']['ListSkills'].update(
+            force_reload=False, cwds=['/another/workspace'])
+        self.native.save_events()
+        with self.assertRaises((ValueError, RuntimeError)):
+            self.prepare()
+        self.assertFalse(self.writes)
+
     def first_reload_during_replay(self, after_reload=None):
         self.native.events.pop()
         self.native.save_events()
@@ -672,7 +878,8 @@ class RefreshBarrierTests(unittest.TestCase):
             return self.send_control(*args, **kwargs)
         with self.assertRaises(ValueError):
             self.prepare(sender)
-        self.assertTrue(self.barrier.intent.exists())
+        self.assertFalse(self.barrier.intent.exists())
+        self.assertTrue(self.barrier.invalid_receipt.exists())
         self.assertTrue(self.barrier.invalid_receipt.exists())
         self.assertFalse(self.writes)
         self.assertFalse(self.prepare())
@@ -688,6 +895,31 @@ class RefreshBarrierTests(unittest.TestCase):
         self.reload()
         self.assertTrue(self.prepare())
         self.assertEqual(len(self.writes), 1)
+
+    def test_startup_loss_in_connected_precommit_is_terminal(self):
+        def sender(*args, **kwargs):
+            original = self.barrier.inspect
+            def lost(**callbacks):
+                return dict(original(**callbacks), startup_observed=False)
+            self.barrier.inspect = lost
+            return self.send_control(*args, **kwargs)
+        with self.assertRaises(ValueError): self.prepare(sender)
+        self.assertFalse(self.writes)
+        self.assertFalse(self.barrier.intent.exists())
+        self.assertTrue(self.barrier.invalid_receipt.exists())
+        self.assertFalse(self.make().prepare())
+
+    def test_startup_loss_in_second_identity_read_is_terminal(self):
+        calls = []
+        def inspect():
+            calls.append(1)
+            row = self.native.inspect()
+            if len(calls) == 2: row['startup_observed'] = False
+            return row
+        self.barrier.inspect = inspect
+        with self.assertRaises(ValueError): self.prepare()
+        self.assertFalse(self.writes)
+        self.assertTrue(self.barrier.invalid_receipt.exists())
 
     def test_pending_startup_does_not_allow_original_writer_replacement(self):
         self.native.events = self.native.events[:2]
@@ -847,7 +1079,10 @@ class RefreshBarrierTests(unittest.TestCase):
         self.prepare(); self.rendered()
         with self.native.tui.open('ab') as stream:
             stream.write(b'{"dir":"from_tui","payload":{"UserTurn":')
-        with self.assertRaises(ValueError): self.barrier.observe()
+        self.assertIsNone(self.barrier.observe())
+        self.assertFalse(self.barrier.invalid_receipt.exists())
+        self.assertFalse(self.prepare())
+        self.assertEqual(len(self.writes), 1)
 
     def test_truncated_prefix_and_modified_receipt_are_rejected(self):
         self.prepare(); self.rendered(); self.barrier.observe()
@@ -937,12 +1172,17 @@ class RefreshBarrierTests(unittest.TestCase):
         def replay(*args, **kwargs):
             order.append('screen')
             return self.replay(*args, **kwargs)
+        def authorized(*args):
+            order.append('authorized')
+            return self.allowed
+        self.barrier.authorized = authorized
         self.client.replay.side_effect = replay
         self.barrier.inspect = lambda **kwargs: self.native.inspect(
             process_reader=process, files_reader=files, rollout_absent=lambda *_: True, **kwargs)
         with mock.patch.object(type(self.native.root), 'rglob', side_effect=AssertionError('hot path scan')):
             row = self.barrier.observe_for_activation()
-        self.assertEqual(order, ['process', 'files', 'screen', 'files', 'process'])
+        self.assertEqual(order, ['process', 'files', 'authorized', 'screen',
+                                 'files', 'authorized', 'process'])
         self.assertTrue(row['idle'] and row['composer_empty'] and row['initialized'])
         self.assertFalse(row['readiness_proven'])
         self.assertNotIn('model_request_count', row)

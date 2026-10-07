@@ -17,7 +17,7 @@ import time
 import uuid
 
 
-def recovered_turn(path, session_id):
+def recovered_turn(path, session_id, *, diagnostic=None):
     """Only a new task after an original terminal rate-limit failure qualifies."""
     failed = set()
     current = None
@@ -26,6 +26,9 @@ def recovered_turn(path, session_id):
     bound = False
     total = 0
     complete_rows = 0
+    last_terminal = None
+    if diagnostic is not None:
+        diagnostic['lifecycle_stage'] = 'reading_transcript'
     with Path(path).open('rb') as stream:
         for raw in stream:
             total += len(raw)
@@ -53,6 +56,7 @@ def recovered_turn(path, session_id):
                     failed.add(turn)
                 current = None
                 active = None
+                last_terminal = turn
             elif event.get('type') == 'task_started':
                 if not turn or active is not None or turn in started:
                     raise ValueError('overlapping or repeated original turn')
@@ -63,9 +67,81 @@ def recovered_turn(path, session_id):
                 raise ValueError('original turn aborted')
     if not bound:
         if not complete_rows:
+            if diagnostic is not None:
+                diagnostic['lifecycle_stage'] = 'identity_pending'
             return None  # Newly opened rollout; no identity or recovery proof yet.
         raise ValueError('transcript session binding absent')
+    if diagnostic is not None:
+        if current:
+            stage = 'recovered_task_active'
+        elif active:
+            stage = 'initial_task_active'
+        elif last_terminal:
+            stage = ('rate_limit_terminal' if last_terminal in failed
+                     else 'terminal_not_rate_limit')
+        else:
+            stage = 'no_task'
+        diagnostic.update(lifecycle_stage=stage, active_turn=active,
+                          lifecycle_recovered_turn=current, last_terminal_turn=last_terminal)
     return current
+
+
+def resolve_request_transcript(transcript, *, recovery_requested, deadline,
+                               clock=time.monotonic, sleep=time.sleep, diagnostic=None,
+                               lifecycle=None):
+    """Wait for live inventory and optional lifecycle in one request budget.
+
+    Never reuse an old path or infer a recovered turn from the input text.
+    ``lifecycle(path)`` validates each fresh observation and returns its recovered
+    turn, or None while pending. Identity/invalid lifecycle errors propagate.
+    Calls are synchronous: the deadline rejects late results, not preempts I/O.
+    """
+    diagnostic = {} if diagnostic is None else diagnostic
+    started_at = clock()
+    polls = 0
+    diagnostic.update(transcript_observed=False, transcript_resolution_polls=0,
+                      lifecycle_resolution_polls=0, lifecycle_pending_polls=0)
+    pending_reason = 'transcript_observation_timeout'
+    try:
+        while True:
+            if recovery_requested and clock() >= deadline:
+                diagnostic['refusal_reason'] = pending_reason
+                raise TimeoutError('original evidence observation deadline elapsed')
+            if callable(transcript):
+                polls += 1  # Include observations that fail identity validation.
+                diagnostic['transcript_resolution_polls'] = polls
+                try:
+                    path = transcript()
+                except Exception:
+                    diagnostic['refusal_reason'] = 'transcript_observer_error'
+                    raise
+            else:
+                path = transcript
+            diagnostic['transcript_observed'] = path is not None
+            if recovery_requested and clock() >= deadline:
+                diagnostic['refusal_reason'] = ('transcript_observation_late'
+                    if path is not None else 'transcript_observation_timeout')
+                raise TimeoutError('original transcript observation deadline elapsed')
+            ready = path is not None
+            if lifecycle is not None:
+                diagnostic['lifecycle_resolution_polls'] += 1
+                try:
+                    ready = lifecycle(path) is not None
+                except Exception:
+                    diagnostic['refusal_reason'] = 'lifecycle_validation_failed'
+                    raise
+                if recovery_requested and clock() >= deadline:
+                    diagnostic['refusal_reason'] = 'lifecycle_observation_late'
+                    raise TimeoutError('original lifecycle observation deadline elapsed')
+            if ready or not recovery_requested:
+                return path, polls
+            pending_reason = ('lifecycle_observation_timeout' if path is not None
+                              else 'transcript_observation_timeout')
+            if path is not None:
+                diagnostic['lifecycle_pending_polls'] += 1
+            sleep(min(0.05, max(0, deadline - clock())))
+    finally:
+        diagnostic['transcript_resolution_elapsed_seconds'] = max(0, clock() - started_at)
 
 
 class _Server(ThreadingHTTPServer):
@@ -93,7 +169,13 @@ class _Response(BaseHTTPRequestHandler):
 
     def do_POST(self):
         fixture = self.server.fixture
-        diagnostic = {}
+        diagnostic = dict(lifecycle_stage='unobserved', active_turn=None,
+                          lifecycle_recovered_turn=None, last_terminal_turn=None)
+        # Share the existing connection budget; pending evidence does not get
+        # an additional timeout and does not cause another model request.
+        started_at = time.monotonic()
+        deadline = started_at + self.connection.gettimeout()
+        phase = 'request_validation'
         try:
             if self.path != '/v1/responses' or self.headers.get('Transfer-Encoding'):
                 raise ValueError('unexpected endpoint/framing')
@@ -117,6 +199,10 @@ class _Response(BaseHTTPRequestHandler):
             text = '\n'.join(p.get('text', '') for p in users[-1].get('content', [])
                              if p.get('type') == 'input_text') if users else ''
             sid = self.headers.get('thread-id')
+            diagnostic['prompt_class'] = (
+                'common' if text == fixture.prompt == fixture.recovery_prompt else
+                'initial' if text == fixture.prompt else
+                'recovery' if text == fixture.recovery_prompt else 'unexpected')
             # Keep attribution without storing request text or authorization.
             try:
                 diagnostic['session_id'] = str(uuid.UUID(sid))
@@ -129,19 +215,43 @@ class _Response(BaseHTTPRequestHandler):
                 if transcript is None:
                     diagnostic['refusal_reason'] = 'unbound_session'
                     raise ValueError('unbound session')
-                if text != fixture.prompt:
+                if text not in {fixture.prompt, fixture.recovery_prompt}:
                     diagnostic['refusal_reason'] = 'unexpected_prompt'
                     raise ValueError('unexpected prompt')
                 fixture.counts[sid] += 1
                 if fixture.counts[sid] > 128:
+                    diagnostic['refusal_reason'] = 'request_budget_exhausted'
                     raise ValueError('per-session request budget exhausted')
-            if callable(transcript):
-                transcript = transcript()
-            # A native may send its first request before persisting rollout.
-            # Absence cannot authorize success or terminal input.
-            turn = recovered_turn(transcript, sid) if transcript is not None else None
-            fixture.record(session_id=sid, recovered_turn=turn,
-                           body_sha256=hashlib.sha256(raw).hexdigest())
+            phase = 'transcript_observation'
+            turn = None
+            def lifecycle(path):
+                nonlocal turn
+                diagnostic.update(lifecycle_stage='unobserved', active_turn=None,
+                                  lifecycle_recovered_turn=None, last_terminal_turn=None)
+                turn = (recovered_turn(path, sid, diagnostic=diagnostic)
+                        if path is not None else None)
+                expected = fixture.recovery_prompt if turn else fixture.prompt
+                diagnostic.update(expected_prompt_class=(
+                    'common' if fixture.prompt == fixture.recovery_prompt else
+                    'recovery' if turn else 'initial'),
+                    prompt_lifecycle_matches=text == expected)
+                return turn
+            transcript, polls = resolve_request_transcript(
+                transcript, recovery_requested=(text == fixture.recovery_prompt
+                    and fixture.recovery_prompt != fixture.prompt), deadline=deadline,
+                diagnostic=diagnostic, lifecycle=lifecycle)
+            diagnostic.update(transcript_observed=transcript is not None,
+                              transcript_resolution_polls=polls)
+            # Missing or partial rollout evidence cannot authorize success.
+            # Every pending recovery poll rechecks live identity before parsing.
+            phase = 'lifecycle_validation'
+            expected_prompt = fixture.recovery_prompt if turn else fixture.prompt
+            if text != expected_prompt:
+                diagnostic['refusal_reason'] = 'prompt_lifecycle_mismatch'
+                raise ValueError('prompt does not match original native lifecycle')
+            diagnostic.update(request_elapsed_seconds=time.monotonic()-started_at,
+                              outcome='accepted', recovered_turn=turn)
+            fixture.record(**diagnostic)
             response = dict(id='resp_'+uuid.uuid4().hex, object='response',
                             status='in_progress', output=[])
             events = [dict(type='response.created', response=response)]
@@ -171,15 +281,19 @@ class _Response(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
         except Exception as exc:
+            diagnostic.setdefault('refusal_reason', phase+'_failed')
+            diagnostic.update(request_elapsed_seconds=time.monotonic()-started_at,
+                              outcome='refused')
             fixture.record(error=type(exc).__name__+': '+str(exc), **diagnostic)
             self.send_error(400, 'fixture refused request')
 
 
 class LocalProvider:
-    def __init__(self, directory, prompt):
+    def __init__(self, directory, prompt, recovery_prompt=None):
         self.directory = Path(directory)
         self.directory.mkdir(mode=0o700, exist_ok=False)
         self.prompt = prompt
+        self.recovery_prompt = prompt if recovery_prompt is None else recovery_prompt
         self.lock = threading.Lock()
         self.sessions, self.counts = {}, {}
         self.cert, key = self.directory/'certificate.pem', self.directory/'key.pem'

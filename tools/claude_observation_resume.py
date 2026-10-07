@@ -222,9 +222,9 @@ def prepare(record, directory, wrapper, observer, observations):
             raise ValueError('unsafe cmux MCP token file')
         env.pop('CMUX_CUA_SOCKET_AUTH_TOKEN', None)
     env = observation_environment(env, observer_pin['path'], observations)
-    # Pin the user's actual config root. Do not derive a profile from a common
-    # parent or synthesize settings/credentials from the supervisor environment.
-    env['CLAUDE_CONFIG_DIR'] = record['inputs']['config_root']
+    # Preserve absence as well as value: explicitly setting the default directory
+    # changes Claude's global config path from ~/.claude.json to
+    # ~/.claude/.claude.json. The resolved transcript root is pinned separately.
     claim_root = Path(observations).absolute() / 'resume-claims'
     claim_root.mkdir(mode=0o700, exist_ok=True)
     claim_identity = hashlib.sha256(json.dumps(record['expected'], sort_keys=True).encode()).hexdigest()
@@ -308,7 +308,10 @@ def exec_native(plan, argv, boundary, *, environment=None, execute=os.execve):
     identity_checks = {
         'executable': bool(argv) and argv[0] == plan['pins'][0]['path'],
         'session': capture_tool.session_from_argv(argv) == plan['expected']['session_id'].lower(),
-        'config root': env.get('CLAUDE_CONFIG_DIR') == plan['session']['root'],
+        'config root': all(
+            (key in env) == (key in plan['original_process']['environment'])
+            and env.get(key) == plan['original_process']['environment'].get(key)
+            for key in ('CLAUDE_CONFIG_DIR', 'HOME')),
         'surface': env.get('CMUX_SURFACE_ID') == plan['environment'].get('CMUX_SURFACE_ID'),
     }
     for field, matches in identity_checks.items():

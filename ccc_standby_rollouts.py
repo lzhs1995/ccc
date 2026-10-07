@@ -42,7 +42,8 @@ class RolloutInventory:
     creation updates the index without invalidating the untouched originals.
     """
     def __init__(self, sessions_root, *, max_directories=2048,
-                 max_entries=200000, max_update_entries=4096, max_rounds=3):
+                 max_entries=200000, max_update_entries=4096, max_rounds=3,
+                 refresh_coalescer=None):
         if not hasattr(select, 'kqueue') or not hasattr(os, 'O_EVTONLY'):
             raise ValueError('live rollout directory events unavailable')
         root = Path(sessions_root)
@@ -65,6 +66,10 @@ class RolloutInventory:
         self._content = set()
         self._sessions = set()
         self._entry_count = 0
+        # The optional owner coalescer groups only callers queued before a
+        # refresh starts. It must never cache or join an in-progress refresh.
+        self._refresh_reader = (self._refresh_current if refresh_coalescer is None
+                                else refresh_coalescer(self._refresh_current))
         try:
             # Watch the home before checking for a missing archive directory.
             # Ancestor identity events catch rename/symlink replacement even
@@ -203,16 +208,15 @@ class RolloutInventory:
                     remaining -= self._scan_tree(path, remaining)
         raise RolloutObservationPending('rollout inventory did not settle within update bound')
 
-    def absent(self, sessions_root, session_id):
+    def _live(self):
+        if self._invalid or self._closed or self._pid != os.getpid():
+            raise ValueError('rollout inventory invalidated, closed or inherited')
+
+    def _refresh_current(self):
         with self._lock:
-            if self._invalid or self._closed or self._pid != os.getpid():
-                raise ValueError('rollout inventory invalidated, closed or inherited')
+            self._live()
             try:
-                if Path(sessions_root) != self.sessions_root:
-                    raise ValueError('rollout inventory belongs to another native home')
-                session_id = str(uuid.UUID(session_id))
                 self._refresh()
-                return session_id not in self._sessions
             except RolloutObservationPending:
                 # All consumed events were validated and inventoried. Only
                 # quiescence is missing; retain watches, never return absence.
@@ -220,6 +224,26 @@ class RolloutInventory:
             except BaseException:
                 self._invalid = True
                 raise
+
+    def absent(self, sessions_root, session_id):
+        self._live()
+        try:
+            if Path(sessions_root) != self.sessions_root:
+                raise ValueError('rollout inventory belongs to another native home')
+            session_id = str(uuid.UUID(session_id))
+        except BaseException:
+            with self._lock:
+                self._invalid = True
+            raise
+        # Do not hold the inventory lock while joining a queued fresh read.
+        # Every caller validates its own root/session, and late readers require
+        # another refresh. No historical session set is copied or cached.
+        self._refresh_reader()
+        with self._lock:
+            self._live()
+            # Used sessions are monotonic, so a newer refresh can only revoke
+            # absence. Close/invalidation between refresh and return also deny.
+            return session_id not in self._sessions
 
     def close(self):
         with self._lock:

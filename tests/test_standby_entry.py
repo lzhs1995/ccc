@@ -2,6 +2,7 @@
 import copy
 from pathlib import Path
 import tempfile
+import time
 import unittest
 from tests.context_fixture import enter_context
 from unittest.mock import patch
@@ -80,6 +81,120 @@ class EntryTests(unittest.TestCase):
         values = {'private_check': True, 'ui_trace': self.origin}
         values.update(kw)
         return batch.start(self.config, self.wid, **values)
+
+    def hint_fixture(self):
+        targets = [{'surface_id': str(uuid.uuid4()), 'workspace_id': self.wid} for _ in range(50)]
+        holds = {t['surface_id']: {'job_id': self.jid, 'index': i} for i, t in enumerate(targets)}
+        self.store.mutate(lambda c: c['workspace_rules'][0].update(batch_start_holds=holds))
+        for i, t in enumerate(targets):
+            core.atomic_write_json(self.jobfile.parent / f'surface-{i}.json',
+                {**t, 'job_id': self.jid, 'index': i, 'launch_id': self.job['slots'][i]['launch_id']})
+        return entry.PeriodicObservationHint(), targets
+
+    def test_periodic_hint_coalesces_original_fifty_without_activation(self):
+        hint, targets = self.hint_fixture()
+        with patch.object(entry.time, 'monotonic', return_value=100), \
+                patch.object(entry, 'request', wraps=entry.request) as rpc:
+            self.assertTrue(all(hint.covered(self.config, t) for t in targets))
+            self.assertEqual(rpc.call_count, 1)
+        self.assertEqual(self.owner.calls, [])
+
+    def test_periodic_hint_only_covers_pre_activation_phases(self):
+        hint, targets = self.hint_fixture()
+        for phase in ('ready', 'activation_queued', 'preparing', 'activating', 'failed', 'closed'):
+            with self.subTest(phase=phase):
+                self.owner.phase = phase
+                hint.cache.clear()
+                self.assertEqual(hint.covered(self.config, targets[0]), phase in {'ready', 'activation_queued'})
+
+    def test_periodic_hint_expiry_observes_phase_change(self):
+        hint, targets = self.hint_fixture()
+        with patch.object(entry.time, 'monotonic', return_value=100):
+            self.assertTrue(hint.covered(self.config, targets[0]))
+        self.owner.phase = 'activating'
+        with patch.object(entry.time, 'monotonic', return_value=100.101):
+            self.assertFalse(hint.covered(self.config, targets[0]))
+
+    def test_periodic_hint_hold_release_and_pause_invalidate_cache(self):
+        for change in ('hold', 'pause', 'target', 'active'):
+            with self.subTest(change=change):
+                hint, targets = self.hint_fixture()
+                original = self.store.load()
+                self.assertTrue(hint.covered(self.config, targets[0]))
+                def mutate(c):
+                    rule = c['workspace_rules'][0]
+                    if change == 'hold':
+                        rule['batch_start_holds'].clear()
+                    elif change == 'pause':
+                        c['global_paused'] = True
+                    elif change == 'target':
+                        c['targets'] = [{**targets[0], 'paused': True}]
+                    else:
+                        rule['active_batch_id'] = str(uuid.uuid4())
+                self.store.mutate(mutate)
+                self.assertFalse(hint.covered(self.config, targets[0]))
+                core.atomic_write_json(self.config, original)
+
+    def test_periodic_hint_live_callback_drift_rejected(self):
+        hint, targets = self.hint_fixture()
+        self.owner.on_status = lambda: self.store.mutate(lambda c: c.update(global_paused=True))
+        self.assertFalse(hint.covered(self.config, targets[0]))
+
+    def test_periodic_hint_registration_boot_and_foreign_owner_rejected(self):
+        hint, targets = self.hint_fixture()
+        self.assertFalse(hint.covered(self.config, {**targets[0], 'workspace_id': str(uuid.uuid4())}))
+        with patch.object(entry.ui, 'boot_id', return_value=str(uuid.uuid4())):
+            self.assertFalse(hint.covered(self.config, targets[0]))
+        receipt = self.jobfile.parent / 'surface-0.json'
+        original = receipt.read_bytes()
+        value = core.load_json(receipt, {})
+        core.atomic_write_json(receipt, {**value, 'launch_id': str(uuid.uuid4())})
+        self.assertFalse(hint.covered(self.config, targets[0]))
+        receipt.write_bytes(original)
+        self.owner.selected = {**self.owner.selected, 'cohort_id': str(uuid.uuid4())}
+        self.assertFalse(hint.covered(self.config, targets[0]))
+
+    def test_periodic_hint_missing_or_slow_service_falls_back(self):
+        hint, targets = self.hint_fixture()
+        self.owner.on_status = lambda: time.sleep(.12)
+        started = time.monotonic()
+        self.assertFalse(hint.covered(self.config, targets[0]))
+        self.assertLess(time.monotonic() - started, .11)
+        self.endpoint.close()
+        self.assertFalse(hint.covered(self.config, targets[0]))
+
+    def test_short_status_deadline_cannot_apply_to_activation(self):
+        with self.assertRaises(ValueError):
+            service.request(self.endpoint.spec_path, self.endpoint.sha256, 'activate', status_timeout=.05)
+
+    def test_periodic_hint_cached_reply_cannot_survive_socket_disappearance(self):
+        hint, targets = self.hint_fixture()
+        self.assertTrue(hint.covered(self.config, targets[0]))
+        self.endpoint.close()
+        self.assertFalse(hint.covered(self.config, targets[0]))
+
+    def test_periodic_hint_cached_reply_cannot_survive_descriptor_change(self):
+        hint, targets = self.hint_fixture()
+        self.assertTrue(hint.covered(self.config, targets[0]))
+        spec = core.load_json(self.endpoint.spec_path, {})
+        core.atomic_write_json(self.endpoint.spec_path, {**spec, 'nonce': 'replacement'})
+        self.assertFalse(hint.covered(self.config, targets[0]))
+
+    def test_status_total_deadline_expires_despite_individual_reads_progressing(self):
+        from unittest.mock import MagicMock
+        # Each partial read advances time but would fit a per-recv timeout.
+        clock = [100.0]
+        connection = MagicMock()
+        connection.__enter__.return_value = connection
+        def partial(_):
+            clock[0] += .02
+            return b' '
+        connection.recv.side_effect = partial
+        with patch.object(service.time, 'monotonic', side_effect=lambda: clock[0]), \
+                patch.object(service.socket, 'socket', return_value=connection):
+            with self.assertRaises(TimeoutError):
+                service.request(self.endpoint.spec_path, self.endpoint.sha256, 'status', status_timeout=.05)
+        self.assertEqual(connection.recv.call_count, 3)
 
     def test_b_button_uses_original_endpoint_and_preserves_job_and_origin(self):
         before = copy.deepcopy(self.origin)

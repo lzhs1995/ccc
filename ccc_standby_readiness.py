@@ -21,7 +21,7 @@ import uuid
 
 import cmux_codex_watch as core
 from ccc_native_standby import generation, identifier, original, write_once
-from ccc_standby_identity import inspect_original, _idle_prefix, StartupPending, ObservationPending
+from ccc_standby_identity import inspect_original, _idle_prefix, StartupPending, ObservationPending, TuiObservationPending
 from ccc_standby_transport import send_initial
 
 
@@ -31,6 +31,10 @@ def _sha(data):
 
 class _Preparing(Exception):
     """A later complete observation may progress without another input."""
+
+
+class _ObservationPreparing(_Preparing):
+    """A fully rejected transient inventory, eligible for one fresh read."""
 
 
 def pwd_visible(grid, cwd):
@@ -86,8 +90,11 @@ class StandbyRefreshBarrier:
         self._write_entered = False
         self._receipt = None
         self._intent_raw = None
+        self._pending_intent = None
+        self._guard_invoked = False
         self._last_clock = -1.0
         self._observation_deadline = None
+        self._tui_deadline = None
         self._attempt_deadline = None
         self._return_deadline = None
         self._index = expected['index']
@@ -162,6 +169,8 @@ class StandbyRefreshBarrier:
         # Keep the exhausted budget and original slot in the propagated error:
         # the service records this error before tearing down its endpoint.
         for kind, deadline, message in (
+                ('tui', self._tui_deadline,
+                 'standby TUI observation unavailable for 30 seconds'),
                 ('return', self._return_deadline,
                  'acknowledged preparation control did not return within 30 seconds'),
                 ('observation', self._observation_deadline,
@@ -173,6 +182,20 @@ class StandbyRefreshBarrier:
                                    f'deadline={deadline:.6f} observed={now:.6f}')
 
     def _inspect(self, *, before_write=False, pending_for_activation=False, **callbacks):
+        # After ACK, an inventory race must not force this original to wait
+        # behind every other slot before trying a fresh complete inspection.
+        # Retry only once, within the unchanged return/operation deadlines.
+        # Never reuse partial inventory or replay activation callbacks.
+        attempts = 2 if self._ack and not before_write and not pending_for_activation else 1
+        for attempt in range(attempts):
+            try:
+                return self._inspect_once(before_write=before_write,
+                    pending_for_activation=pending_for_activation, **callbacks)
+            except _ObservationPreparing:
+                if attempt + 1 == attempts:
+                    raise
+
+    def _inspect_once(self, *, before_write=False, pending_for_activation=False, **callbacks):
         if not self._consumed or self._ack or before_write:
             self._check_observation_deadline()
         try:
@@ -180,26 +203,8 @@ class StandbyRefreshBarrier:
         except StartupPending as pending:
             observation = pending.observation
         except ObservationPending as pending:
-            if self._consumed and not self._ack and not before_write:
-                raise
-            self._live()
-            if any(pending.observation.get(k) != v for k, v in self._expected.items()):
-                raise ValueError('pending original launch changed')
-            if self.authorized(self.client, pending.observation) is not True:
-                raise ValueError('pending observation authorization refused')
-            pending.recheck()
-            self._live()
-            now = self._now()
-            if self._observation_deadline is None:
-                self._observation_deadline = now + 30.0
-            if now >= self._observation_deadline:
-                self._check_observation_deadline()
-            if pending_for_activation:
-                # The outer activation owner must rebuild its proof/final
-                # callbacks too. A second FD read may fail after the first
-                # callback was already consumed; do not retry it in place.
-                raise
-            raise _Preparing('original vnode observation pending') from pending
+            self._handle_pending(pending, before_write=before_write,
+                pending_for_activation=pending_for_activation)
         # A complete identity inspection already brackets two stable native
         # inventories and PID/writer/prefix checks. It ends this unavailable
         # episode, even if the next independent inspection is pending again.
@@ -209,8 +214,45 @@ class StandbyRefreshBarrier:
         self._observation_deadline = None
         return observation
 
-    def _events(self, row):
-        data, sent = _idle_prefix(self.claim)
+    def _handle_pending(self, pending, *, before_write=False, pending_for_activation=False):
+        if isinstance(pending, TuiObservationPending) and self._tui_deadline is None:
+            self._tui_deadline = self._now() + 30.0
+        self._check_observation_deadline()
+        if self._consumed and not self._ack and not before_write:
+            raise pending
+        self._live()
+        if any(pending.observation.get(k) != v for k, v in self._expected.items()):
+            raise ValueError('pending original launch changed')
+        if self.authorized(self.client, pending.observation) is not True:
+            raise ValueError('pending observation authorization refused')
+        try:
+            pending.recheck()
+        except TuiObservationPending as tui_pending:
+            # The original inventory recheck can encounter a new partial TUI
+            # append. Preserve its own fixed deadline and all pending guards;
+            # it provides no identity/readiness proof and authorizes no input.
+            self._handle_pending(tui_pending, before_write=before_write,
+                pending_for_activation=pending_for_activation)
+        self._live()
+        self._check_observation_deadline()
+        now = self._now()
+        if self._observation_deadline is None:
+            self._observation_deadline = now + 30.0
+        if now >= self._observation_deadline:
+            self._check_observation_deadline()
+        if pending_for_activation:
+            # The outer activation owner must rebuild its proof/final
+            # callbacks too. A second FD read may fail after the first
+            # callback was already consumed; do not retry it in place.
+            raise pending
+        raise _ObservationPreparing('original vnode observation pending') from pending
+
+    def _events(self, row, *, pending_for_activation=False):
+        try:
+            data, sent = _idle_prefix(self.claim)
+        except TuiObservationPending as pending:
+            self._handle_pending(pending, before_write=not self._write_entered,
+                pending_for_activation=pending_for_activation)
         size = row['tui_prefix_bytes']
         if (sent or not data.startswith(self._prefix) or size > len(data)
                 or _sha(data[:size]) != row['tui_prefix_sha256']):
@@ -222,13 +264,70 @@ class StandbyRefreshBarrier:
             event = json.loads(line)
             if event.get('dir') == 'from_tui' and event.get('kind') == 'op':
                 skills = event.get('payload', {}).get('ListSkills', {})
-                if skills.get('force_reload') is True and skills.get('cwds') == [self.claim['cwd']]:
+                if 'ListSkills' in event.get('payload', {}):
+                    # The first same-cwd session can reuse its startup catalog.
+                    # Bind that dispatch just like a forced refresh; every later
+                    # dispatch still changes the pinned sequence and invalidates
+                    # the control, including another cached request.
+                    if (type(skills.get('force_reload')) is not bool
+                            or skills.get('cwds') != [self.claim['cwd']]):
+                        raise ValueError('preparation skills dispatch changed cwd or mode')
                     reloads.append({'end_offset': offset, 'sha256': _sha(line)})
         if self._reloads is not None and reloads != self._reloads:
             raise ValueError('another skills refresh invalidated preparation control')
         return data, reloads
 
+    def _check_write(self):
+        """Bracket connected reads with one complete, fresh native inspection."""
+        self._live()
+        checked = []
+        finalized = []
+
+        def connected(row):
+            if checked or any(row.get(k) != value for k, value in self._expected.items()):
+                raise ValueError('preparation original launch changed')
+            identity = original(row, row['workspace_id'])
+            if (not identity.get('writer_identity') or not identity.get('writer_lock')
+                    or self._original is None or identity != self._original):
+                raise ValueError('preparation original identity changed')
+            data, reloads = self._events(row)
+            if self.authorized(self.client, row) is not True:
+                raise ValueError('original live input authorization refused')
+            grid = self._screen(row)
+            if any('Current working directory:' in line for line in grid.lines):
+                raise ValueError('preexisting local output cannot identify a fresh control')
+            self._live()
+            checked.append((copy.deepcopy(row), data, reloads, grid))
+
+        def final():
+            if len(checked) != 1 or finalized:
+                raise ValueError('preparation final check lacks unique connected evidence')
+            if self.authorized(self.client, checked[0][0]) is not True:
+                raise ValueError('original live input authorization changed during connected reads')
+            self._live()
+            finalized.append(True)
+
+        after = self._inspect(before_write=True, connected_check=connected, final_check=final)
+        if len(checked) != 1 or len(finalized) != 1:
+            raise ValueError('preparation identity helper skipped connected/final check')
+        row, data, reloads, grid = checked[0]
+        if (after.get('startup_observed') is not True
+                or any(after.get(k) != value for k, value in self._expected.items())
+                or original(after, row['workspace_id']) != self._original):
+            raise ValueError('preparation identity changed after connected reads')
+        after_data, after_reloads = self._events(after)
+        if not after_data.startswith(data) or after_reloads != reloads:
+            raise ValueError('preparation events changed during connected reads')
+        if not reloads:
+            raise ValueError('original skills refresh evidence disappeared')
+        self._live()
+        self._prefix, self._reloads = after_data, after_reloads
+        self._check_observation_deadline()
+        return after, grid
+
     def _check(self, *, before_control=False, before_write=False):
+        if before_write:
+            return self._check_write()
         self._live()
         row = self._inspect(before_write=before_write)
         if any(row.get(k) != value for k, value in self._expected.items()):
@@ -244,8 +343,8 @@ class StandbyRefreshBarrier:
         if row.get('startup_observed') is not True:
             self._live()
             self._prefix, self._original = data, identity
-            if self._consumed:
-                raise ValueError('native startup evidence lost after control consumption')
+            if self._consumed or self._pending_intent is not None:
+                raise ValueError('native startup evidence lost after control preparation')
             # A validated StartupPending observation includes complete vnode
             # identity evidence. Native startup waiting is not continued
             # file-inventory unavailability; a later outage gets its own bound.
@@ -265,6 +364,8 @@ class StandbyRefreshBarrier:
         # Do not let a callback change the generation or native identity and
         # then use its previous positive result to authorize the write.
         after = self._inspect(before_write=before_write)
+        if after.get('startup_observed') is not True:
+            raise ValueError('native startup evidence lost during connected reads')
         if original(after, row['workspace_id']) != identity:
             raise ValueError('preparation identity changed after connected reads')
         after_data, after_reloads = self._events(after)
@@ -287,7 +388,7 @@ class StandbyRefreshBarrier:
         if not reloads:
             if self._consumed:
                 raise ValueError('original skills refresh evidence disappeared')
-            raise _Preparing('original force-reload dispatch not yet observed')
+            raise _Preparing('original skills dispatch not yet observed')
         self._reloads = reloads
         self._check_observation_deadline()
         if self._control_draft_pending(grid):
@@ -299,17 +400,48 @@ class StandbyRefreshBarrier:
     @contextlib.contextmanager
     def _guard(self):
         with self._write_lock:
-            if self._write_entered:
-                raise ValueError('preparation input already attempted')
+            if self._write_entered or self._guard_invoked or self._pending_intent is None:
+                raise ValueError('preparation input already attempted or not armed')
+            self._guard_invoked = True
+            # A connected observation is not a write attempt. Release this
+            # connection on transient inventory churn instead of waiting out
+            # its transport budget with an irrevocable intent already stored.
+            self._check(before_control=True, before_write=True)
+            self._check_observation_deadline()
+            self._consumed = True
+            self._intent_raw = write_once(self.intent, self._pending_intent)
+            # Persistence can block or run callbacks. Nothing may be written
+            # until original identity/permission/composer are checked again.
+            # From this point every failure remains permanently consumed.
+            read_remaining = getattr(self.client, 'connected_input_remaining', lambda: None)
+            def remaining():
+                budget = read_remaining()
+                # An optional adapter (including a legacy mock) must supply a
+                # real finite deadline before it can authorize more observations.
+                if type(budget) not in (int, float) or not math.isfinite(budget):
+                    return None
+                if budget <= 0:
+                    raise TimeoutError('connected input deadline expired')
+                return budget
+            observation_attempt = 0
             while True:
+                remaining()  # The actual socket deadline includes connection admission.
                 try:
                     self._check(before_control=True, before_write=True)
                     break
-                except _Preparing:
-                    # No input bytes have been written: wait inside this
-                    # single transport attempt, never reconnect or resend.
+                except _ObservationPreparing:
+                    # No transport write has been entered. Discard the entire
+                    # rejected observation and recheck on this same connection
+                    # while its original deadline permits. Without an admitted
+                    # deadline, retain the conservative single reobservation.
+                    # This never retries persistence, input, or an unknown ACK.
+                    budget = remaining()
+                    if self._write_entered or (budget is None and observation_attempt):
+                        raise
+                    observation_attempt += 1
+                    self._live()
                     self._check_observation_deadline()
-                    time.sleep(0.02)
+            remaining()
             self._check_observation_deadline()
             self._write_entered = True
             self._sent_at = self._now()
@@ -332,8 +464,8 @@ class StandbyRefreshBarrier:
                     'reloads': self._reloads, 'tui_prefix_bytes': len(self._prefix),
                     'tui_prefix_sha256': _sha(self._prefix), 'screen_signature': grid.signature(),
                     'intent_monotonic': self._now()}
-                self._consumed = True
-                self._intent_raw = write_once(self.intent, value)
+                self._pending_intent = value
+                self._guard_invoked = False
                 send_initial(self.client, row, '/pwd', control_id, write_guard=self._guard)
                 if not self._write_entered:
                     raise ValueError('preparation transport skipped actual-write guard')
@@ -344,13 +476,29 @@ class StandbyRefreshBarrier:
                 # A known ACK starts an observation-only phase. An unknown
                 # ACK never reaches here and must never permit a retry.
                 self._observation_deadline = None
+                self._tui_deadline = None
                 return True
-            except _Preparing:
+            except _Preparing as exc:
+                if self._consumed:
+                    self.invalidate(exc)
+                    # Service status retains str(error), not the traceback.
+                    # Preserve the original slot and bounded cause types there;
+                    # no raw exception payload, argv or credentials are copied.
+                    causes, seen, cause = [], set(), exc
+                    while cause is not None and id(cause) not in seen and len(causes) < 8:
+                        seen.add(id(cause))
+                        causes.append(type(cause).__name__)
+                        cause = cause.__cause__
+                    raise ValueError('preparation observation failed after durable intent; '
+                                     f'index={self._index} causes={" -> ".join(causes)}') from exc
                 return False
             except Exception as exc:
+                if self._pending_intent is not None:
+                    self._consumed = True  # Terminal dispatch failures never retry.
                 self.invalidate(exc)
                 raise
             finally:
+                self._pending_intent = None
                 self._attempt_deadline = None
 
     def observe(self):
@@ -383,6 +531,7 @@ class StandbyRefreshBarrier:
                     raise ValueError('preparation return receipt changed')
                 self._check_observation_deadline()
                 self._observation_deadline = None
+                self._tui_deadline = None
                 return {**row, 'boot_id': self._boot, 'generation': self._generation,
                     'observed_monotonic': self._now(), 'refresh_return_observed': True,
                     'refresh_success_verified': False, 'readiness_proven': False,
@@ -435,7 +584,7 @@ class StandbyRefreshBarrier:
                     if (any(row.get(k) != value for k, value in self._expected.items())
                             or original(row, row['workspace_id']) != self._original):
                         raise ValueError('activation original differs from preparation')
-                    data, reloads = self._events(row)
+                    data, reloads = self._events(row, pending_for_activation=True)
                     if connected_check is not None:
                         # Proof/permission readers can block. Run them before
                         # the actual screen read and final PID/FD/prefix check.
@@ -446,8 +595,9 @@ class StandbyRefreshBarrier:
                     if self.authorized(self.client, row) is not True:
                         raise ValueError('activation live input authorization refused')
                     grid = self._screen(row)
-                    if self.authorized(self.client, row) is not True:
-                        raise ValueError('activation authorization changed during replay')
+                    # final() checks authorization after the second file
+                    # inventory, covering both replay and inventory changes.
+                    # Avoid another blocking topology read between them.
                     self._live()
                     checked.append((data, reloads, grid.signature()))
                     inspected.append(copy.deepcopy(row))
@@ -467,7 +617,7 @@ class StandbyRefreshBarrier:
                         or any(row.get(k) != value for k, value in self._expected.items())
                         or original(row, row['workspace_id']) != self._original):
                     raise ValueError('activation final original identity changed')
-                data, reloads = self._events(row)
+                data, reloads = self._events(row, pending_for_activation=True)
                 if not data.startswith(checked[0][0]) or reloads != checked[0][1]:
                     raise ValueError('activation events changed during connected inspection')
                 self._live()
@@ -475,6 +625,7 @@ class StandbyRefreshBarrier:
                         or self.return_receipt.read_bytes() != self._receipt):
                     raise ValueError('preparation return receipt changed during inspection')
                 self._prefix = data
+                self._tui_deadline = None
                 return {**row, 'boot_id': self._boot, 'generation': self._generation,
                     'observed_monotonic': self._now(), 'refresh_return_observed': True,
                     'refresh_success_verified': False, 'readiness_proven': False,

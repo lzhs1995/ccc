@@ -48,6 +48,25 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(self.sent, [])
         self.assertFalse((self.directory / 'activation.json').exists())
 
+    def test_refresh_deadline_reports_observer_and_authorization_cost(self):
+        now = [100.0]
+        gather = self.manager._gather
+
+        def timed(callback, *args):
+            result = gather(callback, *args)
+            now[0] += 12.0 if callback == self.manager._observe else 19.0
+            return result
+
+        with patch('ccc_standby_manager.time.monotonic', side_effect=lambda: now[0]), \
+                patch.object(self.manager, '_gather', side_effect=timed):
+            with self.assertRaisesRegex(TimeoutError,
+                    'observation_seconds=12.000; authorization_seconds=19.000; '
+                    'observation_rounds=1; expired_slots=0'):
+                self.manager.refresh()
+        self.assertEqual(self.manager.status()['state'], 'invalidated')
+        self.assertFalse((self.directory / 'activation.json').exists())
+        self.assertEqual(self.sent, [])
+
     def test_fifty_inputs_once_not_task_acceptance(self):
         self.assertEqual(self.manager.refresh()['state'], 'ready')
         result = self.activate()

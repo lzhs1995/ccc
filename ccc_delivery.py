@@ -20,7 +20,7 @@ FIELDS = (
     "send_started_at", "send_io_started_at", "send_completed_at", "send_attempt_evidence",
     "last_send_error", "last_send_at", "send_count", "awaiting", "awaiting_suppressed",
     "sent_fingerprint", "sent_screen_signature", "codex_sent_turn_key",
-    "codex_observed_turn_key", "codex_goal_resume", "codex_goal_proof", "codex_private_check", "codex_input_phase",
+    "codex_observed_turn_key", "codex_goal_resume", "codex_goal_proof", "codex_private_check", "codex_input_phase", "codex_input_not_sent",
     "episode_id", "episode_started_at", "error_type",
 )
 
@@ -67,10 +67,21 @@ class DeliveryStore:
             raise ValueError("invalid durable delivery private check")
         if "codex_goal_proof" in saved and not isinstance(saved["codex_goal_proof"], dict):
             raise ValueError("invalid durable delivery goal proof")
+        if "codex_input_not_sent" in saved and not isinstance(saved["codex_input_not_sent"], dict):
+            raise ValueError("invalid durable zero-write proof")
+        if saved.get("codex_input_phase") == "input_not_sent":
+            proof = saved.get("codex_input_not_sent", {})
+            if (saved.get("delivery_status") != "retryable"
+                    or proof.get("attempt_id") != saved["send_attempt_id"]
+                    or not saved.get("codex_sent_turn_key")
+                    or proof.get("turn_key") != saved["codex_sent_turn_key"]
+                    or not isinstance(proof.get("identity"), dict)
+                    or proof["identity"].get("surface_id") != sid):
+                raise ValueError("invalid durable zero-write binding")
         if saved.get("delivery_status", "") not in {"", "sending", "accepted", "confirmed", "failed", "unknown", "cancelled", "retryable"}:
             raise ValueError("invalid durable delivery status")
         if saved.get("codex_input_phase", "") not in {"", "text_pending", "enter_pending", "enter_acknowledged", "text_retained",
-                                                        "paste_submit_pending", "paste_submit_acknowledged"}:
+                                                        "paste_submit_pending", "paste_submit_acknowledged", "input_not_sent"}:
             raise ValueError("invalid durable native input phase")
         return sid, saved
 

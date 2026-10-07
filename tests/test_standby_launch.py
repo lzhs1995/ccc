@@ -376,6 +376,274 @@ class StandbyLaunchTests(unittest.TestCase):
             self.bind(payload)
         self.assertFalse((self.worker.path.parent / 'standby-session-0.json').exists())
 
+    def inventory_clock(self):
+        clock = [10.0]
+        enter_context(self, patch.object(launch.time, 'monotonic', side_effect=lambda: clock[0]))
+        enter_context(self, patch.object(launch.time, 'sleep',
+                                        side_effect=lambda delay: clock.__setitem__(0, clock[0] + delay)))
+        return clock
+
+    def assert_inventory_failure_consumed(self, payload):
+        self.assertFalse((self.worker.path.parent / 'standby-session-0.json').exists())
+        path = self.worker.path.parent / 'standby-hook-attempt-0.json'
+        before = path.read_bytes()
+        with self.assertRaises(FileExistsError):
+            self.bind(payload)
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_inventory_initial_transient_recovers_without_replaying_hook(self):
+        from ccc_codex_queue import IncompleteVnodeRead, VnodeInventoryChanged
+        payload = self.hook_fixture()
+        self.inventory_clock()
+        with patch('ccc_codex_queue.process_writable_files', side_effect=[
+                IncompleteVnodeRead('partial'), VnodeInventoryChanged('changed'),
+                self.files, self.files]) as reader:
+            self.bind(payload)
+            self.assertEqual(reader.call_count, 4)
+            path = self.worker.path.parent / 'standby-session-0.json'
+            before = path.read_bytes()
+            with self.assertRaises(FileExistsError):
+                self.bind(payload)
+            self.assertEqual(path.read_bytes(), before)
+            self.assertEqual(reader.call_count, 4)
+
+    def test_inventory_final_transient_recovers(self):
+        from ccc_codex_queue import VnodeInventoryChanged
+        payload = self.hook_fixture()
+        self.inventory_clock()
+        with patch('ccc_codex_queue.process_writable_files', side_effect=[
+                self.files, VnodeInventoryChanged('changed'), self.files]) as reader:
+            self.bind(payload)
+        self.assertEqual(reader.call_count, 3)
+        self.assertTrue((self.worker.path.parent / 'standby-session-0.json').exists())
+
+    def test_inventory_continuous_changes_exhaust_budget_without_binding(self):
+        from ccc_codex_queue import VnodeInventoryChanged
+        payload = self.hook_fixture()
+        clock = self.inventory_clock()
+        with patch('ccc_codex_queue.process_writable_files',
+                   side_effect=VnodeInventoryChanged('changed')) as reader:
+            with self.assertRaises(TimeoutError):
+                self.bind(payload)
+        self.assertGreater(reader.call_count, 1)
+        self.assertLessEqual(clock[0], 12.000001)
+        self.assert_inventory_failure_consumed(payload)
+
+    def test_inventory_two_snapshots_share_one_budget(self):
+        from ccc_codex_queue import IncompleteVnodeRead
+        payload = self.hook_fixture()
+        clock = self.inventory_clock()
+        calls = []
+        def read(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                clock[0] += 1.5
+                return self.files
+            raise IncompleteVnodeRead('partial')
+        with patch('ccc_codex_queue.process_writable_files', side_effect=read):
+            with self.assertRaises(TimeoutError):
+                self.bind(payload)
+        self.assertGreater(len(calls), 2)
+        self.assertLessEqual(clock[0], 12.000001)
+        self.assert_inventory_failure_consumed(payload)
+
+    def test_inventory_late_success_cannot_bind(self):
+        payload = self.hook_fixture()
+        clock = self.inventory_clock()
+        def read(*args, **kwargs):
+            clock[0] += 2.01
+            return self.files
+        with patch('ccc_codex_queue.process_writable_files', side_effect=read) as reader:
+            with self.assertRaises(TimeoutError):
+                self.bind(payload)
+        self.assertEqual(reader.call_count, 1)
+        self.assert_inventory_failure_consumed(payload)
+
+    def test_inventory_late_birth_cannot_authorize_another_read(self):
+        payload = self.hook_fixture()
+        clock = self.inventory_clock()
+        def birth(*args, **kwargs):
+            clock[0] += 2.01
+            return self.native['birth']
+        self.birth_mock.side_effect = birth
+        with patch('ccc_codex_queue.process_writable_files') as reader:
+            with self.assertRaises(TimeoutError):
+                self.bind(payload)
+        reader.assert_not_called()
+        self.assert_inventory_failure_consumed(payload)
+
+    def test_inventory_birth_changes_during_retry_refuses(self):
+        from ccc_codex_queue import VnodeInventoryChanged
+        payload = self.hook_fixture()
+        self.inventory_clock()
+        def read(*args, **kwargs):
+            self.birth_mock.return_value = [1234, 9999]
+            raise VnodeInventoryChanged('changed')
+        with patch('ccc_codex_queue.process_writable_files', side_effect=read) as reader:
+            with self.assertRaisesRegex(ValueError, 'process changed'):
+                self.bind(payload)
+        self.assertEqual(reader.call_count, 1)
+        self.assert_inventory_failure_consumed(payload)
+
+    def test_inventory_ordinary_oserror_is_not_retried(self):
+        payload = self.hook_fixture()
+        self.inventory_clock()
+        original = OSError('permission denied')
+        with patch('ccc_codex_queue.process_writable_files', side_effect=original) as reader:
+            with self.assertRaises(OSError) as caught:
+                self.bind(payload)
+        self.assertIs(caught.exception, original)
+        self.assertEqual(reader.call_count, 1)
+        self.assert_inventory_failure_consumed(payload)
+
+    def inventory_final_change(self, mutate):
+        from ccc_codex_queue import VnodeInventoryChanged
+        payload = self.hook_fixture()
+        enter_context(self, patch('ccc_guard_scope.process',
+                                 side_effect=lambda *a, **k:copy.deepcopy(self.native)))
+        self.inventory_clock()
+        calls = []
+        def read(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 2:
+                mutate()
+                raise VnodeInventoryChanged('changed')
+            return copy.deepcopy(self.files)
+        with patch('ccc_codex_queue.process_writable_files', side_effect=read):
+            with self.assertRaises((ValueError, FileNotFoundError)):
+                self.bind(payload)
+        self.assertEqual(len(calls), 3)
+        self.assert_inventory_failure_consumed(payload)
+
+    def test_inventory_retry_preserves_writer_inode_guard(self):
+        def mutate():
+            self.lock.rename(self.lock.with_suffix('.retained'))
+            self.lock.write_bytes(b'')
+            self.files[self.lock] = dict(device=self.lock.stat().st_dev,
+                                        inode=self.lock.stat().st_ino)
+        self.inventory_final_change(mutate)
+
+    def test_inventory_retry_preserves_activation_guard(self):
+        def mutate():
+            path = self.worker.path.parent / 'standby' / 'activation.json'
+            path.write_bytes(path.read_bytes() + b' ')
+        self.inventory_final_change(mutate)
+
+    def test_inventory_retry_preserves_directory_identity_guard(self):
+        def mutate():
+            path = self.worker.path.parent / 'standby'
+            path.rename(path.with_name('retained-standby'))
+            path.mkdir(mode=0o700)
+        self.inventory_final_change(mutate)
+
+    def test_inventory_retry_preserves_full_process_guard(self):
+        def mutate():
+            self.native['argv'] = ['different-client']
+        self.inventory_final_change(mutate)
+
+    def diagnostic_bind(self, read_payload):
+        return launch.bind_with_diagnostics(self.config, self.worker.job['id'], 0,
+                                            self.slot['launch_id'], read_payload)
+
+    def diagnostic_rows(self):
+        paths = list(self.worker.path.parent.glob('standby-hook-diagnostic-0-*.jsonl'))
+        return [json.loads(line) for path in paths for line in path.read_text().splitlines()]
+
+    def test_diagnostic_success_preserves_original_binding(self):
+        payload = self.hook_fixture()
+        self.diagnostic_bind(lambda: payload)
+        self.assertEqual([row['state'] for row in self.diagnostic_rows()], ['started', 'bound'])
+        self.assertTrue((self.worker.path.parent / 'standby-session-0.json').exists())
+        for path in self.worker.path.parent.glob('standby-hook-diagnostic-*.jsonl'):
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_diagnostic_failure_preserves_consumption_and_original_stack(self):
+        payload = self.hook_fixture()
+        payload['session_id'] = str(uuid.uuid4())
+        with self.assertRaisesRegex(ValueError, 'differs from original activation'):
+            self.diagnostic_bind(lambda: payload)
+        rows = self.diagnostic_rows()
+        self.assertEqual([r['state'] for r in rows], ['started', 'failed'])
+        self.assertEqual(rows[-1]['error_type'], 'ValueError')
+        self.assertEqual(rows[-1]['traceback'][-1]['function'], 'bind_initial')
+        attempt = self.worker.path.parent / 'standby-hook-attempt-0.json'
+        original = attempt.read_bytes()
+        with self.assertRaises(FileExistsError):
+            self.diagnostic_bind(lambda: payload)
+        self.assertEqual(attempt.read_bytes(), original)
+        self.assertEqual(len(self.diagnostic_rows()), 4)
+        self.assertFalse((self.worker.path.parent / 'standby-session-0.json').exists())
+
+    def test_diagnostic_payload_error_records_type_without_secret_or_retry(self):
+        error = ValueError('fake-secret-prompt-and-key')
+        def payload():
+            raise error
+        with patch.object(launch, 'bind_initial') as bind:
+            with self.assertRaises(ValueError) as caught:
+                self.diagnostic_bind(payload)
+        self.assertIs(caught.exception, error)
+        bind.assert_not_called()
+        rows = self.diagnostic_rows()
+        self.assertEqual(rows[-1]['state'], 'failed')
+        self.assertNotIn(str(error), json.dumps(rows))
+        self.assertNotIn('test-selected-credential', json.dumps(rows))
+
+    def test_diagnostic_fsync_failure_preserves_original_exception(self):
+        error = RuntimeError('original failure')
+        with patch.object(launch.os, 'fsync', side_effect=OSError('log full')):
+            with patch.object(launch, 'bind_initial', side_effect=error) as bind:
+                with self.assertRaises(RuntimeError) as caught:
+                    self.diagnostic_bind(lambda: {})
+        self.assertIs(caught.exception, error)
+        self.assertEqual(bind.call_count, 1)
+
+    def test_diagnostic_fsync_failure_does_not_turn_success_into_failure(self):
+        with patch.object(launch.os, 'fsync', side_effect=OSError('log full')):
+            with patch.object(launch, 'bind_initial', return_value='bound') as bind:
+                self.assertEqual(self.diagnostic_bind(lambda: {}), 'bound')
+        self.assertEqual(bind.call_count, 1)
+
+    def test_diagnostic_rejects_symlink_and_shared_directory(self):
+        directory = self.worker.path.parent
+        for kind in ('shared', 'symlink'):
+            with self.subTest(kind=kind):
+                original_mode = directory.stat().st_mode & 0o777
+                retained = directory.with_name(directory.name + '.retained')
+                if kind == 'shared':
+                    directory.chmod(0o755)
+                else:
+                    directory.rename(retained)
+                    directory.symlink_to(retained, target_is_directory=True)
+                try:
+                    with patch.object(launch, 'bind_initial', return_value='bound'):
+                        self.assertEqual(self.diagnostic_bind(lambda: {}), 'bound')
+                    self.assertEqual(self.diagnostic_rows(), [])
+                finally:
+                    if kind == 'shared':
+                        directory.chmod(original_mode)
+                    else:
+                        directory.unlink()
+                        retained.rename(directory)
+
+    def test_diagnostic_keeps_original_open_file_after_directory_replacement(self):
+        directory = self.worker.path.parent
+        retained = directory.with_name(directory.name + '.retained')
+        def bind(*args):
+            directory.rename(retained)
+            directory.mkdir(mode=0o700)
+        try:
+            with patch.object(launch, 'bind_initial', side_effect=bind):
+                self.diagnostic_bind(lambda: {})
+            self.assertEqual(list(directory.iterdir()), [])
+            paths = list(retained.glob('standby-hook-diagnostic-*.jsonl'))
+            self.assertEqual(len(paths), 1)
+            self.assertEqual([json.loads(s)['state'] for s in paths[0].read_text().splitlines()],
+                             ['started', 'bound'])
+        finally:
+            if retained.exists():
+                directory.rmdir()
+                retained.rename(directory)
+
     def test_writer_inode_changed_after_activation_rejects_hook(self):
         payload = self.hook_fixture()
         self.lock.rename(self.lock.with_suffix('.old'))

@@ -11,12 +11,17 @@ import stat
 import threading
 import time
 
+import ccc_standby_acceptance as acceptance
 from ccc_standby_acceptance import FirstTaskObserver
 from ccc_codex_queue import IncompleteVnodeRead, VnodeInventoryChanged
 
 
 class OriginalTranscript(FirstTaskObserver):
-    def __init__(self, witness, claim_path):
+    def __init__(self, witness, claim_path, *, files_reader=None):
+        # This preactivation subclass cannot call the activation-bound parent init.
+        # Match its late-bound live reader without caching inventory data.
+        self.files_reader = files_reader or (
+            lambda *a, **kw: acceptance.process_writable_files(*a, **kw))
         self.row = copy.deepcopy(witness)
         self.claim_path = Path(claim_path)
         self.claim_bytes = self.claim_path.read_bytes()

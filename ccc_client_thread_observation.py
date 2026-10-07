@@ -29,6 +29,16 @@ def read_foreground(pid, opt_in, directory=None):
     key = (pid, tuple(generation))
     try:
         argv, env = scope.arguments(pid)
+        # A native app-server inherits the client's observer flag, but never
+        # publishes a TUI selection. Bind this role to live argv and birth;
+        # callers retain the evidence and recheck it at publication time.
+        # Match the subcommand position, never a prompt/config value.
+        if len(argv) > 1 and argv[1] == "app-server":
+            if (scope.birth(pid, codex=True) != generation
+                    or scope.arguments(pid)[0] != argv
+                    or scope.birth(pid, codex=True) != generation):
+                return "invalid", None, None
+            return "nonforeground", None, (key, tuple(argv))
         required = env.get("CODEX_CLIENT_THREAD_OBSERVER")
         if required not in (None, "1"):
             return "invalid", None, None

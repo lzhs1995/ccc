@@ -595,6 +595,7 @@ class TargetRuntime:
     codex_goal_resume: bool = False
     codex_goal_proof: dict[str, Any] = dataclasses.field(default_factory=dict)
     codex_input_phase: str = ""
+    codex_input_not_sent: dict[str, Any] = dataclasses.field(default_factory=dict)
     codex_private_check: dict[str, Any] = dataclasses.field(default_factory=dict)
     codex_absent_probe: str = ""
     codex_absent_since: float = 0.0
@@ -3676,6 +3677,7 @@ def controller_admission(path, deadline, *, capacity=24):
         raise CmuxError('controller admission directory is not private')
     key = hashlib.sha256(f'{endpoint.st_dev}:{endpoint.st_ino}'.encode()).hexdigest()[:24]
     first = (os.getpid() + threading.get_ident()) % capacity
+    delay = .002
     while time.monotonic() < deadline:
         for offset in range(capacity):
             entry = root / f'{key}-{(first + offset) % capacity}.lock'
@@ -3701,7 +3703,10 @@ def controller_admission(path, deadline, *, capacity=24):
                     fcntl.flock(fd, fcntl.LOCK_UN)
             finally:
                 os.close(fd)
-        time.sleep(min(.002, max(0, deadline-time.monotonic())))
+        # Only a fully occupied scan backs off; free capacity remains immediate.
+        # Bound polling CPU while preserving the original admission deadline.
+        time.sleep(min(delay, max(0, deadline-time.monotonic())))
+        delay = min(.01, delay * 2)
     raise InputNotSentError('controller admission deadline exceeded before request')
 
 
@@ -3869,6 +3874,12 @@ class CmuxClient:
                 raise InputNotSentError(f'controller admission failed before input: {exc}') from exc
             raise
 
+    def connected_input_remaining(self):
+        """Return the admitted input socket budget, never start a new budget."""
+        local = getattr(self.viewport_socket, '_connection_local', None)
+        remaining = getattr(local, 'input_remaining', None)
+        return remaining() if remaining is not None else None
+
     def _control_rpc_once(self, method: str, params: Mapping[str, Any], *, timeout: float = 8,
                           write_guard=None):
         """Use the advertised endpoint without CLI selector-resolution RPCs.
@@ -3947,12 +3958,14 @@ class CmuxClient:
                                 raise CmuxError('connected guard process evidence missing')
                             return value
                         transport._connection_local.read_rpc = read_rpc
+                        transport._connection_local.input_remaining = remaining
                         try:
                             if check is not None and not check():
                                 raise InputNotSentError('input authorization changed after controller admission')
                             write_request(connection)
                         finally:
                             transport._connection_local.read_rpc = None
+                            transport._connection_local.input_remaining = None
                 if not attempted:
                     write_request(connection)
                 data = bytearray()
@@ -6988,6 +7001,15 @@ class WatchDaemon:
         sid = str(target["surface_id"])
         with self._runtime_lock:
             runtime = self.runtime.setdefault(sid, TargetRuntime())
+        if not runtime.native_failure_at:
+            from ccc_standby_entry import PeriodicObservationHint
+            with self._runtime_lock:
+                hint = getattr(self, '_standby_periodic_hint', None)
+                if hint is None:
+                    hint = self._standby_periodic_hint = PeriodicObservationHint()
+            if hint.covered(self.config_path, target) and is_current() and not runtime.native_failure_at:
+                # This is no screen observation and grants no sending evidence.
+                return None
         previous = runtime.observation_completed_at
         started = time.monotonic()
         generation = self._config_mtime_ns
@@ -10444,27 +10466,38 @@ class WatchDaemon:
                 and not self.config.get('global_paused'))
 
     def _submit_native_draft(self, target, runtime, state, client, message, proof, is_current,
-                             *, persisted_input_phase=None):
+                             *, persisted_input_phase=None, retry_identity=None):
         """Persist Enter intent, then repeat ownership/draft guards after I/O."""
         sid, wid = str(target['surface_id']), str(target['workspace_id'])
         base = client.client if isinstance(client, SnapshotClient) else client
         transport = getattr(base, 'viewport_socket', None)
+        def same_retry():
+            return (not retry_identity or (self._connected_native_input(client)
+                    and self._codex_input_identity(target, self.codex_queue_recovery.current_turn(target))
+                    == retry_identity))
+
+        def authorized(draft=None):
+            # A zero-write retry remains bound to its original process and
+            # provider through both connected writes, including admission waits.
+            return (same_retry() and self._native_input_ready(
+                target, runtime, state, base, proof, is_current, draft=draft) and same_retry())
+
+        if not same_retry():
+            raise InputNotSentError('original zero-write identity or transport changed; input not sent')
         if (self._connected_native_input(client) and 'terminal.paste' in transport.control_methods):
             runtime.codex_input_phase = 'paste_submit_pending'
             # The caller can persist this exact intent with the original
             # attempt. Standalone callers still require their own durable gate.
             if persisted_input_phase != 'paste_submit_pending':
                 self._save_delivery(sid, runtime, True)
-            with base.input_guard(lambda: self._native_input_ready(
-                    target, runtime, state, base, proof, is_current)):
+            with base.input_guard(authorized):
                 result = base._control_rpc('terminal.paste', {'workspace_id': wid, 'surface_id': sid,
                     'text': message, 'submit_key': 'enter'})
                 if result is None:
                     raise CmuxError('paste capability unavailable; no fallback attempted')
             runtime.codex_input_phase = 'paste_submit_acknowledged'
             return
-        check_text = lambda: self._native_input_ready(target, runtime, state, base, proof, is_current)
-        with base.input_guard(check_text):
+        with base.input_guard(authorized):
             client.send_text(wid, sid, message)
         runtime.codex_input_phase = 'enter_pending'
         key_attempted = False
@@ -10510,8 +10543,7 @@ class WatchDaemon:
                 runtime.native_complete_to_send_ms = round((runtime.send_io_started_at-runtime.native_failure_at)*1000,3)
                 runtime.native_send_deadline_missed = runtime.native_complete_to_send_ms >= 1000
             key_attempted = True
-            check_enter = lambda: self._native_input_ready(
-                target, runtime, state, base, proof, is_current, draft=message)
+            check_enter = lambda: authorized(message)
             with base.input_guard(check_enter):
                 client.send_key(wid, sid, 'enter')
             runtime.codex_input_phase = 'enter_acknowledged'
@@ -10728,6 +10760,46 @@ class WatchDaemon:
             return True
         return False
 
+    @staticmethod
+    def _codex_input_identity(target, turn):
+        """Pin a verified original process and failed turn, never a UI label."""
+        if (not isinstance(turn, Mapping) or turn.get('kind') != 'task_complete'
+                or not turn.get('session_id') or not turn.get('turn_id')
+                or type(turn.get('pid')) is not int or turn['pid'] <= 0
+                or type(turn.get('process_start')) not in (int, float)
+                or not math.isfinite(turn['process_start']) or turn['process_start'] <= 0
+                or type(turn.get('at')) not in (int, float)
+                or not math.isfinite(turn['at']) or turn['at'] <= 0):
+            return {}
+        provider = turn.get('model_provider')
+        if not provider:
+            from ccc_codex_goal import provider_for_turn
+            provider = provider_for_turn(target, turn)
+        if not isinstance(provider, str) or not provider.strip():
+            return {}
+        return dict(surface_id=target['surface_id'], workspace_id=target['workspace_id'],
+                    model_provider=provider,
+                    **{k: turn.get(k) for k in ('session_id', 'turn_id', 'at', 'pid', 'process_start')})
+
+
+    def _unwritten_codex_attempt(self, target, runtime, state):
+        if (state.message_kind != 'codex' or runtime.codex_goal_resume
+                or state.native_goal_stalled or state.requires_goal_proof
+                or runtime.codex_private_check
+                or runtime.codex_input_phase != 'input_not_sent'
+                or runtime.delivery_status != 'retryable'
+                or not runtime.codex_sent_turn_key
+                or runtime.codex_sent_turn_key != runtime.codex_observed_turn_key):
+            return None
+        identity = self._codex_input_identity(target, self.codex_queue_recovery.current_turn(target))
+        proof = runtime.codex_input_not_sent
+        if (identity and proof.get('identity') == identity
+                and proof.get('attempt_id') == runtime.send_attempt_id
+                and proof.get('turn_key') == runtime.codex_sent_turn_key):
+            return runtime.send_attempt_id
+        return None
+
+
     def _handle_state(
         self,
         target: Mapping[str, Any],
@@ -10750,7 +10822,17 @@ class WatchDaemon:
             return
         if state.message_kind == "codex" and not self._codex_turn_ready(target, runtime, state):
             return
-        if state.message_kind == 'codex' and not self._provider_retry_gate(target, runtime, state):
+        retry_attempt = self._unwritten_codex_attempt(target, runtime, state)
+        recovering_unwritten = (state.message_kind == 'codex'
+            and runtime.codex_input_phase == 'input_not_sent'
+            and (not runtime.codex_observed_turn_key
+                 or runtime.codex_sent_turn_key == runtime.codex_observed_turn_key))
+        if recovering_unwritten and (not retry_attempt or not self._connected_native_input(client)):
+            runtime.paused_reason = 'zero-write recovery identity or transport changed; session preserved'
+            return
+        retry_identity = dict(runtime.codex_input_not_sent['identity']) if retry_attempt else None
+        if state.message_kind == 'codex' and not self._provider_retry_gate(
+                target, runtime, state, attempt=retry_attempt, dry_run=True):
             return
         if state.message_kind == "claude":
             state, send_guard_tree = self._prepare_claude_send(
@@ -10910,15 +10992,26 @@ class WatchDaemon:
                          and not runtime.codex_goal_resume else None)
         outgoing_message = private_check["message"] if private_check else None
         runtime.codex_private_check = private_check or {}
+        checked_attempt = self._unwritten_codex_attempt(target, runtime, state)
+        input_identity = (self._codex_input_identity(target, self.codex_queue_recovery.current_turn(target))
+                          if state.message_kind == 'codex' and not private_check
+                          and not runtime.codex_goal_resume and self._connected_native_input(client) else {})
+        if (checked_attempt != retry_attempt
+                or (retry_attempt and input_identity != retry_identity)):
+            runtime.paused_reason = 'zero-write recovery changed before persistence; session preserved'
+            return
         # Persist the attempt before I/O. A restart during a send must reconcile
         # the viewport rather than blindly treating the attempt as never made.
         runtime.send_started_at = time.time()
         runtime.send_io_started_at = 0.0
         runtime.send_completed_at = 0.0
-        runtime.send_attempt_id = uuid.uuid4().hex
+        runtime.send_attempt_id = retry_attempt or uuid.uuid4().hex
         runtime.send_attempt_evidence = state.content_fingerprint
         runtime.codex_sent_turn_key = runtime.codex_observed_turn_key
         runtime.delivery_status = "sending"
+        # Invalidate the zero-write proof durably before any new I/O. A crash
+        # or lost ACK after this point must retain the normal pending guard.
+        runtime.codex_input_not_sent = {}
         runtime.codex_input_phase = "text_pending" if state.message_kind == "codex" else ""
         base = client.client if isinstance(client, SnapshotClient) else client
         if (state.message_kind == 'codex' and not runtime.codex_goal_resume
@@ -10964,6 +11057,10 @@ class WatchDaemon:
                     runtime.delivery_status = "cancelled"
                     self._save_delivery(surface_id, runtime, state.message_kind == "codex", wait=False)
                     return
+                if retry_identity and (not self._connected_native_input(client)
+                        or self._codex_input_identity(target, self.codex_queue_recovery.current_turn(target))
+                        != retry_identity):
+                    raise InputNotSentError('original zero-write identity or transport changed; input not sent')
                 if (state.message_kind == 'codex' and not self._provider_retry_gate(
                         target, runtime, state, attempt=runtime.send_attempt_id)):
                     runtime.delivery_status = 'cancelled'
@@ -10993,7 +11090,8 @@ class WatchDaemon:
                     base = client.client if isinstance(client, SnapshotClient) else client
                     if state.message_kind == "codex" and isinstance(base, CmuxClient):
                         self._submit_native_draft(target, runtime, state, client, message, private_check, is_current,
-                                                  persisted_input_phase=initial_input_phase)
+                                                  persisted_input_phase=initial_input_phase,
+                                                  retry_identity=retry_identity)
                     else:
                         client.send(str(target["workspace_id"]), surface_id, message)
         except (OSError, CmuxError, RuntimeError) as exc:
@@ -11008,8 +11106,27 @@ class WatchDaemon:
                         io_started_at=runtime.send_io_started_at if input_attempted else 0)
             runtime.delivery_status = "unknown" if uncertain else "failed"
             runtime.state = "delivery_unknown" if uncertain else "send_failed"
+            if (isinstance(exc, InputNotSentError) and not uncertain and input_identity
+                    and not private_reserved and not runtime.codex_goal_resume
+                    and runtime.codex_input_phase in {'text_pending', 'paste_submit_pending'}
+                    and runtime.codex_sent_turn_key ==
+                        f"{input_identity['session_id']}:{input_identity['turn_id']}:{input_identity['at']}"):
+                # _control_rpc proves no input sendall was attempted. The
+                # split Enter path wraps every post-text failure as uncertain.
+                runtime.codex_input_not_sent = dict(identity=input_identity,
+                    attempt_id=runtime.send_attempt_id, turn_key=runtime.codex_sent_turn_key)
+                runtime.codex_input_phase = 'input_not_sent'
+                runtime.delivery_status = 'retryable'
             self.logger.error("surface=%s send failed: %s", surface_id[:8], exc)
-            self._save_delivery(surface_id, runtime, state.message_kind == "codex")
+            try:
+                self._save_delivery(surface_id, runtime, state.message_kind == "codex")
+            except (OSError, RuntimeError):
+                # An in-memory claim cannot authorize recovery after a failed
+                # durable write. Leave the old pending record authoritative.
+                runtime.codex_input_not_sent = {}
+                runtime.codex_input_phase = initial_input_phase
+                runtime.delivery_status = 'unknown' if uncertain else 'failed'
+                raise
             return
         if private_reserved:
             try:

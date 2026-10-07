@@ -1,9 +1,12 @@
 """Real Darwin directory events on small synthetic files; no native launch."""
 import copy
+from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
 import select
 import tempfile
+import threading
+import time
 import unittest
 import uuid
 from unittest import mock
@@ -195,6 +198,65 @@ class RolloutInventoryTests(unittest.TestCase):
             return copy.deepcopy(native.files)
         with self.assertRaises(ValueError):
             native.inspect(files_reader=files, rollout_absent=pin.absent)
+
+
+class CoalescedRolloutInventoryTests(RolloutInventoryTests):
+    def make(self, **kwargs):
+        from ccc_standby_prepare import FreshTopology
+        return super().make(refresh_coalescer=FreshTopology, **kwargs)
+
+    def test_late_cohort_reads_again_and_keeps_each_session_result(self):
+        pin = self.make()
+        started, release = threading.Event(), threading.Event()
+        refresh = pin._refresh
+        reads = []
+        def controlled():
+            refresh()
+            reads.append(1)
+            if len(reads) == 1:
+                started.set()
+                if not release.wait(3):
+                    raise TimeoutError('test release missing')
+        with mock.patch.object(pin, '_refresh', side_effect=controlled), ThreadPoolExecutor(4) as pool:
+            first = pool.submit(pin.absent, self.root, str(uuid.uuid4()))
+            try:
+                self.assertTrue(started.wait(3))
+                sessions = [self.session, str(uuid.uuid4()), str(uuid.uuid4())]
+                later = [pool.submit(pin.absent, self.root, sid) for sid in sessions]
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    with pin._refresh_reader.condition:
+                        count = len(pin._refresh_reader.pending)
+                    if count == 3:
+                        break
+                    time.sleep(.001)
+                self.assertEqual(count, 3)
+                self.rollout()
+            finally:
+                release.set()
+            self.assertTrue(first.result(3))
+            self.assertEqual([f.result(3) for f in later], [False, True, True])
+        self.assertEqual(len(reads), 2)
+
+    def test_close_after_shared_refresh_refuses_result(self):
+        pin = self.make()
+        read = pin._refresh_reader
+        def close_after_read():
+            read()
+            pin.close()
+        pin._refresh_reader = close_after_read
+        with self.assertRaisesRegex(ValueError, 'closed'):
+            pin.absent(self.root, self.session)
+
+    def test_newer_observation_revokes_prior_absence(self):
+        pin = self.make()
+        read = pin._refresh_reader
+        def add_after_read():
+            read()
+            self.rollout()
+            pin._refresh_current()
+        pin._refresh_reader = add_after_read
+        self.assertFalse(pin.absent(self.root, self.session))
 
 
 if __name__ == '__main__':

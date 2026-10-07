@@ -57,3 +57,19 @@ class ChainTests(unittest.TestCase):
     def test_slow_chain_not_performance_pass(self):
         self.records[3]['timestamp'] = '1970-01-01T00:00:03.100Z'
         self.assertFalse(self.check()['performance_passed'])
+
+    def test_distinct_prompts_are_ordered_and_no_extra_inputs_hidden(self):
+        self.responses[1]['request']['params']['text'] = '任务请继续'
+        def check():
+            return evaluate(self.records, self.witness, self.responses, self.delivery,
+                            'OK', recovery_prompt='任务请继续')
+        self.assertTrue(check()['performance_passed'])
+        self.responses.reverse()
+        self.assertTrue(check()['performance_passed'])
+        self.responses[0]['request']['params']['text'] = 'OK'
+        with self.assertRaises(ValueError): check()
+        self.responses[0]['request']['params']['text'] = '任务请继续'
+        extra = copy.deepcopy(self.responses[0])
+        extra['request']['params']['text'] = 'unexpected input'
+        self.responses.append(extra)
+        with self.assertRaises(ValueError): check()

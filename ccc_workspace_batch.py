@@ -714,7 +714,7 @@ def _write_once_json(path, record):
     return path, payload
 
 
-def _initial_event_prefix(claim, *, require_turn=False):
+def _initial_event_prefix(claim, *, require_turn=False, retain_partial=False):
     path = Path(claim["tui_log"])
     st = path.stat()
     if [st.st_dev, st.st_ino] != claim["tui_log_identity"]:
@@ -732,6 +732,7 @@ def _initial_event_prefix(claim, *, require_turn=False):
     if len(data) > 2 * 1024 * 1024:
         raise RuntimeError("initial native event prefix exceeded bound")
     # A concurrent write may have emitted JSON but not its terminating newline.
+    raw_prefix = data
     data = data[:data.rfind(b"\n") + 1]
     events = [json.loads(line) for line in data.splitlines()]
     if (not events or events[0].get("dir") != "meta" or events[0].get("kind") != "session_start"
@@ -767,7 +768,7 @@ def _initial_event_prefix(claim, *, require_turn=False):
                 return data, True
     if starts > 1:
         raise RuntimeError("multiple native startup events before hook binding")
-    return data, first_turn
+    return (raw_prefix if retain_partial else data), first_turn
 
 
 def bind_initial_session(config_path, job_id, index, launch_id, payload):

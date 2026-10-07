@@ -1198,7 +1198,8 @@ def resolve_surface_session(
     if agent_kind == "codex":
         from ccc_client_thread_observation import read_foreground
         observed = [(pid, read_foreground(pid, request_observation_directory_matches)) for pid in live]
-        present = [(pid, value) for pid, value in observed if value[0] != "absent"]
+        present = [(pid, value) for pid, value in observed
+                   if value[0] not in ("absent", "nonforeground")]
         if present:
             base.tier = "codex-foreground"
             base.foreground_observations = tuple(observed)
@@ -1215,6 +1216,10 @@ def resolve_surface_session(
                 return base
             base.status, base.session_id = "ok", thread
             base.generation = session_generation(pid, str((ps_table.get(pid) or {}).get("started_at") or ""))
+            return base
+        live = [pid for pid, value in observed if value[0] != "nonforeground"]
+        if not live:
+            base.reason = "只有 Codex 后台服务，没有前台客户端会话"
             return base
 
     commands = [str((ps_table.get(pid) or {}).get("command") or "") for pid in live]

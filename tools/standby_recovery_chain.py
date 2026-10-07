@@ -7,7 +7,8 @@ from datetime import datetime
 from tools.native_acceptance_metrics import evaluate_native_completion
 
 
-def evaluate(records, witness, responses, delivery, prompt):
+def evaluate(records, witness, responses, delivery, prompt, recovery_prompt=None):
+    recovery_prompt = prompt if recovery_prompt is None else recovery_prompt
     sid, surface = witness['session_id'], witness['surface_id']
     lifecycle = evaluate_native_completion(records, sid, 1)
     if not lifecycle['passed']:
@@ -21,10 +22,13 @@ def evaluate(records, witness, responses, delivery, prompt):
     next_at = datetime.fromisoformat(starts[1]['timestamp'].replace('Z', '+00:00')).timestamp()
     inputs = [r for r in responses if r.get('request', {}).get('method') == 'terminal.paste'
               and r['request'].get('params', {}).get('surface_id') == surface
-              and r['request']['params'].get('text') == prompt]
+              and r['request']['params'].get('text') != '/pwd']
     if len(inputs) != 2:
         raise ValueError('expected exactly activation and recovery inputs')
     initial, recovery = sorted(inputs, key=lambda r: r['forward_monotonic_ns'])
+    if (initial['request']['params'].get('text') != prompt
+            or recovery['request']['params'].get('text') != recovery_prompt):
+        raise ValueError('activation/recovery prompt binding mismatch')
     if not initial['forward_at'] < failed_at <= recovery['forward_at'] <= next_at:
         raise ValueError('recovery input not between final failure and new task')
     for row in inputs:

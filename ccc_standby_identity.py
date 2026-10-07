@@ -34,6 +34,25 @@ class ObservationPending(OSError):
         self.recheck = recheck
 
 
+class TuiObservationPending(ObservationPending):
+    """Append-only read exhaustion: no stable prefix or identity proof."""
+    def __init__(self, claim, prefix, file_identity):
+        self.prefix = prefix
+        def recheck():
+            if _private_file(Path(claim['tui_log'])) != file_identity:
+                raise ValueError('standby TUI writer changed while pending')
+            try:
+                current, _ = _idle_prefix(claim)
+            except TuiObservationPending as pending:
+                current = pending.prefix
+            if not current.startswith(prefix):
+                raise ValueError('standby TUI prefix changed while pending')
+        super().__init__({**{k: claim[k] for k in
+            ('job_id', 'index', 'launch_id', 'surface_id', 'workspace_id')},
+            'pid': claim['bootstrap_pid'], 'birth': list(claim['bootstrap_birth'])}, recheck)
+        self.args = ('standby TUI append observation pending',)
+
+
 def _private_file(path):
     info = path.lstat()
     if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
@@ -49,7 +68,7 @@ def _idle_prefix(claim):
     previous = b''
     for _ in range(3):
         before = batch._file_generation(path)
-        data, sent = batch._initial_event_prefix(claim)
+        data, sent = batch._initial_event_prefix(claim, retain_partial=True)
         after = batch._file_generation(path)
         if sent:
             raise ValueError('standby native already submitted a user turn')
@@ -57,13 +76,17 @@ def _idle_prefix(claim):
                 or len(data) < before[2] or not data.startswith(previous)):
             raise ValueError('standby TUI observation incomplete or changed')
         if after == before and len(data) == after[2]:
+            if not data.endswith(b'\n'):
+                # Preserve the entire unfinished line for later prefix checks.
+                # No readiness/negative-input proof until it is fully parsed.
+                raise TuiObservationPending(claim, data, list(before[:2]))
             return data, False
         # Only bounded append progress may retry. Parse the entire new prefix
         # again, so a turn/switch/reload cannot hide behind a benign append.
         if after[2] <= before[2]:
             raise ValueError('standby TUI prefix rewritten during observation')
         previous = data
-    raise ValueError('standby TUI observation did not settle within read bound')
+    raise TuiObservationPending(claim, previous, list(before[:2]))
 
 
 def _rollout_absent(root, session):

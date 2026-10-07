@@ -49,6 +49,50 @@ class FirstTaskTests(unittest.TestCase):
                             {'type': 'user_message', 'message': message}):
                 handle.write(json.dumps({'type': 'event_msg', 'timestamp': stamp, 'payload': payload}) + '\n')
 
+    def test_injected_inventory_rechecks_final_writer_before_release(self):
+        self.task()
+        calls = []
+        def read(*args, **kwargs):
+            calls.append(1)
+            return copy.deepcopy(self.files) if len(calls) == 1 else {}
+        self.observer.files_reader = read
+        with self.assertRaisesRegex(ValueError, 'writer changed'):
+            self.observer.poll(0)
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(self.hold())
+        self.assertFalse(self.result_path.exists())
+
+    def test_shared_inventory_cancellation_preserves_hold(self):
+        from ccc_standby_prepare import InventoryReader
+        self.task()
+        allowed = [True]
+        def read(*args, **kwargs):
+            allowed[0] = False
+            return copy.deepcopy(self.files)
+        reader = InventoryReader(read, lambda: allowed[0], limit=1)
+        self.observer.files_reader = reader
+        with self.assertRaisesRegex(ValueError, 'cancelled'):
+            self.observer.poll(0)
+        self.assertEqual(reader.capacity, 1)
+        self.assertFalse(reader.waiters)
+        self.assertTrue(self.hold())
+        self.assertFalse(self.result_path.exists())
+
+    def test_shared_inventory_success_keeps_fresh_reads(self):
+        from ccc_standby_prepare import InventoryReader
+        self.task()
+        calls = []
+        def read(*args, **kwargs):
+            calls.append(1)
+            return copy.deepcopy(self.files)
+        reader = InventoryReader(read, lambda: True, limit=1)
+        self.observer.files_reader = reader
+        self.assertTrue(self.observer.poll(0)['confirmation']['confirmed'])
+        self.assertGreaterEqual(len(calls), 6)
+        self.assertFalse(self.hold())
+        self.assertEqual(reader.capacity, 1)
+        self.assertFalse(reader.waiters)
+
     def hold(self):
         return core.batch_start_hold(self.store.load()['workspace_rules'][0], self.slot['surface_id'])
 
@@ -68,6 +112,51 @@ class FirstTaskTests(unittest.TestCase):
         self.assertEqual(self.worker.path.read_bytes(), self.job_before)
         self.assertEqual(self.observer.poll(0), result)
         self.assertFalse(self.client.sent)
+
+    def test_evidence_wait_does_not_hold_config_lock(self):
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+        self.task()
+        self.observer.poll(0, release=False)
+        acquired = threading.Event()
+        release = threading.Event()
+        entered = threading.Event()
+        original_lock = self.observer._evidence_lock
+        class TracedLock:
+            def __enter__(inner):
+                if acquired.is_set():
+                    entered.set()
+                original_lock.acquire()
+                return inner
+            def __exit__(inner, *exc):
+                original_lock.release()
+        self.observer._evidence_lock = TracedLock()
+        def hold():
+            with original_lock:
+                acquired.set()
+                if not release.wait(5):
+                    raise AssertionError('test evidence holder did not release')
+        holders = []
+        def before_config(*args):
+            thread = threading.Thread(target=hold)
+            holders.append(thread)
+            thread.start()
+            self.assertTrue(acquired.wait(2))
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            with patch('ccc_private_check.record_origin', side_effect=before_config):
+                future = pool.submit(self.observer.poll, 0)
+                try:
+                    self.assertTrue(entered.wait(2))
+                    # A live permission change must not wait behind evidence IO.
+                    store = core.ConfigStore(self.config, timeout_sec=.1)
+                    store.mutate(lambda config: config.update(global_paused=True))
+                finally:
+                    release.set()
+                    for thread in holders:
+                        thread.join(2)
+                with self.assertRaisesRegex(ValueError, 'no longer authorized'):
+                    future.result(timeout=3)
+        self.assertTrue(self.hold())
 
     def test_incomplete_inventory_waits_without_releasing_then_rechecks(self):
         self.task()

@@ -30,6 +30,8 @@ class StandbyManager:
         self._state_lock = threading.RLock()
         self._executor = ThreadPoolExecutor(max_workers=COUNT, thread_name_prefix='ccc-standby')
         self._closed = False
+        self._refresh_wake = threading.Event()
+        self._observation_costs = {}
         self._invalid = False
         self.state = 'observation_only' if ledger._consumed() else 'preparing'
         self.ready_count = 0
@@ -68,7 +70,9 @@ class StandbyManager:
         return value
 
     def _observe(self, index):
+        started = time.monotonic()
         value = self.observer(index)
+        elapsed = max(0.0, time.monotonic() - started)
         if value is None:
             return None
         if value.get('index') != index:
@@ -79,6 +83,8 @@ class StandbyManager:
             return None
         if not value.get('writer_lock') or not value.get('writer_identity'):
             raise ValueError('standby readiness lacks original writer identity')
+        with self._state_lock:
+            self._observation_costs[index] = elapsed
         return copy.deepcopy(value)
 
     def invalidate(self, reason):
@@ -87,6 +93,7 @@ class StandbyManager:
         with self._state_lock:
             self._invalid = True
             self.state, self.ready_count = 'invalidated', 0
+        self._refresh_wake.set()
         self.ledger._invalidate(reason)
 
     def _gather(self, callback, indexes=range(COUNT)):
@@ -102,6 +109,27 @@ class StandbyManager:
         finally:
             wait(futures)
 
+    def _gather_aligned_observations(self, deadline):
+        # Advisory scheduling only: read every original again, launching slower
+        # reads first. No timestamp is changed and no old proof is reused.
+        # Unlike rolling refresh, all workers finish within this caller context
+        # before the full authorization pass and ledger freshness validation.
+        with self._state_lock:
+            costs = dict(self._observation_costs)
+        target = time.monotonic() + max(costs.values(), default=0.0)
+
+        def inspect(index):
+            self._current()
+            start = target - costs.get(index, 0.0)
+            remaining = max(0.0, min(start, deadline) - time.monotonic())
+            self._refresh_wake.wait(remaining)
+            self._current()
+            if time.monotonic() >= deadline:
+                raise TimeoutError('standby observations unavailable for 30 seconds')
+            return self._observe(index)
+
+        return self._gather(inspect)
+
     def refresh(self):
         with self._operation, self.operation_context():
             return self._refresh_locked()
@@ -112,12 +140,20 @@ class StandbyManager:
             return self.status()
         if deadline is None:
             deadline = time.monotonic() + 30.0
+        observation_seconds = authorization_seconds = 0.0
+        observation_rounds = expired_slots = 0
         try:
             self._current()
+            started = time.monotonic()
             rows = self._gather(self._observe)
+            observation_seconds += time.monotonic() - started
+            observation_rounds += 1
             while True:
                 self._current()
-                if not all(self._gather(self._authorized)):
+                started = time.monotonic()
+                permissions = self._gather(self._authorized)
+                authorization_seconds += time.monotonic() - started
+                if not all(permissions):
                     raise ValueError('standby workspace or original authorization changed')
                 ready_count = sum(row is not None for row in rows)
                 if ready_count != COUNT:
@@ -126,18 +162,26 @@ class StandbyManager:
                     self._publish('preparing', ready_count)
                     return self.status()
                 if time.monotonic() >= deadline:
-                    raise TimeoutError('standby observations unavailable for 30 seconds')
+                    raise TimeoutError('standby observations unavailable for 30 seconds; '
+                        f'observation_seconds={observation_seconds:.3f}; '
+                        f'authorization_seconds={authorization_seconds:.3f}; '
+                        f'observation_rounds={observation_rounds}; expired_slots={expired_slots}')
                 try:
                     self.ledger.observe_ready(rows, config_generation=self.generation_current(),
                         boot_id=self.boot_current(), authorized=True)
                     break
                 except ObservationExpired as expired:
                     self._publish('preparing')
-                    # Reinspect only aged slots, preserving each original and
-                    # actual timestamp. All slot permissions are checked again
-                    # after the new reads, within the same caller context.
-                    replacements = self._gather(self._observe, expired.indexes)
-                    for index, row in zip(expired.indexes, replacements):
+                    # An expired subset can alternate forever with the other
+                    # slots. Reinspect the cohort with measured completion
+                    # alignment; retain each original and actual timestamp.
+                    # Recheck every permission after all workers have finished.
+                    started = time.monotonic()
+                    replacements = self._gather_aligned_observations(deadline)
+                    observation_seconds += time.monotonic() - started
+                    observation_rounds += 1
+                    expired_slots += len(expired.indexes)
+                    for index, row in enumerate(replacements):
                         before = rows[index]
                         if row is None or original(row, self.ledger.manifest['workspace_id']) != original(
                                 before, self.ledger.manifest['workspace_id']):

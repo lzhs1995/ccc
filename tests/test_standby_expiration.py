@@ -39,15 +39,24 @@ class ExpirationTests(unittest.TestCase):
         self.assertFalse(self.f.sent)
         self.assertFalse(self.f.ledger._consumed())
 
-    def test_only_expired_slots_are_reobserved(self):
+    def test_expired_subset_reobserves_complete_cohort(self):
         def observe(index):
             row = self.observe(index)
             if index < 3 and self.reads[index] == 1:
                 row['observed_monotonic'] -= 2.1
             return row
         self.f.manager.observer = observe
+        advanced = []
+        def allowed(index):
+            if index == 49 and not advanced:
+                advanced.append(True)
+                self.f.now += .1
+            return self.f.allowed
+        self.f.manager.authorized = allowed
         self.assertEqual(self.f.manager.refresh()['state'], 'ready')
-        self.assertEqual(self.reads, [2] * 3 + [1] * 47)
+        self.assertEqual(self.reads, [2] * 50)
+        self.assertFalse(self.f.sent)
+        self.assertFalse(self.f.ledger._consumed())
 
     def test_permission_withdrawal_during_reobservation_refuses(self):
         self.expire_at_permission()
@@ -95,11 +104,17 @@ class ExpirationTests(unittest.TestCase):
         self.assertFalse(self.f.sent)
 
     def test_repeated_expiration_has_fixed_deadline(self):
-        self.expire_at_permission(always=True)
-        clock = mock.Mock(side_effect=[0, 1, 31])
+        fired = self.expire_at_permission(always=True)
+        start = self.f.now
+        # Instrumentation may read the clock without advancing time. Advance
+        # the clock at the simulated slow permission operation instead.
+        clock = lambda: self.f.now - start
         with mock.patch('ccc_standby_manager.time', SimpleNamespace(monotonic=clock)):
             with self.assertRaises(TimeoutError):
                 self.f.manager.refresh()
+        self.assertGreater(len(fired), 1)
+        self.assertGreaterEqual(self.f.now - start, 30)
+        self.assertLess(self.f.now - start, 32.1)
         self.assertFalse(self.f.ledger._consumed())
         self.assertFalse(self.f.sent)
 

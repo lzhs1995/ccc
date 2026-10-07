@@ -31,16 +31,20 @@ class FirstTaskObserver:
     _recheck_context_proof = batch.BatchWorker._recheck_context_proof
 
     def __init__(self, config_path, job_id, action_id, *, client, clock=time.time,
-                 observation_clock=None):
+                 observation_clock=None, files_reader=None):
         self.config_path = Path(config_path).resolve(strict=True)
         self.path = batch.job_path(self.config_path, identifier(job_id))
         self.client, self.clock = client, clock
         self.observation_clock = observation_clock or stamp
+        # Share admission with activation checks, never their inventory data.
+        # Keep the default late-bound for standalone observers and test probes.
+        self.files_reader = files_reader or (lambda *a, **kw: process_writable_files(*a, **kw))
         self.store = core.ConfigStore(self.config_path)
         self.action_id = identifier(action_id)
         self._files, self._slots, self._failed = {}, {}, set()
         self._locks = [threading.Lock() for _ in range(COUNT)]
         self._evidence_lock = threading.RLock()
+        self._validated_files = set()
         self.job = self._read(self.path)
         self.selected = launch.policy(self.job, self.config_path)
         self.directory = self.path.parent / 'standby'
@@ -70,29 +74,49 @@ class FirstTaskObserver:
             raise ValueError('first-task evidence directory is not private')
         return info.st_dev, info.st_ino
 
-    def _read(self, path):
+    def _read(self, path, *, decode=True):
+        # File I/O must not hold the shared registry lock. Otherwise one slow
+        # read serializes every original's observation and admission. Keep the
+        # original bytes, not a cached success or an mtime-only proof.
+        info = path.lstat()
+        before = batch._file_generation(path)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or stat.S_IMODE(info.st_mode) & 0o077 or info.st_size > 2 * 1024 * 1024):
+            raise ValueError('first-task evidence is not a bounded private file')
+        raw = path.read_bytes()
+        if batch._file_generation(path) != before:
+            raise ValueError('first-task evidence changed during read')
         with self._evidence_lock:
-            info = path.lstat()
-            before = batch._file_generation(path)
-            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
-                    or stat.S_IMODE(info.st_mode) & 0o077 or info.st_size > 2 * 1024 * 1024):
-                raise ValueError('first-task evidence is not a bounded private file')
-            raw = path.read_bytes()
-            if batch._file_generation(path) != before:
-                raise ValueError('first-task evidence changed during read')
             old = self._files.setdefault(path, (before, raw))
             if old != (before, raw):
                 raise ValueError('first-task original evidence changed')
-            return json.loads(raw)
+            validated = path in self._validated_files
+        # Only skip decoding after a successful parse of these exact original
+        # bytes. Every scan still performs all identity and content reads above.
+        if not decode and validated:
+            return None
+        value = json.loads(raw)
+        with self._evidence_lock:
+            self._validated_files.add(path)
+        return value
 
     def _current(self):
-        if (boot_id() != self.selected['boot_id']
-                or self._dir_identity(self.directory) != self._directory
-                or os.path.lexists(self.directory / 'invalidated.json')):
-            raise ValueError('first-task activation invalidated')
-        with self._evidence_lock:
-            for path in tuple(self._files):
-                self._read(path)
+        checked = set()
+        while True:
+            if (boot_id() != self.selected['boot_id']
+                    or self._dir_identity(self.directory) != self._directory
+                    or os.path.lexists(self.directory / 'invalidated.json')):
+                raise ValueError('first-task activation invalidated')
+            with self._evidence_lock:
+                paths = tuple(path for path in self._files if path not in checked)
+            if not paths:
+                return
+            # Re-read every registered original, including evidence admitted
+            # during this scan. Final activation checks follow the reads. No
+            # other slot's check or cached result stands in for our own proof.
+            for path in paths:
+                self._read(path, decode=False)
+                checked.add(path)
 
     def _bind(self, index):
         row = self.originals[index]
@@ -137,7 +161,7 @@ class FirstTaskObserver:
         if (str(root) != hook['sessions_root'] or Path(row['writer_lock']) !=
                 root.parent / 'thread-writer-locks' / (row['session_id'] + '.lock')):
             raise ValueError('first-task original native home changed')
-        files = process_writable_files(row['pid'], identities=True)
+        files = self.files_reader(row['pid'], identities=True)
         for name, expected in ((row['writer_lock'], row['writer_identity']),
                                (claim['tui_log'], claim['tui_log_identity'])):
             path = Path(name)
@@ -149,7 +173,7 @@ class FirstTaskObserver:
         if (process(row['pid'], launch=True) != current
                 or birth(row['pid'], codex=True) != row['birth']):
             raise ValueError('first-task original process changed during observation')
-        final_files = process_writable_files(row['pid'], identities=True)
+        final_files = self.files_reader(row['pid'], identities=True)
         for name, expected in ((row['writer_lock'], row['writer_identity']),
                                (claim['tui_log'], claim['tui_log_identity'])):
             path = Path(name)
@@ -379,4 +403,11 @@ class FirstTaskObserver:
                 if reasons.get(sid) == own:
                     reasons.pop(sid)
                     rule['excluded_surface_ids'] = [s for s in rule.get('excluded_surface_ids', []) if s != sid]
+            # _current reads files outside its brief registry critical section;
+            # never wrap the transaction in the registry lock and serialize
+            # unrelated observers again. Permissions are checked in change.
+            # Drain pending registration before taking config.lock, then let
+            # other readers register while the callback verifies originals.
+            with self._evidence_lock:
+                pass
             self.store.mutate(change)

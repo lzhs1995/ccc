@@ -9,7 +9,6 @@ from __future__ import annotations
 import argparse
 import contextlib
 import copy
-from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 import hashlib
 import json
@@ -28,6 +27,7 @@ from ccc_native_standby import COUNT, identifier, write_once
 from ccc_standby_acceptance import FirstTaskObserver
 from ccc_standby_timing import ActivationTiming
 from ccc_standby_bootstrap import _identity, _encode
+from ccc_standby_prepare import FreshTopology
 from ccc_standby_settlement import settle
 
 LIMIT = 256 * 1024
@@ -67,12 +67,6 @@ class CohortService:
         self.observation_timeout, self.poll_interval = observation_timeout, poll_interval
         self._lock = threading.RLock()
         self._stop, self._cancel = threading.Event(), threading.Event()
-        # Native FD inventories involve many libproc calls. Fifty concurrent
-        # readers prolong each snapshot while startup opens/closes files.
-        # Bound preparation reads only; launch and activation retain COUNT.
-        self._preparation_reads = threading.BoundedSemaphore(8)
-        self._preparation_waiters = deque()
-        self._preparation_condition = threading.Condition()
         self._started = False
         self._origin = self._action = self._action_guard = None
         self._future = None
@@ -110,33 +104,9 @@ class CohortService:
 
     def _poll_preparation(self, index):
         self._require_live()
-        ticket = object()
-        acquired = False
-        with self._preparation_condition:
-            self._preparation_waiters.append(ticket)
-        try:
-            while True:
-                self._require_live()
-                with self._preparation_condition:
-                    if (self._preparation_waiters[0] is ticket
-                            and self._preparation_reads.acquire(blocking=False)):
-                        acquired = True
-                        self._preparation_waiters.popleft()
-                        self._preparation_condition.notify_all()
-                        break
-                    self._preparation_condition.wait(.05)
-        finally:
-            if not acquired:
-                with self._preparation_condition:
-                    self._preparation_waiters.remove(ticket)
-                    self._preparation_condition.notify_all()
-        try:
-            self._require_live()
-            return self.preparation.poll(index)
-        finally:
-            with self._preparation_condition:
-                self._preparation_reads.release()
-                self._preparation_condition.notify_all()
+        # PreparationOwner bounds actual FD inventory reads. A slot waiting
+        # for terminal transport must not hold another slot's read capacity.
+        return self.preparation.poll(index)
 
     def status(self):
         with self._lock:
@@ -161,7 +131,9 @@ class CohortService:
 
     def _prepare(self):
         try:
-            with ThreadPoolExecutor(max_workers=COUNT, thread_name_prefix='ccc-standby-prepare') as pool:
+            # Shell creation is preparation, not simultaneous native activation.
+            # Bound admission before each launch starts its unchanged RPC budget.
+            with ThreadPoolExecutor(max_workers=4, thread_name_prefix='ccc-standby-create') as pool:
                 def create(index):
                     self._require_live()
                     return self.preparation.launch_one(index)
@@ -176,6 +148,7 @@ class CohortService:
                     for future in futures:
                         future.cancel()
                     raise
+            with ThreadPoolExecutor(max_workers=COUNT, thread_name_prefix='ccc-standby-prepare') as pool:
                 def prepare_original(index):
                     # A slow unrelated slot must not consume this original's
                     # bounded observation window between successive polls.
@@ -249,7 +222,8 @@ class CohortService:
                                               timing=timing, authorized=self._allowed)
                     self._require_live()
                 observer = self.observer_factory(self.preparation.config_path,
-                    self.selected['job_id'], self._action, client=self.preparation.client)
+                    self.selected['job_id'], self._action, client=self.preparation.client,
+                    files_reader=self.preparation._files_reader)
                 self._require_live()
                 # Construct only after durable consumption. Start observing
                 # before send workers and independently of their ACK waits.
@@ -282,29 +256,45 @@ class CohortService:
         try:
             pending = set(range(COUNT))
             with ThreadPoolExecutor(max_workers=COUNT, thread_name_prefix='ccc-first-task') as pool:
-                while pending and self._allowed() and time.monotonic() < deadline:
-                    def poll(index):
+                def observe_original(index):
+                    # Retry a pending original independently of other reads.
+                    # All slots share the original observation deadline; a
+                    # slow or changing inventory must not hold up their next
+                    # live check or create a fresh observation budget.
+                    while self._allowed() and time.monotonic() < deadline:
                         self._require_live()
-                        return observer.poll(index, release=True)
-                    futures = {}
-                    try:
-                        for i in pending:
-                            futures[pool.submit(poll, i)] = i
-                        for future in as_completed(futures):
-                            if future.result() is not None:
-                                index = futures[future]
-                                pending.remove(index)
-                                with self._lock:
+                        result = observer.poll(index, release=True)
+                        # A fresh inventory/observation may span the remaining
+                        # budget or a revocation. Retain its original evidence,
+                        # but never turn a late result into timely confirmation.
+                        if not self._allowed() or time.monotonic() >= deadline:
+                            return None
+                        if result is not None:
+                            return result
+                        remaining = deadline - time.monotonic()
+                        if remaining > 0:
+                            self._stop.wait(min(self.poll_interval, remaining))
+                    return None
+                futures = {}
+                try:
+                    for i in pending:
+                        futures[pool.submit(observe_original, i)] = i
+                    for future in as_completed(futures):
+                        if future.result() is not None:
+                            index = futures[future]
+                            with self._lock:
+                                # A completed future can wait for collection
+                                # after its original action has been revoked.
+                                if self._allowed():
+                                    pending.remove(index)
                                     self._confirmed.add(index)
-                    except BaseException:
-                        self._cancel.set()
-                        for future in futures:
-                            future.cancel()
-                        raise
-                    finally:
-                        wait(futures)
-                    if pending:
-                        self._stop.wait(self.poll_interval)
+                except BaseException:
+                    self._cancel.set()
+                    for future in futures:
+                        future.cancel()
+                    raise
+                finally:
+                    wait(futures)
             if not self._allowed():
                 outcome, reason = 'cancelled', 'original action cancelled or owner closed'
             elif pending:
@@ -421,6 +411,10 @@ class ServiceEndpoint:
         if os.path.lexists(self.socket_path) or os.path.lexists(self.spec_path):
             raise ValueError('standby service lifetime cannot be recreated')
         self._closed = threading.Event()
+        # Every late caller joins a new filesystem read. Only callers already
+        # waiting when that read starts share its complete endpoint checks;
+        # there is no cached authorization across input boundaries.
+        self._file_checks = FreshTopology(lambda: self._check_files())
         self._server = self._thread = None
         try:
             self._server = _Server(str(self.socket_path), _Handler)
@@ -446,6 +440,18 @@ class ServiceEndpoint:
             raise
 
     def _check(self):
+        try:
+            if self._closed.is_set():
+                raise ValueError('original standby service endpoint changed')
+            self._file_checks()
+            # Another wave or close may revoke the endpoint while we wait.
+            if self._closed.is_set():
+                raise ValueError('original standby service endpoint changed')
+        except BaseException:
+            self._closed.set()
+            raise
+
+    def _check_files(self):
         try:
             if (self._closed.is_set() or self.directory.resolve(strict=True) != self.directory
                     or _identity(self.directory, stat.S_ISDIR) != self._directory
@@ -528,8 +534,18 @@ class ServiceEndpoint:
                 self.socket_path.unlink()
 
 
-def request(spec_path, spec_sha256, operation, *, origin=None):
+def request(spec_path, spec_sha256, operation, *, origin=None, status_timeout=None):
     """One RPC attempt. A lost activation reply is recovered by status only."""
+    if status_timeout is not None and (operation != 'status'
+            or type(status_timeout) not in (int, float)
+            or not math.isfinite(status_timeout) or not 0 < status_timeout <= 3):
+        raise ValueError('only status may use a shorter total deadline')
+    deadline = None if status_timeout is None else time.monotonic() + status_timeout
+    def remaining():
+        value = 3 if deadline is None else deadline - time.monotonic()
+        if value <= 0:
+            raise TimeoutError('standby status deadline expired')
+        return value
     path = Path(spec_path)
     if path.parent.resolve(strict=True) != path.parent:
         raise ValueError('canonical owner descriptor required')
@@ -557,13 +573,29 @@ def request(spec_path, spec_sha256, operation, *, origin=None):
     if len(wire) > LIMIT:
         raise ValueError('oversized standby UI origin')
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-        connection.settimeout(3)
+        connection.settimeout(remaining())
         connection.connect(spec['socket_path'])
         check()
+        connection.settimeout(remaining())
         connection.sendall(wire)
-        with connection.makefile('rb') as stream:
-            result = _read(stream)
+        if deadline is None:
+            with connection.makefile('rb') as stream:
+                result = _read(stream)
+        else:
+            raw_reply = bytearray()
+            while b'\n' not in raw_reply and len(raw_reply) <= LIMIT:
+                connection.settimeout(remaining())
+                part = connection.recv(min(65536, LIMIT + 1 - len(raw_reply)))
+                if not part:
+                    break
+                raw_reply.extend(part)
+            if len(raw_reply) > LIMIT or not raw_reply.endswith(b'\n'):
+                raise ValueError('incomplete or oversized standby service message')
+            result = json.loads(raw_reply)
+            if not isinstance(result, dict):
+                raise ValueError('standby service message must be an object')
     check()
+    remaining()
     if (result.get('ok') is not True or set(result) != {'ok', 'request_id', 'spec_sha256', 'job_id', 'result'}
             or any(result.get(k) != payload[k] for k in ('request_id', 'spec_sha256', 'job_id'))):
         raise ValueError('standby UI response missing or mismatched; query status, do not recreate')

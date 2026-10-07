@@ -16,6 +16,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import sys
 import threading
@@ -200,17 +201,51 @@ class VnodeInventoryChanged(OSError):
     """Two complete reads disagreed; neither is stable identity evidence."""
 
 
-def process_writable_files(pid, *, identities=False):
+class _VnodePathPass:
+    """Share parent walks only inside one pass, then recheck every parent.
+
+    Leaf symlinks and failed lstats retain full pathlib resolution. Each
+    inventory's second pass creates a new instance, so no cached canonical
+    path crosses the native descriptor recheck or an observation boundary.
+    """
+    def __init__(self):
+        self.parents = {}
+
+    def resolve(self, path):
+        if path.name in {"", ".", ".."}:
+            return path.resolve()
+        try:
+            linked = stat.S_ISLNK(path.lstat().st_mode)
+        except OSError:
+            return path.resolve()
+        if linked:
+            return path.resolve()
+        parent = path.parent
+        if parent not in self.parents:
+            self.parents[parent] = parent.resolve()
+        return self.parents[parent] / path.name
+
+    def verify(self):
+        for parent, resolved in self.parents.items():
+            if parent.resolve() != resolved:
+                raise VnodeInventoryChanged("canonical vnode parent changed")
+
+
+def process_writable_files(pid, *, identities=False, writer_identity_only=False):
     """Inspect one process directly, without forking lsof for every CLI poll.
 
     Incomplete native reads or changing vnode descriptors remain unknown.
     Callers separately recheck PID generation, placement and original session.
     lsof is only the portable fallback when the native API is unavailable.
+    Standby may explicitly compare writer identities only: both complete native
+    inventories are still read, including every new descriptor. Read-only churn
+    is irrelevant to writer ownership; short reads and any writer drift fail.
+    This is not an atomic OS snapshot; callers retain their final live checks.
     """
     if type(pid) is not int or not 0 < pid < 2**31:
         raise OSError("invalid process identity")
     if _proc_pidinfo is None or _proc_pidfdinfo is None:
-        if identities:
+        if identities or writer_identity_only:
             raise OSError("native file identities unavailable")
         result = subprocess.run(["/usr/sbin/lsof", "-n", "-P", "-a", "-p", str(pid), "-Ffan"],
                                 capture_output=True, text=True, timeout=2)
@@ -256,11 +291,12 @@ def process_writable_files(pid, *, identities=False):
                    for flags, name, device, inode in files.values() if flags & 2}
         result = {}
         raw = {}
+        resolver = _VnodePathPass()
         for name, device, inode in writers:
             path = Path(name)
             if not path.is_absolute():
                 raise OSError("missing vnode path")
-            path = path.resolve()
+            path = resolver.resolve(path)
             identity = (device, inode)
             if name in raw and raw[name] != (path, identity):
                 raise VnodeInventoryChanged("conflicting raw vnode identity")
@@ -268,11 +304,44 @@ def process_writable_files(pid, *, identities=False):
             if path in result and result[path] != identity:
                 raise VnodeInventoryChanged("conflicting canonical vnode identity")
             result[path] = identity
+        resolver.verify()
         return result, raw
 
     paths, raw = resolved_writers()
-    if descriptors() != before or vnodes(before, 'verification') != files:
-        raise VnodeInventoryChanged("process vnode descriptors changed")
+    after = descriptors()
+    verified = vnodes(after, 'verification') if writer_identity_only or after == before else None
+    if writer_identity_only:
+        # Never infer that a new/removed FD is harmless from its number. Read
+        # every member of both snapshots and retain FD numbers in comparison,
+        # so duplicate writer paths cannot conceal an added/replaced writer.
+        initial_writers = {fd: value for fd, value in files.items() if value[0] & 2}
+        final_writers = {fd: value for fd, value in verified.items() if value[0] & 2}
+        changed_inventory = initial_writers != final_writers
+    else:
+        changed_inventory = after != before or verified != files
+    if changed_inventory:
+        error = VnodeInventoryChanged("process vnode descriptors changed")
+        # Bounded diagnostics from reads already required by the guard. Never
+        # perform another native read, expose paths, or accept partial evidence.
+        changed = sorted(before ^ after if after != before else
+                         (fd for fd in before if files[fd] != verified[fd]))
+        def describe(value):
+            if value is None:
+                return None
+            flags, name, device, inode = value
+            return {'access': flags, 'path_sha256': hashlib.sha256(os.fsencode(name)).hexdigest(),
+                    'device': int.from_bytes(device, sys.byteorder),
+                    'inode': int.from_bytes(inode, sys.byteorder)}
+        error.inventory_change = {
+            'kind': 'descriptor_set' if after != before else 'descriptor_identity',
+            'before_count': len(before), 'after_count': len(after),
+            'changed_count': len(changed), 'truncated': len(changed) > 16,
+            'descriptors': [{'fd': fd, 'present_before': fd in before,
+                             'present_after': fd in after,
+                             'before': describe(files.get(fd)),
+                             'after': describe(verified.get(fd)) if verified is not None else None}
+                            for fd in changed[:16]]}
+        raise error
     if resolved_writers() != (paths, raw):
         raise VnodeInventoryChanged("canonical vnode paths changed")
     if identities:

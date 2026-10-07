@@ -165,13 +165,19 @@ class RolloutPendingBarrierTests(unittest.TestCase):
 
     def test_connected_pending_rechecks_pause_before_send(self):
         f = self.fixture
-        def sender(*args, **kwargs):
-            f.barrier.inspect = self.pending
-            return f.send_control(*args, **kwargs)
-        def pause(_):
+        paused = []
+        def pending_and_pause(**callbacks):
+            paused.append(True)
             f.allowed = False
-        with mock.patch.object(readiness_fixture.readiness.time, 'sleep', side_effect=pause):
-            with self.assertRaises(ValueError): f.prepare(sender)
+            return self.pending(**callbacks)
+        def sender(*args, **kwargs):
+            f.barrier.inspect = pending_and_pause
+            return f.send_control(*args, **kwargs)
+        # Pending observation no longer sleeps. Revoke during the actual read;
+        # the connected guard must reject before any write.
+        with self.assertRaisesRegex(ValueError, 'pending observation authorization refused'):
+            f.prepare(sender)
+        self.assertEqual(paused, [True])
         self.assertFalse(f.writes)
 
     def test_pending_uses_fixed_deadline(self):

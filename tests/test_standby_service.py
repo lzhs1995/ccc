@@ -78,6 +78,7 @@ class Preparation:
         self.selected.update(mode='b', generation='a' * 64, policy='native-standby-v1')
         self.job = {'initial_prompt': 'fixed original prompt'}
         self.created, self.polled = [], []
+        self._files_reader = lambda *a, **kw: {}
 
     def bind_lifetime_guard(self, check):
         self.lifetime_guard = check
@@ -180,85 +181,40 @@ class ServiceTests(unittest.TestCase):
             self.owner._future.result(timeout=3)
         self.assertEqual(self.owner.status()['state'], 'ready')
 
-    def test_preparation_read_limit_preserves_all_fifty_originals(self):
-        release = threading.Event()
-        full = threading.Event()
+    def test_eight_terminal_waits_do_not_block_other_original_observations(self):
+        release, full, repolled = threading.Event(), threading.Event(), threading.Event()
         lock = threading.Lock()
-        active, peak, seen = [0], [0], []
+        blocked, attempts = [], []
         def poll(index):
-            with lock:
-                active[0] += 1
-                peak[0] = max(peak[0], active[0])
-                seen.append(index)
-                if active[0] == 8:
-                    full.set()
-            try:
-                if not release.wait(3):
-                    raise TimeoutError('test failed to release preparation reads')
-                return {'witness': True}
-            finally:
+            if index < 8:
                 with lock:
-                    active[0] -= 1
+                    blocked.append(index)
+                    if len(blocked) == 8:
+                        full.set()
+                if not release.wait(3):
+                    raise TimeoutError('missing terminal release')
+            if index == 49:
+                attempts.append(index)
+                if len(attempts) == 1:
+                    return None
+                repolled.set()
+            return {'witness': True}
         self.activation.preparation.poll = poll
         self.owner.prepare()
         try:
-            self.assertTrue(full.wait(3))
-            self.assertEqual(len(self.activation.preparation.created), 50)
-            self.assertEqual(peak[0], 8)
+            self.assertTrue(full.wait(2))
+            self.assertTrue(repolled.wait(1), 'eight terminal waits consumed FD capacity')
         finally:
             release.set()
         self.owner._future.result(timeout=3)
-        self.assertEqual(sorted(seen), list(range(50)))
-        self.assertEqual(peak[0], 8)
+        self.assertEqual(sorted(self.activation.preparation.created), list(range(50)))
         self.assertEqual(self.owner.status()['state'], 'ready')
 
-    def test_cancelled_waiting_preparation_reader_never_polls(self):
-        for _ in range(8):
-            self.owner._preparation_reads.acquire()
-        try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(self.owner._poll_preparation, 49)
-                deadline = time.monotonic() + 2
-                with self.owner._preparation_condition:
-                    while not self.owner._preparation_waiters:
-                        self.assertLess(time.monotonic(), deadline)
-                        self.owner._preparation_condition.wait(.01)
-                self.owner._cancel.set()
-                with self.assertRaisesRegex(ValueError, 'cancelled'):
-                    future.result(timeout=1)
-            self.assertEqual(self.activation.preparation.polled, [])
-            self.assertFalse(self.owner._preparation_waiters)
-        finally:
-            for _ in range(8):
-                self.owner._preparation_reads.release()
-
-    def test_preparation_waiters_take_capacity_in_arrival_order(self):
-        for _ in range(8):
-            self.owner._preparation_reads.acquire()
-        seen = []
-        self.activation.preparation.poll = lambda index: seen.append(index)
-        pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
-        futures = []
-        try:
-            for index in (47, 3, 28, 0):
-                futures.append(pool.submit(self.owner._poll_preparation, index))
-                deadline = time.monotonic() + 2
-                with self.owner._preparation_condition:
-                    while len(self.owner._preparation_waiters) < len(futures):
-                        self.assertLess(time.monotonic(), deadline)
-                        self.owner._preparation_condition.wait(.01)
-            # Exactly one permit keeps completion order observable; each
-            # reader returns it for the oldest still-waiting original.
-            self.owner._preparation_reads.release()
-            for future in futures:
-                future.result(timeout=2)
-            self.assertEqual(seen, [47, 3, 28, 0])
-            self.assertFalse(self.owner._preparation_waiters)
-        finally:
-            self.owner._cancel.set()
-            for _ in range(7):
-                self.owner._preparation_reads.release()
-            pool.shutdown(wait=True)
+    def test_cancelled_preparation_never_polls(self):
+        self.owner._cancel.set()
+        with self.assertRaisesRegex(ValueError, 'cancelled'):
+            self.owner._poll_preparation(49)
+        self.assertEqual(self.activation.preparation.polled, [])
 
     def test_route_commit_follows_durable_timing_before_any_send(self):
         sequence = []
@@ -390,6 +346,94 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(self.manager.writes, 50)
         self.assertEqual(sorted(self.observer.calls), [(i, True) for i in range(50)])
 
+    def test_first_task_pending_repolled_before_unrelated_slow_read_finishes(self):
+        entered, release, repolled = (threading.Event() for _ in range(3))
+        attempts = []
+        self.owner.observation_timeout = 3
+        def poll(index, *, release):
+            if index == 0:
+                entered.set()
+                if not slow_release.wait(3):
+                    raise TimeoutError('slow observer not released')
+            if index == 1:
+                attempts.append(index)
+                if len(attempts) == 1:
+                    return None
+                repolled.set()
+            return {'first_task': index}
+        slow_release = release
+        self.observer.poll = poll
+        self.ready()
+        self.owner.activate(self.origin)
+        try:
+            self.assertTrue(entered.wait(1))
+            self.assertTrue(repolled.wait(1), 'pending first task waited for unrelated slow read')
+        finally:
+            release.set()
+            result = self.finish()
+        self.assertEqual(result['first_tasks_confirmed'], 50)
+        self.assertEqual(result['activation_terminal']['outcome'], 'complete')
+        self.assertEqual(attempts, [1, 1])
+
+    def test_first_task_pending_not_repolled_after_original_deadline(self):
+        calls = []
+        self.owner.observation_timeout = 1
+        now = [100.0]
+        def poll(index, *, release):
+            calls.append(index)
+            now[0] = 101.0
+            return None
+        self.observer.poll = poll
+        # One slot makes the deadline boundary deterministic without sleeping.
+        with patch.object(service, 'COUNT', 1), patch.object(service.time, 'monotonic', side_effect=lambda: now[0]):
+            self.owner._observe(self.observer, self.timing)
+        self.assertEqual(calls, [0])
+        self.assertEqual(self.timing.finishes[-1]['outcome'], 'timeout')
+        self.assertEqual(self.owner.status()['first_tasks_confirmed'], 0)
+
+    def test_first_task_pending_cancelled_before_next_poll(self):
+        calls = []
+        def poll(index, *, release):
+            calls.append(index)
+            self.owner._cancel.set()
+            return None
+        self.observer.poll = poll
+        with patch.object(service, 'COUNT', 1):
+            self.owner._observe(self.observer, self.timing)
+        self.assertEqual(calls, [0])
+        self.assertEqual(self.timing.finishes[-1]['outcome'], 'cancelled')
+        self.assertEqual(self.owner.status()['first_tasks_confirmed'], 0)
+
+    def test_first_task_error_revokes_before_unrelated_read_finishes(self):
+        entered, release = threading.Event(), threading.Event()
+        self.owner.observation_timeout = 3
+        def poll(index, *, release):
+            if index == 0:
+                entered.set()
+                if not slow_release.wait(3):
+                    raise TimeoutError('slow observer not released')
+                return None
+            if not entered.wait(3):
+                raise TimeoutError('slow observer not entered')
+            raise OSError('first-task evidence changed')
+        slow_release = release
+        self.observer.poll = poll
+        with patch.object(service, 'COUNT', 2):
+            worker = threading.Thread(target=self.owner._observe, args=(self.observer, self.timing))
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(1))
+                self.assertTrue(self.owner._cancel.wait(1))
+                self.assertTrue(worker.is_alive())
+                self.assertFalse(self.owner._allowed())
+            finally:
+                release.set()
+                worker.join(3)
+            self.assertFalse(worker.is_alive())
+        self.assertEqual(self.owner.status()['state'], 'failed')
+        self.assertEqual(self.owner.status()['first_tasks_confirmed'], 0)
+        self.assertEqual(self.timing.finishes, [])
+
     def test_lost_response_repeated_action_never_resends(self):
         self.ready()
         self.owner.activate(self.origin)
@@ -504,6 +548,135 @@ class ServiceTests(unittest.TestCase):
         with core.FileLock(self.root / 'worker.lock', timeout_sec=0):
             pass
 
+    def test_observer_uses_same_preparation_inventory_admission(self):
+        received = []
+        def factory(*args, **kwargs):
+            received.append(kwargs['files_reader'])
+            return self.observer
+        self.owner.observer_factory = factory
+        self.ready()
+        self.owner.activate(self.origin)
+        self.finish()
+        self.assertEqual(received, [self.activation.preparation._files_reader])
+        self.assertEqual(self.manager.writes, 50)
+
+    def test_first_task_return_at_or_after_deadline_not_confirmed(self):
+        for returned_at in (101.0, 101.1):
+            with self.subTest(returned_at=returned_at):
+                now = [100.0]
+                calls = []
+                self.owner.observation_timeout = 1
+                def poll(index, *, release):
+                    calls.append(index)
+                    now[0] = returned_at
+                    return {'first_task': index}
+                self.observer.poll = poll
+                with patch.object(service, 'COUNT', 1), patch.object(
+                        service.time, 'monotonic', side_effect=lambda: now[0]):
+                    self.owner._observe(self.observer, self.timing)
+                self.assertEqual(calls, [0])
+                self.assertEqual(self.timing.finishes[-1]['outcome'], 'timeout')
+                self.assertEqual(self.owner.status()['first_tasks_confirmed'], 0)
+                self.assertEqual(self.manager.writes, 0)
+
+    def test_first_task_return_before_deadline_confirmed(self):
+        now = [100.0]
+        self.owner.observation_timeout = 1
+        def poll(index, *, release):
+            now[0] = 100.5
+            return {'first_task': index}
+        self.observer.poll = poll
+        with patch.object(service, 'COUNT', 1), patch.object(
+                service.time, 'monotonic', side_effect=lambda: now[0]):
+            self.owner._observe(self.observer, self.timing)
+        self.assertEqual(self.timing.finishes[-1]['outcome'], 'complete')
+        self.assertEqual(self.owner.status()['first_tasks_confirmed'], 1)
+
+    def test_first_task_return_after_lifetime_revocation_not_confirmed(self):
+        calls = []
+        def poll(index, *, release):
+            calls.append(index)
+            self.owner._cancel.set()
+            return {'first_task': index}
+        self.observer.poll = poll
+        with patch.object(service, 'COUNT', 1):
+            self.owner._observe(self.observer, self.timing)
+        self.assertEqual(calls, [0])
+        self.assertEqual(self.timing.finishes[-1]['outcome'], 'cancelled')
+        self.assertEqual(self.owner.status()['first_tasks_confirmed'], 0)
+        self.assertEqual(self.manager.writes, 0)
+
+    def test_first_task_collection_after_revocation_not_confirmed(self):
+        def completed(futures):
+            for future in concurrent.futures.as_completed(futures):
+                self.assertIsNotNone(future.result())
+                self.owner._cancel.set()
+                yield future
+        with patch.object(service, 'COUNT', 1), patch.object(
+                service, 'as_completed', side_effect=completed):
+            self.owner._observe(self.observer, self.timing)
+        self.assertEqual(self.timing.finishes[-1]['outcome'], 'cancelled')
+        self.assertEqual(self.owner.status()['first_tasks_confirmed'], 0)
+        self.assertEqual(self.manager.writes, 0)
+
+    def test_create_admission_bounded_but_all_fifty_originals_prepared(self):
+        entered, release = threading.Event(), threading.Event()
+        lock = threading.Lock()
+        calls, active, peak = [], 0, 0
+        def create(index):
+            nonlocal active, peak
+            with lock:
+                calls.append(index)
+                active += 1
+                peak = max(peak, active)
+                if active == 4:
+                    entered.set()
+            try:
+                if not release.wait(3):
+                    raise AssertionError('creation not released')
+            finally:
+                with lock:
+                    active -= 1
+        self.activation.preparation.launch_one = create
+        self.owner.prepare()
+        try:
+            self.assertTrue(entered.wait(2))
+            with lock:
+                self.assertEqual(len(calls), 4)
+                self.assertEqual(peak, 4)
+        finally:
+            release.set()
+        self.finish()
+        self.assertEqual(sorted(calls), list(range(50)))
+        self.assertEqual(sorted(self.activation.preparation.polled), list(range(50)))
+        self.assertEqual(peak, 4)
+        self.assertEqual(self.owner.status()['state'], 'ready')
+
+
+    def test_cancel_does_not_launch_queued_creation(self):
+        entered, release = threading.Event(), threading.Event()
+        calls, lock = [], threading.Lock()
+        def create(index):
+            with lock:
+                calls.append(index)
+                if len(calls) == 4:
+                    entered.set()
+            if not release.wait(3):
+                raise AssertionError('creation not released')
+        self.activation.preparation.launch_one = create
+        self.owner.prepare()
+        try:
+            self.assertTrue(entered.wait(2))
+            self.owner.cancel()
+        finally:
+            release.set()
+        self.finish()
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(self.activation.preparation.polled, [])
+        self.assertEqual(self.manager.writes, 0)
+
+
+
 
 class EndpointTests(unittest.TestCase):
     setUp = ServiceTests.setUp
@@ -516,6 +689,84 @@ class EndpointTests(unittest.TestCase):
         endpoint = service.ServiceEndpoint(self.owner, directory)
         self.addCleanup(endpoint.close)
         return endpoint
+
+    def test_endpoint_guard_queues_file_reads_behind_live_read(self):
+        endpoint = self.endpoint()
+        entered, release, overtook = (threading.Event() for _ in range(3))
+        original = Path.read_bytes
+        calls = []
+        lock = threading.Lock()
+        def read(path):
+            if path == endpoint.spec_path:
+                with lock:
+                    calls.append(threading.get_ident())
+                    first = len(calls) == 1
+                if first:
+                    entered.set()
+                    if not release.wait(3):
+                        raise TimeoutError('endpoint guard release missing')
+                else:
+                    overtook.set()
+            return original(path)
+        with patch.object(Path, 'read_bytes', read):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                first = pool.submit(endpoint._authorized)
+                self.assertTrue(entered.wait(3))
+                later = [pool.submit(endpoint._authorized) for _ in range(3)]
+                try:
+                    self.assertFalse(overtook.wait(.1),
+                        'concurrent guards duplicated an in-flight filesystem read')
+                finally:
+                    release.set()
+                self.assertTrue(first.result(timeout=3))
+                self.assertTrue(all(f.result(timeout=3) for f in later))
+            self.assertEqual(len(calls), 2)
+            self.assertTrue(endpoint._authorized())
+            self.assertEqual(len(calls), 3)  # A later boundary requires a fresh read.
+
+    def test_endpoint_close_after_shared_read_refuses_authorization(self):
+        endpoint = self.endpoint()
+        def read_then_close():
+            endpoint._check_files()
+            endpoint._closed.set()
+        with patch.object(endpoint, '_file_checks', side_effect=read_then_close):
+            with self.assertRaisesRegex(ValueError, 'endpoint changed'):
+                endpoint._authorized()
+
+    def test_endpoint_late_guard_rechecks_change_during_previous_read(self):
+        endpoint = self.endpoint()
+        entered, release = threading.Event(), threading.Event()
+        read = endpoint._check_files
+        calls = []
+        def checked():
+            read()
+            calls.append(True)
+            if len(calls) == 1:
+                entered.set()
+                if not release.wait(3):
+                    raise TimeoutError('endpoint mutation release missing')
+        with patch.object(endpoint, '_check_files', side_effect=checked):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                first = pool.submit(endpoint._authorized)
+                self.assertTrue(entered.wait(3))
+                later = pool.submit(endpoint._authorized)
+                try:
+                    deadline = time.monotonic() + 3
+                    while time.monotonic() < deadline:
+                        with endpoint._file_checks.condition:
+                            waiting = len(endpoint._file_checks.pending)
+                        if waiting:
+                            break
+                        time.sleep(.001)
+                    self.assertEqual(waiting, 1)
+                    endpoint.spec_path.write_bytes(endpoint.spec_path.read_bytes() + b' ')
+                finally:
+                    release.set()
+                with contextlib.suppress(ValueError):
+                    first.result(timeout=3)
+                with self.assertRaisesRegex(ValueError, 'endpoint changed'):
+                    later.result(timeout=3)
+        self.assertTrue(endpoint._closed.is_set())
 
     def test_resource_report_empty_endpoint_close(self):
         endpoint = self.endpoint()

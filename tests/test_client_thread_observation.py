@@ -48,6 +48,51 @@ class ForegroundTests(unittest.TestCase):
         self.assertEqual((result.status, result.session_id, result.tier), ('ok', self.new, 'codex-foreground'))
         self.assertIsNotNone(result.foreground_evidence)
 
+    def test_inherited_observer_on_backend_does_not_hide_frontend_key(self):
+        self.publish()
+        backend = self.pid + 1
+        env = {'CODEX_HOME': str(self.home), 'CODEX_CLIENT_THREAD_OBSERVER': '1'}
+        backend_argv = ['codex', 'app-server', '--listen', 'unix://', '--managed-daemon']
+        def arguments(pid):
+            return (backend_argv if pid == backend else ['codex', 'resume', self.old], env)
+        request = self.directory / f'{self.old}-{self.new}-request_attempt.json'
+        request.write_text(json.dumps(dict(schema=1, observer_epoch=self.old, pid=self.pid,
+            thread_id=self.new, purpose='request_attempt', transport='http',
+            observed_at_ms=3000, authorization='Bearer fake-frontend-key')))
+        request.chmod(0o600)
+        with patch.object(binding.scope, 'arguments', side_effect=arguments):
+            result = tui.resolve_surface_session('codex', [self.pid, backend],
+                {self.pid: {'command': f'codex resume {self.old}'}}, {}, now=3)
+            self.assertEqual((result.status, result.pid, result.session_id), ('ok', self.pid, self.new))
+            tui.observe_request_api_key(result, self.directory)
+            self.assertEqual(result.api_key_observed, 'fake-frontend-key')
+            # A backend becoming a frontend cannot retain the earlier Key.
+            backend_argv[:] = ['codex', 'resume', self.old]
+            tui.observe_request_api_key(result, self.directory)
+            self.assertEqual(result.api_key_observed, '')
+
+    def test_backend_alone_cannot_fall_back_to_argv_session(self):
+        env = {'CODEX_CLIENT_THREAD_OBSERVER': '1'}
+        with patch.object(binding.scope, 'arguments', return_value=(['codex', 'app-server'], env)):
+            result = self.resolve()
+            self.assertEqual(result.status, 'unknown')
+            self.assertIsNone(result.session_id)
+
+    def test_backend_identity_or_argv_drift_is_invalid(self):
+        args = (['codex', 'app-server'], {'CODEX_CLIENT_THREAD_OBSERVER': '1'})
+        with patch.object(binding.scope, 'arguments', return_value=args), \
+             patch.object(binding.scope, 'birth', side_effect=[[1, 0], [2, 0]]):
+            self.assertEqual(self.read()[0], 'invalid')
+        with patch.object(binding.scope, 'arguments', side_effect=[args, (['codex'], {})]):
+            self.assertEqual(self.read()[0], 'invalid')
+
+    def test_app_server_in_prompt_or_config_does_not_waive_foreground_record(self):
+        env = {'CODEX_HOME': str(self.home), 'CODEX_CLIENT_THREAD_OBSERVER': '1'}
+        for argv in [['codex', 'resume', self.old, 'app-server'],
+                     ['codex', '-c', 'app-server'], ['codex', '--', 'app-server']]:
+            with self.subTest(argv=argv), patch.object(binding.scope, 'arguments', return_value=(argv, env)):
+                self.assertEqual(self.read()[0], 'invalid')
+
     def test_null_and_lost_record_never_restore_old_argv(self):
         self.data['thread_id'] = None
         self.publish()

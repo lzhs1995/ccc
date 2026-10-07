@@ -133,6 +133,46 @@ class NativeFileTests(unittest.TestCase):
             with self.assertRaises(native.VnodeInventoryChanged):
                 native.process_writable_files(123)
 
+    def test_inventory_diagnostics_are_bounded_without_extra_native_reads(self):
+        self.entries = [(fd, 1) for fd in range(3, 35)]
+        self.files = {fd: (1, b'/tmp/private-reader') for fd, _ in self.entries}
+        calls = 0
+        def changed(*args):
+            nonlocal calls
+            result = self.vnode(*args)
+            calls += 1
+            if calls == 32:
+                self.entries = [(fd, 1) for fd in range(35, 67)]
+            return result
+        with patch.object(native, '_proc_pidinfo', side_effect=self.descriptors), \
+                patch.object(native, '_proc_pidfdinfo', side_effect=changed):
+            with self.assertRaises(native.VnodeInventoryChanged) as caught:
+                native.process_writable_files(123)
+        detail = caught.exception.inventory_change
+        self.assertEqual(calls, 32)
+        self.assertEqual(detail['changed_count'], 64)
+        self.assertTrue(detail['truncated'])
+        self.assertEqual(len(detail['descriptors']), 16)
+        self.assertNotIn('/tmp/private-reader', str(detail))
+        self.assertEqual(detail['descriptors'][0]['before']['access'], 1)
+
+    def test_reused_descriptor_diagnostics_preserve_both_identities(self):
+        self.entries = [(3, 1)]
+        def changed(*args):
+            result = self.vnode(*args)
+            self.files[3] = (1, b'/tmp/replacement')
+            return result
+        with patch.object(native, '_proc_pidinfo', side_effect=self.descriptors), \
+                patch.object(native, '_proc_pidfdinfo', side_effect=changed) as read:
+            with self.assertRaises(native.VnodeInventoryChanged) as caught:
+                native.process_writable_files(123)
+        detail = caught.exception.inventory_change
+        self.assertEqual(read.call_count, 2)
+        self.assertEqual(detail['kind'], 'descriptor_identity')
+        row = detail['descriptors'][0]
+        self.assertEqual((row['before']['access'], row['after']['access']), (3, 1))
+        self.assertNotEqual(row['before']['path_sha256'], row['after']['path_sha256'])
+
     def test_canonical_collision_with_distinct_inode_is_rejected(self):
         self.files[4] = (3, b'/tmp/alias.jsonl')
         def distinct(*args):

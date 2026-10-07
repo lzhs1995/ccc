@@ -92,6 +92,26 @@ class ClaudeObservationRelaunchTests(unittest.TestCase):
         duplicate.parent.mkdir(); duplicate.write_text('duplicate')
         with self.assertRaises(ValueError): self.prepare()
 
+    def test_unset_config_dir_survives_real_wrapper_handoff(self):
+        self.env.pop('CLAUDE_CONFIG_DIR')
+        self.test_full_private_wrapper_handoff_to_fake_native()
+
+    def test_unset_config_dir_is_not_materialized_and_injection_is_rejected(self):
+        self.env.pop('CLAUDE_CONFIG_DIR')
+        plan = self.prepare()
+        self.assertNotIn('CLAUDE_CONFIG_DIR', plan['environment'])
+        env = self.claim(plan)
+        args = [str(self.native), '--resume', self.sid]
+        for value in (str(self.config), ''):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'config root'):
+                resume.exec_native(plan, args, lambda p: None,
+                    environment=dict(env, CLAUDE_CONFIG_DIR=value),
+                    execute=lambda *a: self.fail('changed global config path'))
+        calls = []
+        resume.exec_native(plan, args, lambda p: None, environment=env,
+                           execute=lambda *a: calls.append(a))
+        self.assertNotIn('CLAUDE_CONFIG_DIR', calls[0][2])
+
     def test_history_append_and_same_bytes_inode_replacement_refuse_launch(self):
         plan = self.prepare()
         self.history.write_text(self.history.read_text() + '{}\n')
@@ -205,6 +225,8 @@ class ClaudeObservationRelaunchTests(unittest.TestCase):
         observed=json.loads(result.stdout)
         self.assertEqual(capture.session_from_argv(observed['argv']),self.sid)
         self.assertEqual(observed['env']['ANTHROPIC_API_KEY'],'fake-original-key')
+        self.assertEqual('CLAUDE_CONFIG_DIR' in observed['env'], 'CLAUDE_CONFIG_DIR' in self.env)
+        self.assertEqual(observed['env'].get('CLAUDE_CONFIG_DIR'), self.env.get('CLAUDE_CONFIG_DIR'))
         self.assertIn('--preload',observed['env']['BUN_OPTIONS'])
         self.assertTrue(Path(plan['claim_path']+'.native').exists())
         self.assertTrue(Path(plan['claim_path']+'.base').exists())

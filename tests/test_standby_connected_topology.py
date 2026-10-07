@@ -57,6 +57,7 @@ class ConnectedTopologyTests(unittest.TestCase):
                 return client.workspace_tree(wid)
 
             owner = SimpleNamespace(client=client, _topology=FreshTopology(topology),
+                _connected_topology=FreshTopology(lambda: client.workspace_tree(wid)),
                 job={'workspace_id': wid, 'slots': [{}]}, _current=lambda: None,
                 _permission=lambda *_: allowed[0], _failed=threading.Event())
             waiting = []

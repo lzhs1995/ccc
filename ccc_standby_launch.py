@@ -14,6 +14,8 @@ import shlex
 import stat
 import sys
 import time
+import traceback
+import uuid
 
 import cmux_codex_watch as core
 import ccc_workspace_batch as batch
@@ -242,7 +244,7 @@ def launch_registered(config_path, job_id, index, launch_id, *, generation_curre
 def bind_initial(config_path, job_id, index, launch_id, payload):
     """Join a postactivation Hook to the session pinned before activation."""
     from ccc_guard_scope import process, birth
-    from ccc_codex_queue import process_writable_files
+    from ccc_codex_queue import process_writable_files, IncompleteVnodeRead, VnodeInventoryChanged
     from ccc_batch_timing import boot_id
     jobfile = batch.job_path(config_path, job_id)
     selected = policy(core.load_json(jobfile, {}), config_path)
@@ -321,7 +323,37 @@ def bind_initial(config_path, job_id, index, launch_id, payload):
     root = (Path(current['environment'].get('CODEX_HOME') or Path.home() / '.codex') / 'sessions').resolve()
     lock = Path(row['writer_lock'])
     tui = Path(native_claim['tui_log'])
-    files = process_writable_files(row['pid'], identities=True)
+    # Startup may open/close native files while the two inventories are read.
+    # Retry only that read within this already-consumed Hook, never the Hook or
+    # input itself. Both snapshots share one budget below the native 5s timeout;
+    # no partial inventory becomes evidence, and every original guard remains.
+    inventory_deadline = time.monotonic() + 2.0
+
+    def writer_inventory():
+        while True:
+            if time.monotonic() >= inventory_deadline:
+                raise TimeoutError('standby Hook file inventory deadline elapsed')
+            if birth(row['pid'], codex=True) != row['birth']:
+                raise ValueError('standby Hook process changed during file observation')
+            if time.monotonic() >= inventory_deadline:
+                raise TimeoutError('standby Hook file inventory deadline elapsed')
+            try:
+                value = process_writable_files(row['pid'], identities=True)
+            except (IncompleteVnodeRead, VnodeInventoryChanged):
+                remaining = inventory_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError('standby Hook file inventory deadline elapsed')
+                time.sleep(min(0.02, remaining))
+                continue
+            if time.monotonic() >= inventory_deadline:
+                raise TimeoutError('standby Hook file inventory deadline elapsed')
+            if birth(row['pid'], codex=True) != row['birth']:
+                raise ValueError('standby Hook process changed during file observation')
+            if time.monotonic() >= inventory_deadline:
+                raise TimeoutError('standby Hook file inventory deadline elapsed')
+            return value
+
+    files = writer_inventory()
     for path, expected in ((lock, row['writer_identity']), (tui, native_claim['tui_log_identity'])):
         info = path.lstat()
         if (not stat.S_ISREG(info.st_mode) or [info.st_dev, info.st_ino] != expected
@@ -338,7 +370,7 @@ def bind_initial(config_path, job_id, index, launch_id, payload):
         if (not Path(transcript).is_relative_to(root)
                 or not Path(transcript).name.endswith(row['session_id'] + '.jsonl')):
             raise ValueError('standby Hook transcript differs from original session')
-    current_files = process_writable_files(row['pid'], identities=True)
+    current_files = writer_inventory()
     after_directory = directory.lstat()
     if (process(row['pid'], launch=True) != current or birth(row['pid'], codex=True) != row['birth']
             or current_files.get(lock) != files[lock] or current_files.get(tui) != files[tui]
@@ -364,6 +396,75 @@ def bind_initial(config_path, job_id, index, launch_id, payload):
         'tui_prefix_bytes': len(data), 'tui_prefix_sha256': hashlib.sha256(data).hexdigest()})
 
 
+def _open_hook_diagnostic(config_path, job_id, index, launch_id):
+    """Best-effort, private invocation log; never an authorization receipt."""
+    directory_fd = None
+    try:
+        identifier(job_id)
+        identifier(launch_id)
+        if type(index) is not int or not 0 <= index < COUNT:
+            return None
+        directory_fd = os.open(batch.job_path(config_path, job_id).parent,
+                               os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        info = os.fstat(directory_fd)
+        if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077:
+            return None
+        name = f'standby-hook-diagnostic-{index}-{uuid.uuid4().hex}.jsonl'
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                     0o600, dir_fd=directory_fd)
+        return os.fdopen(fd, 'wb')
+    except Exception:
+        return None
+    finally:
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+
+def _record_hook_diagnostic(handle, record):
+    if handle is None:
+        return
+    try:
+        handle.write((json.dumps(record, sort_keys=True) + '\n').encode())
+        handle.flush()
+        os.fsync(handle.fileno())
+    except Exception:
+        # Diagnostics must not mask the original error or alter consumption.
+        pass
+
+
+def bind_with_diagnostics(config_path, job_id, index, launch_id, read_payload):
+    handle = _open_hook_diagnostic(config_path, job_id, index, launch_id)
+    started = time.monotonic()
+    _record_hook_diagnostic(handle, {
+        'state': 'started', 'at': time.time(), 'monotonic': started,
+        'job_id': job_id, 'index': index, 'launch_id': launch_id,
+        'hook_pid': os.getpid(), 'identity_source': 'unverified_invocation_arguments'})
+    try:
+        result = bind_initial(config_path, job_id, index, launch_id, read_payload())
+    except BaseException as exc:
+        # Store the original frame chain, without locals, payload, environment
+        # or arbitrary exception text. The unchanged exception still reaches
+        # stderr. A killed Hook can leave only 'started'; that is not proof of
+        # a timeout, and cannot be used as permission to rerun the Hook.
+        _record_hook_diagnostic(handle, {
+            'state': 'failed', 'at': time.time(), 'elapsed': time.monotonic() - started,
+            'error_type': type(exc).__name__,
+            'traceback': [{'file': frame.f_code.co_filename, 'line': line,
+                           'function': frame.f_code.co_name}
+                          for frame, line in traceback.walk_tb(exc.__traceback__)]})
+        raise
+    else:
+        _record_hook_diagnostic(handle, {
+            'state': 'bound', 'at': time.time(), 'elapsed': time.monotonic() - started})
+        return result
+    finally:
+        if handle is not None:
+            try:
+                handle.close()
+            except Exception:
+                pass
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('command', choices=['bind'])
@@ -372,7 +473,8 @@ def main():
     parser.add_argument('--index', type=int, required=True)
     parser.add_argument('--launch-id', required=True)
     args = parser.parse_args()
-    bind_initial(args.config, args.job, args.index, args.launch_id, json.loads(sys.stdin.read()))
+    bind_with_diagnostics(args.config, args.job, args.index, args.launch_id,
+                          lambda: json.loads(sys.stdin.read()))
 
 
 if __name__ == '__main__':

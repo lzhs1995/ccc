@@ -173,7 +173,7 @@ class StandbyIdentityTests(unittest.TestCase):
     def test_partial_user_turn_tail_is_not_negative_input_evidence(self):
         with self.tui.open('ab') as handle:
             handle.write(b'{"dir":"from_tui","kind":"op","payload":{"UserTurn":')
-        with self.assertRaises(ValueError):
+        with self.assertRaises(identity.TuiObservationPending):
             self.inspect()
 
 

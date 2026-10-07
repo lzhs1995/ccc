@@ -336,6 +336,7 @@ class StandbyLedger:
                     or current.get('generation') != activation['generation']):
                 raise ValueError('original standby identity or authorization changed')
             evidence_current()  # Callbacks may block while another slot invalidates the cohort.
+            return current
 
         claim = self.directory / f'input-{index}.json'
         # Activation is already durably committed. Only competing claims for
@@ -372,7 +373,12 @@ class StandbyLedger:
                     # Connected reads for independent originals may run in
                     # parallel. Never carry their result across a lock wait:
                     # a contended admission discards it and checks again.
-                    check()
+                    current = check()
+                    # Per-slot disk I/O must not hold the cohort admission
+                    # lock. External changes are not protected by that lock.
+                    if used or claim.is_symlink() or claim.read_bytes() != payload:
+                        raise ValueError('standby transport permit consumed or changed')
+                    fresh(current, activation['boot_id'], self.clock())
                     acquired = self._write_lock.acquire(blocking=False)
                     if not acquired:
                         with self._write_lock:
@@ -384,9 +390,9 @@ class StandbyLedger:
                 # slots again. External files were never protected by this
                 # process-local lock; every contended admission still repeats
                 # their full validation above.
-                if self._invalid or os.path.lexists(self.directory / 'invalidated.json'):
+                if self._invalid:
                     raise ValueError('standby activation invalidated')
-                if used or claim.is_symlink() or claim.read_bytes() != payload:
+                if used:
                     raise ValueError('standby transport permit consumed or changed')
                 used = True
                 self._active_writes += 1
