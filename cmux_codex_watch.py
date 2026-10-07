@@ -629,6 +629,12 @@ class TargetRuntime:
     # A closed executor turn may still have an unconfirmed callback. Reuse the
     # no-send latch, but preserve that distinction in state and the event ledger.
     claude_report_ready_task_id: str | None = None
+    # A verified handshake is not a business task. Its ACK waits for native
+    # receipt of the task pack and must never trigger the generic watchdog.
+    claude_handshake_challenge: dict[str, Any] | None = None
+    claude_handshake_wait: bool = False
+    claude_handshake_ack_at: float = 0.0
+    claude_handshake_ack_event_id: str | None = None
     claude_turn_started_at: float = 0.0
     claude_completion_fingerprint: str | None = None
     claude_completed_at: float = 0.0
@@ -6552,6 +6558,7 @@ class WatchDaemon:
             runtime.claude_last_prompt_attribution = None
             runtime.claude_completed_latched = False
             runtime.claude_report_ready_task_id = None
+            self._clear_claude_handshake(runtime)
             runtime.claude_turn_started_at = 0.0
             runtime.claude_completion_fingerprint = None
             runtime.claude_completed_at = 0.0
@@ -8310,7 +8317,7 @@ class WatchDaemon:
         if runtime.last_send_at > runtime.claude_deferred_since:
             self._clear_claude_deferred(runtime, reason="covered_by_later_send")
             return False
-        if runtime.claude_completed_latched:
+        if runtime.claude_completed_latched or runtime.claude_handshake_wait:
             self._clear_claude_deferred(runtime, reason="completed")
             return False
         if runtime.claude_submit_phase != "none":
@@ -8404,6 +8411,7 @@ class WatchDaemon:
         """
 
         event_id = str(event.get("event_id") or "")
+        self._clear_claude_handshake(runtime)
         # Record this event's own verdict.  Written here rather than read from
         # here: the field is forensics for the turn just started, never the
         # default for the next one.
@@ -8591,7 +8599,7 @@ class WatchDaemon:
                        'claude_last_submit_session_id', 'claude_last_submit_generation', 'claude_last_submit_at')
         previous_echo = {key: getattr(runtime, key) for key in echo_fields}
         try:
-            if runtime.claude_submit_write_unknown:
+            if runtime.claude_submit_write_unknown or runtime.claude_handshake_wait:
                 return False
             base = client.client if isinstance(client, SnapshotClient) else client
             if input_check is None:
@@ -8617,7 +8625,7 @@ class WatchDaemon:
             identity_check = input_check
 
             def submit_check():
-                if not identity_check():
+                if runtime.claude_handshake_wait or not identity_check():
                     return False
                 message = str(self.config.get("claude_message") or CLAUDE_MESSAGE)
                 if (runtime.claude_submit_message_hash
@@ -8626,6 +8634,7 @@ class WatchDaemon:
                 frame = Grid.from_rpc(base.replay(str(target["workspace_id"]), surface_id), surface_id)
                 state = classify_claude_grid(frame, claude_message=message)
                 return (state.kind == "composer_busy" and state.watchdog_echo and identity_check()
+                        and not runtime.claude_handshake_wait
                         and str(self.config.get("claude_message") or CLAUDE_MESSAGE) == message)
 
             if not submit_check():
@@ -8703,6 +8712,12 @@ class WatchDaemon:
         and fallback paths do not also act on the same surface.
         """
 
+        if runtime.claude_handshake_wait:
+            # A stranded watchdog prompt cannot consume a handshake. Preserve
+            # both the wait and the Enter budget until native task admission.
+            runtime.state = "claude_handshake_wait"
+            return True
+
         # Every other Enter/text site checks this pair; recovery is a *new* send
         # origin rather than the continuation of an armed transaction, so it has
         # to check them too.  Without this a globally paused daemon still pressed
@@ -8764,6 +8779,9 @@ class WatchDaemon:
         unchanged watchdog composer retries Enter only, never the full text.
         """
 
+        if runtime.claude_handshake_wait:
+            runtime.state = "claude_handshake_wait"
+            return True
         if runtime.claude_report_ready_task_id or state.kind == "claude_report_ready":
             # Stop retrying writes without turning an unknown submission into
             # a confirmation. Preserve its transaction until native evidence
@@ -8866,6 +8884,8 @@ class WatchDaemon:
         runtime: TargetRuntime,
         client: CmuxClient,
     ) -> tuple[bool, str]:
+        if runtime.claude_handshake_wait:
+            return False, "handshake waits for native task dispatch"
         surface_id = str(target["surface_id"])
         preflight_started = time.time()
         # In-process durations use perf_counter (monotonic, unaffected by clock
@@ -8957,6 +8977,7 @@ class WatchDaemon:
                         and self.config.get("claude_enabled")
                         and not current.get("paused") and current.get("enabled", True)
                         and not runtime.claude_completed_latched
+                        and not runtime.claude_handshake_wait
                         and (not event.get("_registration_revalidation")
                              or self._registration_stop_is_latest(event)))
             except (OSError, ValueError, TypeError, CmuxError):
@@ -9189,7 +9210,8 @@ class WatchDaemon:
         a Working viewport, synthetic fallback, an ordinary Stop, or a clock
         measured when the daemon handled a replayed completion.
         """
-        if (not runtime.claude_completed_latched or runtime.claude_submit_phase != "none"
+        if (runtime.claude_handshake_wait
+                or not runtime.claude_completed_latched or runtime.claude_submit_phase != "none"
                 or runtime.claude_report_ready_task_id
                 or event.get("synthetic_fallback") or event.get("event_name") != "Stop"
                 or event.get("completed") is not False or event.get("stop_hook_active") is not True):
@@ -9236,6 +9258,162 @@ class WatchDaemon:
         surface_id = str(event.get("surface_id") or "")
         with self._surface_lock(surface_id or "__unmapped__"):
             return self._handle_claude_event_locked(event, client)
+
+    @staticmethod
+    def _clear_claude_handshake(runtime: TargetRuntime) -> None:
+        runtime.claude_handshake_challenge = None
+        runtime.claude_handshake_wait = False
+        runtime.claude_handshake_ack_at = 0.0
+        runtime.claude_handshake_ack_event_id = None
+
+    @staticmethod
+    def _claude_protocol_identity(
+        runtime: TargetRuntime, event: Mapping[str, Any], target: Mapping[str, Any],
+        *, allow_new_session: bool = False,
+    ) -> bool:
+        """Protocol state belongs to the accepted native root, never a ref alone."""
+        stamp = event.get("created_at")
+        return bool(
+            not event.get("synthetic_fallback")
+            and type(stamp) in (int, float) and math.isfinite(stamp)
+            and 0 < stamp <= time.time() + 1
+            and type(event.get("agent_pid")) is int
+            and runtime.claude_process_pid and event.get("agent_pid") == runtime.claude_process_pid
+            and runtime.claude_process_generation
+            and event.get("process_generation") == runtime.claude_process_generation
+            and runtime.claude_session_id
+            and (allow_new_session or event.get("session_id") == runtime.claude_session_id)
+            and all(target.get(key) and event.get(key) == target.get(key)
+                    for key in ("surface_id", "workspace_id"))
+        )
+
+    @staticmethod
+    def _claude_dispatch_matches(
+        challenge: Mapping[str, Any], dispatch: Mapping[str, Any], target: Mapping[str, Any],
+    ) -> bool:
+        """A native dispatch must reference this handshake's finalized task pack.
+
+        File presence never releases the wait by itself. The caller also
+        requires a later native UserPromptSubmit from the same process.
+        """
+        try:
+            expected = Path(challenge["receipt_path"]).parent / "task-pack.json"
+            if dispatch.get("task_pack") != str(expected) or dispatch.get("task_id") != challenge["task_id"]:
+                return False
+            if expected.is_symlink() or expected.stat().st_size > 1024 * 1024:
+                return False
+            pack = json.loads(expected.read_text(encoding="utf-8"))
+            ack = (f"PREFLIGHT_ACK|{challenge['task_id']}|{challenge['agent']}"
+                   f"|READY|INLINE|{challenge['ack_nonce']}")
+            if not isinstance(pack, dict):
+                return False
+            callback_matches = pack.get("callback") == ack
+            # The harness can retain its literal ACK template in a finalized
+            # pack. Resolve only that exact template through the unique ACKED
+            # executor receipt, also matching the ACK observed in native Hooks.
+            template = f"PREFLIGHT_ACK|{challenge['task_id']}|<provider>:identity|READY|INLINE|<nonce>"
+            if not callback_matches and pack.get("callback") == template:
+                receipt_path = Path(challenge["receipt_path"])
+                if receipt_path.is_symlink() or receipt_path.stat().st_size > 1024 * 1024:
+                    return False
+                receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                rows = receipt.get("executors") if isinstance(receipt, dict) else None
+                if not isinstance(rows, list):
+                    return False
+                matches = [row for row in rows if isinstance(row, dict)
+                           and row.get("executor") == challenge.get("executor")]
+                if len(matches) != 1:
+                    return False
+                row = matches[0]
+                callback_matches = bool(
+                    receipt.get("task_id") == challenge["task_id"]
+                    and row.get("task_id") == challenge["task_id"]
+                    and row.get("executor_provider") == "claude"
+                    and row.get("ack_nonce") == challenge["ack_nonce"]
+                    and row.get("status") == "PASS" and row.get("lifecycle") == "ACKED"
+                    and row.get("executor_ack") is True
+                    and row.get("ack_line") == ack and row.get("ack_line_expected") == ack)
+            return bool(isinstance(pack, dict) and pack.get("draft") is False
+                        and pack.get("task_id") == challenge["task_id"]
+                        and callback_matches
+                        and pack.get("completion_nonce") == dispatch.get("marker")
+                        and pack.get("executor") == challenge.get("executor")
+                        and pack.get("executor_uuid") == target.get("surface_id"))
+        except (OSError, ValueError, KeyError, TypeError):
+            return False
+
+    def _handle_claude_handshake(
+        self, runtime: TargetRuntime, event: Mapping[str, Any], target: Mapping[str, Any],
+    ) -> bool:
+        """Consume protocol events after native identity validation."""
+        name = event.get("event_name")
+        challenge = runtime.claude_handshake_challenge
+        incoming = event.get("handshake_challenge") if name == "UserPromptSubmit" else None
+        stamp = float(event["created_at"])
+        boundary = max(runtime.claude_turn_started_at, runtime.claude_handshake_ack_at,
+                       float((challenge or {}).get("created_at", 0)))
+        if name == "UserPromptSubmit" and isinstance(incoming, dict):
+            if incoming.get("executor") != target.get("ref") or stamp <= boundary:
+                self._mark_claude_event(event, runtime, "stale_handshake_challenge")
+                return True
+            if challenge and all(incoming.get(key) == challenge.get(key)
+                                 for key in ("task_id", "ack_nonce", "executor", "receipt_path")):
+                self._mark_claude_event(event, runtime, "handshake_challenge_replay")
+                return True
+            # A fresh native challenge owns a new handshake, not a completed
+            # business task. Existing unknown writes are cancelled, not confirmed.
+            if runtime.claude_submit_phase != "none":
+                self._clear_claude_submit(runtime, reason="human_prompt_override")
+            self._apply_human_prompt_reset(str(target["surface_id"]), runtime, event)
+            runtime.claude_handshake_challenge = {
+                **incoming, **{key: event.get(key) for key in (
+                    "session_id", "process_generation", "agent_pid", "event_id",
+                    "message_hash", "created_at", "surface_id", "workspace_id")}}
+            self._mark_claude_event(event, runtime, "handshake_challenge")
+            return True
+        ack = event.get("handshake_ack") if name == "Stop" else None
+        if isinstance(ack, dict) and stamp <= runtime.claude_turn_started_at:
+            # A delayed ACK from the preceding handshake cannot become an
+            # ordinary unfinished Stop after task dispatch cleared the wait.
+            self._mark_claude_event(event, runtime, "stale_handshake_ack")
+            return True
+        if isinstance(ack, dict) and challenge:
+            if (stamp <= boundary or any(ack.get(key) != challenge.get(key)
+                                        for key in ("task_id", "agent", "ack_nonce"))):
+                self._mark_claude_event(event, runtime, "stale_handshake_ack")
+                return True
+            runtime.claude_handshake_wait = True
+            runtime.claude_handshake_ack_at = stamp
+            runtime.claude_handshake_ack_event_id = str(event["event_id"])
+            self._clear_claude_deferred(runtime, reason="handshake_wait")
+            self._clear_claude_fallback_episode(runtime)
+            runtime.error_type = None
+            runtime.state = "claude_handshake_wait"
+            self._mark_claude_event(event, runtime, "handshake_wait")
+            return True
+        if name == "UserPromptSubmit" and (challenge or runtime.claude_handshake_wait):
+            dispatch = event.get("task_dispatch")
+            if (runtime.claude_handshake_wait and isinstance(dispatch, dict) and stamp > boundary
+                    and self._claude_dispatch_matches(challenge or {}, dispatch, target)):
+                if runtime.claude_submit_phase != "none":
+                    self._clear_claude_submit(runtime, reason="human_prompt_override")
+                self._apply_human_prompt_reset(str(target["surface_id"]), runtime, event)
+                self._mark_claude_event(event, runtime, "task_dispatch")
+                return True
+            if (event.get("collaboration_protocol") or event.get("prompt_kind") != "human"
+                    or stamp <= boundary):
+                self._mark_claude_event(event, runtime, "suppressed_handshake_wait")
+                return True
+            # A later, explicit non-protocol human prompt may take ownership.
+            if runtime.claude_submit_phase != "none":
+                self._clear_claude_submit(runtime, reason="human_prompt_override")
+            self._apply_human_prompt_reset(str(target["surface_id"]), runtime, event)
+            return True
+        if runtime.claude_handshake_wait:
+            runtime.state = "claude_handshake_wait"
+            self._mark_claude_event(event, runtime, "suppressed_handshake_wait")
+            return True
+        return False
 
     def _handle_claude_event_locked(
         self,
@@ -9309,6 +9487,44 @@ class WatchDaemon:
             )
             return
         event_name = str(event["event_name"])
+        handshake_session_start = event_name == "SessionStart" and bool(
+            runtime.claude_handshake_challenge or runtime.claude_handshake_wait)
+        protocol_event = event_name != "SessionStart" and bool(
+            runtime.claude_handshake_challenge or runtime.claude_handshake_wait
+            or event.get("collaboration_protocol") or event.get("handshake_ack"))
+        if handshake_session_start or (protocol_event and not event.get("process_generation")):
+            # Native Hooks carry PID/session, not the daemon's generation.
+            # Derive missing metadata only from a fresh process inspection;
+            # never copy a persisted generation onto an unverified event.
+            try:
+                inspected = inspect_claude_process(int(event.get("agent_pid") or 0))
+                started = inspected.get("started_epoch")
+                stamp = event.get("created_at")
+                if (inspected.get("generation") == runtime.claude_process_generation
+                        and (not event.get("process_generation")
+                             or event.get("process_generation") == inspected.get("generation"))
+                        and type(started) in (int, float) and math.isfinite(started)
+                        and type(stamp) in (int, float) and math.isfinite(stamp)
+                        and 0 < started <= stamp):
+                    event = {**event, "process_generation": inspected["generation"]}
+                elif handshake_session_start:
+                    self._mark_claude_event(event, runtime, "handshake_identity_unverified")
+                    return
+            except (OSError, ValueError, TypeError, RuntimeError):
+                if handshake_session_start:
+                    self._mark_claude_event(event, runtime, "handshake_identity_unverified")
+                    return
+        if handshake_session_start:
+            boundary = max(runtime.claude_turn_started_at, runtime.claude_handshake_ack_at,
+                           float((runtime.claude_handshake_challenge or {}).get("created_at", 0)))
+            if (not self._claude_protocol_identity(runtime, event, target, allow_new_session=True)
+                    or (session_id != runtime.claude_session_id
+                        and float(event["created_at"]) <= boundary)):
+                self._mark_claude_event(event, runtime, "handshake_identity_unverified")
+                return
+        if protocol_event and not self._claude_protocol_identity(runtime, event, target):
+            self._mark_claude_event(event, runtime, "handshake_identity_unverified")
+            return
         report_task = event.get("report_ready_task_id") if event_name == "Stop" else None
         if not isinstance(report_task, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,159}", report_task):
             report_task = None
@@ -9316,7 +9532,7 @@ class WatchDaemon:
         # event or the screen fallback enqueue another copy while the first
         # prompt is still sitting in the composer. The watchdog's own prompt
         # confirms the transaction; a real user prompt cancels it and wins.
-        if runtime.claude_submit_phase != "none":
+        if runtime.claude_submit_phase != "none" and not protocol_event:
             prompt_kind = str(event.get("prompt_kind") or "")
             if event_name == "UserPromptSubmit" and prompt_kind == "human":
                 self._clear_claude_submit(runtime, reason="human_prompt_override")
@@ -9472,6 +9688,7 @@ class WatchDaemon:
             runtime.claude_process_pid = event_pid
         if event_name == "SessionStart":
             if runtime.claude_session_id != session_id:
+                self._clear_claude_handshake(runtime)
                 runtime.__dict__.pop("_live_claude_hook_identity", None)
                 if runtime.claude_report_ready_task_id:
                     runtime.claude_report_ready_task_id = None
@@ -9485,7 +9702,7 @@ class WatchDaemon:
             runtime.claude_session_id = session_id
             runtime.claude_generation_id = event_id
             runtime.claude_hook_process_generation = runtime.claude_process_generation or event_generation or None
-            runtime.state = "claude_hook_waiting"
+            runtime.state = "claude_handshake_wait" if runtime.claude_handshake_wait else "claude_hook_waiting"
             self._mark_claude_event(event, runtime, "session_started")
             self._record_live_claude_hook_identity(runtime, event, target)
             self.logger.info(
@@ -9529,6 +9746,7 @@ class WatchDaemon:
             # Hook and makes the next stopped turn eligible again.
             self._clear_claude_fallback_episode(runtime)
         if runtime.claude_session_id != session_id:
+            self._clear_claude_handshake(runtime)
             runtime.__dict__.pop("_live_claude_hook_identity", None)
             if runtime.claude_report_ready_task_id:
                 # A verified root-session rebind can arrive without SessionStart.
@@ -9546,6 +9764,9 @@ class WatchDaemon:
             runtime.claude_hook_process_generation = runtime.claude_process_generation or event_generation or None
             runtime.claude_last_hook_at = float(event.get("created_at") or time.time())
             self._record_live_claude_hook_identity(runtime, event, target)
+
+        if protocol_event and self._handle_claude_handshake(runtime, event, target):
+            return
 
         if event_name == "UserPromptSubmit":
             self._clear_claude_fallback_episode(runtime)
@@ -10075,6 +10296,14 @@ class WatchDaemon:
         runtime.claude_candidate_key = None
         runtime.claude_candidate_since = 0.0
         runtime.claude_candidate_focused = False
+        if runtime.claude_handshake_wait:
+            return ScreenState(
+                "claude_handshake_wait", fingerprint=runtime.claude_handshake_ack_event_id,
+                screen_signature=state.screen_signature,
+                reason="Claude handshake acknowledged; waiting for native task dispatch",
+                message_kind="claude", content_fingerprint=state.content_fingerprint,
+                claude_context=getattr(state, "claude_context", None),
+            )
         if runtime.claude_completed_latched:
             return ScreenState(
                 "claude_report_ready" if runtime.claude_report_ready_task_id else "claude_completed",
@@ -10172,7 +10401,7 @@ class WatchDaemon:
         content fingerprints are observations and cannot reset its retry budget.
         """
 
-        if not bool(self.config.get("claude_hook_gap_fallback_enabled", True)):
+        if runtime.claude_handshake_wait or not bool(self.config.get("claude_hook_gap_fallback_enabled", True)):
             self._reset_claude_fallback_candidate(runtime)
             return False
         if runtime.claude_submit_phase != "none":

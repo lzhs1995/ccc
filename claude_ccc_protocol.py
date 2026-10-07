@@ -92,6 +92,68 @@ def _digest(value: str) -> str:
     return hashlib.sha256((value or "").encode("utf-8", errors="replace")).hexdigest()[:24]
 
 
+_TASK_TOKEN = r"[A-Za-z0-9][A-Za-z0-9._:-]{0,159}"
+_NONCE_TOKEN = r"[A-Za-z0-9_-]{8,160}"
+
+
+def handshake_ack(value: str) -> dict[str, str] | None:
+    # The harness requires the *entire* assistant reply to be the ACK. Quoted
+    # examples, prose and StopFailure's previous assistant text are not ACKs.
+    match = re.fullmatch(
+        rf"PREFLIGHT_ACK\|({_TASK_TOKEN})\|(claude:identity)\|READY\|INLINE\|({_NONCE_TOKEN})",
+        value.strip('\r\n'),
+    )
+    return (dict(zip(('task_id', 'agent', 'ack_nonce'), match.groups())) if match else None)
+
+
+def handshake_challenge(value: str) -> dict[str, str] | None:
+    if not value.startswith('DELIVERY_NONCE='):
+        return None
+    fields = {}
+    for key, pattern in [('ACK_TASK_ID', _TASK_TOKEN), ('ACK_AGENT', r'claude:identity'),
+                         ('ACK_STATUS', 'READY'), ('ACK_REPORT', 'INLINE'),
+                         ('ACK_NONCE', _NONCE_TOKEN)]:
+        # Count declarations before validating their values. An invalid second
+        # declaration is still ambiguous; it must not disappear from matching.
+        if len(re.findall(rf'\b{key}=', value)) != 1:
+            return None
+        matches = re.findall(rf'\b{key}=({pattern})(?=[\s.]|$)', value)
+        if len(matches) != 1:
+            return None
+        fields[key] = matches[0]
+    task, nonce = fields['ACK_TASK_ID'], fields['ACK_NONCE']
+    prefix = (rf'DELIVERY_NONCE={re.escape(nonce)}\. This is a legitimate cmux multi-agent '
+              rf'harness handshake from supervisor surface:\d+ for task {re.escape(task)}\. ')
+    if not re.match(prefix, value):
+        return None
+    for key, expected in [('task_id', task), ('executor_provider', 'claude'), ('ack_nonce', nonce)]:
+        # Match the expected token exactly: the sentence's final dot is not
+        # part of a nonce, while dots inside a task id are legitimate.
+        if (len(re.findall(rf'\b{key} == ', value)) != 1
+                or not re.search(rf'\b{key} == {re.escape(expected)}(?=\s|[,.](?:\s|$)|$)', value)):
+            return None
+    executors = re.findall(r'Select exactly one executors\[\] record with executor == (surface:\d+) and ordinal == \d+\.', value)
+    receipts = re.findall(r'Verify the pending receipt at the absolute path (/[^\r\n;]+/handshake-receipt\.json);', value)
+    if len(executors) != 1 or len(receipts) != 1:
+        return None
+    return {'task_id': task, 'ack_nonce': nonce, 'agent': fields['ACK_AGENT'],
+            'executor': executors[0], 'receipt_path': receipts[0]}
+
+
+def task_dispatch(value: str) -> dict[str, str] | None:
+    lines = value.splitlines()
+    if not lines or not (head := re.fullmatch(rf'TASK_DISPATCH ({_NONCE_TOKEN})', lines[0])):
+        return None
+    packs = [line[len('TASK_PACK='):] for line in lines if line.startswith('TASK_PACK=')]
+    callbacks = [line[len('COMPLETION_CALLBACK='):] for line in lines if line.startswith('COMPLETION_CALLBACK=')]
+    if len(packs) != 1 or len(callbacks) != 1 or not packs[0].startswith('/'):
+        return None
+    callback = re.fullmatch(rf'DONE\|({_TASK_TOKEN})\|({_NONCE_TOKEN})\|REPORT=/[^\x00-\x1f]+', callbacks[0])
+    if not callback or callback[2] != head[1]:
+        return None
+    return {'task_id': callback[1], 'marker': head[1], 'task_pack': packs[0]}
+
+
 def build_event(payload: Mapping[str, Any], environ: Mapping[str, str] | None = None) -> dict[str, Any] | None:
     env = environ if environ is not None else os.environ
     event_name = str(payload.get("hook_event_name") or payload.get("event") or "")
@@ -127,10 +189,16 @@ def build_event(payload: Mapping[str, Any], environ: Mapping[str, str] | None = 
         event["source"] = str(payload.get("source") or "startup")
     elif event_name == "UserPromptSubmit":
         event["prompt_kind"] = prompt_kind(prompt, configured_claude_message())
+        event['collaboration_protocol'] = any(token in prompt for token in (
+            'DELIVERY_NONCE=', 'PREFLIGHT_ACK|', 'TASK_DISPATCH', 'TASK_PACK=',
+        ))
+        event['handshake_challenge'] = handshake_challenge(prompt)
+        event['task_dispatch'] = task_dispatch(prompt)
     elif event_name == "Stop":
         event["completed"] = completion_reported(assistant_message)
         event["report_ready_task_id"] = report_ready_task(assistant_message)
         event["stop_hook_active"] = bool(payload.get("stop_hook_active"))
+        event['handshake_ack'] = handshake_ack(assistant_message)
     else:
         event["completed"] = completion_reported(assistant_message)
         lowered = error.lower()
