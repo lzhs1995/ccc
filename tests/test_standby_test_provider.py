@@ -14,6 +14,20 @@ from tools.standby_test_provider import (LocalProvider, recovered_turn,
 
 
 class ProviderTests(unittest.TestCase):
+    def patch_resolution_budget(self, budget):
+        # These HTTPS cases verify polling/lifecycle semantics, not scheduler
+        # speed. Keep the real resolver and advance only its injected clock;
+        # real-time delayed-publication cases below retain their real clocks.
+        def bounded_resolution(transcript, **kwargs):
+            elapsed = [0.0]
+            kwargs.update(deadline=budget, clock=lambda: elapsed[0],
+                          sleep=lambda delay: elapsed.__setitem__(0, elapsed[0] + delay))
+            return resolve_request_transcript(transcript, **kwargs)
+        patcher = patch('tools.standby_test_provider.resolve_request_transcript',
+                        side_effect=bounded_resolution)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_resolution_failures_keep_attempts_elapsed_and_cause(self):
         for late_path in (False, True):
             with self.subTest(late_path=late_path):
@@ -44,11 +58,7 @@ class ProviderTests(unittest.TestCase):
         self.assertAlmostEqual(diagnostic['transcript_resolution_elapsed_seconds'], .02)
 
     def test_https_refusal_diagnostics_preserve_prompt_and_lifecycle_evidence(self):
-        def short_resolution(transcript, **kwargs):
-            kwargs['deadline'] = min(kwargs['deadline'], time.monotonic() + .02)
-            return resolve_request_transcript(transcript, **kwargs)
-        self.enterContext(patch('tools.standby_test_provider.resolve_request_transcript',
-                                side_effect=short_resolution))
+        self.patch_resolution_budget(.02)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             sid = str(uuid.uuid4())
@@ -335,11 +345,7 @@ class ProviderTests(unittest.TestCase):
 
 
     def test_distinct_recovery_prompt_requires_terminal_and_new_native_turn(self):
-        def short_resolution(transcript, **kwargs):
-            kwargs['deadline'] = min(kwargs['deadline'], time.monotonic() + .3)
-            return resolve_request_transcript(transcript, **kwargs)
-        self.enterContext(patch('tools.standby_test_provider.resolve_request_transcript',
-                                side_effect=short_resolution))
+        self.patch_resolution_budget(.3)
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)
             sid = str(uuid.uuid4())
@@ -380,7 +386,7 @@ class ProviderTests(unittest.TestCase):
             with provider.lock:
                 provider.sessions[sid] = lambda: next(observations)
             status, body = request('任务请继续')
-            self.assertEqual(status, 200)
+            self.assertEqual(status, 200, body.decode())
             self.assertIn(b'response.completed', body)
             rows = [json.loads(line) for line in
                     (provider.directory/'requests.jsonl').read_text().splitlines()]

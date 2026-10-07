@@ -25,7 +25,16 @@ class VnodeParentPassTests(unittest.TestCase):
                          root/'link', root/'broken', root/'loop', root/'absent',
                          root/'MixedCase'/'child', root/'..']:
                 with self.subTest(path=str(path)):
-                    self.assertEqual(resolver.resolve(path), path.resolve())
+                    try:
+                        expected = path.resolve()
+                    except (OSError, RuntimeError) as error:
+                        # Python <3.13 raises on a non-strict symlink loop;
+                        # newer pathlib returns the unresolved path instead.
+                        with self.assertRaises(type(error)) as caught:
+                            resolver.resolve(path)
+                        self.assertEqual(str(caught.exception), str(error))
+                    else:
+                        self.assertEqual(resolver.resolve(path), expected)
             resolver.verify()
 
     def test_shared_parent_is_resolved_and_rechecked_in_each_new_pass(self):
