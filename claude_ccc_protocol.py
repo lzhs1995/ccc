@@ -141,6 +141,29 @@ def handshake_challenge(value: str) -> dict[str, str] | None:
 
 
 def task_dispatch(value: str) -> dict[str, str] | None:
+    # submit_task_pack accepts both the original multiline envelope and the
+    # single-line DELIVERY_NONCE envelope used by the live harness. Parse only
+    # explicit, unique fields; never open a prompt-selected file in a Hook.
+    if value.startswith('DELIVERY_NONCE='):
+        keys = ('DELIVERY_NONCE', 'REQUIRED_SKILL', 'TASK_PACK',
+                'CALLBACK_TARGET', 'COMPLETION_CALLBACK')
+        if any(len(re.findall(rf'\b{key}=', value)) != 1 for key in keys):
+            return None
+        nonce = r'[A-Za-z0-9][A-Za-z0-9_.:-]{7,159}'
+        match = re.fullmatch(
+            rf'DELIVERY_NONCE=({nonce}) READ_AND_OBEY_REQUIRED_SKILL_FIRST '
+            rf'REQUIRED_SKILL=(/[^\x00-\x1f]+?) TASK_PACK=(/[^\x00-\x1f]+?) '
+            rf'CALLBACK_TARGET=(surface:\d+) COMPLETION_CALLBACK='
+            rf'((?:DONE|BLOCKED)\|({_TASK_TOKEN})\|({nonce})\|REPORT=/[^\x00-\x1f]+)',
+            value,
+        )
+        if not match or match[1] != match[7]:
+            return None
+        # The callback may end immediately before Chinese prose. Keep the tail
+        # intact: only the finalized pack can establish the exact report path.
+        return {'task_id': match[6], 'marker': match[1], 'task_pack': match[3],
+                'required_skill': match[2], 'callback_target': match[4],
+                'completion_tail': match[5]}
     lines = value.splitlines()
     if not lines or not (head := re.fullmatch(rf'TASK_DISPATCH ({_NONCE_TOKEN})', lines[0])):
         return None

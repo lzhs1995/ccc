@@ -635,6 +635,7 @@ class TargetRuntime:
     claude_handshake_wait: bool = False
     claude_handshake_ack_at: float = 0.0
     claude_handshake_ack_event_id: str | None = None
+    claude_handshake_report_recovery: dict[str, Any] = dataclasses.field(default_factory=dict)
     claude_turn_started_at: float = 0.0
     claude_completion_fingerprint: str | None = None
     claude_completed_at: float = 0.0
@@ -9307,6 +9308,19 @@ class WatchDaemon:
                    f"|READY|INLINE|{challenge['ack_nonce']}")
             if not isinstance(pack, dict):
                 return False
+            if 'completion_tail' in dispatch:
+                callback = pack.get('completion_callback')
+                report = pack.get('report')
+                tail = dispatch['completion_tail']
+                if (not isinstance(report, str) or not report.startswith('/')
+                        or callback not in (
+                            f"DONE|{challenge['task_id']}|{dispatch.get('marker')}|REPORT={report}",
+                            f"BLOCKED|{challenge['task_id']}|{dispatch.get('marker')}|REPORT={report}")
+                        or not isinstance(tail, str) or not tail.startswith(callback)
+                        or (tail[len(callback):] and tail[len(callback)] not in ' \t。\n')
+                        or dispatch.get('required_skill') != pack.get('required_skill')
+                        or dispatch.get('callback_target') != pack.get('callback_target')):
+                    return False
             callback_matches = pack.get("callback") == ack
             # The harness can retain its literal ACK template in a finalized
             # pack. Resolve only that exact template through the unique ACKED
@@ -9410,10 +9424,93 @@ class WatchDaemon:
             self._apply_human_prompt_reset(str(target["surface_id"]), runtime, event)
             return True
         if runtime.claude_handshake_wait:
+            if (name == 'Stop' and challenge and stamp > boundary
+                    and event.get('report_ready_task_id') == challenge.get('task_id')):
+                # A report-only stop cannot authorize input or confirm delivery.
+                # It outranks handshake wait even if an old Hook missed dispatch.
+                self._clear_claude_handshake(runtime)
+                return False
             runtime.state = "claude_handshake_wait"
             self._mark_claude_event(event, runtime, "suppressed_handshake_wait")
             return True
         return False
+
+    def _recover_claude_handshake_report(self, surface_id: str, runtime: TargetRuntime) -> bool:
+        with self._surface_lock(surface_id):
+            return self._recover_claude_handshake_report_locked(surface_id, runtime)
+
+    def _recover_claude_handshake_report_locked(self, surface_id: str, runtime: TargetRuntime) -> bool:
+        """Recover only a latest, already-suppressed report; never replay input.
+
+        Old Hooks omitted single-line dispatch metadata. Preserve their ledger
+        outcomes and consume no event again. This migration only adds a stop
+        latch after native report, ledger and current process identity agree.
+        """
+        target = copy.deepcopy(self._event_target(surface_id))
+        challenge = copy.deepcopy(runtime.claude_handshake_challenge)
+        if (not target or not challenge or not runtime.claude_handshake_wait
+                or runtime.claude_submit_phase != 'none' or runtime.claude_submit_write_unknown
+                or runtime.claude_deferred_event
+                or self._foreign_claude_session_owner(surface_id, runtime.claude_session_id or '')
+                or runtime.claude_hook_health != 'healthy'):
+            return False
+        try:
+            journal = self.claude_event_inbox.journal_path
+            before = journal.stat()
+            events = [e for e in self._registration_events()
+                      if e.get('surface_id') == surface_id and not e.get('synthetic_fallback')]
+            event = max(enumerate(events), key=lambda p: (p[1]['created_at'], p[0]))[1]
+            with self.claude_event_ledger._lock:
+                row = dict(self.claude_event_ledger.events.get(event['event_id'], {}))
+            inspected = inspect_claude_process(runtime.claude_process_pid)
+            boundary = max(runtime.claude_turn_started_at, runtime.claude_handshake_ack_at,
+                           float(challenge.get('created_at', 0)))
+            if (event.get('event_name') != 'Stop'
+                    or event.get('report_ready_task_id') != challenge.get('task_id')
+                    or event.get('event_id') != runtime.claude_last_event_id
+                    or row.get('status') != 'suppressed_handshake_wait'
+                    or any(row.get(k) != event.get(k) for k in (
+                        'event_name', 'surface_id', 'workspace_id', 'session_id', 'agent_pid', 'created_at'))
+                    or row.get('process_generation') != runtime.claude_process_generation
+                    or inspected.get('generation') != runtime.claude_process_generation
+                    or inspected.get('pid') != runtime.claude_process_pid
+                    or not 0 < inspected.get('started_epoch', 0) <= event['created_at']
+                    or not boundary < event['created_at'] <= time.time()
+                    or not self._claude_protocol_identity(runtime, challenge, target)
+                    or not self._claude_protocol_identity(runtime, {**event,
+                        'process_generation': row['process_generation']}, target)):
+                return False
+            after = journal.stat()
+            if (any(getattr(before, key) != getattr(after, key) for key in (
+                        'st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns'))
+                    or target != self._event_target(surface_id)
+                    or challenge != runtime.claude_handshake_challenge
+                    or not runtime.claude_handshake_wait
+                    or runtime.claude_submit_phase != 'none' or runtime.claude_submit_write_unknown
+                    or runtime.claude_deferred_event
+                    or self._foreign_claude_session_owner(surface_id, runtime.claude_session_id or '')
+                    or runtime.claude_hook_health != 'healthy'
+                    or runtime.claude_last_event_id != event['event_id']):
+                return False
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+            return False
+        runtime.claude_handshake_report_recovery = {
+            'event_id': event['event_id'], 'ack_event_id': runtime.claude_handshake_ack_event_id,
+            'task_id': event['report_ready_task_id'], 'recovered_at': time.time(),
+            'original_status': row['status'], 'input_count': 0,
+        }
+        self._clear_claude_handshake(runtime)
+        runtime.claude_completed_latched = True
+        runtime.claude_report_ready_task_id = event['report_ready_task_id']
+        runtime.claude_completion_event_id = event['event_id']
+        runtime.claude_completed_at = event['created_at']
+        self._clear_claude_deferred(runtime, reason='report_ready')
+        self._clear_claude_fallback_episode(runtime)
+        self._reset_claude_repeat_warning(runtime)
+        runtime.error_type = None
+        runtime.state = 'claude_report_ready'
+        self.logger.info('surface=%s recovered suppressed report=%s; no input', surface_id[:8], event['event_id'])
+        return True
 
     def _handle_claude_event_locked(
         self,
@@ -10296,6 +10393,8 @@ class WatchDaemon:
         runtime.claude_candidate_key = None
         runtime.claude_candidate_since = 0.0
         runtime.claude_candidate_focused = False
+        if runtime.claude_handshake_wait and state.kind == 'claude_report_ready':
+            self._recover_claude_handshake_report(surface_id, runtime)
         if runtime.claude_handshake_wait:
             return ScreenState(
                 "claude_handshake_wait", fingerprint=runtime.claude_handshake_ack_event_id,

@@ -61,6 +61,19 @@ def dispatch_text(directory, *, task=TASK, marker=MARKER):
     )
 
 
+def inline_dispatch(directory, *, task=TASK, marker=MARKER):
+    return (f'DELIVERY_NONCE={marker} READ_AND_OBEY_REQUIRED_SKILL_FIRST '
+            'REQUIRED_SKILL=/tmp/ccc-offline/SKILL.md '
+            f'TASK_PACK={directory}/task-pack.json CALLBACK_TARGET=surface:9 '
+            f'COMPLETION_CALLBACK=DONE|{task}|{marker}|REPORT={directory}/executor-report.md'
+            '。独立验收任务：只读复核后提交报告。')
+
+
+def report_text(task=TASK):
+    return (f'STATUS: REPORT_READY TASK_ID={task} CALLBACK_UNCONFIRMED '
+            'REPORT=/tmp/executor-report.md supervisor_reconciliation_required')
+
+
 def native_event(event_id, event_name, text='', *, created_at=None, **changes):
     payload = {'hook_event_name': event_name, 'session_id': 'session-uuid'}
     payload['prompt' if event_name == 'UserPromptSubmit' else 'last_assistant_message'] = text
@@ -73,6 +86,30 @@ def native_event(event_id, event_name, text='', *, created_at=None, **changes):
 
 
 class HandshakeProtocolTests(unittest.TestCase):
+    def test_inline_native_dispatch_retains_paths_and_callback_tail_without_io(self):
+        value = inline_dispatch('/tmp/with spaces')
+        with mock.patch.object(Path, 'read_text', side_effect=AssertionError('unexpected disk read')):
+            event = native_event('inline', 'UserPromptSubmit', value)
+        dispatch = event['task_dispatch']
+        self.assertEqual(dispatch['task_id'], TASK)
+        self.assertEqual(dispatch['marker'], MARKER)
+        self.assertEqual(dispatch['task_pack'], '/tmp/with spaces/task-pack.json')
+        self.assertEqual(dispatch['required_skill'], '/tmp/ccc-offline/SKILL.md')
+        self.assertEqual(dispatch['callback_target'], 'surface:9')
+        self.assertTrue(dispatch['completion_tail'].endswith('。独立验收任务：只读复核后提交报告。'))
+
+    def test_inline_dispatch_rejects_quotes_ambiguous_fields_and_nonce_mismatch(self):
+        value = inline_dispatch('/tmp/ccc754')
+        bad = ['> ' + value, '```\n' + value + '\n```', 'Example: ' + value,
+               value.replace(f'DONE|{TASK}|{MARKER}|', f'DONE|{TASK}|wrong754|'),
+               value.replace('TASK_PACK=/tmp', 'TASK_PACK=relative'), value + '\x00',
+               value.replace('READ_AND_OBEY_REQUIRED_SKILL_FIRST ', '')]
+        bad.extend(value + ' ' + field + '=duplicate' for field in (
+            'DELIVERY_NONCE', 'REQUIRED_SKILL', 'TASK_PACK', 'CALLBACK_TARGET', 'COMPLETION_CALLBACK'))
+        for text in bad:
+            with self.subTest(text=text):
+                self.assertIsNone(native_event('bad', 'UserPromptSubmit', text).get('task_dispatch'))
+
     def test_native_challenge_ack_and_dispatch_extract_bounded_metadata(self):
         event = native_event('challenge', 'UserPromptSubmit', challenge_text('/tmp/ccc737'))
         self.assertEqual(event.get('handshake_challenge'), {
@@ -176,6 +213,9 @@ class HandshakeWaitTests(unittest.TestCase):
         pack = {'task_id': TASK, 'callback': ack_text(), 'completion_nonce': MARKER,
                 'executor': 'surface:1', 'executor_uuid': 'surface-uuid',
                 'draft': False, 'role': 'executor',
+                'required_skill': '/tmp/ccc-offline/SKILL.md', 'callback_target': 'surface:9',
+                'report': f'{self.tmp.name}/executor-report.md',
+                'completion_callback': f'DONE|{TASK}|{MARKER}|REPORT={self.tmp.name}/executor-report.md',
                 'executors': [{'surface_ref': 'surface:1', 'provider': 'claude', 'ordinal': 1}]}
         pack.update(changes)
         path = Path(self.tmp.name) / 'task-pack.json'
@@ -232,6 +272,159 @@ class HandshakeWaitTests(unittest.TestCase):
         self.client.payload = claude_wrapped_composer_payload()
         self.client.text = '❯ ' + core.CLAUDE_MESSAGE
         return self.screen()
+
+    def test_inline_dispatch_unlocks_unfinished_task_exactly_once(self):
+        self.wait()
+        event = self.event('UserPromptSubmit', inline_dispatch(self.tmp.name), offset=2)
+        event.pop('process_generation')
+        self.handle(event)
+        self.assertFalse(self.runtime.claude_handshake_wait)
+        self.assertEqual(self.daemon.claude_event_ledger.status_of(event['event_id']), 'task_dispatch')
+        stop = self.event('Stop', 'Unfinished task', offset=3)
+        self.handle(stop)
+        self.handle(stop)
+        self.assertEqual(len(self.client.sent_text), 1)
+        self.assertEqual(len(self.client.sent_keys), 1)
+
+    def test_inline_dispatch_then_report_stops_without_input(self):
+        self.wait()
+        self.handle(self.event('UserPromptSubmit', inline_dispatch(self.tmp.name), offset=2))
+        self.handle(self.event('Stop', report_text(), offset=3))
+        self.assertEqual(self.runtime.state, 'claude_report_ready')
+        self.assertEqual(self.runtime.claude_report_ready_task_id, TASK)
+        self.assert_no_input()
+
+    def test_inline_dispatch_validates_final_pack_bindings(self):
+        self.wait()
+        bad = [inline_dispatch(self.tmp.name, task='wrong-task'),
+               inline_dispatch(self.tmp.name, marker='wrong754'),
+               inline_dispatch('/tmp/other'),
+               inline_dispatch(self.tmp.name).replace('SKILL.md', 'OTHER.md'),
+               inline_dispatch(self.tmp.name).replace('surface:9', 'surface:99'),
+               inline_dispatch(self.tmp.name).replace('executor-report.md', 'executor-report.md.evil')]
+        for value in bad:
+            with self.subTest(value=value):
+                self.handle(self.event('UserPromptSubmit', value, offset=2))
+                self.assert_waiting()
+        self.assert_no_input()
+
+    def test_native_report_outranks_old_wait_but_does_not_confirm_callback(self):
+        self.wait()
+        self.runtime.claude_submit_phase = 'text_written'
+        self.runtime.claude_submit_write_unknown = True
+        self.handle(self.event('Stop', report_text(), offset=2))
+        self.assertFalse(self.runtime.claude_handshake_wait)
+        self.assertEqual(self.runtime.state, 'claude_report_ready')
+        self.assertEqual(self.runtime.claude_submit_phase, 'text_written')
+        self.assertTrue(self.runtime.claude_submit_write_unknown)
+        self.assertEqual(self.runtime.claude_submit_confirmed_at, 0)
+        self.assert_no_input()
+
+    def suppressed_report(self):
+        self.wait()
+        event = self.event('Stop', report_text(), offset=2)
+        self.daemon._mark_claude_event(event, self.runtime, 'suppressed_handshake_wait')
+        self.journal = Path(self.tmp.name) / 'claude-events.jsonl'
+        self.daemon.claude_event_inbox.journal_path = self.journal
+        self.journal.write_text(json.dumps(event) + '\n', encoding='utf-8')
+        return event
+
+    def recover_report(self):
+        return self.daemon._recover_claude_handshake_report('surface-uuid', self.runtime)
+
+    def test_old_suppressed_report_migrates_without_ledger_or_send_and_survives_restart(self):
+        event = self.suppressed_report()
+        ledger = self.daemon.claude_event_ledger.path
+        before = ledger.read_bytes()
+        state = self.daemon._apply_claude_runtime_guards('surface-uuid', self.runtime,
+                    core.ScreenState('claude_report_ready', message_kind='claude'))
+        self.assertEqual(state.kind, 'claude_report_ready')
+        self.assertFalse(self.runtime.claude_handshake_wait)
+        self.assertEqual(self.runtime.claude_report_ready_task_id, TASK)
+        self.assertEqual(self.runtime.claude_handshake_report_recovery['event_id'], event['event_id'])
+        self.assertEqual(self.runtime.claude_handshake_report_recovery['input_count'], 0)
+        self.assertFalse(self.recover_report())
+        self.assertEqual(ledger.read_bytes(), before)
+        self.daemon.save()
+        restored = core.WatchDaemon(Path(self.tmp.name) / 'config.json',
+                                   Path(self.tmp.name) / 'state.json', client=self.client)
+        self.assertEqual(restored.runtime['surface-uuid'].claude_report_ready_task_id, TASK)
+        self.assertEqual(self.runtime.send_count, 0)
+        self.assert_no_input()
+
+    def test_recovery_refuses_newer_native_event(self):
+        self.suppressed_report()
+        newer = self.event('UserPromptSubmit', 'New task', offset=3)
+        with self.journal.open('a') as stream:
+            stream.write(json.dumps(newer) + '\n')
+        self.assertFalse(self.recover_report())
+        self.assert_waiting()
+        self.assert_no_input()
+
+    def test_recovery_refuses_missing_ledger_wrong_task_and_identity(self):
+        event = self.suppressed_report()
+        for changes in [{'event_id': 'no-ledger'}, {'report_ready_task_id': 'other'},
+                        {'session_id': 'other'}, {'agent_pid': 999},
+                        {'workspace_id': 'other'}, {'created_at': self.at},
+                        {'event_name': 'StopFailure'}, {'synthetic_fallback': True}]:
+            with self.subTest(changes=changes):
+                self.journal.write_text(json.dumps({**event, **changes}) + '\n', encoding='utf-8')
+                self.assertFalse(self.recover_report())
+                self.assert_waiting()
+        self.assert_no_input()
+
+    def test_recovery_refuses_unknown_submit_changed_birth_and_unhealthy_process(self):
+        self.suppressed_report()
+        for field, value in [('claude_submit_phase', 'text_written'),
+                             ('claude_submit_write_unknown', True),
+                             ('claude_process_generation', 'new-birth'),
+                             ('claude_session_id', 'new-session'),
+                             ('claude_hook_health', 'missing')]:
+            old = getattr(self.runtime, field)
+            with self.subTest(field=field):
+                setattr(self.runtime, field, value)
+                self.assertFalse(self.recover_report())
+                setattr(self.runtime, field, old)
+        self.process_inspection.return_value = {'pid': 1234, 'started_epoch': 1.0, 'generation': 'reused'}
+        self.assertFalse(self.recover_report())
+        self.assert_waiting()
+        self.assert_no_input()
+
+    def test_recovery_refuses_journal_append_during_identity_inspection(self):
+        self.suppressed_report()
+        inspection = dict(self.process_inspection.return_value)
+        def inspect(_pid):
+            with self.journal.open('a') as stream:
+                stream.write(json.dumps(self.event('UserPromptSubmit', 'New work', offset=3)) + '\n')
+            return inspection
+        self.process_inspection.side_effect = inspect
+        self.assertFalse(self.recover_report())
+        self.assert_waiting()
+        self.assert_no_input()
+
+    def test_recovery_refuses_unknown_write_created_during_inspection(self):
+        self.suppressed_report()
+        inspection = dict(self.process_inspection.return_value)
+        def inspect(_pid):
+            self.runtime.claude_submit_write_unknown = True
+            return inspection
+        self.process_inspection.side_effect = inspect
+        self.assertFalse(self.recover_report())
+        self.assert_waiting()
+        self.assert_no_input()
+
+    def test_recovery_preserves_deferred_ledger_and_refuses_foreign_session_owner(self):
+        self.suppressed_report()
+        ledger = self.daemon.claude_event_ledger.path
+        before = ledger.read_bytes()
+        self.runtime.claude_deferred_event = self.event('Stop', 'Unfinished', offset=1.5)
+        self.assertFalse(self.recover_report())
+        self.runtime.claude_deferred_event = None
+        with mock.patch.object(self.daemon, '_foreign_claude_session_owner', return_value='other-surface'):
+            self.assertFalse(self.recover_report())
+        self.assertEqual(ledger.read_bytes(), before)
+        self.assert_waiting()
+        self.assert_no_input()
 
     def test_challenge_binds_native_identity_without_business_completion(self):
         event = self.challenge()
