@@ -1,9 +1,11 @@
 import copy
+import gc
 from pathlib import Path
 import os
 import select
 import tempfile
 import unittest
+import weakref
 from unittest.mock import patch
 
 from ccc_standby_generation import SCOPES, StandbyGeneration, _VnodeWatch
@@ -35,6 +37,46 @@ class GenerationTests(unittest.TestCase):
         self.assertFalse(pin.resource_report()['resources_released'])
         pin.close()
         self.assertTrue(pin.resource_report()['resources_released'])
+
+    def assert_capture_released_without_gc(self, *, use_events):
+        # A finished traversal must not retain a whole source inventory through
+        # recursive closures until a later collection on a latency-critical turn.
+        was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            pin = self.pin(use_events=use_events)
+            try:
+                self.assertEqual(pin.current(), pin.value)
+                reference = weakref.ref(pin)
+            finally:
+                pin.close()
+            del pin
+            self.assertIsNone(reference())
+        finally:
+            if was_enabled:
+                gc.enable()
+
+    def test_closed_generation_released_without_cyclic_gc(self):
+        self.assert_capture_released_without_gc(use_events=False)
+
+    @unittest.skipUnless(hasattr(select, 'kqueue') and hasattr(os, 'O_SYMLINK'), 'Darwin vnode events')
+    def test_closed_watched_generation_released_without_cyclic_gc(self):
+        self.assert_capture_released_without_gc(use_events=True)
+
+    def test_rejected_scan_released_without_cyclic_gc(self):
+        was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            pin = StandbyGeneration.__new__(StandbyGeneration)
+            pin._configure(self.roots, lambda: self.settings, 1, 1)
+            reference = weakref.ref(pin)
+            with self.assertRaisesRegex(ValueError, 'inventory too large'):
+                pin._snapshot()
+            del pin
+            self.assertIsNone(reference())
+        finally:
+            if was_enabled:
+                gc.enable()
 
     @unittest.skipUnless(hasattr(select, 'kqueue'), 'Darwin kqueue required')
     def test_real_watcher_close_receipt(self):

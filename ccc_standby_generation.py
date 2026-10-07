@@ -251,10 +251,16 @@ class StandbyGeneration:
             finally:
                 active.remove(key)
 
-        for scope, paths in sorted(self.roots.items()):
-            for path in paths:
-                current_root = path
-                visit(Path(path))
+        try:
+            for scope, paths in sorted(self.roots.items()):
+                for path in paths:
+                    current_root = path
+                    visit(Path(path))
+        finally:
+            # Both recursive closures otherwise retain the complete inventory
+            # until cyclic GC runs, possibly during a later deadline-bound RPC.
+            # No traversal is needed after this point, even on a failed scan.
+            del anchor_path, visit
         if _digest(self.effective()) != effective_sha:
             raise ValueError('effective settings changed during inventory')
         for name, identity in anchors.items():
