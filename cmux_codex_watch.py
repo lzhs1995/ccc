@@ -8550,7 +8550,9 @@ class WatchDaemon:
         # so plainly rather than claiming certainty.
         return "ambiguous_exact_prompt" if age <= 1.0 else "watchdog_echo_correlated"
 
-    def _consume_claude_echo_receipt(self, runtime: TargetRuntime, event: Mapping[str, Any]) -> str | None:
+    def _consume_claude_echo_receipt(
+        self, runtime: TargetRuntime, event: Mapping[str, Any], *, reserve_only: bool = False,
+    ) -> str | None:
         """Correlate one native prompt with one accepted Enter, never text alone.
 
         A consumed receipt cannot suppress a later human paste, even inside the
@@ -8591,17 +8593,17 @@ class WatchDaemon:
                 return 'human_exact_prompt'
             if not receipt.get('consumed_by'):
                 if not receipt.get('reserved_by'):
-                    # Pin the credit to this Hook before attempting consumption.
-                    # The safe handler can persist this reservation along with
-                    # a failed outcome if either write raises. A replay remains
-                    # deduplicated, but a later human paste cannot steal the
-                    # unconsumed credit after a restart. Reservation is evidence
-                    # of ownership only, never a successful consumption/send.
+                    # The normal Hook path pins ownership in the same atomic
+                    # write as its claim. A crash can retain both or neither,
+                    # never a handling claim with an available echo credit.
                     receipt = {**receipt, 'reserved_by': event_id, 'reserved_at': stamp}
                     row = {**row, 'watchdog_submission': receipt}
                     self.claude_event_ledger.events[source_id] = row
-                    atomic_write_json(self.claude_event_ledger.path,
-                                      {'version': 1, 'events': self.claude_event_ledger.events})
+                    if not reserve_only:
+                        atomic_write_json(self.claude_event_ledger.path,
+                                          {'version': 1, 'events': self.claude_event_ledger.events})
+                if reserve_only:
+                    return 'watchdog_echo_durable_correlated'
                 updated = {**row, 'watchdog_submission': {**receipt,
                     'consumed_by': event_id, 'consumed_at': stamp}}
                 events = {**self.claude_event_ledger.events, source_id: updated}
@@ -9638,8 +9640,21 @@ class WatchDaemon:
         if not _valid_claude_event(event):
             return
         claim_mark = time.perf_counter()
-        claim_result = (self.claude_event_ledger.claim_registration(event) if registration_revalidation
-                        else self.claude_event_ledger.claim_detailed(event))
+        with self.claude_event_ledger._lock:
+            if (not registration_revalidation
+                    and event_id not in self.claude_event_ledger.events
+                    and event.get('event_name') == 'UserPromptSubmit'
+                    and event.get('prompt_kind') != 'human'):
+                echo_runtime = self.runtime.get(str(event.get('surface_id') or ''))
+                if echo_runtime is not None:
+                    # Reserve before claim_detailed's sole ledger write. If
+                    # that write and the exception handler's write both fail,
+                    # restart can replay the unclaimed Hook. If either lands,
+                    # ownership is already pinned and later human input cannot
+                    # consume the old credit. This grants no input permission.
+                    self._consume_claude_echo_receipt(echo_runtime, event, reserve_only=True)
+            claim_result = (self.claude_event_ledger.claim_registration(event) if registration_revalidation
+                            else self.claude_event_ledger.claim_detailed(event))
         if claim_result != CLAUDE_CLAIMED:
             if claim_result == CLAUDE_HISTORICAL_ID_COLLISION:
                 self.logger.error(

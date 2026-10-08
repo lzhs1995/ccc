@@ -159,6 +159,44 @@ class DurableEchoTests(unittest.TestCase):
         self.handle_later(self.echo())
         self.assertTrue(self.runtime.claude_completed_latched)
 
+    def test_claim_and_echo_reservation_remain_atomic_when_all_writes_fail(self):
+        self.send()
+        event = self.echo('failed-claim')
+        ledger = self.daemon.claude_event_ledger
+        before = ledger.path.read_bytes()
+        write = core.atomic_write_json
+        attempts = []
+
+        def unavailable(path, data, *args, **kwargs):
+            if path == ledger.path:
+                events = data['events']
+                if event['event_id'] in events:
+                    attempts.append(events[event['event_id']]['status'])
+                    self.assertEqual(events['sent-stop']['watchdog_submission']['reserved_by'],
+                                     event['event_id'])
+                    raise OSError('ledger unavailable throughout Hook handling')
+            return write(path, data, *args, **kwargs)
+
+        with mock.patch.object(core, 'atomic_write_json', side_effect=unavailable):
+            with mock.patch.object(core.time, 'time', return_value=event['created_at'] + 1):
+                with self.assertRaises(OSError):
+                    self.daemon._handle_claude_event_safely(event, self.client)
+        self.assertEqual(attempts, ['handling', 'failed'])
+        self.assertEqual(ledger.path.read_bytes(), before)
+        self.assertTrue(self.runtime.claude_completed_latched)
+        self.daemon.claude_event_ledger = core.ClaudeEventLedger(ledger.path)
+        self.runtime = core.TargetRuntime.from_dict(self.runtime.to_dict())
+        self.daemon.runtime['surface-uuid'] = self.runtime
+        self.handle_later(event)
+        self.assertTrue(self.runtime.claude_completed_latched)
+        self.assertEqual(self.daemon.claude_event_ledger.events['sent-stop']
+                         ['watchdog_submission']['consumed_by'], event['event_id'])
+        self.handle_later(self.echo('human-after-storage-recovery', delay=227))
+        self.assertFalse(self.runtime.claude_completed_latched)
+        self.assertEqual(self.runtime.send_count, 0)
+        self.assertEqual(len(self.client.sent_text), 1)
+        self.assertEqual(len(self.client.sent_keys), 1)
+
     def test_no_legacy_fallback_when_new_receipt_is_missing(self):
         self.send()
         self.daemon.claude_event_ledger.events.pop('sent-stop')
