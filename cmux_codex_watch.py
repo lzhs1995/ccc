@@ -530,6 +530,9 @@ class ScreenState:
     # as new user input that would re-arm the same stop event.
     watchdog_echo: bool = False
     claude_context: "ClaudeContextTelemetry | None" = None
+    # Native activity is independent of composer ownership: an exact watchdog
+    # draft may coexist with Claude's own retry, work or compaction.
+    claude_native_activity: str | None = None
     evidence_row: int | None = None
     evidence_fingerprint: str | None = None
     ignored_chrome_rows: tuple[int, ...] = ()
@@ -1537,8 +1540,14 @@ CLAUDE_CONTEXT_LINE_RE = re.compile(
     r"(?:\s*\(\s*输入\s*:\s*(?P<input>[\d.]+[kKmM]?)\s*,\s*"
     r"缓存\s*:\s*(?P<cache>[\d.]+[kKmM]?)\s*\))?\s*$"
 )
+CLAUDE_GOAL_STATUS_RE = re.compile(
+    r"^\s*(?:·\s*)?(?:◎\s*)?/goal\s+(?:active|paused|blocked|complete)"
+    r"(?:\s*\([^()\r\n]*\))?\s*$", re.IGNORECASE,
+)
 CLAUDE_AUTO_COMPACT_RE = re.compile(
-    r"^\s*(?P<percent>\d{1,3})%\s+until\s+auto-compact\s*$",
+    r"^\s*(?P<percent>\d{1,3})%\s+until\s+auto-compact"
+    r"(?:\s*·\s*◎\s*/goal\s+(?:active|paused|blocked|complete)"
+    r"(?:\s*\([^()\r\n]*\))?)?\s*$",
     re.IGNORECASE,
 )
 CLAUDE_CONTEXT_LIMIT_RE = re.compile(
@@ -1546,7 +1555,8 @@ CLAUDE_CONTEXT_LIMIT_RE = re.compile(
     re.IGNORECASE,
 )
 CLAUDE_COMPACTING_RE = re.compile(
-    r"^\s*\S{0,3}\s*Compacting conversation(?:…|\.\.\.)",
+    r"^\s*\S{0,3}\s*Compacting conversation(?:…|\.\.\.)"
+    r"(?:\s*\([^)]*\))?\s*$",
     re.IGNORECASE,
 )
 CLAUDE_COMPACTION_PROGRESS_RE = re.compile(
@@ -1569,6 +1579,15 @@ CLAUDE_CLIENT_RETRY_RE = re.compile(
     r"\s*(?:[✻※✶✳✢✽●◐◑]\s+)?(?:API error\b|[45]\d{2}\b)[^\r\n]*?"
     r"\bRetrying in\s+\d+(?:\.\d+)?\s*(?:seconds?|s)"
     r"\s*(?:·|…|\.\.\.)\s*\(?attempt\s+[1-9]\d*/[1-9]\d*\)?\s*", re.IGNORECASE,
+)
+CLAUDE_NATIVE_WAIT_RE = re.compile(
+    r"\s*[✻※✶✳✢✽●◐◑]\s+(?:"
+    r"Waiting for API response(?:…|\.\.\.)?"
+    r"(?:\s*·\s*will retry in\s+(?:\d+(?:\.\d+)?\s*"
+    r"(?:hours?|minutes?|seconds?|h|m|s)\s*)+)?"
+    r"(?:\s*·\s*check your network)?|"
+    r"Reconnecting(?:…|\.\.\.)(?:\s*\([^)]*\))?"
+    r")\s*", re.IGNORECASE,
 )
 # Live Claude API/stream chrome.  Anchored at the start of a line so a recap
 # sentence that *mentions* an API Error is not a send trigger.  Optional
@@ -1846,6 +1865,10 @@ def _claude_is_chrome_line(text: str) -> bool:
         return True
     if CLAUDE_ASK_FOOTER_RE.search(stripped) or CLAUDE_PROGRESS_RE.search(stripped):
         return True
+    if (CLAUDE_AUTO_COMPACT_RE.fullmatch(stripped)
+            or CLAUDE_GOAL_STATUS_RE.fullmatch(stripped)
+            or CLAUDE_CONTEXT_LINE_RE.fullmatch(stripped)):
+        return True
     if CLAUDE_ACTIVE_SPINNER_RE.search(stripped) or CLAUDE_ACTIVE_TOOL_RE.search(stripped):
         return True
     if CLAUDE_PROMPT_RE.match(stripped) or "new task?" in stripped.lower():
@@ -1853,6 +1876,60 @@ def _claude_is_chrome_line(text: str) -> bool:
     if stripped.startswith("任务中断了么") or CLAUDE_NUDGE_WRAP_RE.match(stripped):
         return True
     return False
+
+
+def _claude_native_activity(lines: Sequence[str], end: int) -> str | None:
+    """Recognize only the current status block, including wrapped retry rows.
+
+    Goal/context telemetry can sit between the live status and the composer.
+    It is not assistant output or proof that a turn is active. A newer reply,
+    completed-turn timer or user prompt prevents old status text from holding
+    a subsequent stop. Keep composer ownership separate from this evidence.
+    """
+
+    # With the composer hidden, ``end`` includes the configurable statusline.
+    # Its tool/MCP counters are not transcript content. Locate the footer by
+    # the Claude marker immediately below its rule, rather than whitelisting
+    # every user-configured footer row or broadening the Claude UI identity gate.
+    # New assistant output above that rule still terminates the status scan.
+    for row in range(end - 1, 0, -1):
+        if not CLAUDE_FOOTER_RE.search(lines[row]):
+            continue
+        boundary = row - 1
+        while boundary >= 0 and not lines[boundary].strip():
+            boundary -= 1
+        if boundary >= 0 and CLAUDE_RULE_RE.fullmatch(lines[boundary].strip()):
+            end = boundary
+            break
+
+    tail: list[str] = []
+    for line in reversed(lines[:end]):
+        stripped = line.strip()
+        if CLAUDE_COMPLETED_RE.match(stripped) or CLAUDE_PROMPT_RE.match(stripped):
+            break
+        if (CLAUDE_AUTO_COMPACT_RE.fullmatch(stripped)
+                or CLAUDE_GOAL_STATUS_RE.fullmatch(stripped)
+                or CLAUDE_CONTEXT_LINE_RE.fullmatch(stripped)
+                or CLAUDE_COMPACTION_PROGRESS_RE.fullmatch(stripped)):
+            continue
+        if (not stripped or CLAUDE_RULE_RE.fullmatch(stripped)
+                or CLAUDE_FOOTER_RE.search(stripped)
+                or CLAUDE_ASK_FOOTER_RE.fullmatch(stripped)
+                or CLAUDE_PROGRESS_RE.match(stripped)):
+            if tail:
+                break
+            continue
+        tail.append(stripped)
+        block = " ".join(reversed(tail))
+        if CLAUDE_CLIENT_RETRY_RE.fullmatch(block) or CLAUDE_NATIVE_WAIT_RE.fullmatch(block):
+            return "retry"
+        if CLAUDE_COMPACTING_RE.fullmatch(block):
+            return "compacting"
+        if CLAUDE_ACTIVE_SPINNER_RE.fullmatch(block) or CLAUDE_ACTIVE_TOOL_RE.fullmatch(block):
+            return "working"
+        if len(tail) >= 8:
+            break
+    return None
 
 
 def _normalise_claude_prompt(value: str) -> str:
@@ -2114,6 +2191,9 @@ def classify_claude_grid(grid: Grid, *, claude_message: str = CLAUDE_MESSAGE) ->
     scan_rows = set(range(start, end)) | set(range(max(0, grid.rows - 12), grid.rows))
     nearby = [grid.lines[row] for row in sorted(scan_rows)]
     content_fp = _claude_content_fingerprint(grid.lines, prompt_row, claude_message)
+    native_activity = _claude_native_activity(
+        grid.lines, prompt_row if composer_kind in {"empty", "busy"} else grid.rows,
+    )
 
     if any(
         CLAUDE_QUESTION_RE.search(text) and not CLAUDE_ASK_FOOTER_RE.search(text)
@@ -2126,6 +2206,7 @@ def classify_claude_grid(grid: Grid, *, claude_message: str = CLAUDE_MESSAGE) ->
             message_kind="claude",
             content_fingerprint=content_fp,
             claude_context=context,
+            claude_native_activity=native_activity,
         )
     if composer_kind == "busy":
         return ScreenState(
@@ -2140,6 +2221,16 @@ def classify_claude_grid(grid: Grid, *, claude_message: str = CLAUDE_MESSAGE) ->
                 claude_message,
             ),
             claude_context=context,
+            claude_native_activity=native_activity,
+        )
+
+    if native_activity:
+        return ScreenState(
+            "working", error_type="claude_retry" if native_activity == "retry" else None,
+            screen_signature=signature,
+            reason=f"Claude native {native_activity} is active; do not queue another prompt",
+            message_kind="claude", content_fingerprint=content_fp, claude_context=context,
+            claude_native_activity=native_activity,
         )
 
     last_content = _claude_last_content_lines(grid.lines, prompt_row, claude_message)
@@ -2155,16 +2246,6 @@ def classify_claude_grid(grid: Grid, *, claude_message: str = CLAUDE_MESSAGE) ->
             reason="selected Claude model is unavailable; repeating the prompt cannot repair model access",
             content_fingerprint=content_fp, claude_context=context,
         )
-    # The current client owns this countdown, including its final attempt.
-    # Only a suffix of the latest block may match: quoted historical banners
-    # must not hide a newer stop. Wrapped banners need up to three rows.
-    if any(CLAUDE_CLIENT_RETRY_RE.fullmatch(" ".join(reversed(last_content[:count])))
-           for count in range(1, len(last_content) + 1)):
-        return ScreenState(
-            "working", error_type="claude_retry", screen_signature=signature,
-            reason="Claude client retry countdown is active; do not queue another prompt",
-            message_kind="claude", content_fingerprint=content_fp, claude_context=context,
-        )
     error_type = _claude_live_error_type(grid, prompt_row, claude_message)
     if error_type is not None:
         # A terminal error wins over a leftover tool row. An active client
@@ -2175,18 +2256,6 @@ def classify_claude_grid(grid: Grid, *, claude_message: str = CLAUDE_MESSAGE) ->
             fingerprint=content_fp or _short_hash(error_type),
             screen_signature=signature,
             reason=f"current {error_type} Claude error",
-            message_kind="claude",
-            content_fingerprint=content_fp,
-            claude_context=context,
-        )
-
-    if any(CLAUDE_ACTIVE_SPINNER_RE.search(text) for text in nearby) or any(
-        CLAUDE_ACTIVE_TOOL_RE.search(text) for text in nearby
-    ):
-        return ScreenState(
-            "working",
-            screen_signature=signature,
-            reason="Claude is working",
             message_kind="claude",
             content_fingerprint=content_fp,
             claude_context=context,
@@ -8742,7 +8811,8 @@ class WatchDaemon:
                     raise InputNotSentError('Claude pending message configuration changed')
                 frame = Grid.from_rpc(base.replay(str(target["workspace_id"]), surface_id), surface_id)
                 state = classify_claude_grid(frame, claude_message=message)
-                return (state.kind == "composer_busy" and state.watchdog_echo and identity_check()
+                return (state.kind == "composer_busy" and state.watchdog_echo
+                        and not state.claude_native_activity and identity_check()
                         and not runtime.claude_handshake_wait
                         and str(self.config.get("claude_message") or CLAUDE_MESSAGE) == message)
 
@@ -8841,6 +8911,9 @@ class WatchDaemon:
         # and ``menu`` mean Claude already consumed it.
         if state.kind != "composer_busy":
             return False
+        if state.claude_native_activity:
+            runtime.state = "working"
+            return True
         surface_id = str(target["surface_id"])
         # F2（2026-09-01）：总量上限。间隔限制只保证"每 5 秒最多一次"，不保证
         # 总次数有限；预算耗尽即 degraded，把决定权交还给人而不是永远按键。
@@ -8933,6 +9006,13 @@ class WatchDaemon:
             # boundary can resolve this. Neither timeout nor an old viewport can.
             runtime.state = "claude_submit_unconfirmed"
             return True
+        if state.claude_native_activity and runtime.claude_submit_phase == "text_written":
+            # Native activity may hide the composer without consuming our
+            # draft. Preserve the event and text; neither confirm nor expire
+            # an Enter that has never been sent.
+            runtime.claude_submit_not_sent = True
+            runtime.state = "claude_submit_pending"
+            return True
         age = max(0.0, now - runtime.claude_submit_since)
         timeout = float(self.config.get(
             "claude_submit_confirm_timeout_sec", CLAUDE_SUBMIT_CONFIRM_TIMEOUT_SEC,
@@ -8951,7 +9031,8 @@ class WatchDaemon:
         # Working/menu are both valid post-submit states; Hook events provide a
         # stronger confirmation asynchronously but are not required for the
         # transaction to stop retrying.
-        if state.kind in {"working", "menu"} and not state.watchdog_echo:
+        if (runtime.claude_submit_phase == "enter_sent"
+                and state.kind in {"working", "menu"} and not state.watchdog_echo):
             runtime.claude_submit_confirmed_at = now
             self.logger.info(
                 "surface=%s Claude submit confirmed state=%s event=%s",
@@ -9140,6 +9221,17 @@ class WatchDaemon:
         self.save()
         _submit_stage("persist_reserve_ms")
         message = str(self.config.get("claude_message") or CLAUDE_MESSAGE)
+        def text_input_check():
+            if not live_input_check():
+                return False
+            frame = Grid.from_rpc(base.replay(str(target["workspace_id"]), surface_id), surface_id)
+            current_state = classify_claude_grid(frame, claude_message=message)
+            return (current_state.kind in {"claude_stopped", "recoverable_error"}
+                    and not current_state.claude_native_activity
+                    and current_state.content_fingerprint == final.content_fingerprint
+                    and str(self.config.get("claude_message") or CLAUDE_MESSAGE) == message
+                    and live_input_check())
+
         runtime.claude_submit_event_id = str(event["event_id"])
         runtime.claude_submit_message_hash = _short_hash(message)
         runtime.claude_submit_fingerprint = final.content_fingerprint or final_signature or first_signature
@@ -9156,9 +9248,9 @@ class WatchDaemon:
         self.save()
         text_attempted = False
         try:
-            if not live_input_check():
-                raise InputNotSentError("Claude live identity changed before text")
-            guard = (base.input_guard(live_input_check) if hasattr(base, "input_guard")
+            if not text_input_check():
+                raise InputNotSentError("Claude live identity or current stop changed before text")
+            guard = (base.input_guard(text_input_check) if hasattr(base, "input_guard")
                      else contextlib.nullcontext())
             with guard:
                 text_attempted = True
@@ -10567,16 +10659,12 @@ class WatchDaemon:
         }[status]
         runtime.state = kind
         runtime.error_type = kind
-        return ScreenState(
-            kind,
+        return dataclasses.replace(
+            state,
+            kind=kind,
             error_type=kind,
-            fingerprint=state.fingerprint,
-            screen_signature=state.screen_signature,
             reason=reason,
             message_kind="claude",
-            content_fingerprint=state.content_fingerprint,
-            watchdog_echo=state.watchdog_echo,
-            claude_context=telemetry,
         )
 
     def _apply_claude_runtime_guards(
@@ -10607,74 +10695,56 @@ class WatchDaemon:
         self._recover_claude_report_stop(surface_id, runtime)
         legacy_report = self._legacy_claude_report_latch(runtime)
         if runtime.claude_completed_latched and not legacy_report:
-            return ScreenState(
-                "claude_completed", fingerprint=runtime.claude_completion_event_id,
-                screen_signature=state.screen_signature,
+            return dataclasses.replace(
+                state, kind="claude_completed", error_type=None,
+                fingerprint=runtime.claude_completion_event_id,
                 reason="Claude completion remains latched until a real user prompt or verified later Stop-hook continuation",
-                message_kind="claude", content_fingerprint=state.content_fingerprint,
-                claude_context=getattr(state, "claude_context", None),
+                message_kind="claude",
             )
         if runtime.claude_handshake_wait:
-            return ScreenState(
-                "claude_handshake_wait", fingerprint=runtime.claude_handshake_ack_event_id,
-                screen_signature=state.screen_signature,
+            return dataclasses.replace(
+                state, kind="claude_handshake_wait", error_type=None,
+                fingerprint=runtime.claude_handshake_ack_event_id,
                 reason="Claude handshake acknowledged; waiting for native task dispatch",
-                message_kind="claude", content_fingerprint=state.content_fingerprint,
-                claude_context=getattr(state, "claude_context", None),
+                message_kind="claude",
             )
         if legacy_report:
-            return ScreenState(
-                "claude_report_ready",
+            return dataclasses.replace(
+                state, kind="claude_report_ready", error_type=None,
                 fingerprint=runtime.claude_completion_event_id,
-                screen_signature=state.screen_signature,
                 reason="Legacy report recovery awaits a current verified Stop and no pending submission; task completion is unproven",
                 message_kind="claude",
-                content_fingerprint=state.content_fingerprint,
-                claude_context=getattr(state, "claude_context", None),
             )
         if state.kind == "claude_model_unavailable":
             return state
         if runtime.claude_hook_health == "legacy_override":
-            return ScreenState(
-                "claude_hook_legacy",
-                screen_signature=state.screen_signature,
+            return dataclasses.replace(
+                state, kind="claude_hook_legacy", error_type=None, fingerprint=None,
                 reason="inline settings omit the CCC Hook; effective loaded hooks remain unverified",
                 message_kind="claude",
-                content_fingerprint=state.content_fingerprint,
-                claude_context=getattr(state, "claude_context", None),
             )
         if runtime.claude_hook_health in {"missing", "historical"}:
-            return ScreenState(
-                "claude_hook_missing",
-                screen_signature=state.screen_signature,
+            return dataclasses.replace(
+                state, kind="claude_hook_missing", error_type=None, fingerprint=None,
                 reason=("same-process Hook identity recovered; waiting for a new accepted event"
                         if runtime.claude_hook_health == "historical" else
                         "no accepted CCC Hook for this process; installation is not determined"),
                 message_kind="claude",
-                content_fingerprint=state.content_fingerprint,
-                claude_context=getattr(state, "claude_context", None),
             )
         if runtime.claude_hook_health == "unverified" and state.kind in {
             "claude_hook_waiting",
             "incompatible",
         }:
-            return ScreenState(
-                "claude_hook_unverified",
-                screen_signature=state.screen_signature,
+            return dataclasses.replace(
+                state, kind="claude_hook_unverified", error_type=None, fingerprint=None,
                 reason="waiting for SessionStart or another Claude lifecycle Hook",
                 message_kind="claude",
-                content_fingerprint=state.content_fingerprint,
-                claude_context=getattr(state, "claude_context", None),
             )
         if state.kind == "claude_hook_waiting" and runtime.claude_last_hook_at <= 0:
-            return ScreenState(
-                "claude_hook_missing",
-                fingerprint=state.fingerprint,
-                screen_signature=state.screen_signature,
+            return dataclasses.replace(
+                state, kind="claude_hook_missing", error_type=None,
                 reason="Claude UI is idle but no lifecycle Hook has been observed",
                 message_kind="claude",
-                content_fingerprint=state.content_fingerprint,
-                claude_context=getattr(state, "claude_context", None),
             )
         return state
 

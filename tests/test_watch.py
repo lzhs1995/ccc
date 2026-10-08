@@ -4042,13 +4042,7 @@ class WatchTests(unittest.TestCase):
             state = daemon._apply_claude_runtime_guards(
                 "surface-uuid",
                 runtime,
-                type("State", (), {
-                    "message_kind": None,
-                    "error_type": None,
-                    "kind": "incompatible",
-                    "screen_signature": None,
-                    "content_fingerprint": None,
-                })(),
+                ScreenState("incompatible"),
             )
             self.assertEqual(state.kind, "claude_hook_legacy")
             self.assertFalse(daemon.config["targets"][0].get("paused", False))
