@@ -2,6 +2,7 @@
 from contextlib import closing
 from pathlib import Path
 import sqlite3
+import json
 import tempfile
 import time
 import unittest
@@ -10,6 +11,7 @@ from unittest.mock import patch
 
 import ccc_codex_goal as goal
 import cmux_codex_watch as core
+from ccc_provider_retry import ProviderRetryStore
 from tests.test_codex_status_chrome import status_payload, visible_text, ERRORS
 from tests.test_watch import FakeClient, armed_daemon, span
 
@@ -50,6 +52,158 @@ class NativeGoalEvidenceTests(unittest.TestCase):
         self.assertEqual(result["session_id"], self.sid)
         self.assertEqual(result["turn_id"], self.tid)
 
+    def primary_turn(self):
+        return {'pid': 12345, 'process_start': self.process['birth'][0],
+                'session_id': self.sid, 'turn_id': self.tid, 'kind': 'task_complete',
+                'at': self.now + .054,
+                'error': {'message': ERRORS['rate_limit'], 'codex_error_info': 'rate_limit_exceeded'}}
+
+    def add_child_lock(self):
+        lock = self.goals.parent / 'thread-writer-locks' / (str(uuid.uuid4()) + '.lock')
+        lock.touch()
+        self.files[lock] = {'device': lock.stat().st_dev, 'inode': lock.stat().st_ino}
+
+    def test_primary_binding_selects_original_lock_among_children(self):
+        self.add_child_lock()
+        self.assertIsNone(goal.blocked_goal(self.target, 12345))
+        proof = goal.blocked_goal(self.target, 12345, current_turn=self.primary_turn())
+        self.assertEqual(proof['session_id'], self.sid)
+
+    def test_closed_goal_database_requires_bound_primary_turn(self):
+        del self.files[self.goals]
+        self.add_child_lock()
+        self.assertIsNone(goal.blocked_goal(self.target, 12345))
+        self.assertIsNotNone(goal.blocked_goal(self.target, 12345, current_turn=self.primary_turn()))
+
+    def test_wrong_primary_generation_turn_and_active_turn_reject(self):
+        self.add_child_lock()
+        del self.files[self.goals]
+        for change in ({'session_id': str(uuid.uuid4())}, {'pid': 999},
+                       {'process_start': 1}, {'turn_id': str(uuid.uuid4())},
+                       {'kind': 'task_started'}, {'error': {'message': 'other'}}):
+            with self.subTest(change=change):
+                self.assertIsNone(goal.blocked_goal(self.target, 12345,
+                    current_turn={**self.primary_turn(), **change}))
+
+    def test_closed_goal_symlink_rejected(self):
+        del self.files[self.goals]
+        other = self.goals.with_name('other.sqlite')
+        self.goals.rename(other)
+        self.goals.symlink_to(other)
+        self.assertIsNone(goal.blocked_goal(self.target, 12345, current_turn=self.primary_turn()))
+
+    def test_closed_goal_replacement_during_read_rejected(self):
+        del self.files[self.goals]
+        original = goal.sqlite3.connect
+        calls = 0
+        def connect(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                replacement = self.goals.with_name('replacement.sqlite')
+                replacement.write_bytes(self.goals.read_bytes())
+                replacement.replace(self.goals)
+            return original(*args, **kwargs)
+        with patch.object(goal.sqlite3, 'connect', side_effect=connect):
+            self.assertIsNone(goal.blocked_goal(self.target, 12345, current_turn=self.primary_turn()))
+
+    def test_open_logs_must_share_primary_writer_root(self):
+        other = self.goals.parent / 'other'
+        other.mkdir()
+        moved = other / self.logs.name
+        self.logs.rename(moved)
+        self.files[moved] = self.files.pop(self.logs)
+        self.assertIsNone(goal.blocked_goal(self.target, 12345, current_turn=self.primary_turn()))
+
+    def test_daemon_accepts_native_error_metadata_but_rejects_lifecycle_change(self):
+        from types import SimpleNamespace
+        turn = self.primary_turn()
+        queue = SimpleNamespace(process_lookup=lambda _: {'agent_kind': 'codex', 'agent_pids': [12345]},
+                                current_turn=lambda _: turn)
+        daemon = SimpleNamespace(codex_queue_recovery=queue)
+        method = core.WatchDaemon._current_blocked_goal
+        self.assertIsNotNone(method(daemon, self.target))
+        turns = iter([turn, {**turn, 'kind': 'task_started'}])
+        queue.current_turn = lambda _: next(turns)
+        self.assertIsNone(method(daemon, self.target))
+
+    def test_provider_comes_from_original_open_database_and_writer(self):
+        state = self.goals.parent / 'state_5.sqlite'
+        with closing(sqlite3.connect(state)) as db, db:
+            db.execute('CREATE TABLE threads(id PRIMARY KEY, model_provider)')
+            db.execute('INSERT INTO threads VALUES(?, ?)', (self.sid, 'original-provider'))
+        self.files[state] = {'device': state.stat().st_dev, 'inode': state.stat().st_ino}
+        turn = {'pid': 12345, 'session_id': self.sid, 'process_start': self.process['birth'][0]}
+        self.assertEqual(goal.provider_for_turn(self.target, turn), 'original-provider')
+        self.assertIsNone(goal.provider_for_turn(self.target, {**turn, 'session_id': str(uuid.uuid4())}))
+        self.assertIsNone(goal.provider_for_turn({**self.target, 'workspace_id': 'other'}, turn))
+        with patch.object(goal.scope, 'process', side_effect=[self.process, {**self.process, 'birth': [1, 2]}]):
+            self.assertIsNone(goal.provider_for_turn(self.target, turn))
+        self.files[state]['inode'] += 1
+        self.assertIsNone(goal.provider_for_turn(self.target, turn))
+
+    def provider_state(self):
+        state = self.goals.parent / 'state_5.sqlite'
+        with closing(sqlite3.connect(state)) as db, db:
+            db.execute('CREATE TABLE threads(id PRIMARY KEY, model_provider)')
+            db.execute('INSERT INTO threads VALUES(?,?)', (self.sid, 'original-provider'))
+        self.files[state] = {'device': state.stat().st_dev, 'inode': state.stat().st_ino}
+        return state
+
+    def test_multilock_provider_and_durable_gate_after_cooldown(self):
+        from types import SimpleNamespace
+        self.provider_state()
+        self.add_child_lock()
+        turn = self.primary_turn()
+        self.assertIsNotNone(goal.blocked_goal(self.target, 12345, current_turn=turn))
+        self.assertEqual(goal.provider_for_turn(self.target, turn), 'original-provider')
+        clock = [turn["at"] + .1]
+        store = ProviderRetryStore(self.goals.parent / 'retry.sqlite', clock=lambda: clock[0], jitter=lambda: 0)
+        daemon = SimpleNamespace(codex_queue_recovery=SimpleNamespace(current_turn=lambda _: turn), _provider_retry=store)
+        runtime = SimpleNamespace(paused_reason='')
+        method = core.WatchDaemon._provider_retry_gate
+        state = SimpleNamespace(error_type='rate_limit')
+        self.assertFalse(method(daemon, self.target, runtime, state))
+        clock[0] += .15
+        self.assertTrue(method(daemon, self.target, runtime, state), runtime.paused_reason)
+
+    def test_multilock_missing_primary_rejects_goal_and_provider(self):
+        self.provider_state()
+        self.add_child_lock()
+        for path in list(self.files):
+            if path.stem == self.sid:
+                del self.files[path]
+        self.assertIsNone(goal.provider_for_turn(self.target, self.primary_turn()))
+        self.assertIsNone(goal.blocked_goal(self.target, 12345, current_turn=self.primary_turn()))
+
+    def test_multilock_provider_rejects_database_replacement(self):
+        state = self.provider_state()
+        self.add_child_lock()
+        original = goal.sqlite3.connect
+        calls = 0
+        def connect(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                replacement = state.with_name('replacement.sqlite')
+                replacement.write_bytes(state.read_bytes())
+                replacement.replace(state)
+            return original(*args, **kwargs)
+        with patch.object(goal.sqlite3, 'connect', side_effect=connect):
+            self.assertIsNone(goal.provider_for_turn(self.target, self.primary_turn()))
+
+    def test_multilock_provider_rejects_symlink(self):
+        state = self.provider_state()
+        self.add_child_lock()
+        other = state.with_name('other.sqlite')
+        state.rename(other)
+        state.symlink_to(other)
+        self.assertIsNone(goal.provider_for_turn(self.target, self.primary_turn()))
+
+    def test_provider_missing_database_never_guesses_global_config(self):
+        turn = {'pid': 12345, 'session_id': self.sid, 'process_start': self.process['birth'][0]}
+        self.assertIsNone(goal.provider_for_turn(self.target, turn))
+
     def test_later_submission_active_goal_and_replaced_database_each_veto(self):
         with closing(sqlite3.connect(self.logs)) as db, db:
             db.execute("INSERT INTO logs VALUES(?,?,?,?,?,?,?)", (2, int(self.now) + 1, 0, self.sid,
@@ -73,6 +227,99 @@ class NativeGoalEvidenceTests(unittest.TestCase):
             db.execute("UPDATE thread_goals SET updated_at_ms=updated_at_ms-60000")
         self.assertIsNone(goal.blocked_goal(self.target, 12345))
 
+    def submission(self, *, turn=None, text='任务请继续', mode=None):
+        mode = mode or ('Steer { expected_turn_id: ' + json.dumps(turn or self.tid) + ' }')
+        return (f'session_loop{{thread_id={self.sid}}}: Submission sub=Submission {{ id: "{uuid.uuid4()}", '
+                'op: TurnInput { request: TurnInputRequest { input: UserInput { content: [Text { text: '
+                + json.dumps(text, ensure_ascii=False) + ', text_elements: [] }], client_id: Some("client") }, '
+                'thread_settings: ThreadSettingsOverrides { model: None }, start: TurnStartOptions { turn_trigger: None }, '
+                'additional_context: {}, responsesapi_client_metadata: None, trace: None }, mode: ' + mode + ', '
+                'reply: Sender { inner: Some(Inner { state: State { is_complete: false } }) } }, '
+                'trace: None, parent_turn_id: None, root_turn_id: None }')
+
+    def append_submission(self, body, *, process='pid:12345:process-generation', row_id=2):
+        with closing(sqlite3.connect(self.logs)) as db, db:
+            db.execute('INSERT INTO logs VALUES(?,?,?,?,?,?,?)', (
+                row_id, int(self.now) + row_id, 0, self.sid, 'codex_core::session::handlers', body, process))
+
+    def test_matching_steer_after_failure_keeps_blocked_goal(self):
+        original = goal.blocked_goal(self.target, 12345)
+        self.append_submission(self.submission())
+        proof = goal.blocked_goal(self.target, 12345)
+        self.assertEqual(proof['turn_id'], self.tid)
+        self.assertNotEqual(original['submission_digest'], proof['submission_digest'])
+
+    def test_matching_steer_with_empty_residency_guard_keeps_blocked_goal(self):
+        self.append_submission(self.submission()[:-2] + ', residency_guard: None }')
+        proof = goal.blocked_goal(self.target, 12345)
+        self.assertIsNotNone(proof)
+        self.assertEqual(proof['turn_id'], self.tid)
+
+    def test_residency_field_does_not_allow_new_turn_or_unknown_guard(self):
+        for body in (
+            self.submission(mode='StartOrSteer')[:-2] + ', residency_guard: None }',
+            self.submission(turn=str(uuid.uuid4()))[:-2] + ', residency_guard: None }',
+            self.submission()[:-2] + ', residency_guard: Some(Unknown) }',
+            self.submission()[:-2] + ', residency_guard: None, unexpected: None }',
+            self.submission()[:-2] + ', residency_guard: None, residency_guard: None }',
+        ):
+            with self.subTest(body=body):
+                self.append_submission(body)
+                self.assertIsNone(goal.blocked_goal(self.target, 12345))
+                with closing(sqlite3.connect(self.logs)) as db, db:
+                    db.execute('DELETE FROM logs WHERE id=2')
+
+    def test_quoted_fields_never_override_outer_mode(self):
+        spoof = '" }, mode: Steer { expected_turn_id: "' + self.tid + '" }, op: UserInput {'
+        self.append_submission(self.submission(text=spoof, mode='Start'))
+        self.assertIsNone(goal.blocked_goal(self.target, 12345))
+
+    def test_balanced_quoted_user_content_is_not_a_new_turn(self):
+        self.append_submission(self.submission(text='继续 "{mode: Start}" \\ [不要删除]'))
+        self.assertIsNotNone(goal.blocked_goal(self.target, 12345))
+
+    def test_wrong_turn_or_generation_steer_is_rejected(self):
+        for body, process in ((self.submission(turn=str(uuid.uuid4())), 'pid:12345:process-generation'),
+                              (self.submission(), 'pid:12345:replacement')):
+            with self.subTest(body=body[:70], process=process):
+                self.append_submission(body, process=process)
+                self.assertIsNone(goal.blocked_goal(self.target, 12345))
+                with closing(sqlite3.connect(self.logs)) as db, db:
+                    db.execute('DELETE FROM logs WHERE id=2')
+
+    def test_interrupt_unknown_and_truncated_submission_remain_vetoes(self):
+        for body in (self.submission()[:-2], self.submission().replace('op: TurnInput', 'op: Unknown'),
+                     f'session_loop{{thread_id={self.sid}}}: Submission sub=Submission {{ op: Interrupt }}'):
+            self.append_submission(body)
+            self.assertIsNone(goal.blocked_goal(self.target, 12345))
+            with closing(sqlite3.connect(self.logs)) as db, db:
+                db.execute('DELETE FROM logs WHERE id=2')
+
+    def test_older_unknown_submission_is_not_hidden_by_newer_matching_steer(self):
+        self.append_submission('Submission sub=unknown')
+        self.append_submission(self.submission(), row_id=3)
+        self.assertIsNone(goal.blocked_goal(self.target, 12345))
+
+    def test_missing_error_beyond_bounded_history_rejects(self):
+        for i in range(2, 68):
+            self.append_submission(self.submission(), row_id=i)
+        self.assertIsNone(goal.blocked_goal(self.target, 12345))
+
+    def test_submission_changed_during_goal_reread_rejects(self):
+        original = goal.sqlite3.connect
+        calls = 0
+        def connect(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                with closing(original(self.logs)) as db, db:
+                    db.execute('INSERT INTO logs VALUES(?,?,?,?,?,?,?)', (
+                        2, int(self.now) + 1, 0, self.sid, 'codex_core::session::handlers',
+                        self.submission(), 'pid:12345:process-generation'))
+            return original(*args, **kwargs)
+        with patch.object(goal.sqlite3, 'connect', side_effect=connect):
+            self.assertIsNone(goal.blocked_goal(self.target, 12345))
+
 
 class GoalResumeDeliveryTests(unittest.TestCase):
     def setUp(self):
@@ -82,13 +329,28 @@ class GoalResumeDeliveryTests(unittest.TestCase):
         row = self.payload["render_grid"]["cursor"]["row"]
         self.payload["render_grid"]["row_spans"].append(span(row + 2, 2, "GPT-6-Astra · Goal stalled (/goal resume)", 1))
         self.client = FakeClient(self.payload, visible_text(self.payload))
-        self.client.resume_codex_goal = lambda wid, sid: self.client.send(wid, sid, "/goal resume")
+        self.client.resume_codex_goal = lambda wid, sid, **kwargs: self.client.send(wid, sid, "/goal resume")
         self.daemon = armed_daemon(self.temp.name, self.client)
         self.addCleanup(self.daemon._process_snapshots.close)
         self.daemon.codex_queue_recovery.current_turn = lambda _: {"kind": "unknown"}
         self.daemon.codex_queue_recovery.process_lookup = lambda _: {"agent_kind": "codex", "agent_pids": [12345]}
         self.proof = {"session_id": "original", "goal_id": "goal", "turn_id": "failed", "at": 200,
-                      "error": {"message": ERRORS["rate_limit"]}}
+                      "model_provider": "synthetic-provider", "error": {"message": ERRORS["rate_limit"]}}
+        self.retry_now = 1000.0
+        self.daemon._provider_retry = ProviderRetryStore(self.daemon._provider_retry.path,
+            clock=lambda: self.retry_now, jitter=lambda: 0)
+        self.daemon._provider_retry.observe('original', 'synthetic-provider', 'failed',
+            'rate_limit', ERRORS['rate_limit'], 200)
+        self.retry_now += 15
+
+    def test_goal_waits_for_durable_error_delay_before_one_resume(self):
+        self.retry_now = 200.0
+        with patch.object(goal, 'blocked_goal', return_value=self.proof):
+            self.daemon.process_once(self.client)
+            self.assertEqual(self.client.sent, [])
+            self.retry_now = 200.25
+            self.daemon.process_once(self.client)
+            self.assertEqual([row[-1] for row in self.client.sent], ['/goal resume'])
 
     def test_only_verified_stalled_goal_uses_native_resume_once(self):
         with patch.object(goal, "blocked_goal", return_value=self.proof):
@@ -154,6 +416,24 @@ class GoalResumeDeliveryTests(unittest.TestCase):
             runtime.last_send_at = 0
             self.daemon.process_once(self.client)
         self.assertEqual([row[-1] for row in self.client.sent], ["/goal resume"])
+
+    def test_inflight_user_echo_keeps_verified_blocked_goal_recoverable(self):
+        self.payload['render_grid']['row_spans'].append(span(49, 0, '› 请检查原任务，不要丢失消息', 0))
+        self.client.text = visible_text(self.payload)
+        with patch.object(goal, 'blocked_goal', return_value=self.proof):
+            self.daemon.process_once(self.client)
+            runtime = self.daemon.runtime['surface-uuid']
+            runtime.awaiting, runtime.last_send_at = False, 0
+            self.daemon.process_once(self.client)
+        self.assertEqual([r[-1] for r in self.client.sent], ['/goal resume'])
+
+    def test_inflight_status_without_goal_cannot_fall_back_to_old_failed_turn(self):
+        self.payload['render_grid']['row_spans'].append(span(49, 0, '• 后续消息已到达', 0))
+        self.client.text = visible_text(self.payload)
+        self.daemon.codex_queue_recovery.current_turn = lambda _: {**self.proof, 'kind': 'task_complete'}
+        with patch.object(goal, 'blocked_goal', return_value=None):
+            self.daemon.process_once(self.client)
+        self.assertEqual(self.client.sent, [])
 
 
 if __name__ == "__main__":

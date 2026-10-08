@@ -1,4 +1,5 @@
 import tempfile
+import contextlib
 import unittest
 from unittest.mock import Mock
 from unittest.mock import patch
@@ -54,20 +55,35 @@ class CodexTurnGateTests(unittest.TestCase):
         self.assertEqual(self.client.sent, [])
 
     def test_new_user_turn_between_persistence_and_io_cancels_send(self):
-        self.turn.side_effect = [self.finished, {"kind": "task_started"}]
-        self.daemon.process_once(self.client)
+        persist = self.daemon._delivery_store.persist
+        def changed(sid, runtime):
+            persist(sid, runtime)
+            self.turn.return_value = {"kind": "task_started"}
+        with patch.object(self.daemon._delivery_store, 'persist', side_effect=changed):
+            self.daemon.process_once(self.client)
         self.assertEqual(self.client.sent, [])
         self.assertEqual(self.daemon.runtime["surface-uuid"].delivery_status, "cancelled")
 
     def test_binding_disappearing_before_io_cancels_send(self):
-        self.turn.side_effect = [self.finished, None]
-        self.daemon.process_once(self.client)
+        persist = self.daemon._delivery_store.persist
+        def disappeared(sid, runtime):
+            persist(sid, runtime)
+            self.turn.return_value = None
+        with patch.object(self.daemon._delivery_store, 'persist', side_effect=disappeared):
+            self.daemon.process_once(self.client)
         self.assertEqual(self.client.sent, [])
         self.assertEqual(self.daemon.runtime["surface-uuid"].delivery_status, "cancelled")
 
     def test_new_turn_while_waiting_for_workspace_lock_cancels_io(self):
-        self.turn.side_effect = [self.finished, self.finished, {"kind": "task_started"}]
-        self.daemon.process_once(self.client)
+        import cmux_codex_watch as core
+        lock = core.workspace_input_lock
+        @contextlib.contextmanager
+        def changed(*args, **kwargs):
+            with lock(*args, **kwargs):
+                self.turn.return_value = {"kind": "task_started"}
+                yield
+        with patch.object(core, 'workspace_input_lock', side_effect=changed):
+            self.daemon.process_once(self.client)
         self.assertEqual(self.client.sent, [])
         self.assertEqual(self.daemon.runtime['surface-uuid'].delivery_status, 'cancelled')
 
@@ -122,7 +138,7 @@ class CodexTurnGateTests(unittest.TestCase):
         restarted.process_once(self.client)
         self.assertEqual(len(self.client.sent), 1)
 
-    def test_timed_out_unsent_prompt_recovers_only_after_stable_native_evidence(self):
+    def test_unknown_prompt_cannot_replay_from_unchanged_native_evidence(self):
         self.daemon.process_once(self.client)
         runtime = self.daemon.runtime["surface-uuid"]
         runtime.delivery_status = "unknown"
@@ -135,7 +151,7 @@ class CodexTurnGateTests(unittest.TestCase):
         self.assertEqual(len(self.client.sent), 1)
         with patch("cmux_codex_watch.time.time", return_value=162.1):
             self.daemon.process_once(self.client)
-        self.assertEqual(len(self.client.sent), 2)
+        self.assertEqual(len(self.client.sent), 1)
 
     def test_unknown_send_is_not_retried_after_native_progress(self):
         self.daemon.process_once(self.client)

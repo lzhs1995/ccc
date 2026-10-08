@@ -26,9 +26,12 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
 import cmux_codex_watch as core
+import ccc_batch_timing as batch_timing
 
 
 SOURCE_LABELS = {
+    "claude_auto": "Claude自动",
+    "pane_follow": "同窗跟随",
     "untracked": "未登记",
     "explicit": "单路",
     "workspace_rule": "整池",
@@ -127,6 +130,7 @@ STATE_LABELS = {
     "claude_model_unavailable": "模型错误",
     "claude_input_guard": "输入保护",
     "claude_completed": "已完成",
+    "claude_report_ready": "报告待核",
     "claude_pending_input": "已续跑",
     "claude_hook_waiting": "Hook等待",
     "claude_event_pending": "待续跑",
@@ -170,6 +174,7 @@ DETAIL_FALLBACKS = {
     "claude_model_unavailable": "Claude 报告模型不存在或无访问权限；重复续跑不能修复，需核对 /model",
     "claude_input_guard": "等待输入保护期结束；用户输入优先",
     "claude_completed": "Claude 已完成；仍持续监控，下个任务自动恢复",
+    "claude_report_ready": "报告已就绪，回调未确认；停止催促，等待监督侧核收",
     "claude_pending_input": "本次停止已续跑，不会重复排队",
     "claude_hook_waiting": "等待 Claude Stop/StopFailure 事件；画面本身不会触发发送",
     "claude_event_pending": "已收到 Claude 停止事件，正在进行输入保护校验",
@@ -208,6 +213,7 @@ DETAIL_SHORT = {
     "claude_model_unavailable": "模型错误",
     "claude_input_guard": "保护中",
     "claude_completed": "已完成",
+    "claude_report_ready": "报告待核",
     "claude_pending_input": "已续跑",
     "claude_hook_waiting": "等Hook",
     "claude_event_pending": "待续跑",
@@ -388,6 +394,22 @@ class Candidate:
         return SESSION_UNMEASURED
 
     @property
+    def api_key_text(self) -> str:
+        if self.session.api_key_observation_historical:
+            return "历史请求（K查看完整值）"
+        if self.session.api_key_observed:
+            return self.session.api_key_observed
+        if self.session.api_key_observation_status == "absent":
+            return "暂无请求记录"
+        if self.session.api_key_observation_status == "previous_process":
+            return "仅旧进程记录"
+        if self.session.api_key_observation_status == "not_instrumented":
+            return "未接入采集（K查看）"
+        # The row represents this running session. Repeating a shared mutable
+        # TOML value here falsely suggests all loaded sessions use that key.
+        return "未核实"
+
+    @property
     def surface_id(self) -> str:
         return self.record["surface_id"]
 
@@ -433,6 +455,7 @@ def is_idling(candidate: Candidate) -> bool:
         "claude_stopped",
         "claude_input_guard",
         "claude_completed",
+        "claude_report_ready",
         "claude_pending_input",
         "claude_hook_waiting",
         "claude_event_pending",
@@ -453,7 +476,7 @@ def is_idling(candidate: Candidate) -> bool:
         return True
     if candidate.paused or candidate.source == "workspace_excluded":
         return False
-    return candidate.agent_kind != "codex"
+    return candidate.agent_kind not in {"codex", "claude"}
 
 
 def program_label(candidate: Candidate) -> str:
@@ -475,9 +498,9 @@ def watch_kind(candidate: Candidate) -> str:
         return "excluded"
     if candidate.source in {"workspace_rule", "workspace_non_codex"}:
         return "pool_idling" if is_idling(candidate) else "pool"
-    if candidate.source == "explicit" and candidate.paused:
+    if candidate.source in SINGLE_SOURCES and candidate.paused:
         return "paused"
-    if candidate.source == "explicit":
+    if candidate.source in SINGLE_SOURCES:
         return "idling" if is_idling(candidate) else "watching"
     return "untracked"
 
@@ -891,6 +914,15 @@ class SessionResult:
     measured_at: float = 0.0
     pid: int = 0
     generation: str = ""
+    api_key_config: str = field(default="", repr=False)
+    api_key_source: str = ""
+    api_key_note: str = "运行态 Key 未确认"
+    api_key_observed: str = field(default="", repr=False)
+    api_key_observation_historical: bool = False
+    api_key_observation_note: str = ""
+    api_key_observation_status: str = "unverified"
+    foreground_evidence: tuple | None = field(default=None, repr=False)
+    foreground_observations: tuple = field(default=(), repr=False)
 
     @property
     def ok(self) -> bool:
@@ -1167,6 +1199,33 @@ def resolve_surface_session(
         base.reason = "没有可用的进程 PID"
         return base
 
+    if agent_kind == "codex":
+        from ccc_client_thread_observation import read_foreground
+        observed = [(pid, read_foreground(pid, request_observation_directory_matches)) for pid in live]
+        present = [(pid, value) for pid, value in observed
+                   if value[0] not in ("absent", "nonforeground")]
+        if present:
+            base.tier = "codex-foreground"
+            base.foreground_observations = tuple(observed)
+            if any(value[0] != "ok" for _, value in present):
+                base.reason = "当前客户端会话记录失效，不能沿用启动时 session"
+                return base
+            if len({value[1] for _, value in present}) != 1:
+                base.status, base.reason = "conflict", "当前客户端会话记录冲突"
+                return base
+            pid, (_, thread, evidence) = present[0]
+            base.pid, base.foreground_evidence = pid, evidence
+            if thread is None:
+                base.reason = "客户端当前未选择会话"
+                return base
+            base.status, base.session_id = "ok", thread
+            base.generation = session_generation(pid, str((ps_table.get(pid) or {}).get("started_at") or ""))
+            return base
+        live = [pid for pid, value in observed if value[0] != "nonforeground"]
+        if not live:
+            base.reason = "只有 Codex 后台服务，没有前台客户端会话"
+            return base
+
     commands = [str((ps_table.get(pid) or {}).get("command") or "") for pid in live]
     status, session_id, note = resolve_from_argv(commands)
     if status == "ok":
@@ -1350,6 +1409,12 @@ class SessionResolver:
                 lsof_runner=self._lsof_runner,
                 grok_path=self._grok_path, grok_loader=self._grok_loader,
             )
+            result = resolved[surface_id]
+            if result.ok and result.agent_kind == "codex":
+                observe_request_api_key(result)
+            elif result.ok and result.agent_kind == "claude":
+                from ccc_claude_request_key import observe
+                observe(result)
         with self._lock:
             # A pass that started before a newer one is discarded rather than
             # written: late results would otherwise resurrect ids for processes
@@ -1358,6 +1423,255 @@ class SessionResolver:
                 return
             self._results = resolved
             self._fetched_at = now
+
+
+from ccc_request_observation_policy import request_observation_directory_matches
+
+
+def observe_request_api_key(result: SessionResult, directory: Path | None = None) -> None:
+    """Project native send-boundary records; never fall back to configuration.
+
+    This is the most recent observed attempt for a thread, not a promise about
+    a future request. A live Codex writer, matching opt-in path, private files,
+    and a timestamp after its birth are required. Ambiguous writers are refused.
+    """
+    import os
+    import stat
+    import ccc_guard_scope as scope
+    from ccc_request_key_binding import connected_writer
+    def identity(info):
+        return (info.st_dev, info.st_ino, info.st_mode, info.st_uid,
+                info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+    def session_records():
+        found = {}
+        for path in directory.iterdir():
+            if path.name.endswith(f"-{result.session_id}-request_attempt.json"):
+                if len(found) >= 4096:
+                    result.api_key_observation_note = "该会话请求记录过多，无法完整核验实际 Key。"
+                    return None
+                found[path] = identity(path.lstat())
+        return found
+
+    result.api_key_observed = ""
+    result.api_key_observation_historical = False
+    result.api_key_observation_note = ""
+    result.api_key_observation_status = "unverified"
+    if not result.ok or result.agent_kind != "codex":
+        result.api_key_observation_note = "尚未关联可核实的 Codex 会话。"
+        return
+    cli_birth = scope.birth(result.pid, codex=True)
+    if cli_birth is None:
+        result.api_key_observation_note = "原客户端进程已退出或身份无法核实。"
+        return
+    try:
+        if directory is None:
+            # Resolve the observed client's directory, not this panel's HOME.
+            # A different CODEX_HOME is common with per-session credentials.
+            cli_argv, cli_env = scope.arguments(result.pid)
+            if not cli_argv or scope.birth(result.pid, codex=True) != cli_birth:
+                return
+            explicit = cli_env.get("CODEX_CREDENTIAL_OBSERVATIONS_DIR")
+            if explicit is not None:
+                directory = Path(explicit)
+            else:
+                home = cli_env.get("CODEX_HOME")
+                if home is None:
+                    if not cli_env.get("HOME"):
+                        return
+                    home = str(Path(cli_env["HOME"]) / ".codex")
+                directory = Path(home) / "credential-observations"
+        root = directory.lstat()
+        if (not directory.is_absolute() or not stat.S_ISDIR(root.st_mode)
+                or root.st_uid != os.getuid() or root.st_mode & 0o077):
+            result.api_key_observation_note = "请求记录目录的类型、属主或权限未通过核验。"
+            return
+        records = []
+        previous_processes = set()
+        previous_records = 0
+        before_records = session_records()
+        if before_records is None:
+            return
+        for path, expected_identity in before_records.items():
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, "rb") as stream:
+                before = os.fstat(stream.fileno())
+                if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
+                        or before.st_mode & 0o077 or before.st_size > 16384):
+                    continue
+                raw = stream.read(16385)
+                after = os.fstat(stream.fileno())
+            if (len(raw) > 16384 or identity(before) != identity(after)
+                    or identity(before) != expected_identity):
+                continue
+            data = json.loads(raw)
+            if (not isinstance(data, dict) or type(data.get("schema")) is not int
+                    or data.get("schema") != 1 or data.get("thread_id") != result.session_id
+                    or data.get("purpose") != "request_attempt"
+                    or data.get("transport") not in ("http", "websocket")
+                    or not is_session_uuid(data.get("observer_epoch"))):
+                continue
+            pid = data.get("pid")
+            if type(pid) is not int or pid <= 0:
+                continue
+            if path.name != f"{data['observer_epoch']}-{result.session_id}-request_attempt.json":
+                continue
+            birth = scope.birth(pid, codex=True)
+            if birth is None:
+                stamp = data.get("observed_at_ms")
+                if (type(stamp) is int and 0 < stamp <
+                        cli_birth[0] * 1000 + cli_birth[1] / 1000):
+                    previous_processes.add(pid)
+                    previous_records += 1
+                continue
+            stamp = data.get("observed_at_ms")
+            if (type(stamp) is not int or stamp < birth[0] * 1000 + birth[1] / 1000
+                    or stamp > time.time() * 1000 + 1000):
+                continue
+            argv, env = scope.arguments(pid)
+            if (not argv or not request_observation_directory_matches(env, directory)
+                    or scope.birth(pid, codex=True) != birth):
+                continue
+            if not connected_writer(result.pid, pid, cli_birth, birth):
+                continue
+            authorization = data.get("authorization")
+            key = data.get("api_key")
+            # Count every bound writer, including a writer whose latest request
+            # has no observable credential. Otherwise an older/different writer
+            # with a key could masquerade as the sole request identity.
+            records.append((data, "", birth))
+            if data.get("credential_scope", "request_headers") != "request_headers":
+                continue
+            if isinstance(authorization, str):
+                scheme, separator, token = authorization.partition(" ")
+                if separator and scheme.lower() == "bearer":
+                    if key and key != token:
+                        continue
+                    key = token
+            if not isinstance(key, str) or not 0 < len(key) <= 4096 or not all(32 < ord(c) < 127 for c in key):
+                continue
+            records[-1] = (data, key, birth)
+        # Two live backends using the same thread are not one credential identity.
+        if len(records) != 1:
+            if (not before_records and scope.birth(result.pid, codex=True) == cli_birth
+                    and session_records() == before_records
+                    and identity(directory.lstat())[:4] == identity(root)[:4]):
+                result.api_key_observation_status = "absent"
+                result.api_key_observation_note = (
+                    "未采集到该会话的请求记录；不能据此判断它使用哪一个 Key。"
+                    "此检查只读，不会为探测 Key 发起模型请求。"
+                )
+            elif len(records) > 1:
+                result.api_key_observation_note = "存在多个与该会话关联的请求进程，暂不能确定唯一来源。"
+            elif (before_records and previous_records == len(before_records)
+                    and scope.birth(result.pid, codex=True) == cli_birth
+                    and session_records() == before_records
+                    and identity(directory.lstat())[:4] == identity(root)[:4]):
+                result.api_key_observation_status = "previous_process"
+                result.api_key_observation_note = (
+                    "仅有早于当前客户端启动的旧进程请求记录（PID "
+                    + ", ".join(str(pid) for pid in sorted(previous_processes))
+                    + "）；旧请求进程已退出或不再匹配 Codex 身份。"
+                    "尚未采集到当前客户端的请求 Key，下一次自然请求后自动更新，无需重启。"
+                )
+            else:
+                result.api_key_observation_note = "请求记录缺失、读取期间改变或未通过格式及进程身份核验。"
+            return
+        data, key, birth = records[0]
+        if not connected_writer(result.pid, data["pid"], cli_birth, birth):
+            return
+        # Atomic publications by OTHER threads change the directory's times
+        # and size. They do not invalidate this thread's request identity.
+        # Recheck its entire record set (including replacements/new writers),
+        # plus the directory inode/owner/type/mode, before publishing a key.
+        if (session_records() != before_records
+                or identity(directory.lstat())[:4] != identity(root)[:4]):
+            return
+        if not key:
+            result.api_key_observation_note = (
+                "最近请求发生库内部重定向，末跳认证头未暴露；已清除首跳 Key。"
+                if data.get("credential_scope") == "opaque_redirect" else
+                "最近请求未记录可确认的 API Key；已清除先前显示。"
+            )
+            return
+        if result.foreground_evidence is None:
+            result.api_key_observation_note = "当前前台会话尚未取得原生证明；不能用启动时的 session 显示请求 Key。"
+            return
+        if result.foreground_evidence is not None:
+            from ccc_client_thread_observation import read_foreground
+            expected = result.foreground_observations or (
+                (result.pid, ("ok", result.session_id, result.foreground_evidence)),)
+            current = tuple((pid, read_foreground(pid, request_observation_directory_matches))
+                            for pid, _ in expected)
+            if current != expected:
+                result.api_key_observation_note = "读取期间当前会话改变，等待重新关联。"
+                return
+        result.api_key_observed = key
+        result.api_key_observation_status = "observed"
+        when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(data["observed_at_ms"] / 1000))
+        result.api_key_observation_note = (
+            f"原生最近请求尝试 {when}；{data['transport']}；{data.get('endpoint', '')}；"
+            f"后台 PID {data['pid']}。来自实际认证请求头，不代表服务端接受或下一次请求。"
+        )
+        if data["observed_at_ms"] < cli_birth[0] * 1000 + cli_birth[1] / 1000:
+            result.api_key_observation_historical = True
+            result.api_key_observation_note += (
+                "此记录早于当前 CLI 启动，仅为该会话历史请求；尚未观察到本次启动后的请求。"
+            )
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError) as exc:
+        result.api_key_observation_note = f"请求记录读取或核验失败（{type(exc).__name__}），不是已确认没有请求。"
+        return
+
+
+def observe_configured_api_key(result: SessionResult) -> None:
+    """Read a process's user config on the worker, never infer loaded auth.
+
+    Deliberately labelled configuration-only, even when its mtime predates the
+    process. Config layers, provider snapshots and server-side routing prevent
+    treating that timestamp (or a masked error token) as credential proof.
+    """
+    try:
+        import ccc_guard_scope as scope
+        try:
+            import tomllib
+        except ImportError:
+            import tomli as tomllib
+        before = scope.birth(result.pid, codex=True)
+        if before is None:
+            return
+        argv, env = scope.arguments(result.pid)
+        # Only attach the observation to the exact resumed session we resolved.
+        if "resume" not in argv or result.session_id not in argv:
+            return
+        home = env.get("CODEX_HOME") or str(Path(env["HOME"]) / ".codex")
+        path = Path(home) / "config.toml"
+        if not path.is_absolute():
+            return
+        with path.open("rb") as stream:
+            raw = stream.read(1024 * 1024 + 1)
+        if len(raw) > 1024 * 1024:
+            return
+        config = tomllib.loads(raw.decode("utf-8"))
+        provider = config.get("model_providers", {}).get(config.get("model_provider"), {})
+        key = provider.get("experimental_bearer_token")
+        env_key = provider.get("env_key")
+        if isinstance(env_key, str) and env_key:
+            key = env.get(env_key)
+        with path.open("rb") as stream:
+            after_raw = stream.read(1024 * 1024 + 1)
+        if scope.birth(result.pid, codex=True) != before or after_raw != raw:
+            return
+        result.api_key_source = str(path)
+        result.api_key_note = (
+            "仅当前磁盘配置；运行态/项目覆盖未确认。多个会话可能共用此文件，"
+            "显示相同不代表实际使用相同 Key，也不能判断混合配置是否生效。"
+            "Switch 切换不代表现有会话已换 Key。"
+        )
+        if isinstance(key, str) and 0 < len(key) <= 512 and all(32 < ord(c) < 127 for c in key):
+            result.api_key_config = key
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError, ImportError):
+        # Credentials are optional diagnostics, never an input/send gate.
+        return
 
 
 # ---------------------------------------------------------------------------
@@ -1844,6 +2158,7 @@ def _row_text(
     session: str = "",
     collab: str | None = None,
     visible_columns: tuple[tuple[str, int, str], ...] | None = None,
+    api_key: str = "",
 ) -> str:
     """One table row with responsive column layout.
 
@@ -1876,7 +2191,13 @@ def _row_text(
     # 口，于是"放不下 id"变成"连行都画坏"。完整 id 由焦点行给出。
     if cell is None:
         return head.rstrip()
-    return f"{head} {cell}".rstrip()
+    row = f"{head} {cell}"
+    # Keep the full credential (including its configuration-only label) or
+    # omit the entire column. Never present a clipped key as copyable auth.
+    if api_key and display_width(row) + 1 + 72 <= width:
+        value = api_key if display_width(api_key) <= 72 else "Key 过长，见详情"
+        row += " " + pad(value, 72)
+    return row.rstrip()
 
 
 def header_text(width: int | None = None, collab: str | None = None, visible_columns: tuple[tuple[str, int, str], ...] | None = None) -> str:
@@ -1889,6 +2210,7 @@ def header_text(width: int | None = None, collab: str | None = None, visible_col
     return _row_text(
         "     ", tuple(name for name, _, _ in columns), "标题",
         width, "session", collab, visible_columns,
+        api_key="api-key(最近请求)",
     )
 
 
@@ -2028,6 +2350,9 @@ def focus_summary(candidate: Candidate | None, workspace_ref: str = "") -> str:
     # generated command is built here from the validated ID -- never from the
     # possibly-clipped cell.
     facts.append(session_detail(candidate))
+    if candidate.agent_kind == "codex":
+        note = candidate.session.api_key_observation_note or "尚无可核实的原生请求记录"
+        facts.append(f"api-key（最近请求） {candidate.api_key_text}（{note}）")
     return "  |  ".join(facts)
 
 
@@ -2058,7 +2383,8 @@ def session_detail(candidate: Candidate) -> str:
     return "，".join(parts)
 
 
-MONITORED_SOURCES = {"explicit", "workspace_rule", "workspace_starting", "workspace_excluded", "workspace_non_codex"}
+SINGLE_SOURCES = {"explicit", "claude_auto", "pane_follow"}
+MONITORED_SOURCES = SINGLE_SOURCES | {"workspace_rule", "workspace_starting", "workspace_excluded", "workspace_non_codex"}
 POOL_SOURCES = {"workspace_rule", "workspace_starting", "workspace_excluded", "workspace_non_codex"}
 
 
@@ -2086,7 +2412,7 @@ def group_counts(candidates: list[Candidate]) -> dict[str, int]:
     idling = sum(1 for item in candidates if is_idling(item))
     return {
         "watching": sum(1 for item in candidates
-                        if item.source == "explicit" and not item.paused and not is_idling(item)),
+                        if item.source in SINGLE_SOURCES and not item.paused and not is_idling(item)),
         "idling": idling,
         "paused": sum(1 for item in candidates
                       if not is_idling(item)
@@ -2307,11 +2633,13 @@ def selected_action_hint(candidate: Candidate | None) -> str:
     """Only the keys that do something to the row under the cursor."""
     if candidate is None:
         return "/ 搜索  ·  f 切换筛选"
+    if candidate.record.get("claude_workspace_excluded"):
+        return f"已取消 {candidate.workspace_ref} 的 Claude 自动发现；w 重新授权整池"
     if candidate.source == "untracked":
         return f"a 只加这一路   w 授权整个 {candidate.workspace_ref}（以后新开的 Codex 也会跟）"
     if candidate.source == "workspace_non_codex":
         return f"u 取消整个 {candidate.workspace_ref} 授权   （这一路发不发由守护器读屏决定）"
-    if candidate.source == "explicit":
+    if candidate.source in SINGLE_SOURCES:
         if candidate.paused:
             if candidate.unreadable_sec > 0:
                 span = compact_duration(candidate.unreadable_sec)
@@ -2352,6 +2680,8 @@ def selected_action_hint(candidate: Candidate | None) -> str:
                 "供应商额度已耗尽，CCC 继续监控；"
                 "额度或授权恢复后在原会话重试，无需重新登记"
             )
+        if candidate.state == "claude_report_ready":
+            return "报告已就绪、回调未确认；等待监督侧核收，新任务仍可正常继续"
         if candidate.state == "claude_completed":
             return "已完成但仍持续监控；下个任务自动恢复判断，无需按 r   ·   p 暂停   x 删除"
         if candidate.hook_health == "legacy_override":
@@ -2399,8 +2729,8 @@ def private_batch_prompt(pool: str) -> str:
 
 
 def access_batch_prompt(pool: str) -> str:
-    return (f"在 {pool} 新开节费50？50路持续尝试，保留Codex原生重连，不设累计HTTP次数或运行时长上限；每次只发短问、请求上限128输出token。"
-            "一条完整回复后停止新增检查，在途请求自行结束；不自动Interrupt。原B保留，不能用检查页执行实际任务。")
+    return (f"在 {pool} 新开N原生50？50路并行启动，每路独立空目录、直接使用Codex原生连接，只请求回复OK；失败自动续跑。"
+            "节费限制暂缓：不等齐50路、不设累计HTTP次数、运行时长或输出token上限，不承诺接通后整池自动止损。")
 
 
 def confirm_prompt(action: str, candidate: Candidate, *, live_codex: int | None = None) -> str:
@@ -2421,7 +2751,7 @@ def confirm_prompt(action: str, candidate: Candidate, *, live_codex: int | None 
         count = f"这一池现在有 {live_codex} 个活 Codex。" if live_codex is not None else ""
         return f"确认授权整个 {pool}？{count}之后该池新开的 Codex 也会自动续跑"
     if action == "add":
-        if candidate.agent_kind != "codex":
+        if candidate.agent_kind not in {"codex", "claude"}:
             kind = candidate.process_summary or agent_label(candidate.agent_kind)
             return f"{location} 看起来是 {kind}，不是 Codex。仍要登记这一路 UUID？"
         return f"确认只登记 {location}（{target_name(candidate.record)}）？只有这一路会自动续跑"
@@ -2552,17 +2882,22 @@ class SupervisorModel:
         self._action_thread = None
         self._action_result = None
         self._action_generation = 0
+        self._action_context = threading.local()
 
-    def start_action(self, operation, success: str, *, priority: bool = False) -> str:
+    def start_action(self, operation, success: str, *, priority: bool = False, ui_trace=None) -> str:
         """Keep CLI mutations and pool interrupts off the keyboard thread."""
         with self._action_lock:
             if not priority and self._action_thread is not None and self._action_thread.is_alive():
+                batch_timing.record(self.config_path, ui_trace, 'rejected_busy')
                 return "上一操作仍在处理，可继续浏览"
             self._action_result = None
             self._action_generation += 1
             generation = self._action_generation
+            batch_timing.mark(ui_trace, 'action_enqueued')
             def work():
                 try:
+                    self._action_context.ui_trace = ui_trace
+                    batch_timing.record(self.config_path, ui_trace, 'action_started')
                     result = operation()
                     message = success
                     if isinstance(result, str):
@@ -2572,6 +2907,12 @@ class SupervisorModel:
                                 message = f"已整池停发；已向 {len(details['interrupt_requested'])} 路请求 Interrupt"
                 except Exception as exc:
                     message = f"失败: {exc}"
+                finally:
+                    self._action_context.ui_trace = None
+                    if ui_trace is not None:
+                        with contextlib.suppress(OSError, ValueError):
+                            latest = batch_timing.read(self.config_path, ui_trace['action_id'])
+                            batch_timing.record(self.config_path, latest, 'action_finished')
                 with self._action_lock:
                     if generation == self._action_generation:
                         self._action_result = message
@@ -2707,6 +3048,10 @@ class SupervisorModel:
                 for item in self.config.get("targets", [])
                 if item.get("surface_id")
             }
+            # Reuse this refresh's inventory: the display must agree with the
+            # daemon without issuing another fleet RPC or granting input.
+            dynamic_by_id = {t["surface_id"]: t for t in core.discover_all_targets(
+                core.DiscoverySnapshot(self.client, tree=tree, top=top), self.config)}
             rules_by_workspace = {
                 str(rule.get("workspace_id")): rule
                 for rule in self.config.get("workspace_rules", [])
@@ -2717,7 +3062,10 @@ class SupervisorModel:
                 surface_id = record["surface_id"]
                 target = explicit_by_id.get(surface_id)
                 rule = rules_by_workspace.get(str(record.get("workspace_id") or ""))
-                record = {**record, "workspace_authorized": rule is not None}
+                record = {**record, "workspace_authorized": rule is not None or (
+                    self.config.get("claude_auto_discover") and self.config.get("claude_enabled")
+                    and str(record.get("workspace_id")) not in self.config.get("claude_excluded_workspace_ids", [])
+                    and core.surface_process_label(process_by_id, record).get("agent_kind") == "claude")}
                 process_info = core.surface_process_label(process_by_id, record)
                 agent_kind = str(process_info.get("agent_kind") or "unknown")
                 process_summary = str(process_info.get("summary") or "无进程信息")
@@ -2728,14 +3076,30 @@ class SupervisorModel:
                 hold = core.batch_start_hold(rule or {}, surface_id)
                 reason = (rule or {}).get("excluded_surface_reasons", {}).get(surface_id)
                 operator_excluded = surface_id in excluded and not (isinstance(reason, str) and reason.startswith("batch:"))
-                if hold and not operator_excluded and not (target and (target.get("paused") or not target.get("enabled", True))):
+                workspace_excluded = (agent_kind == "claude"
+                    and record.get("workspace_id") in self.config.get("claude_excluded_workspace_ids", [])
+                    and (target is None or target.get("source") in {"claude_auto", "pane_follow"}))
+                record = {**record, "claude_workspace_excluded": workspace_excluded}
+                policy_excluded = (surface_id in self.config.get("discovery_excluded_surface_ids", [])
+                    or workspace_excluded)
+                if policy_excluded:
+                    source = "workspace_excluded"
+                    target = {"paused": True, "paused_reason": (
+                        "已取消整池 Claude 自动发现；w 重新授权" if workspace_excluded else "此路已退出自动发现；r 重新纳入")}
+                elif hold and not operator_excluded and not (target and (target.get("paused") or not target.get("enabled", True))):
                     source = "workspace_starting"
                     target = {"paused": False}
                 elif target is not None:
-                    source = "explicit"
+                    source = target.get("source") if target.get("source") in SINGLE_SOURCES else "explicit"
+                    if not target.get("enabled", True) or (source in {"claude_auto", "pane_follow"}
+                            and not core.dynamic_target_authorized(self.config, target)):
+                        target = {**target, "paused": True, "paused_reason": "发现授权未启用"}
                 elif rule is not None and surface_id in excluded:
                     source = "workspace_excluded"
                     target = {"paused": True}
+                elif surface_id in dynamic_by_id:
+                    target = dynamic_by_id[surface_id]
+                    source = target["source"]
                 elif rule is not None and agent_kind == "codex":
                     source = "workspace_rule"
                     target = {"paused": False}
@@ -2750,6 +3114,19 @@ class SupervisorModel:
                 observed_error, observed_reason = runtime_observation(runtime)
                 exclusion = (rule or {}).get("excluded_surface_reasons", {}).get(surface_id, {})
                 exclusion_reason = str(exclusion.get("reason") or "") if isinstance(exclusion, Mapping) else ""
+                pause_detail = runtime.get("paused_reason")
+                # Historical automatic anchor exclusions can outlive inclusion
+                # in state.json. Show the new observation only after monitoring
+                # has resumed; retain all real pauses and provider wait reasons.
+                if (pause_detail == "incompatible: native live frame did not confirm screen anchoring"
+                        and source == "workspace_rule" and rule and rule.get("enabled", True)
+                        and not rule.get("paused") and not self.config.get("global_paused")
+                        and target and not target.get("paused")
+                        and surface_id not in excluded and not exclusion_reason
+                        and not (target or {}).get("paused_reason")
+                        and runtime.get("observed_state") in {"working", "queued_followup", "recoverable_error", "idle"}
+                        and runtime.get("observed_at") and observed_reason):
+                    pause_detail = None
                 rows.append(Candidate(
                     record=record,
                     source=source,
@@ -2758,7 +3135,7 @@ class SupervisorModel:
                     send_count=int(runtime.get("send_count") or 0),
                     paused=bool(target and target.get("paused")),
                     selected_hint=surface_id in {self.suggested_surface, str(self.suggested_surface)},
-                    status_detail=str(runtime.get("paused_reason") or (target or {}).get("paused_reason") or exclusion_reason or observed_reason),
+                    status_detail=str(pause_detail or (target or {}).get("paused_reason") or exclusion_reason or observed_reason),
                     agent_kind=agent_kind,
                     process_summary=process_summary,
                     **continuation_fields(
@@ -2857,6 +3234,9 @@ class SupervisorModel:
     def run_cli(self, args: list[str]) -> str:
         # Redirecting Python's global stdout on a worker would capture curses
         # output. Give each action its own bounded CLI process instead.
+        trace = getattr(self._action_context, 'ui_trace', None)
+        if trace is not None and args[0] == 'batch-workspace':
+            args = [*args, '--ui-action-id', trace['action_id']]
         result = subprocess.run([sys.executable, "-B", str(Path(core.__file__).resolve()),
                                  "--config", str(self.config_path), *args],
                                 capture_output=True, text=True, timeout=180 if args[0] in {
@@ -2876,7 +3256,7 @@ class SupervisorModel:
             # label only decides whether the waiver flag is attached; it never
             # decides which command runs.
             args = ["track-surface", surface_id, "--name", target_name(candidate.record)]
-            if candidate.agent_kind != "codex":
+            if candidate.agent_kind not in {"codex", "claude"}:
                 # The non-Codex warning was acknowledged in the confirm prompt.
                 args.append("--allow-non-codex")
             self.run_cli(args)
@@ -2889,19 +3269,21 @@ class SupervisorModel:
         elif action == "private_batch_workspace":
             self.run_cli(["batch-workspace", candidate.record["workspace_id"], "--private-check"])
         elif action == "access_batch_workspace":
-            self.run_cli(["batch-workspace", candidate.record["workspace_id"], "--access-check"])
+            self.run_cli(["batch-workspace", candidate.record["workspace_id"], "--native-access"])
         elif action == "pause":
             if candidate.source in {"workspace_rule", "workspace_starting", "workspace_excluded"}:
                 self.run_cli(["exclude", surface_id])
             else:
                 self.run_cli(["pause", surface_id])
         elif action == "resume":
+            if candidate.record.get("claude_workspace_excluded"):
+                raise RuntimeError("该 workspace 已退出 Claude 自动发现；请按 w 重新授权，单路恢复不会解除整池退出")
             if candidate.source in {"workspace_rule", "workspace_starting", "workspace_excluded"}:
                 self.run_cli(["include", surface_id])
             else:
                 self.run_cli(["resume", surface_id])
         elif action == "remove":
-            if candidate.source != "explicit":
+            if candidate.source not in SINGLE_SOURCES:
                 raise RuntimeError("只有单路登记能用 x 删除")
             self.run_cli(["remove", surface_id])
         elif action == "untrack_workspace":
@@ -2931,7 +3313,7 @@ class SupervisorModel:
         elif action == "private_batch_workspace":
             self.run_cli(["batch-workspace", row.workspace_id, "--private-check"])
         elif action == "access_batch_workspace":
-            self.run_cli(["batch-workspace", row.workspace_id, "--access-check"])
+            self.run_cli(["batch-workspace", row.workspace_id, "--native-access"])
         else:
             raise RuntimeError("组头只支持 w 授权整池 · u 取消整池 · Tab 折叠")
 
@@ -4193,6 +4575,24 @@ def row_focus_summary(row: ViewRow | None) -> str:
     return focus_summary(row.candidate, row.workspace_ref)
 
 
+def row_request_key_summary(row: ViewRow | None, width: int) -> str:
+    """Show the selected session's observed request key on the focus separator."""
+    if row is None or row.candidate is None or row.candidate.agent_kind not in {"codex", "claude"}:
+        return rule("-", width)
+    candidate = row.candidate
+    if candidate.session.api_key_observation_historical:
+        return "历史请求 Key：本次启动后尚未核实；K 查看完整值"
+    prefix = f"s{_ref_digits(candidate.record.get('ref'))} 最近请求 Key: "
+    key = candidate.session.api_key_observed
+    if not key:
+        return prefix + candidate.api_key_text + "；K 查看详情"
+    value = prefix + key
+    if display_width(value) <= width:
+        return value
+    # Never present a partial credential as a complete value.
+    return "最近请求 Key：K 查看完整值"
+
+
 def row_action_hint(row: ViewRow | None) -> str:
     if row is None:
         return "/ 搜索   f 切换筛选"
@@ -4239,15 +4639,15 @@ def view_row_attr(row: ViewRow) -> int:
     return row_attr(row.candidate) if row.candidate else 0
 
 
-GLOBAL_KEYS_1 = "↑↓ jk 移动  Tab 折/展  z/Z 全折/展  [ ] 跳 workspace  / 查找  c 清除  y 复制ID（也可点击ID）"
-GLOBAL_KEYS_2 = "N 节费50  b 空目录50  f 筛选 R 刷新 G 存储 v 三件套 e 配置 A 开启发 S 停发 d 观察 q 退出"
+GLOBAL_KEYS_1 = "K API-key详情  ↑↓ jk 移动  Tab 折/展  z/Z 全折/展  [ ] 跳 workspace  / 查找  c 清除  y 复制ID"
+GLOBAL_KEYS_2 = "N 原生50·节费暂缓  b 空目录50  f 筛选 R 刷新 G 存储 v 三件套 e 配置 A 开启发 S 停发 d 观察 q 退出"
 
 
 def workspace_buttons():
     column = 0
     result = []
     for key, label in (("w", "整池授权"), ("P", "暂停+Interrupt"),
-                       ("B", "新开50+授权"), ("W", "恢复整池"), ("N", "节费50"), ("b", "空目录50")):
+                       ("B", "新开50+授权"), ("W", "恢复整池"), ("N", "原生50·节费暂缓"), ("b", "空目录50")):
         text = f"[{key} {label}]"
         result.append((ord(key), column, column + display_width(text), text))
         column += display_width(text) + 2
@@ -4272,6 +4672,80 @@ def _draw_compact(stdscr: Any, model: SupervisorModel, rows: list[ViewRow],
         if row_index >= height:
             return
         _safe_addnstr(stdscr, row_index, 0, text, clip, style)
+
+
+def api_key_detail_lines(candidate: Candidate, width: int) -> list[str]:
+    """Wrap the complete observation by terminal cells, including long keys."""
+    width = max(2, width)
+    observed = candidate.session.api_key_observed
+    heading = ("API-key：历史请求（早于当前 CLI 启动）"
+               if candidate.session.api_key_observation_historical else
+               "API-key：最近实际请求" if observed else
+               "API-key：仅旧进程记录" if candidate.session.api_key_observation_status == "previous_process" else
+               "API-key：暂无请求记录" if candidate.session.api_key_observation_status == "absent" else
+               "API-key：本进程未接入请求采集" if candidate.session.api_key_observation_status == "not_instrumented" else
+               "API-key：实际请求未核实")
+    values = [heading,
+              candidate.session.api_key_observed or (
+                  "最近请求无可展示 Key" if candidate.session.api_key_observation_note
+                  else "尚无原生请求记录"),
+              candidate.session.api_key_observation_note, candidate.session.session_id,
+              "", "本页仅展示该会话实际请求记录，不读取全局配置 Key。",
+              "请求记录不保证下一次请求使用同一 Key。"]
+    lines = []
+    for value in values:
+        line = ""
+        for char in str(value):
+            if char == "\n":
+                lines.append(line)
+                line = ""
+                continue
+            if display_width(line + char) > width:
+                lines.append(line)
+                line = ""
+            line += char
+        lines.append(line)
+    return lines
+
+
+def _api_key_page(stdscr: Any, candidate: Candidate) -> None:
+    # Read-only snapshot: never refresh credentials, send input, or change auth.
+    offset = 0
+    message = ""
+    while True:
+        height, width = stdscr.getmaxyx()
+        clip = max(1, width - 1)
+        lines = api_key_detail_lines(candidate, clip)
+        visible = max(1, height - 2)
+        offset = min(offset, max(0, len(lines) - visible))
+        stdscr.erase()
+        for y, line in enumerate(lines[offset:offset + visible]):
+            _safe_addnstr(stdscr, y, 0, line, clip)
+        if height >= 2:
+            _safe_addnstr(stdscr, height - 2, 0, message, clip)
+            _safe_addnstr(stdscr, height - 1, 0, "↑↓滚动 y复制当前详情Key q返回", clip)
+        stdscr.refresh()
+        key = stdscr.getch()
+        if key in (27, ord("q"), ord("Q"), ord("K")):
+            return
+        if key in (curses.KEY_DOWN, ord("j")):
+            offset = min(offset + 1, max(0, len(lines) - visible))
+        elif key in (curses.KEY_UP, ord("k")):
+            offset = max(0, offset - 1)
+        elif key in (ord("y"), ord("Y")):
+            copy_key = candidate.session.api_key_observed
+            if not copy_key:
+                message = "尚无已核实的请求 Key，未复制"
+                continue
+            try:
+                result = subprocess.run(["/usr/bin/pbcopy"],
+                                        input=copy_key,
+                                        text=True, capture_output=True, timeout=2)
+                label = ("已复制历史请求 Key" if candidate.session.api_key_observation_historical
+                         else "已复制最近请求 Key")
+                message = label if result.returncode == 0 else "复制失败"
+            except (OSError, subprocess.TimeoutExpired):
+                message = "复制失败"
 
 
 def _draw(
@@ -4457,13 +4931,14 @@ def _draw(
                 candidate.session_text,
                 collab_cells.get(row.key, "") if show_collab else None,
                 visible_columns,
+                api_key=candidate.api_key_text,
             )
         style = curses.A_REVERSE if selected else view_row_attr(row)
         _safe_addnstr(stdscr, at["first_row"] + row_index, 0, label, clip, style)
 
     # Everything about the cursor lives below the table, never above it.
     focus = rows[index] if rows else None
-    _safe_addnstr(stdscr, at["focus_rule"], 0, rule("-", clip), clip, attr("rule"))
+    _safe_addnstr(stdscr, at["focus_rule"], 0, row_request_key_summary(focus, clip), clip, attr("rule"))
     focus_line = row_focus_summary(focus)
     if focus is not None and focus.candidate is not None:
         note = collab_focus_note(focus.candidate, collab_by_uuid)
@@ -4492,9 +4967,7 @@ def _draw(
     elif status:
         _safe_addnstr(stdscr, at["message"], 0, status, clip, attr("error"))
     elif focus and (batch := getattr(model, "batch_jobs", {}).get(focus.workspace_id)):
-        mode = {'private_check': '空目录短答50', 'access_check': '节费50'}.get(batch.get('startup_mode'), '原B50')
-        progress = (f"{mode} {batch['status']} | 创建 {batch['created']}/50 | 就绪 {batch['ready']} | "
-                    f"已提交 {batch['submitted']} | 已启动 {batch['started']} | 未完成 {50 - batch['started']} | 异常 {batch['failed']}")
+        progress = batch_preparation_progress(batch)
         if batch.get("protection"):
             progress = batch_guard_label(batch["protection"])
         if batch.get('startup_mode') == 'access_check' and (check := batch.get('access')):
@@ -4504,6 +4977,29 @@ def _draw(
     _safe_addnstr(stdscr, at["keys1"], 0, GLOBAL_KEYS_1, clip, attr("dim"))
     _safe_addnstr(stdscr, at["keys2"], 0, GLOBAL_KEYS_2, clip, attr("dim"))
     stdscr.refresh()
+
+
+def batch_preparation_progress(batch, *, now=None):
+    mode = ('N原生50·节费暂缓' if batch.get('native_access_policy') == 'direct-native-v1' else
+            {'private_check': '空目录短答50', 'access_check': '旧节费50'}.get(batch.get('startup_mode'), '原B50'))
+    wait = batch.get('wait') if isinstance(batch.get('wait'), dict) else {}
+    phase = wait.get('message') or {
+        'complete': '首任务已全数启动', 'running': '准备中', 'waiting': '等待准备',
+        'workspace_closed': '工作区已关闭', 'cancelled': '已取消',
+        'needs_attention': '部分原会话待处理',
+    }.get(batch.get('status'), batch.get('status') or '状态未知')
+    total = batch.get('total', 50)
+    named = batch.get('named')
+    result = (f"{mode} | {phase} | 创建 {batch.get('created', 0)}/{total}"
+              + (f" 命名 {named}/{total}" if named is not None else '')
+              + f" 首任务 {batch.get('started', 0)}/{total}")
+    if batch.get('failed'):
+        result += f" | 待处理 {batch['failed']}"
+    at = batch.get('last_progress_at')
+    if type(at) in {int, float} and 0 < at < float('inf'):
+        age = max(0, int((time.time() if now is None else now) - at))
+        result += f" | 最近进展 {age}秒前"
+    return result
 
 
 def next_status_after_key(key: int, status: str) -> str:
@@ -5001,6 +5497,8 @@ def _run(stdscr: Any, model: SupervisorModel) -> None:
             cursor_key = rows[index].key
         _draw(stdscr, model, rows, index, view, query, status)
         key = stdscr.getch()
+        input_stamp = batch_timing.stamp()
+        input_kind = 'mouse' if key == curses.KEY_MOUSE else 'keyboard'
         if key == curses.KEY_MOUSE:
             try:
                 _, mx, my, _, buttons = curses.getmouse()
@@ -5028,6 +5526,13 @@ def _run(stdscr: Any, model: SupervisorModel) -> None:
         status = next_status_after_key(key, status)
         if key in (ord("q"), ord("Q")):
             return
+        if key == ord("K"):
+            candidate = rows[index].candidate if rows else None
+            if candidate is not None and candidate.agent_kind == "codex":
+                _api_key_page(stdscr, candidate)
+            else:
+                status = "请选择一个 Codex 会话查看配置 Key"
+            continue
         if key == ord("G"):
             # The storage page owns its own keys while it is open, which is why
             # p/c/r there act on the janitor without changing what they mean
@@ -5143,15 +5648,20 @@ def _run(stdscr: Any, model: SupervisorModel) -> None:
             ord("N"): "access_batch_workspace",
         }[key]
         row = rows[index]
+        ui_trace = batch_timing.new(action, row.workspace_id, input_kind,
+                                    'group' if row.kind == 'group' else 'candidate', input_stamp)
         if row.kind == "group":
             refusal = group_action_error(row, action)
             if refusal:
+                batch_timing.record(model.config_path, ui_trace, 'rejected_selection')
                 status = refusal
                 continue
             live = row.counts.get("all", 0) or None
             if not _confirm(stdscr, workspace_confirm_prompt(row, action, live_codex=live)):
+                batch_timing.record(model.config_path, ui_trace, 'cancelled')
                 status = "已取消"
                 continue
+            batch_timing.mark(ui_trace, 'confirmation_accepted')
             try:
                 success = (f"已授权整个 {row.workspace_ref}" if action == "workspace"
                           else f"已取消整个 {row.workspace_ref} 授权")
@@ -5163,9 +5673,9 @@ def _run(stdscr: Any, model: SupervisorModel) -> None:
                 elif action == "private_batch_workspace":
                     success = f"{row.workspace_ref} 批次已提交；新批次用空目录短答，未完成旧批次保留原模式；P 可停止"
                 elif action == "access_batch_workspace":
-                    success = f"{row.workspace_ref} 节费50已提交；接通后不再新增检查，原B保留"
+                    success = f"{row.workspace_ref} N原生50已提交；并行启动、原生连接，节费限制暂缓"
                 status = model.start_action(lambda row=row, action=action: model.mutate_workspace(row, action), success,
-                                            priority=action == "pause_workspace")
+                                            priority=action == "pause_workspace", ui_trace=ui_trace)
             except Exception as exc:
                 status = f"失败: {exc}"
             continue
@@ -5177,7 +5687,7 @@ def _run(stdscr: Any, model: SupervisorModel) -> None:
         if action in {"pause", "resume"} and candidate.source in {"untracked", "workspace_non_codex"}:
             status = "未登记候选不能暂停/恢复；先按 a 加单路，或按 w 授权其 workspace"
             continue
-        if action == "remove" and candidate.source != "explicit":
+        if action == "remove" and candidate.source not in SINGLE_SOURCES:
             if candidate.source == "untracked":
                 status = "未登记目标不用删。要监控请按 a，或按 w 授权整个 workspace"
             else:
@@ -5198,8 +5708,10 @@ def _run(stdscr: Any, model: SupervisorModel) -> None:
         if action in {"pause", "remove", "add", "workspace", "untrack_workspace", "pause_workspace", "resume_workspace", "batch_workspace", "private_batch_workspace", "access_batch_workspace"} and not _confirm(
             stdscr, confirm_prompt(action, candidate, live_codex=live_codex)
         ):
+            batch_timing.record(model.config_path, ui_trace, 'cancelled')
             status = "已取消"
             continue
+        batch_timing.mark(ui_trace, 'confirmation_accepted')
         try:
             where = f"{candidate.workspace_ref}/{candidate.ref}"
             success = {
@@ -5213,10 +5725,10 @@ def _run(stdscr: Any, model: SupervisorModel) -> None:
                 "resume_workspace": f"{candidate.workspace_ref} 已恢复整池监控",
                 "batch_workspace": f"{candidate.workspace_ref} 批量任务已提交；创建50路并整池授权，P 可停止",
                 "private_batch_workspace": f"{candidate.workspace_ref} 批次已提交；新批次用空目录短答，未完成旧批次保留原模式；P 可停止",
-                "access_batch_workspace": f"{candidate.workspace_ref} 节费50已提交；接通后不再新增检查，原B保留",
+                "access_batch_workspace": f"{candidate.workspace_ref} N原生50已提交；并行启动、原生连接，节费限制暂缓",
             }.get(action, f"已处理 {where}")
             status = model.start_action(lambda candidate=candidate, action=action: model.mutate_selected(candidate, action), success,
-                                        priority=action == "pause_workspace")
+                                        priority=action == "pause_workspace", ui_trace=ui_trace)
         except Exception as exc:
             status = f"失败: {exc}"
 

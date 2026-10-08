@@ -34,6 +34,10 @@ class BatchStartupTests(unittest.TestCase):
     setUp = fixtures.WorkspaceBatchTests.setUp
 
     def failed(self):
+        # The recovery scenarios below own one original failed slot. Whole
+        # batch concurrency is covered by the immediate-start suite.
+        self.worker.job['slots'] = self.worker.job['slots'][:1]
+        self.worker.save()
         self.worker.step()
         slot = self.worker.job['slots'][0]
         sid = slot['surface_id']
@@ -55,7 +59,7 @@ class BatchStartupTests(unittest.TestCase):
         self.assertEqual(tokens[0], '/test/native/codex')
         self.assertNotIn('--remote', tokens)
 
-    def test_native_sqlite_is_per_batch_without_replacing_codex_home(self):
+    def test_native_sqlite_is_per_slot_without_replacing_codex_home(self):
         self.worker.step()
         first = self.worker.job['slots'][0]
         self.now += 1
@@ -73,7 +77,8 @@ class BatchStartupTests(unittest.TestCase):
             path = Path(json.loads(sqlite[0].split('=', 1)[1]))
             self.assertTrue(path.is_dir())
             values.append(path)
-        self.assertEqual(*values)
+        self.assertNotEqual(*values)
+        self.assertEqual(values[0].parent, values[1].parent)
         self.assertNotEqual(values[0], batch.sqlite_home(self.config, str(uuid.uuid4()), 0))
 
     def test_db_failure_relaunches_same_surface_once_and_proves_first_task(self):
@@ -264,9 +269,10 @@ class BatchStartupTests(unittest.TestCase):
         self.assertIn('PTY', self.worker.job['error'])
         self.worker.pty_probe = lambda: True
         self.worker.step()
-        self.assertEqual(len(self.client.calls), 1)
+        self.assertEqual(len(self.client.calls), 50)
 
     def test_no_pty_surface_is_reused_after_capacity_returns(self):
+        self.worker.job['slots'] = self.worker.job['slots'][:1]
         self.worker.step()
         slot = self.worker.job['slots'][0]
         sid = slot['surface_id']
@@ -315,8 +321,8 @@ class BatchStartupTests(unittest.TestCase):
         self.worker.step()
         self.assertEqual(first['phase'], 'surface_closed')
         self.assertEqual(first['surface_id'], original)
-        self.assertEqual(len(self.client.calls), 1)  # Next original pending slot.
-        self.assertNotEqual(self.client.calls[0], original)
+        self.assertEqual(len(self.client.calls), 0)  # All original slots had already been created.
+        self.assertTrue(all(s['phase'] == 'surface_closed' for s in self.worker.job['slots']))
 
 
 class CmuxRequestRejectionTests(unittest.TestCase):
@@ -431,13 +437,13 @@ class NativeMetadataSeedTests(unittest.TestCase):
             config, jid = root / 'ccc/config.json', str(uuid.uuid4())
             with patch.dict(os.environ, CODEX_SQLITE_HOME=str(source)), \
                     patch.object(Path, 'read_text', side_effect=FileNotFoundError):
-                batch.prepare_sqlite_home(config, jid)
+                batch.prepare_slot_sqlite_home(config, jid, 0)
                 target = batch.sqlite_home(config, jid, 0)
                 with closing(sqlite3.connect(target / 'state_5.sqlite')) as db, db:
                     self.assertEqual(db.execute('SELECT * FROM threads').fetchall(), [('old', '/original/rollout.jsonl')])
                     self.assertEqual(db.execute('SELECT status FROM backfill_state').fetchone(), ('complete',))
                     db.execute("INSERT INTO threads VALUES ('new', '/new/rollout.jsonl')")
-                batch.prepare_sqlite_home(config, jid)
+                batch.prepare_slot_sqlite_home(config, jid, 0)
             with closing(sqlite3.connect(target / 'state_5.sqlite')) as db:
                 self.assertEqual(db.execute('SELECT COUNT(*) FROM threads').fetchone(), (2,))
             self.assertFalse((target / 'logs_2.sqlite').exists())

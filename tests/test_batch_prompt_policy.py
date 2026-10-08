@@ -27,7 +27,7 @@ class BatchPromptPolicyTests(unittest.TestCase):
     def test_old_job_without_prompt_policy_keeps_original_submission_and_proof(self):
         self.worker.job.pop('initial_prompt')
         self.worker.job.pop('cwd_policy')
-        self.worker.job.pop('name_policy')
+        self.worker.job.pop('name_policy', None)
         self.worker.job['slots'] = self.worker.job['slots'][:1]
         self.worker.save()
         self.assertEqual(batch.job_prompt(self.worker.job), 'show me u power')

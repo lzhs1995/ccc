@@ -7,6 +7,7 @@ CCC is a macOS command-line toolkit for Claude Code and Codex operations:
 - `ccc_session_audit.py` prints audit summaries without changing sessions.
 - `janitor/src/` contains the quarantine-first cmux cleanup worker and guard.
 - `ccp_new.py` manages profiles interactively; credentials remain in a user-selected directory.
+- The `api-key` column shows verified recent-request credentials for each session; see [request Key states and client upgrades](docs/request-api-key.md).
 - `bin/cmux-stack` projects component status without merging the execution processes.
 - `ccc network` shares optional AnyRouter reachability checks and route failover across sessions. An explicit manual-failover policy can transfer a failed manual choice to a newly checked automatic route while retaining healthy manual choices; see [network guard setup](docs/network-guard.md).
 
@@ -127,6 +128,7 @@ requests. The selected workspace has clickable controls (the same keys work):
 - `W` 恢复整池：恢复续跑，保留单路暂停、排除；不会自行重启被取消的创建任务。
 - `B` 新开50 + 授权：在选定 workspace 的主区域 pane 新建最多50个后台 Codex 标签页。继承原工作目录，并在本次启动中信任该精确目录，自动通过 Folder access；不写全局信任配置。确认原 session 和空输入框后发送一次 `show me u power`。自动切断保持关闭。
 - `b` 空目录50（试用）：单独选择空目录短答模式。新批次每路使用独立空目录，仅在该次启动信任该目录，并请求只回复 `OK`；未完成旧批次继续原模式，界面显示实际模式。自动暂停、自动切断保持关闭。
+- 新建 b 的原检查任务失败后，续跑仍发送同一条短检查。守卫逐轮核对原会话、原始指令与自己的发送记录；用户接手输入其他任务、已有正常回复或进入 goal 后，使用普通续跑语义。旧批次保留原策略，已有排队内容和草稿保留原文。
 - `N` 节费50（Python 3.11+）：50路持续争取 API 接入，保留 Codex 原生重连；原生重试结束后，守卫器继续在同一会话提交短请求。新批次不设累计HTTP次数或运行时长上限。每次只转发固定短问，申请最多128个输出token，禁工具和标题；一条完整回复后不再新增检查，在途请求自然结束。不会自动 Interrupt，也不改原B。旧的有限批次保留原账本与上限，不会自动变成持续批次。
 - N 在请求尚未发出时遇到暂时连接失败，会保留原50路继续准备和重连，面板显示“连接重试”及原因。已发出的结果不明请求仍按原账本处理。旧版 `first-wave setup failed` 本地409可通过显式恢复工具，在完整核对原端口、账本和原会话后恢复；日常升级不会自动接管现有网关。
 
@@ -221,7 +223,7 @@ ignores read-only history files that Codex opens while indexing older sessions.
 
 - **监控**：`未登记` / `监控中` / `空转` / `整池空转` / `已暂停` / `整池` / `整池／启动中` / `已排除` / `待检测` / `投递待验` / `发送失败` / `读取异常` / `服务阻塞`。登记仍保留，投递异常直接显示；焦点行显示最近检查的年龄。
 - **程序**：`Codex` / `Claude` / `grok` / `Copilot` / `gh` / `shell` / `其他` / `未知`。程序列只显示身份；空转属于「监控」列。
-- **画面**：`空闲` / `运行中` / `菜单` / `待续跑` / `已排队` / `已过时` / `额度耗尽` / `正在输入` / `看不清` / `非Codex` / `Claude关` / `Hook等待` / `输入保护` / `发送中` / `已完成` / `已续跑` / `Hook待验` / `Hook未验` / `配置待核` / `模型错误` / `身份冲突` / `需人工` / `未初始化` / `等待压缩` / `压缩中` / `读不出` / `提交中` / `未确认` / `投递待验` / `发送失败` / `服务阻塞`。完成、压缩和客户端重试不代表续跑器故障。
+- **画面**：`空闲` / `运行中` / `菜单` / `待续跑` / `已排队` / `已过时` / `额度耗尽` / `正在输入` / `看不清` / `非Codex` / `Claude关` / `Hook等待` / `输入保护` / `发送中` / `已完成` / `已续跑` / `Hook待验` / `Hook未验` / `配置待核` / `模型错误` / `身份冲突` / `需人工` / `未初始化` / `等待压缩` / `压缩中` / `读不出` / `提交中` / `未确认` / `投递待验` / `发送失败` / `服务阻塞` / `报告待核`。完成、压缩和客户端重试不代表续跑器故障。`报告待核` 表示 Claude 报告已就绪、回调尚未确认；续跑器停止催促该任务，等待监督侧核收，新的人工任务仍可正常继续。
 - **Hook**：当前进程代次的 Hook 验证结果；历史身份记录本身不能授予发送权限。
 - **错误**：最近的观测原因或错误类型，与当前画面、续跑计数分别展示。
 - **续跑**：当前 episode 的累计发送次数。
@@ -378,6 +380,10 @@ B 的实时保护只接受配置中 `batch_guard.origin_job_id` 与真实 `works
 大规模运行时，独立本机进程索引可在 GUI 进程清单未返回时发现原生 Codex；它只提供观察线索，不代替工作区授权或发送前的原 PID/session 校验。原生完成监控复用已核实的真实文件路径，逐路更新监控状态，扫描失效最迟5秒退回普通观察。旧拓扑缓存中缺少某一路，不能单独证明它已关闭。`tools/continuation_scale_acceptance.py` 可用隔离的 cmux/PID 输入测试数百路调度、错误识别和持久化去重，不访问生产 API 或真实 surface。
 
 历史批次核对会复用未改变文件的配置校验结果，在授权边界仍检查文件身份；已完成且没有启动保护的 job 不再反复改写。面板只读取当前行涉及的批次摘要，历史 job 保留。`tools/batch_native_acceptance.py --mode existing --verify-continuation --output /absolute/evidence/path` 在一个独立临时工作区创建真实 B50，用本机接口让50个初始请求都失败，再核验每个原 session 恰好一次 CCC 续跑并完整成功；测试结束仅关闭它创建的临时工作区。
+
+多个批次申请启动名额时，只对发生变化或仍可能占用名额的 job 重做解析。历史记录继续保留；文件替换、修改或恢复启动会使摘要失效。共享的4个初始化许可、0.5秒启动间隔与30秒初始化租约保持原值，实际预约前重新检查当前授权。
+
+批次进度分别显示创建、命名和首任务启动数量，并显示共享容量、启动锁、拓扑、命名或首任务确认等等待原因和最后进展时间。相同等待不会每次刷新都落盘；进展恢复后清除旧等待提示。“首任务已全数启动”表示原生会话接受了输入，模型是否回复仍看各会话结果。
 
 批次进度、其他 surface 的注册或启动保护更新不会作废本路观察。调度保留等待次序，一次发现过程共享一份拓扑和进程清单；进程枚举不完整时保留仍在原工作区的已有目标及投递记录。真正的暂停、排除、移出或关闭仍会使目标失效，实际发送前继续检查最新配置与原生会话。
 

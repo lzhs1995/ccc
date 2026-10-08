@@ -1,5 +1,6 @@
 """Exercise 50 durable slots without creating real terminals or model calls."""
 import copy
+from concurrent.futures import Future
 from datetime import datetime, timezone
 import json
 import os
@@ -14,6 +15,23 @@ from unittest.mock import Mock, patch
 import ccc_workspace_batch as batch
 import cmux_codex_watch as core
 from tests.test_watch import grid_payload, span
+
+
+class InlineExecutor:
+    """Keep single-slot policy fixtures deterministic; concurrency is separate."""
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def submit(self, function, *args, **kwargs):
+        future = Future()
+        try:
+            future.set_result(function(*args, **kwargs))
+        except BaseException as exc:
+            future.set_exception(exc)
+        return future
+
+    def shutdown(self, **kwargs):
+        pass
 
 
 class BatchFixture:
@@ -42,7 +60,7 @@ class BatchFixture:
     def top(self, wid):
         return self.top_all()
 
-    def new_codex_surface(self, window, wid, pane, command):
+    def new_codex_surface(self, window, wid, pane, command, *, clean_shell=False):
         self.test.assertEqual((window, wid, pane), (self.test.window, self.test.wid, self.test.pane))
         self.test.assertNotIn(batch.PROMPT, command)  # First prompt waits for readiness.
         tokens = shlex.split(command)
@@ -51,6 +69,7 @@ class BatchFixture:
         slot = core.load_json(batch.job_path(self.test.config, jid), {})['slots'][index]
         self.test.assertEqual(slot['phase'], 'creating')
         sid, session = str(uuid.uuid4()), str(uuid.uuid4())
+        sid = getattr(self.test, 'controller_id', str)(sid)
         self.calls.append(sid)
         with patch.dict(os.environ, {'CMUX_SURFACE_ID': sid, 'CMUX_WORKSPACE_ID': wid}):
             batch.register(self.test.config, jid, index, tokens[tokens.index('--launch-id') + 1])
@@ -119,6 +138,9 @@ class BatchFixture:
 
 class WorkspaceBatchTests(unittest.TestCase):
     def setUp(self):
+        executor = patch.object(batch, 'ThreadPoolExecutor', InlineExecutor)
+        executor.start()
+        self.addCleanup(executor.stop)
         native = patch('ccc_batch_guard.native_binary', return_value='/test/native/codex')
         native.start()
         self.addCleanup(native.stop)
@@ -130,8 +152,12 @@ class WorkspaceBatchTests(unittest.TestCase):
         pty = patch.object(batch, 'pty_available', return_value=True)
         pty.start()
         self.addCleanup(pty.stop)
-        seed = patch.object(batch, 'prepare_sqlite_home', side_effect=lambda config, jid:
-                            batch.sqlite_home(config, jid, 0).mkdir(parents=True, exist_ok=True))
+        def empty_metadata(config, jid):
+            directory = batch.sqlite_seed_home(config, jid)
+            directory.mkdir(parents=True, exist_ok=True)
+            if not (directory / 'seed.json').exists():
+                core.atomic_write_json(directory / 'seed.json', {'metadata': []})
+        seed = patch.object(batch, 'prepare_sqlite_home', side_effect=empty_metadata)
         seed.start()
         self.addCleanup(seed.stop)
         self.tmp = tempfile.TemporaryDirectory()
@@ -139,6 +165,7 @@ class WorkspaceBatchTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.config = self.root / 'config.json'
         self.wid, self.window, self.pane = (str(uuid.uuid4()) for _ in range(3))
+        self.wid = getattr(self, 'controller_id', str)(self.wid)
         self.store = core.ConfigStore(self.config)
         self.store.mutate(lambda c: c.update(mode='armed', global_paused=False))
         self.client = BatchFixture(self)
@@ -148,10 +175,17 @@ class WorkspaceBatchTests(unittest.TestCase):
         self.addCleanup(names.stop)
         self.job = batch.start(self.config, self.wid, client=self.client, launch=False,
                                private_check=getattr(self, 'private_check', True))
+        # This shared fixture models historical jobs whose first prompt is
+        # delivered through the UI. New argv bootstrap tests exercise their
+        # own permanent claim and native hook records separately.
+        path = batch.job_path(self.config, self.job['job_id'])
+        legacy = core.load_json(path, {})
+        legacy.pop('initial_prompt_policy', None)
+        core.atomic_write_json(path, legacy)
         self.now = time.time()
         self.worker = batch.BatchWorker(self.config, self.job['job_id'], client=self.client, queue=self.client,
                                         clock=lambda: self.now, pty_probe=lambda: True)
-        self.addCleanup(self.worker.cache.close)
+        self.addCleanup(self.worker.close)
         self.worker.job['status'] = 'running'
 
     def finish(self):
@@ -196,7 +230,7 @@ class WorkspaceBatchTests(unittest.TestCase):
     def test_restart_after_submit_uses_transcript_instead_of_repeating_prompt(self):
         self.worker.step()
         self.worker.step()
-        self.assertEqual(len(self.client.sent), 1)
+        self.assertEqual(len(self.client.sent), 50)
         self.worker = batch.BatchWorker(self.config, self.job['job_id'], client=self.client, queue=self.client)
         self.assertEqual(self.finish()['started'], 50)
         self.assertEqual(len(self.client.sent), 50)
@@ -208,7 +242,7 @@ class WorkspaceBatchTests(unittest.TestCase):
         self.store.mutate(lambda c: c['workspace_rules'][0].update(paused=False))
         self.assertFalse(self.worker.step())
         self.assertEqual(self.worker.job['status'], 'cancelled')
-        self.assertEqual(len(self.client.calls), 1)
+        self.assertEqual(len(self.client.calls), 50)
         self.assertEqual(self.client.sent, [])
 
     def test_drafts_menus_and_existing_tasks_are_not_overwritten(self):
@@ -231,7 +265,7 @@ class WorkspaceBatchTests(unittest.TestCase):
         self.worker.step()
         self.assertEqual(slot['phase'], 'create_unknown')
         self.assertNotIn('surface_id', slot)
-        self.assertEqual(len(self.client.calls), 1)  # Only the next untouched slot.
+        self.assertEqual(len(self.client.calls), 49)  # Every other original untouched slot.
 
     def test_authorization_and_user_exclusions_are_preserved(self):
         self.store.mutate(lambda c: c['workspace_rules'][0].update(

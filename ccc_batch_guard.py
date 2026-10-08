@@ -49,17 +49,80 @@ def core():
     return cmux_codex_watch
 
 
-def native_binary():
-    # The installed conditional launcher delegates here too. Never recurse
-    # through that launcher when starting a guardian-owned native backend.
-    link = Path.home() / "Library/Application Support/cmux-codex-continue/codex-launcher.json"
-    value = read_json(link).get("native_binary") if link.exists() else "/opt/homebrew/bin/codex"
-    candidate = Path(value) if isinstance(value, str) and value else Path()
-    wrapper = link.with_name("codex-guard").resolve()
-    if (not candidate.is_absolute() or not candidate.is_file()
-            or not os.access(candidate, os.X_OK) or candidate.resolve() == wrapper):
-        raise RuntimeError("original native Codex executable cannot be proved; no session launched")
-    return str(candidate.resolve())
+def native_binary(*, entrypoint=None, metadata=None):
+    """Resolve the installed launcher, never a superseded launcher's registration.
+
+    A retained native path is authoritative only while codex-guard is still the
+    installed entrypoint. Otherwise use the current executable or the exact
+    managed observer wrapper shipped alongside its Codex package. Do not execute
+    shell text to discover a binary, or fall back to an older version on error.
+    """
+    entry = Path(entrypoint or "/opt/homebrew/bin/codex")
+    link = Path(metadata or (Path.home() / "Library/Application Support/cmux-codex-continue/codex-launcher.json"))
+    error = "installed native Codex executable cannot be proved; no session launched"
+    try:
+        if not entry.is_absolute():
+            raise ValueError(error)
+        installed = entry.resolve(strict=True)
+        wrapper = link.with_name("codex-guard").resolve()
+        observed = {}
+
+        def read_small(path):
+            before = path.stat()
+            with path.open('rb') as stream:
+                raw = stream.read(65537)
+            if len(raw) > 65536 or path.stat() != before:
+                raise ValueError(error)
+            observed[path] = (before, raw)
+            return raw
+
+        candidate = installed
+        if installed == wrapper:
+            record = json.loads(read_small(link))
+            value = record.get("native_binary")
+            if not isinstance(value, str) or not Path(value).is_absolute():
+                raise ValueError(error)
+            candidate = Path(value).resolve(strict=True)
+            if candidate == wrapper:
+                raise ValueError(error)
+        with candidate.open('rb') as stream:
+            magic = stream.read(4)
+        if magic[:2] == b'#!':
+            root = candidate.parent
+            manifest = json.loads(read_small(root / 'codex-package.json'))
+            if (manifest.get('layoutVersion') != 1 or manifest.get('variant') != 'codex'
+                    or manifest.get('entrypoint') != 'bin/codex'):
+                raise ValueError(error)
+            binary = root / 'bin/codex'
+            expected = ('#!/bin/sh\nexport CODEX_CLIENT_THREAD_OBSERVER=1\nexec '
+                        + shlex.quote(str(binary)) + ' "$@"\n').encode()
+            # The packaged installer uses double quotes; accept that exact
+            # shell-safe spelling as well, without evaluating arbitrary shell.
+            double_path = str(binary)
+            for special in ('\\', '"', '$', '`'):
+                double_path = double_path.replace(special, '\\' + special)
+            double_expected = ('#!/bin/sh\nexport CODEX_CLIENT_THREAD_OBSERVER=1\nexec "'
+                               + double_path + '" "$@"\n').encode()
+            if read_small(candidate) not in (expected, double_expected) or binary.resolve(strict=True) != binary:
+                raise ValueError(error)
+            candidate = binary
+            with candidate.open('rb') as stream:
+                magic = stream.read(4)
+        # Native Mach-O (both endian/fat forms) and ELF, not another script.
+        if (magic not in {b'\xcf\xfa\xed\xfe', b'\xce\xfa\xed\xfe', b'\xfe\xed\xfa\xcf',
+                          b'\xfe\xed\xfa\xce', b'\xca\xfe\xba\xbe', b'\xbe\xba\xfe\xca',
+                          b'\xca\xfe\xba\xbf', b'\xbf\xba\xfe\xca', b'\x7fELF'}
+                or not candidate.is_file() or not os.access(candidate, os.X_OK)
+                or entry.resolve(strict=True) != installed):
+            raise ValueError(error)
+        for path, (before, raw) in observed.items():
+            if path.stat() != before or path.read_bytes() != raw:
+                raise ValueError(error)
+        if entry.resolve(strict=True) != installed:
+            raise ValueError(error)
+        return str(candidate)
+    except (OSError, ValueError, TypeError, AttributeError, RuntimeError) as exc:
+        raise RuntimeError(error) from exc
 
 
 def uid(value):
@@ -130,11 +193,11 @@ def provenance(config_path, workspace_id, config=None):
     return rule
 
 
-def blocked(config_path, workspace_id):
+def blocked(config_path, workspace_id, *, marker_path=None):
     # A tiny per-workspace marker, including on the last send boundary. Ordinary
     # workspaces have no marker and never acquire global pause semantics.
     try:
-        return (pool_dir(config_path, workspace_id) / "STOP.json").exists()
+        return (marker_path if marker_path is not None else pool_dir(config_path, workspace_id) / "STOP.json").exists()
     except (ValueError, OSError):
         return False
 

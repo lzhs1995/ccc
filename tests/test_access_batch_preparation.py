@@ -2,6 +2,7 @@
 import copy
 import unittest
 import uuid
+from unittest.mock import patch
 
 import ccc_access_service as service
 import ccc_workspace_batch as batch
@@ -37,28 +38,38 @@ class AccessBatchPreparationTests(unittest.TestCase):
             self.assertTrue(batch.access_cohort_prepared(self.worker.job))
             first_sent.append(self.now)
         self.client.on_send = on_send
-        for _ in range(120):
-            self.now += 10  # Fair allocation among twenty workspaces is slower.
-            more = self.worker.step()
-            if not batch.access_cohort_prepared(self.worker.job):
-                self.assertEqual(self.client.sent, [])
-            if not more:
-                break
+        current = self.client.current_turn
+        def slow_last(target):
+            last = self.worker.job['slots'][-1]
+            if target['surface_id'] == last.get('surface_id') and self.now - began < 500:
+                return {'kind': 'unknown'}
+            return current(target)
+        with patch.object(self.client, 'current_turn', side_effect=slow_last):
+            for _ in range(120):
+                self.now += 10  # A genuinely slow legacy original session.
+                more = self.worker.step()
+                if not batch.access_cohort_prepared(self.worker.job):
+                    self.assertEqual(self.client.sent, [])
+                if not more:
+                    break
         self.assertEqual(len(self.client.sent), 50)
         self.assertEqual(batch.counts(self.worker.job)['started'], 50)
         self.assertGreater(first_sent[0] - began, 490)
         self.assertEqual(len(list(self.worker.path.parent.glob('access-session-*.json'))), 50)
         self.assertFalse((self.worker.path.parent / 'access-journal.jsonl').exists())
 
-    def test_prepared_sessions_release_cold_start_capacity_before_any_model_request(self):
+    def test_all_legacy_native_sessions_can_start_before_any_model_request(self):
         began = self.now
         while self.now - began < 10 and len(self.client.calls) < 6:
             self.now += .5
             self.worker.step()
-        self.assertGreaterEqual(len(self.client.calls), 6)
-        self.assertLess(self.now - began, batch.STARTUP_LEASE_SEC)
+        self.assertEqual(len(self.client.calls), 50)
+        self.assertLess(self.now - began, 1)
         self.assertEqual(self.client.sent, [])
-        self.assertGreaterEqual(sum(s['phase'] == 'access_ready' for s in self.worker.job['slots']), 4)
+        self.now += .5
+        self.worker.step()
+        self.assertEqual(sum(s['phase'] == 'access_ready' for s in self.worker.job['slots']), 50)
+        self.assertEqual(self.client.sent, [])
 
     def test_paused_or_changed_prepared_session_cannot_receive_the_initial_prompt(self):
         # Reach the durable barrier without taking the next submission step.
@@ -100,9 +111,15 @@ class AccessBatchPreparationTests(unittest.TestCase):
         self.assertEqual(self.client.sent, [])
 
     def test_worker_restart_preserves_half_prepared_and_submitted_sessions(self):
-        for _ in range(10):
+        self.worker.step()
+        original_current = self.client.current_turn
+        def half_prepared(target):
+            index = next(s['index'] for s in self.worker.job['slots'] if s.get('surface_id') == target['surface_id'])
+            return {'kind': 'unknown'} if index >= 25 else original_current(target)
+        with patch.object(self.client, 'current_turn', side_effect=half_prepared):
             self.now += 1
             self.worker.step()
+        self.assertEqual(sum(s['phase'] == 'access_ready' for s in self.worker.job['slots']), 25)
         original_ids = set(self.client.calls)
         self.assertGreater(len(original_ids), 4)
         self.assertEqual(self.client.sent, [])

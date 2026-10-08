@@ -18,7 +18,10 @@ CONTEXT = ('# AGENTS.md instructions\n\n<INSTRUCTIONS>local startup rules</INSTR
 
 
 class BatchContextRecoveryTests(unittest.TestCase):
-    setUp = fixtures.WorkspaceBatchTests.setUp
+    def setUp(self):
+        fixtures.WorkspaceBatchTests.setUp(self)
+        self.worker.job['slots'] = self.worker.job['slots'][:1]
+        self.worker.save()
     submitted = recovery.BatchAuthorizationTests.submitted
     rows = recovery.BatchAuthorizationTests.rows
     append = recovery.BatchAuthorizationTests.append

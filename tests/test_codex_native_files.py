@@ -55,7 +55,7 @@ class NativeFileTests(unittest.TestCase):
             return result
         with patch.object(native, '_proc_pidinfo', side_effect=self.descriptors), \
                 patch.object(native, '_proc_pidfdinfo', side_effect=changing):
-            with self.assertRaises(OSError):
+            with self.assertRaises(native.VnodeInventoryChanged):
                 native.process_writable_files(123)
         self.entries = [(3, 1)]
         self.files[3] = (3, b'')
@@ -74,6 +74,35 @@ class NativeFileTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 native.process_writable_files(123)
 
+    def test_short_vnode_records_fd_phase_count_and_current_errno(self):
+        self.entries = [(3, 1)]
+        for phase, fail_at in [('initial', 1), ('verification', 2)]:
+            calls = 0
+            def short(*args):
+                nonlocal calls
+                calls += 1
+                if calls == fail_at:
+                    ctypes.set_errno(9)
+                    return 0
+                return self.vnode(*args)
+            with self.subTest(phase=phase), \
+                    patch.object(native, '_proc_pidinfo', side_effect=self.descriptors), \
+                    patch.object(native, '_proc_pidfdinfo', side_effect=short):
+                with self.assertRaises(OSError) as caught:
+                    native.process_writable_files(123, identities=True)
+                self.assertEqual(caught.exception.errno, 9)
+                self.assertIn(f'pid=123 fd=3 phase={phase} returned=0 expected=1200', str(caught.exception))
+                self.assertEqual(calls, fail_at)
+
+    def test_short_vnode_without_errno_does_not_report_stale_errno(self):
+        ctypes.set_errno(13)
+        with patch.object(native, '_proc_pidinfo', side_effect=self.descriptors), \
+                patch.object(native, '_proc_pidfdinfo', return_value=1199):
+            with self.assertRaises(OSError) as caught:
+                native.process_writable_files(123)
+            self.assertEqual(caught.exception.errno, 0)
+            self.assertIn('returned=1199 expected=1200', str(caught.exception))
+
     def test_reused_descriptor_number_cannot_supply_stale_writer(self):
         self.entries = [(3, 1)]
         def reused(*args):
@@ -82,8 +111,80 @@ class NativeFileTests(unittest.TestCase):
             return result
         with patch.object(native, '_proc_pidinfo', side_effect=self.descriptors), \
                 patch.object(native, '_proc_pidfdinfo', side_effect=reused):
-            with self.assertRaises(OSError):
+            with self.assertRaises(native.VnodeInventoryChanged):
                 native.process_writable_files(123)
+
+    def test_duplicate_descriptors_resolve_twice_per_observation_without_cache_reuse(self):
+        self.entries = [(fd, 1) for fd in range(3, 67)]
+        self.files = {fd: (3, b'/tmp/current.jsonl') for fd, _ in self.entries}
+        with patch.object(native, '_proc_pidinfo', side_effect=self.descriptors), \
+                patch.object(native, '_proc_pidfdinfo', side_effect=self.vnode) as vnode, \
+                patch.object(Path, 'resolve', return_value=Path('/private/tmp/current.jsonl')) as resolve:
+            for _ in range(2):
+                self.assertEqual(native.process_writable_files(123, identities=True),
+                                 {Path('/private/tmp/current.jsonl'): {'device': 0, 'inode': 0}})
+            self.assertEqual(resolve.call_count, 4)
+            self.assertEqual(vnode.call_count, 256)
+
+    def test_canonical_path_drift_is_rejected(self):
+        with patch.object(native, '_proc_pidinfo', side_effect=self.descriptors), \
+                patch.object(native, '_proc_pidfdinfo', side_effect=self.vnode), \
+                patch.object(Path, 'resolve', side_effect=[Path('/a'), Path('/b')]):
+            with self.assertRaises(native.VnodeInventoryChanged):
+                native.process_writable_files(123)
+
+    def test_inventory_diagnostics_are_bounded_without_extra_native_reads(self):
+        self.entries = [(fd, 1) for fd in range(3, 35)]
+        self.files = {fd: (1, b'/tmp/private-reader') for fd, _ in self.entries}
+        calls = 0
+        def changed(*args):
+            nonlocal calls
+            result = self.vnode(*args)
+            calls += 1
+            if calls == 32:
+                self.entries = [(fd, 1) for fd in range(35, 67)]
+            return result
+        with patch.object(native, '_proc_pidinfo', side_effect=self.descriptors), \
+                patch.object(native, '_proc_pidfdinfo', side_effect=changed):
+            with self.assertRaises(native.VnodeInventoryChanged) as caught:
+                native.process_writable_files(123)
+        detail = caught.exception.inventory_change
+        self.assertEqual(calls, 32)
+        self.assertEqual(detail['changed_count'], 64)
+        self.assertTrue(detail['truncated'])
+        self.assertEqual(len(detail['descriptors']), 16)
+        self.assertNotIn('/tmp/private-reader', str(detail))
+        self.assertEqual(detail['descriptors'][0]['before']['access'], 1)
+
+    def test_reused_descriptor_diagnostics_preserve_both_identities(self):
+        self.entries = [(3, 1)]
+        def changed(*args):
+            result = self.vnode(*args)
+            self.files[3] = (1, b'/tmp/replacement')
+            return result
+        with patch.object(native, '_proc_pidinfo', side_effect=self.descriptors), \
+                patch.object(native, '_proc_pidfdinfo', side_effect=changed) as read:
+            with self.assertRaises(native.VnodeInventoryChanged) as caught:
+                native.process_writable_files(123)
+        detail = caught.exception.inventory_change
+        self.assertEqual(read.call_count, 2)
+        self.assertEqual(detail['kind'], 'descriptor_identity')
+        row = detail['descriptors'][0]
+        self.assertEqual((row['before']['access'], row['after']['access']), (3, 1))
+        self.assertNotEqual(row['before']['path_sha256'], row['after']['path_sha256'])
+
+    def test_canonical_collision_with_distinct_inode_is_rejected(self):
+        self.files[4] = (3, b'/tmp/alias.jsonl')
+        def distinct(*args):
+            size = self.vnode(*args)
+            info = ctypes.cast(args[3], ctypes.POINTER(native._VnodeFdInfo)).contents
+            info.vnode[8] = args[1]
+            return size
+        with patch.object(native, '_proc_pidinfo', side_effect=self.descriptors), \
+                patch.object(native, '_proc_pidfdinfo', side_effect=distinct), \
+                patch.object(Path, 'resolve', return_value=Path('/same')):
+            with self.assertRaises(native.VnodeInventoryChanged):
+                native.process_writable_files(123, identities=True)
 
 
 if __name__ == '__main__':

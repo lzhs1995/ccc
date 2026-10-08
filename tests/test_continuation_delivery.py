@@ -12,7 +12,20 @@ from unittest import mock
 
 import ccc_observation as health
 import cmux_codex_watch as core
-from tests.test_watch import FakeClient, HIGH_DEMAND_TEXT, armed_daemon, grid_payload, process_fixture, span, visible_lines
+from tests.native_failure_fixture import bind_native_failure
+from tests.test_watch import FakeClient, HIGH_DEMAND_TEXT, armed_daemon as unbound_daemon, grid_payload, process_fixture, span, visible_lines
+
+
+def armed_daemon(directory, client, extra_targets=None):
+    """Delivery-layer fixture with an explicit, stable native failed turn.
+
+    Rendering an error alone no longer authorizes delivery. Keep the shared
+    unbound fixture unchanged so missing-proof gate tests remain meaningful.
+    Each scheduler target has its own synthetic native session identity.
+    """
+    daemon = unbound_daemon(directory, client, extra_targets=extra_targets)
+    bind_native_failure(daemon, HIGH_DEMAND_TEXT)
+    return daemon
 
 
 def error_frame():
@@ -117,7 +130,7 @@ class DeliveryTests(unittest.TestCase):
             self.assertEqual(client.attempts, 1)
             self.assertEqual(restarted.runtime["surface-uuid"].state, "delivery_unknown")
 
-    def test_new_error_after_a_prompt_reopens_retry_after_unknown_delivery(self):
+    def test_changed_banner_without_new_native_turn_cannot_replay_unknown_delivery(self):
         with tempfile.TemporaryDirectory() as directory:
             client = TimeoutClient()
             daemon = armed_daemon(directory, client)
@@ -127,9 +140,9 @@ class DeliveryTests(unittest.TestCase):
             client.payload, client.text = frame, "\n".join(visible_lines(frame))
             with mock.patch.object(core.time, "time", return_value=1001.1):
                 daemon.process_once(client)
-            self.assertEqual(client.attempts, 2)
-            self.assertEqual(daemon.runtime["surface-uuid"].delivery_status, "accepted")
-            self.assertEqual(daemon.runtime["surface-uuid"].last_send_at, 1001.1)
+            self.assertEqual(client.attempts, 1)
+            self.assertEqual(daemon.runtime["surface-uuid"].delivery_status, "unknown")
+            self.assertEqual(daemon.runtime["surface-uuid"].send_started_at, 1000)
 
     def test_fresh_send_preflight_observes_working_and_user_input(self):
         for frame in (grid_payload([], working=True), grid_payload([], composer="busy")):

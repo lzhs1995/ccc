@@ -69,6 +69,26 @@ class HistoricalOwnerHealthTests(unittest.TestCase):
         self.assertEqual(observed['status'], 'missing')
         self.assertEqual(continued['status'], 'missing')
 
+    def test_moved_surface_original_owner_survives_old_workspace_environment(self):
+        process = self.client.top_data['windows'][0]['workspaces'][0]['surfaces'][0]['processes'][0]
+        process.update(pid=1234, cmux_surface_id='surface-uuid', cmux_workspace_id='old-workspace')
+        self.inspected['generation'] = 'original-generation'
+        self.refresh()
+        self.assertIs(self.daemon._observation_metadata['owners']['surface-uuid'], True)
+
+    def test_moved_surface_reused_pid_does_not_restore_original_owner(self):
+        process = self.client.top_data['windows'][0]['workspaces'][0]['surfaces'][0]['processes'][0]
+        process.update(pid=1234, cmux_surface_id='surface-uuid', cmux_workspace_id='old-workspace')
+        self.refresh()
+        self.assertIs(self.daemon._observation_metadata['owners']['surface-uuid'], False)
+
+    def test_foreign_surface_cannot_restore_owner_even_with_matching_generation(self):
+        process = self.client.top_data['windows'][0]['workspaces'][0]['surfaces'][0]['processes'][0]
+        process.update(pid=1234, cmux_surface_id='foreign-surface', cmux_workspace_id='workspace-uuid')
+        self.inspected['generation'] = 'original-generation'
+        self.refresh()
+        self.assertIs(self.daemon._observation_metadata['owners']['surface-uuid'], False)
+
     def test_real_original_owner_cannot_be_hidden_as_dormant(self):
         self.inspected['generation'] = 'original-generation'
         self.client.tree_data = {'windows': []}
