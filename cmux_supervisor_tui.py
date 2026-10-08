@@ -130,7 +130,7 @@ STATE_LABELS = {
     "claude_model_unavailable": "模型错误",
     "claude_input_guard": "输入保护",
     "claude_completed": "已完成",
-    "claude_report_ready": "报告待核",
+    "claude_report_ready": "旧报告待恢复",
     "claude_pending_input": "已续跑",
     "claude_hook_waiting": "Hook等待",
     "claude_event_pending": "待续跑",
@@ -174,7 +174,7 @@ DETAIL_FALLBACKS = {
     "claude_model_unavailable": "Claude 报告模型不存在或无访问权限；重复续跑不能修复，需核对 /model",
     "claude_input_guard": "等待输入保护期结束；用户输入优先",
     "claude_completed": "Claude 已完成；仍持续监控，下个任务自动恢复",
-    "claude_report_ready": "报告已就绪，回调未确认；停止催促，等待监督侧核收",
+    "claude_report_ready": "旧报告误判记录待恢复；需核实当前停止事件及在途发送，尚不代表任务完成",
     "claude_pending_input": "本次停止已续跑，不会重复排队",
     "claude_hook_waiting": "等待 Claude Stop/StopFailure 事件；画面本身不会触发发送",
     "claude_event_pending": "已收到 Claude 停止事件，正在进行输入保护校验",
@@ -213,7 +213,7 @@ DETAIL_SHORT = {
     "claude_model_unavailable": "模型错误",
     "claude_input_guard": "保护中",
     "claude_completed": "已完成",
-    "claude_report_ready": "报告待核",
+    "claude_report_ready": "旧报告待恢复",
     "claude_pending_input": "已续跑",
     "claude_hook_waiting": "等Hook",
     "claude_event_pending": "待续跑",
@@ -2681,7 +2681,7 @@ def selected_action_hint(candidate: Candidate | None) -> str:
                 "额度或授权恢复后在原会话重试，无需重新登记"
             )
         if candidate.state == "claude_report_ready":
-            return "报告已就绪、回调未确认；等待监督侧核收，新任务仍可正常继续"
+            return "旧报告误判记录尚未安全恢复：正在核实原会话停止事件与在途发送；报告就绪不等于任务完成"
         if candidate.state == "claude_completed":
             return "已完成但仍持续监控；下个任务自动恢复判断，无需按 r   ·   p 暂停   x 删除"
         if candidate.hook_health == "legacy_override":

@@ -25,7 +25,7 @@ DEFAULT_CLAUDE_MESSAGE = (
     "任务中断了么？如果是就请继续，如果任务完成了务必在最后一句向我报告 "
     "‘ 完成，建议检查 usage: /context’ 。如果任务没有中断就请继续，不要影响你的进度"
 )
-COMPLETION_SUFFIX = "建议检查usage:/context"
+COMPLETION_SUFFIX = "完成,建议检查usage:/context"
 TRAILING_PUNCTUATION_RE = re.compile(r"[。.!！?？'\"’”）)】」』]+$")
 
 
@@ -36,15 +36,36 @@ def _compact(value: str) -> str:
 
 
 def completion_reported(value: str) -> bool:
-    """Only the required suffix marks a Claude turn as normally complete."""
+    """Require the user's whole final sentence, outside quoted/code content.
 
-    return _compact(value).lower().endswith(COMPLETION_SUFFIX)
+    Keep line boundaries until after checking fences and indentation. Flattening
+    first made a quoted example or ``未完成，建议检查 ...`` a completion signal.
+    Whitespace, terminal wraps and full-width punctuation remain compatible.
+    """
+    text = unicodedata.normalize("NFKC", value or "")
+    match = re.search(
+        r"(?:\A|(?<=[\n。.!！?？;；]))[ \t]{0,3}"
+        r"完成\s*,\s*建议检查\s*usage\s*:\s*/context"
+        r"[\s。.!！'\"’”）)】」』]*\Z", text, re.IGNORECASE,
+    )
+    if not match:
+        return False
+    fence = None
+    for line in text[:match.start()].splitlines():
+        marker = re.match(r"\s*(`{3,}|~{3,})", line)
+        if marker:
+            token = marker.group(1)
+            if fence is None:
+                fence = token
+            elif token[0] == fence[0] and len(token) >= len(fence) and not line[marker.end():].strip():
+                fence = None
+    return fence is None
 
 
 def report_ready_task(value: str) -> str | None:
     """Recognize the complete closeout declaration, never a quoted mention.
 
-    This is a stop request, not proof of delivery or supervisor acceptance.
+    This is report metadata, not task completion, delivery or acceptance.
     Removing whitespace also accepts terminal wraps inside a task ID or path.
     """
     lines = (value or "").splitlines()
@@ -144,6 +165,27 @@ def task_dispatch(value: str) -> dict[str, str] | None:
     # submit_task_pack accepts both the original multiline envelope and the
     # single-line DELIVERY_NONCE envelope used by the live harness. Parse only
     # explicit, unique fields; never open a prompt-selected file in a Hook.
+    if value.startswith('TASK_PACK='):
+        # The bridge's older finalized envelope uses CR (or LF) separators
+        # and a bare callback. It has no DELIVERY_NONCE/TASK_DISPATCH header.
+        lines = value.splitlines()
+        keys = ('TASK_PACK', 'REQUIRED_SKILL', 'CALLBACK_TARGET')
+        if (len(lines) < 5 or re.search(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', value)
+                or lines[2] != 'READ_AND_OBEY_REQUIRED_SKILL_FIRST'
+                or any(len(re.findall(rf'\b{key}=', value)) != 1 for key in keys)
+                or any(token in value for token in ('DELIVERY_NONCE=', 'TASK_DISPATCH', 'COMPLETION_CALLBACK='))
+                or sum(line.startswith(('DONE|', 'BLOCKED|')) for line in lines) != 1):
+            return None
+        pack = re.fullmatch(r'TASK_PACK=(/[^\x00-\x1f]+)', lines[0])
+        skill = re.fullmatch(r'REQUIRED_SKILL=(/[^\x00-\x1f]+)', lines[1])
+        target = re.fullmatch(r'CALLBACK_TARGET=(surface:\d+)', lines[3])
+        callback = re.fullmatch(
+            rf'(?:DONE|BLOCKED)\|({_TASK_TOKEN})\|({_NONCE_TOKEN})\|REPORT=/[^\x00-\x1f]+', lines[4])
+        if not all((pack, skill, target, callback)):
+            return None
+        return {'task_id': callback[1], 'marker': callback[2], 'task_pack': pack[1],
+                'required_skill': skill[1], 'callback_target': target[1],
+                'completion_tail': lines[4]}
     if value.startswith('DELIVERY_NONCE='):
         keys = ('DELIVERY_NONCE', 'REQUIRED_SKILL', 'TASK_PACK',
                 'CALLBACK_TARGET', 'COMPLETION_CALLBACK')

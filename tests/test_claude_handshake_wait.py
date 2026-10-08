@@ -69,6 +69,16 @@ def inline_dispatch(directory, *, task=TASK, marker=MARKER):
             '。独立验收任务：只读复核后提交报告。')
 
 
+def pack_first_dispatch(directory, *, task=TASK, marker=MARKER):
+    # Native r14: CR-separated fields, bare callback, no delivery header.
+    return (f'TASK_PACK={directory}/task-pack.json\r'
+            'REQUIRED_SKILL=/tmp/ccc-offline/SKILL.md\r'
+            'READ_AND_OBEY_REQUIRED_SKILL_FIRST\r'
+            'CALLBACK_TARGET=surface:9\r'
+            f'DONE|{task}|{marker}|REPORT={directory}/executor-report.md\r'
+            '一次窄独审：只读复核后提交报告。')
+
+
 def report_text(task=TASK):
     return (f'STATUS: REPORT_READY TASK_ID={task} CALLBACK_UNCONFIRMED '
             'REPORT=/tmp/executor-report.md supervisor_reconciliation_required')
@@ -86,6 +96,33 @@ def native_event(event_id, event_name, text='', *, created_at=None, **changes):
 
 
 class HandshakeProtocolTests(unittest.TestCase):
+    def test_pack_first_native_dispatch_handles_cr_lf_and_spaced_paths_without_io(self):
+        for separator in ('\r', '\n', '\r\n'):
+            with self.subTest(separator=repr(separator)), mock.patch.object(
+                    Path, 'read_text', side_effect=AssertionError('unexpected disk read')):
+                value = pack_first_dispatch('/tmp/with spaces').replace('\r', separator)
+                event = native_event('pack-first', 'UserPromptSubmit', value)
+                self.assertTrue(event['collaboration_protocol'])
+                self.assertEqual(event['task_dispatch'], {
+                    'task_id': TASK, 'marker': MARKER, 'task_pack': '/tmp/with spaces/task-pack.json',
+                    'required_skill': '/tmp/ccc-offline/SKILL.md', 'callback_target': 'surface:9',
+                    'completion_tail': f'DONE|{TASK}|{MARKER}|REPORT=/tmp/with spaces/executor-report.md'})
+
+    def test_pack_first_dispatch_rejects_quoted_incomplete_and_ambiguous_envelopes(self):
+        value = pack_first_dispatch('/tmp/native-r14')
+        bad = ['> ' + value, '```\n' + value + '\n```', 'Example: ' + value,
+               value.replace('TASK_PACK=/tmp', 'TASK_PACK=relative'),
+               value.replace('READ_AND_OBEY_REQUIRED_SKILL_FIRST\r', ''),
+               value.replace('CALLBACK_TARGET=surface:9', 'CALLBACK_TARGET=other'),
+               value.replace(f'DONE|{TASK}|{MARKER}|', f'DONE|{TASK}|short|'),
+               value.replace('\rDONE|', '\rCOMPLETION_CALLBACK=DONE|'), value + '\x00',
+               value + '\r' + value.split('\r')[4]]
+        bad.extend(value + '\r' + field + '=duplicate' for field in (
+            'TASK_PACK', 'REQUIRED_SKILL', 'CALLBACK_TARGET', 'DELIVERY_NONCE', 'COMPLETION_CALLBACK'))
+        for text in bad:
+            with self.subTest(text=text):
+                self.assertIsNone(native_event('bad', 'UserPromptSubmit', text).get('task_dispatch'))
+
     def test_inline_native_dispatch_retains_paths_and_callback_tail_without_io(self):
         value = inline_dispatch('/tmp/with spaces')
         with mock.patch.object(Path, 'read_text', side_effect=AssertionError('unexpected disk read')):
@@ -259,7 +296,6 @@ class HandshakeWaitTests(unittest.TestCase):
         self.assertTrue(self.runtime.claude_handshake_wait)
         self.assertEqual(self.runtime.state, 'claude_handshake_wait')
         self.assertFalse(self.runtime.claude_completed_latched)
-        self.assertFalse(self.runtime.claude_report_ready_task_id)
 
     def assert_no_input(self):
         self.assertEqual(self.client.sent_text, [])
@@ -286,13 +322,65 @@ class HandshakeWaitTests(unittest.TestCase):
         self.assertEqual(len(self.client.sent_text), 1)
         self.assertEqual(len(self.client.sent_keys), 1)
 
-    def test_inline_dispatch_then_report_stops_without_input(self):
+    def test_pack_first_dispatch_allows_new_failure_once_and_does_not_send_on_dispatch(self):
+        self.wait()
+        self.handle(self.event('UserPromptSubmit', pack_first_dispatch(self.tmp.name), offset=2))
+        self.assertFalse(self.runtime.claude_handshake_wait)
+        self.assert_no_input()
+        stop = self.event('StopFailure', offset=3, error_kind='claude_429')
+        self.handle(stop)
+        self.handle(stop)
+        self.assertEqual(len(self.client.sent_text), 1)
+        self.assertEqual(len(self.client.sent_keys), 1)
+
+    def test_pack_first_dispatch_then_report_continues_once_without_completion_or_confirmation(self):
+        self.wait()
+        self.handle(self.event('UserPromptSubmit', pack_first_dispatch(self.tmp.name), offset=2))
+        self.assertFalse(self.runtime.claude_handshake_wait)
+        self.assert_no_input()
+        event = self.event('Stop', report_text(), offset=3)
+        self.handle(event)
+        self.handle(event)
+        self.assertNotIn(self.runtime.state, {'claude_report_ready', 'claude_completed'})
+        self.assertEqual(self.runtime.claude_report_ready_task_id, TASK)
+        self.assertFalse(self.runtime.claude_completed_latched)
+        self.assertIsNone(self.runtime.claude_completion_event_id)
+        self.assertEqual(self.daemon.claude_event_ledger.status_of(event['event_id']), 'sent')
+        self.assertEqual(self.runtime.claude_submit_confirmed_at, 0)
+        self.assertEqual(len(self.client.sent_text), 1)
+        self.assertEqual(len(self.client.sent_keys), 1)
+
+    def test_pack_first_dispatch_requires_final_pack_identity_and_exact_callback(self):
+        self.wait()
+        for field, value in [('draft', True), ('executor_uuid', 'other-uuid'),
+                             ('executor', 'surface:99'), ('callback', ack_text(nonce='wrongnonce')),
+                             ('required_skill', '/tmp/OTHER.md'), ('callback_target', 'surface:99'),
+                             ('completion_nonce', 'wrong-marker'), ('report', '/tmp/other.md')]:
+            with self.subTest(field=field):
+                self.write_pack(**{field: value})
+                self.handle(self.event('UserPromptSubmit', pack_first_dispatch(self.tmp.name), offset=2))
+                self.assert_waiting()
+        self.write_pack()
+        self.handle(self.event('UserPromptSubmit', pack_first_dispatch(self.tmp.name), offset=3))
+        self.assertFalse(self.runtime.claude_handshake_wait)
+        self.assert_no_input()
+
+    def test_inline_dispatch_then_report_continues_once_without_completion_or_confirmation(self):
         self.wait()
         self.handle(self.event('UserPromptSubmit', inline_dispatch(self.tmp.name), offset=2))
-        self.handle(self.event('Stop', report_text(), offset=3))
-        self.assertEqual(self.runtime.state, 'claude_report_ready')
-        self.assertEqual(self.runtime.claude_report_ready_task_id, TASK)
+        self.assertFalse(self.runtime.claude_handshake_wait)
         self.assert_no_input()
+        event = self.event('Stop', report_text(), offset=3)
+        self.handle(event)
+        self.handle(event)
+        self.assertNotIn(self.runtime.state, {'claude_report_ready', 'claude_completed'})
+        self.assertEqual(self.runtime.claude_report_ready_task_id, TASK)
+        self.assertFalse(self.runtime.claude_completed_latched)
+        self.assertIsNone(self.runtime.claude_completion_event_id)
+        self.assertEqual(self.daemon.claude_event_ledger.status_of(event['event_id']), 'sent')
+        self.assertEqual(self.runtime.claude_submit_confirmed_at, 0)
+        self.assertEqual(len(self.client.sent_text), 1)
+        self.assertEqual(len(self.client.sent_keys), 1)
 
     def test_inline_dispatch_validates_final_pack_bindings(self):
         self.wait()
@@ -308,16 +396,52 @@ class HandshakeWaitTests(unittest.TestCase):
                 self.assert_waiting()
         self.assert_no_input()
 
-    def test_native_report_outranks_old_wait_but_does_not_confirm_callback(self):
+    def test_native_report_records_diagnostics_without_releasing_wait_or_confirming_callback(self):
         self.wait()
         self.runtime.claude_submit_phase = 'text_written'
+        self.runtime.claude_submit_event_id = 'pending-unknown'
         self.runtime.claude_submit_write_unknown = True
-        self.handle(self.event('Stop', report_text(), offset=2))
-        self.assertFalse(self.runtime.claude_handshake_wait)
-        self.assertEqual(self.runtime.state, 'claude_report_ready')
+        event = self.handle(self.event('Stop', report_text(), offset=2))
+        self.assert_waiting()
+        self.assertEqual(self.runtime.claude_report_ready_task_id, TASK)
+        self.assertEqual(self.daemon.claude_event_ledger.status_of(event['event_id']),
+                         'suppressed_handshake_wait')
+        self.assertEqual(self.recover_report().kind, 'claude_handshake_wait')
         self.assertEqual(self.runtime.claude_submit_phase, 'text_written')
+        self.assertEqual(self.runtime.claude_submit_event_id, 'pending-unknown')
         self.assertTrue(self.runtime.claude_submit_write_unknown)
         self.assertEqual(self.runtime.claude_submit_confirmed_at, 0)
+        self.assert_no_input()
+
+    def test_native_completion_sentence_outranks_report_diagnostics_and_handshake_wait(self):
+        self.wait()
+        report = self.handle(self.event('Stop', report_text(), offset=2))
+        self.assert_waiting()
+        self.assertEqual(self.runtime.claude_report_ready_task_id, TASK)
+        completed = self.event('Stop', report_text() + '\n完成，建议检查 usage: /context', offset=3)
+        self.assertTrue(completed['completed'])
+        self.handle(completed)
+        self.assertTrue(self.runtime.claude_completed_latched)
+        self.assertEqual(self.runtime.state, 'claude_completed')
+        self.assertEqual(self.runtime.claude_completion_event_id, completed['event_id'])
+        self.assertEqual(self.daemon.claude_event_ledger.status_of(completed['event_id']), 'completed')
+        self.assertEqual(self.daemon.claude_event_ledger.status_of(report['event_id']),
+                         'suppressed_handshake_wait')
+        self.assertEqual(self.recover_report().kind, 'claude_completed')
+        self.assertEqual(self.runtime.claude_submit_confirmed_at, 0)
+        self.assert_no_input()
+
+    def test_wrong_native_identity_report_cannot_change_wait_or_diagnostics(self):
+        self.wait()
+        challenge = dict(self.runtime.claude_handshake_challenge)
+        for changes in [{'agent_pid': 999}, {'session_id': 'other-session'},
+                        {'surface_id': 'other-surface'}, {'workspace_id': 'other-workspace'},
+                        {'process_generation': 'other-birth'}, {'synthetic_fallback': True}]:
+            with self.subTest(changes=changes):
+                self.handle(self.event('Stop', report_text(), offset=2, **changes))
+                self.assert_waiting()
+                self.assertEqual(self.runtime.claude_handshake_challenge, challenge)
+                self.assertIsNone(self.runtime.claude_report_ready_task_id)
         self.assert_no_input()
 
     def suppressed_report(self):
@@ -330,25 +454,31 @@ class HandshakeWaitTests(unittest.TestCase):
         return event
 
     def recover_report(self):
-        return self.daemon._recover_claude_handshake_report('surface-uuid', self.runtime)
+        return self.daemon._apply_claude_runtime_guards('surface-uuid', self.runtime, self.screen())
 
-    def test_old_suppressed_report_migrates_without_ledger_or_send_and_survives_restart(self):
+    def test_old_suppressed_report_preserves_wait_and_ledger_across_restart(self):
         event = self.suppressed_report()
         ledger = self.daemon.claude_event_ledger.path
         before = ledger.read_bytes()
-        state = self.daemon._apply_claude_runtime_guards('surface-uuid', self.runtime,
-                    core.ScreenState('claude_report_ready', message_kind='claude'))
-        self.assertEqual(state.kind, 'claude_report_ready')
-        self.assertFalse(self.runtime.claude_handshake_wait)
-        self.assertEqual(self.runtime.claude_report_ready_task_id, TASK)
-        self.assertEqual(self.runtime.claude_handshake_report_recovery['event_id'], event['event_id'])
-        self.assertEqual(self.runtime.claude_handshake_report_recovery['input_count'], 0)
-        self.assertFalse(self.recover_report())
+        journal_before = self.journal.read_bytes()
+        for _ in range(2):
+            self.assertEqual(self.recover_report().kind, 'claude_handshake_wait')
+            self.assert_waiting()
+        self.assertEqual(self.runtime.claude_handshake_report_recovery, {})
+        self.assertIsNone(self.runtime.claude_completion_event_id)
         self.assertEqual(ledger.read_bytes(), before)
         self.daemon.save()
-        restored = core.WatchDaemon(Path(self.tmp.name) / 'config.json',
-                                   Path(self.tmp.name) / 'state.json', client=self.client)
-        self.assertEqual(restored.runtime['surface-uuid'].claude_report_ready_task_id, TASK)
+        self.daemon = bind_fake_claude_process_identity(core.WatchDaemon(
+            Path(self.tmp.name) / 'config.json', Path(self.tmp.name) / 'state.json',
+            client=self.client), self.client)
+        self.runtime = self.daemon.runtime['surface-uuid']
+        self.assertEqual(self.recover_report().kind, 'claude_handshake_wait')
+        self.assert_waiting()
+        self.assertEqual(self.runtime.claude_handshake_report_recovery, {})
+        self.assertEqual(self.daemon.claude_event_ledger.status_of(event['event_id']),
+                         'suppressed_handshake_wait')
+        self.assertEqual(ledger.read_bytes(), before)
+        self.assertEqual(self.journal.read_bytes(), journal_before)
         self.assertEqual(self.runtime.send_count, 0)
         self.assert_no_input()
 
@@ -357,7 +487,7 @@ class HandshakeWaitTests(unittest.TestCase):
         newer = self.event('UserPromptSubmit', 'New task', offset=3)
         with self.journal.open('a') as stream:
             stream.write(json.dumps(newer) + '\n')
-        self.assertFalse(self.recover_report())
+        self.assertEqual(self.recover_report().kind, 'claude_handshake_wait')
         self.assert_waiting()
         self.assert_no_input()
 
@@ -369,7 +499,7 @@ class HandshakeWaitTests(unittest.TestCase):
                         {'event_name': 'StopFailure'}, {'synthetic_fallback': True}]:
             with self.subTest(changes=changes):
                 self.journal.write_text(json.dumps({**event, **changes}) + '\n', encoding='utf-8')
-                self.assertFalse(self.recover_report())
+                self.assertEqual(self.recover_report().kind, 'claude_handshake_wait')
                 self.assert_waiting()
         self.assert_no_input()
 
@@ -383,45 +513,55 @@ class HandshakeWaitTests(unittest.TestCase):
             old = getattr(self.runtime, field)
             with self.subTest(field=field):
                 setattr(self.runtime, field, value)
-                self.assertFalse(self.recover_report())
+                self.assertEqual(self.recover_report().kind, 'claude_handshake_wait')
+                self.assertEqual(getattr(self.runtime, field), value)
                 setattr(self.runtime, field, old)
         self.process_inspection.return_value = {'pid': 1234, 'started_epoch': 1.0, 'generation': 'reused'}
-        self.assertFalse(self.recover_report())
+        self.assertEqual(self.recover_report().kind, 'claude_handshake_wait')
         self.assert_waiting()
         self.assert_no_input()
 
-    def test_recovery_refuses_journal_append_during_identity_inspection(self):
+    def test_suppressed_report_does_not_inspect_identity_or_append_journal(self):
         self.suppressed_report()
+        before = self.journal.read_bytes()
         inspection = dict(self.process_inspection.return_value)
         def inspect(_pid):
             with self.journal.open('a') as stream:
                 stream.write(json.dumps(self.event('UserPromptSubmit', 'New work', offset=3)) + '\n')
             return inspection
         self.process_inspection.side_effect = inspect
-        self.assertFalse(self.recover_report())
+        self.process_inspection.reset_mock()
+        self.assertEqual(self.recover_report().kind, 'claude_handshake_wait')
+        self.process_inspection.assert_not_called()
+        self.assertEqual(self.journal.read_bytes(), before)
         self.assert_waiting()
         self.assert_no_input()
 
-    def test_recovery_refuses_unknown_write_created_during_inspection(self):
+    def test_suppressed_report_does_not_inspect_identity_or_create_unknown_write(self):
         self.suppressed_report()
         inspection = dict(self.process_inspection.return_value)
         def inspect(_pid):
             self.runtime.claude_submit_write_unknown = True
             return inspection
         self.process_inspection.side_effect = inspect
-        self.assertFalse(self.recover_report())
+        self.process_inspection.reset_mock()
+        self.assertEqual(self.recover_report().kind, 'claude_handshake_wait')
+        self.process_inspection.assert_not_called()
+        self.assertFalse(self.runtime.claude_submit_write_unknown)
         self.assert_waiting()
         self.assert_no_input()
 
-    def test_recovery_preserves_deferred_ledger_and_refuses_foreign_session_owner(self):
+    def test_suppressed_report_preserves_deferred_event_and_ledger_with_foreign_owner(self):
         self.suppressed_report()
         ledger = self.daemon.claude_event_ledger.path
         before = ledger.read_bytes()
-        self.runtime.claude_deferred_event = self.event('Stop', 'Unfinished', offset=1.5)
-        self.assertFalse(self.recover_report())
+        pending = self.event('Stop', 'Unfinished', offset=1.5)
+        self.runtime.claude_deferred_event = pending
+        self.assertEqual(self.recover_report().kind, 'claude_handshake_wait')
+        self.assertEqual(self.runtime.claude_deferred_event, pending)
         self.runtime.claude_deferred_event = None
         with mock.patch.object(self.daemon, '_foreign_claude_session_owner', return_value='other-surface'):
-            self.assertFalse(self.recover_report())
+            self.assertEqual(self.recover_report().kind, 'claude_handshake_wait')
         self.assertEqual(ledger.read_bytes(), before)
         self.assert_waiting()
         self.assert_no_input()

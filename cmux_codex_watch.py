@@ -40,7 +40,7 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
-from claude_ccc_protocol import EVENT_JOURNAL_PATH, EVENT_SOCKET_PATH, report_ready_task
+from claude_ccc_protocol import EVENT_JOURNAL_PATH, EVENT_SOCKET_PATH, completion_reported, report_ready_task
 import ccc_observation as observation_health
 import ccc_network_client as network_health
 from ccc_codex_queue import NativeCompletionWatcher, QueueRecovery
@@ -1532,11 +1532,6 @@ CLAUDE_QUESTION_RE = re.compile(
     re.IGNORECASE,
 )
 CLAUDE_ASK_FOOTER_RE = re.compile(r"^\s*✓\s*AskUserQuestion(?:\s*[×x]\s*\d+)?\s*$", re.IGNORECASE)
-CLAUDE_DONE_RE = re.compile(
-    r"建议检查\s*usage\s*[:：]\s*/context\s*[。.!！?？'\"’”）)]*\s*$",
-    re.IGNORECASE,
-)
-CLAUDE_DONE_COMPACT = "建议检查usage:/context"
 CLAUDE_CONTEXT_LINE_RE = re.compile(
     r"^\s*上下文\s+[█▓▒░]+\s+(?P<percent>\d{1,3})%"
     r"(?:\s*\(\s*输入\s*:\s*(?P<input>[\d.]+[kKmM]?)\s*,\s*"
@@ -1975,7 +1970,7 @@ def _claude_last_content_lines(
     return collected
 
 
-def _claude_report_ready_task(lines, prompt_row, claude_message=CLAUDE_MESSAGE):
+def _claude_latest_reply(lines, prompt_row, claude_message=CLAUDE_MESSAGE):
     # Keep the latest reply together, including fences and intervening blank
     # lines. Searching only the last paragraph loses both prose-final reports
     # and the code fence that makes a quoted declaration ineligible.
@@ -2004,19 +1999,15 @@ def _claude_report_ready_task(lines, prompt_row, claude_message=CLAUDE_MESSAGE):
     # indented code does not become a declaration just because it is first.
     text = "\n".join(line[1:].lstrip() if line.startswith('⏺') else line
                      for line in reply)
-    return report_ready_task(text)
+    return text
+
+
+def _claude_report_ready_task(lines, prompt_row, claude_message=CLAUDE_MESSAGE):
+    return report_ready_task(_claude_latest_reply(lines, prompt_row, claude_message))
 
 
 def _claude_block_is_completion(collected: Sequence[str]) -> bool:
-    if not collected:
-        return False
-    last_line = collected[0]
-    # The newest effective content must end with the sentinel.  A completion
-    # sentence farther up the transcript cannot win over newer content.
-    if CLAUDE_DONE_RE.search(last_line):
-        return True
-    compact = re.sub(r"\s+", "", last_line)
-    return compact.endswith(CLAUDE_DONE_COMPACT)
+    return completion_reported("\n".join(reversed(collected)))
 
 
 def _claude_content_fingerprint(
@@ -2045,7 +2036,7 @@ def _claude_live_error_type(
     """
 
     collected = _claude_last_content_lines(grid.lines, prompt_row, claude_message)
-    last_is_done = _claude_block_is_completion(collected)
+    last_is_done = completion_reported(_claude_latest_reply(grid.lines, prompt_row, claude_message))
     if collected and not last_is_done:
         error_type = _claude_error_type(collected[0])
         if error_type is not None:
@@ -2072,10 +2063,10 @@ def _claude_completion_fingerprint(
     never became the last sentence.
     """
 
-    collected = _claude_last_content_lines(lines, prompt_row, claude_message)
-    if not _claude_block_is_completion(collected):
+    reply = _claude_latest_reply(lines, prompt_row, claude_message)
+    if not completion_reported(reply):
         return None
-    return _short_hash(" ".join(reversed(collected)))
+    return _short_hash(reply)
 
 
 def _claude_finished_normally(
@@ -2207,14 +2198,6 @@ def classify_claude_grid(grid: Grid, *, claude_message: str = CLAUDE_MESSAGE) ->
         any(CLAUDE_COMPLETED_RE.search(text) for text in nearby),
     )
     if composer_kind == "empty":
-        report_task = _claude_report_ready_task(grid.lines, prompt_row, claude_message)
-        if report_task:
-            return ScreenState(
-                "claude_report_ready", fingerprint=_short_hash(report_task),
-                screen_signature=signature, message_kind="claude",
-                reason="Claude report awaits supervisor reconciliation; callback unconfirmed",
-                content_fingerprint=content_fp, claude_context=context,
-            )
         completion_fingerprint = _claude_completion_fingerprint(
             grid.lines,
             prompt_row,
@@ -3373,6 +3356,8 @@ class ClaudeEventLedger:
         for key in (
             "episode_id", "process_generation", "attempt_number",
             "evidence_fingerprint", "synthetic_fallback", "agent_pid", "workspace_id", "created_at",
+            "report_migration_source_event_id", "report_migration_turn_started_at",
+            "report_migration_generation_id",
         ):
             if key in event and event.get(key) not in (None, ""):
                 row[key] = event[key]
@@ -3408,8 +3393,8 @@ class ClaudeEventLedger:
     def status_of(self, event_id: str) -> str:
         """Current status, or "" when unknown.
 
-        ``mark`` replaces the whole row, so a caller that wants to advance a
-        provisional status without clobbering a terminal one has to read first.
+        ``mark`` preserves metadata but advances the outcome, so callers must
+        read first before advancing a provisional rather than terminal status.
         Needed by the deferred-slot cleanup: the success path marks ``sent`` and
         *then* releases the slot, so writing a terminal state unconditionally
         would overwrite the record of the delivery that actually happened.
@@ -8008,6 +7993,16 @@ class WatchDaemon:
         detail: str = "",
     ) -> None:
         synthetic_fallback = bool(event.get("synthetic_fallback"))
+        stamp = event.get("created_at")
+        if runtime is not None and not synthetic_fallback and (
+            type(stamp) not in (int, float) or not math.isfinite(stamp)
+            or stamp < max(runtime.claude_last_hook_at, runtime.claude_turn_started_at)
+            or status.startswith("stale_") or status == "handshake_identity_unverified"
+        ):
+            # A delayed/rejected event owns only its own ledger outcome. It
+            # cannot move the accepted native watermark or current turn back.
+            self.claude_event_ledger.mark(event, status, detail=detail)
+            return
         if status in {"unmapped", "identity_conflict", "failed"}:
             if runtime is not None:
                 runtime.claude_last_rejected_hook_status = status
@@ -8209,7 +8204,9 @@ class WatchDaemon:
             "process_generation": parked_generation,
             "episode_id": parked_episode_id,
         }
-        for key in ("synthetic_fallback", "attempt_number", "evidence_fingerprint", "workspace_id", "agent_pid", "_registration_revalidation"):
+        for key in ("synthetic_fallback", "attempt_number", "evidence_fingerprint", "workspace_id", "agent_pid", "_registration_revalidation",
+                    "report_migration_source_event_id", "report_migration_turn_started_at",
+                    "report_migration_generation_id"):
             if key in parked_event:
                 runtime.claude_deferred_event[key] = parked_event[key]
         runtime.claude_deferred_reason = reason
@@ -8336,6 +8333,16 @@ class WatchDaemon:
             return False
         if runtime.claude_submit_phase != "none":
             return False
+        if deferred.get("report_migration_source_event_id"):
+            status = self.claude_event_ledger.status_of(str(deferred.get("event_id") or ""))
+            # The ledger can be ahead of state.json after a crash. A reserved
+            # write is unknown, not permission to replay this migrated Stop.
+            if status != "deferred_report_migration":
+                self._clear_claude_deferred(runtime, reason="migration_already_consumed")
+                return False
+            if not self._claude_report_source_current(deferred, target, runtime):
+                self._clear_claude_deferred(runtime, reason="migration_source_changed")
+                return False
         max_age = float(self.config.get(
             "claude_deferred_max_age_sec", CLAUDE_DEFERRED_MAX_AGE_SEC,
         ))
@@ -8723,6 +8730,12 @@ class WatchDaemon:
             def submit_check():
                 if runtime.claude_handshake_wait or not identity_check():
                     return False
+                with self.claude_event_ledger._lock:
+                    submit = dict(self.claude_event_ledger.events.get(
+                        str(runtime.claude_submit_event_id or ""), {}))
+                if (submit.get("report_migration_source_event_id")
+                        and not self._claude_report_source_current(submit, target, runtime)):
+                    return False
                 message = str(self.config.get("claude_message") or CLAUDE_MESSAGE)
                 if (runtime.claude_submit_message_hash
                         and runtime.claude_submit_message_hash != _short_hash(message)):
@@ -8879,10 +8892,10 @@ class WatchDaemon:
         if runtime.claude_handshake_wait:
             runtime.state = "claude_handshake_wait"
             return True
-        if runtime.claude_report_ready_task_id or state.kind == "claude_report_ready":
-            # Stop retrying writes without turning an unknown submission into
-            # a confirmation. Preserve its transaction until native evidence
-            # or a real human prompt resolves it.
+        if self._legacy_claude_report_latch(runtime):
+            # A pending transaction can coexist with the historical report
+            # bug. Keep its evidence intact while migration is inadmissible;
+            # an old report is neither a receipt nor permission to retry Enter.
             runtime.state = "claude_report_ready"
             return True
         if runtime.claude_submit_phase == "none" or not runtime.claude_submit_event_id:
@@ -9076,7 +9089,9 @@ class WatchDaemon:
                         and not runtime.claude_completed_latched
                         and not runtime.claude_handshake_wait
                         and (not event.get("_registration_revalidation")
-                             or self._registration_stop_is_latest(event)))
+                             or self._registration_stop_is_latest(event))
+                        and (not event.get("report_migration_source_event_id")
+                             or self._claude_report_source_current(event, target, runtime)))
             except (OSError, ValueError, TypeError, CmuxError):
                 return False
         try:
@@ -9102,6 +9117,9 @@ class WatchDaemon:
             return False, "assistant content changed during preflight"
         if event.get("_registration_revalidation") and not self._registration_stop_is_latest(event):
             return False, "registration Stop superseded before submission"
+        if (event.get("report_migration_source_event_id")
+                and not self._claude_report_source_current(event, target, runtime)):
+            return False, "report migration source superseded before submission"
         _stage("verify_ms")
         # Freeze preflight cost here, at the last preflight stage.  Everything
         # after this line is the submit transaction and is timed on its own.
@@ -9150,6 +9168,10 @@ class WatchDaemon:
             runtime.claude_submit_write_unknown = False
             self.save()
         except InputNotSentError as exc:
+            if event.get("report_migration_source_event_id"):
+                # Only a proven zero-input refusal may reopen this reservation.
+                # Unknown writes and crash-left reserved rows remain consumed.
+                self.claude_event_ledger.mark(event, "deferred_report_migration", detail=str(exc))
             self._clear_claude_submit(runtime, reason=f"text not sent: {exc}")
             self.save()
             return False, f"Claude input not sent: {exc}"
@@ -9309,7 +9331,6 @@ class WatchDaemon:
         """
         if (runtime.claude_handshake_wait
                 or not runtime.claude_completed_latched or runtime.claude_submit_phase != "none"
-                or runtime.claude_report_ready_task_id
                 or event.get("synthetic_fallback") or event.get("event_name") != "Stop"
                 or event.get("completed") is not False or event.get("stop_hook_active") is not True):
             return False
@@ -9341,6 +9362,7 @@ class WatchDaemon:
         runtime.claude_completed_latched = False
         runtime.claude_completion_event_id = None
         runtime.claude_completed_at = 0.0
+        runtime.claude_completion_fingerprint = None
         # Keep all send counts, reservations, and original ledger outcomes.
         # The ordinary deferred path still performs its current input guards.
         self.logger.info("surface=%s Claude completion superseded completion=%s hook=%s",
@@ -9461,7 +9483,7 @@ class WatchDaemon:
         challenge = runtime.claude_handshake_challenge
         incoming = event.get("handshake_challenge") if name == "UserPromptSubmit" else None
         stamp = float(event["created_at"])
-        boundary = max(runtime.claude_turn_started_at, runtime.claude_handshake_ack_at,
+        boundary = max(runtime.claude_turn_started_at, runtime.claude_last_hook_at, runtime.claude_handshake_ack_at,
                        float((challenge or {}).get("created_at", 0)))
         mismatch = event.get('handshake_provider_mismatch')
         if isinstance(mismatch, dict):
@@ -9541,93 +9563,176 @@ class WatchDaemon:
             self._apply_human_prompt_reset(str(target["surface_id"]), runtime, event)
             return True
         if runtime.claude_handshake_wait:
-            if (name == 'Stop' and challenge and stamp > boundary
-                    and event.get('report_ready_task_id') == challenge.get('task_id')):
-                # A report-only stop cannot authorize input or confirm delivery.
-                # It outranks handshake wait even if an old Hook missed dispatch.
-                self._clear_claude_handshake(runtime)
-                return False
             runtime.state = "claude_handshake_wait"
             self._mark_claude_event(event, runtime, "suppressed_handshake_wait")
             return True
+        if name == "UserPromptSubmit" and event.get("task_dispatch"):
+            # A delayed pack cannot become an ordinary human turn after the
+            # original handshake was cleared by newer input or completion.
+            self._mark_claude_event(event, runtime, "stale_task_dispatch")
+            return True
         return False
 
-    def _recover_claude_handshake_report(self, surface_id: str, runtime: TargetRuntime) -> bool:
-        with self._surface_lock(surface_id):
-            return self._recover_claude_handshake_report_locked(surface_id, runtime)
-
-    def _recover_claude_handshake_report_locked(self, surface_id: str, runtime: TargetRuntime) -> bool:
-        """Recover only a latest, already-suppressed report; never replay input.
-
-        Old Hooks omitted single-line dispatch metadata. Preserve their ledger
-        outcomes and consume no event again. This migration only adds a stop
-        latch after native report, ledger and current process identity agree.
-        """
-        target = copy.deepcopy(self._event_target(surface_id))
-        challenge = copy.deepcopy(runtime.claude_handshake_challenge)
-        if (not target or not challenge or not runtime.claude_handshake_wait
-                or runtime.claude_submit_phase != 'none' or runtime.claude_submit_write_unknown
-                or runtime.claude_deferred_event
-                or self._foreign_claude_session_owner(surface_id, runtime.claude_session_id or '')
-                or runtime.claude_hook_health != 'healthy'):
+    def _legacy_claude_report_latch(self, runtime: TargetRuntime) -> bool:
+        if not (runtime.claude_completed_latched and runtime.claude_report_ready_task_id
+                and runtime.claude_completion_event_id):
             return False
+        return self.claude_event_ledger.status_of(runtime.claude_completion_event_id) == "report_ready"
+
+    def _clear_legacy_claude_report_latch(self, runtime: TargetRuntime) -> None:
+        # Diagnostic report metadata may also accompany a genuine completion.
+        # Clear only the historical outcome that actually installed the bug.
+        if self._legacy_claude_report_latch(runtime):
+            runtime.claude_completed_latched = False
+            runtime.claude_completion_event_id = None
+            runtime.claude_completed_at = 0.0
+            runtime.claude_completion_fingerprint = None
+        runtime.claude_report_ready_task_id = None
+
+    @staticmethod
+    def _claude_report_guard_snapshot(runtime: TargetRuntime) -> tuple[Any, ...]:
+        # Snapshot guards as well as identity: inspect/journal I/O must not
+        # let a newly pending send, handshake or degraded Hook lose ownership.
+        return copy.deepcopy(tuple(getattr(runtime, key) for key in (
+            "claude_submit_phase", "claude_submit_event_id", "claude_submit_write_unknown",
+            "claude_deferred_event", "claude_handshake_wait", "claude_handshake_challenge",
+            "claude_handshake_provider_conflict", "claude_hook_health", "claude_hook_provenance",
+            "claude_hook_process_generation", "claude_completed_latched",
+            "claude_completion_event_id", "claude_last_event_id", "claude_report_ready_task_id")))
+
+    def _validated_claude_report_source(
+        self, source_id: str, target: Mapping[str, Any], runtime: TargetRuntime,
+    ) -> dict[str, Any] | None:
+        """Bind an old report to its original ledger, latest Stop and live birth.
+
+        The raw journal is not rewritten. Cache only its bounded read under an
+        exact stat tuple; every decision still inspects the process and checks
+        the journal again after that inspection.
+        """
+        generation = str(runtime.claude_process_generation or "")
+        session = str(runtime.claude_session_id or "")
+        pid = runtime.claude_process_pid
+        if (not source_id or not generation or not session or not pid
+                or runtime.claude_hook_health != "healthy"
+                or runtime.claude_hook_process_generation not in (None, "", generation)
+                or self._foreign_claude_session_owner(str(target["surface_id"]), session)):
+            return None
+        binding = (pid, generation, session, runtime.claude_generation_id,
+                   runtime.claude_turn_started_at, runtime.claude_last_hook_at)
+        guards = self._claude_report_guard_snapshot(runtime)
         try:
             journal = self.claude_event_inbox.journal_path
+            fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
             before = journal.stat()
-            events = [e for e in self._registration_events()
-                      if e.get('surface_id') == surface_id and not e.get('synthetic_fallback')]
-            event = max(enumerate(events), key=lambda p: (p[1]['created_at'], p[0]))[1]
+            signature = tuple(getattr(before, key) for key in fields)
+            if journal.is_symlink() or not stat.S_ISREG(before.st_mode):
+                return None
+            cache_key = (str(journal), signature, str(target["surface_id"]))
+            cached = runtime.__dict__.get("_report_migration_journal")
+            if cached is not None and cached[0] == cache_key:
+                event = copy.deepcopy(cached[1])
+            else:
+                events = [e for e in self._registration_events()
+                          if e.get("surface_id") == target["surface_id"] and not e.get("synthetic_fallback")]
+                event = max(enumerate(events), key=lambda pair: (pair[1]["created_at"], pair[0]))[1]
+                runtime.__dict__["_report_migration_journal"] = (cache_key, copy.deepcopy(event))
             with self.claude_event_ledger._lock:
-                row = dict(self.claude_event_ledger.events.get(event['event_id'], {}))
-            inspected = inspect_claude_process(runtime.claude_process_pid)
-            boundary = max(runtime.claude_turn_started_at, runtime.claude_handshake_ack_at,
-                           float(challenge.get('created_at', 0)))
-            if (event.get('event_name') != 'Stop'
-                    or event.get('report_ready_task_id') != challenge.get('task_id')
-                    or event.get('event_id') != runtime.claude_last_event_id
-                    or row.get('status') != 'suppressed_handshake_wait'
-                    or any(row.get(k) != event.get(k) for k in (
-                        'event_name', 'surface_id', 'workspace_id', 'session_id', 'agent_pid', 'created_at'))
-                    or row.get('process_generation') != runtime.claude_process_generation
-                    or inspected.get('generation') != runtime.claude_process_generation
-                    or inspected.get('pid') != runtime.claude_process_pid
-                    or not 0 < inspected.get('started_epoch', 0) <= event['created_at']
-                    or not boundary < event['created_at'] <= time.time()
-                    or not self._claude_protocol_identity(runtime, challenge, target)
-                    or not self._claude_protocol_identity(runtime, {**event,
-                        'process_generation': row['process_generation']}, target)):
-                return False
+                row = dict(self.claude_event_ledger.events.get(source_id, {}))
+            stamp = event.get("created_at")
+            if (event.get("event_id") != source_id or event.get("event_name") != "Stop"
+                    or event.get("completed") is not False or not event.get("report_ready_task_id")
+                    or row.get("status") != "report_ready"
+                    or any(row.get(key) != event.get(key) for key in (
+                        "event_name", "surface_id", "workspace_id", "session_id", "agent_pid", "created_at"))
+                    or any(event.get(key) != target.get(key) for key in ("surface_id", "workspace_id"))
+                    or event.get("session_id") != session or event.get("agent_pid") != pid
+                    or any(item.get("process_generation") not in (None, "", generation) for item in (event, row))
+                    or type(stamp) not in (int, float) or not math.isfinite(stamp)
+                    or not 0 < stamp <= time.time()
+                    or stamp < max(runtime.claude_turn_started_at, runtime.claude_last_hook_at)):
+                return None
+            inspected = inspect_claude_process(pid)
+            started = inspected.get("started_epoch")
+            if (inspected.get("pid") != pid or inspected.get("generation") != generation
+                    or type(started) not in (int, float) or not math.isfinite(started)
+                    or not 0 < started <= stamp):
+                return None
+            # Missing generation in an old native record is supported only
+            # with its original PID/session/timestamp ledger and a current
+            # birth preceding that record, never by copying runtime alone.
             after = journal.stat()
-            if (any(getattr(before, key) != getattr(after, key) for key in (
-                        'st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns'))
-                    or target != self._event_target(surface_id)
-                    or challenge != runtime.claude_handshake_challenge
-                    or not runtime.claude_handshake_wait
-                    or runtime.claude_submit_phase != 'none' or runtime.claude_submit_write_unknown
-                    or runtime.claude_deferred_event
-                    or self._foreign_claude_session_owner(surface_id, runtime.claude_session_id or '')
-                    or runtime.claude_hook_health != 'healthy'
-                    or runtime.claude_last_event_id != event['event_id']):
-                return False
+            with self.claude_event_ledger._lock:
+                current_row = dict(self.claude_event_ledger.events.get(source_id, {}))
+            if (tuple(getattr(after, key) for key in fields) != signature
+                    or current_row != row
+                    or self._claude_report_guard_snapshot(runtime) != guards
+                    or target != self._event_target(str(target["surface_id"]))
+                    or binding != (runtime.claude_process_pid, runtime.claude_process_generation,
+                                   runtime.claude_session_id, runtime.claude_generation_id,
+                                   runtime.claude_turn_started_at, runtime.claude_last_hook_at)):
+                return None
+            return {**event, "process_generation": generation}
         except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+            return None
+
+    def _claude_report_source_current(
+        self, event: Mapping[str, Any], target: Mapping[str, Any], runtime: TargetRuntime,
+    ) -> bool:
+        """Recheck migration provenance at Text, immediate and delayed Enter."""
+        source_id = str(event.get("report_migration_source_event_id") or "")
+        if (not source_id or runtime.claude_completed_latched or runtime.claude_handshake_wait
+                or runtime.claude_handshake_provider_conflict
+                or event.get("report_migration_turn_started_at") != runtime.claude_turn_started_at
+                or str(event.get("report_migration_generation_id") or "") != str(runtime.claude_generation_id or "")
+                or event.get("process_generation") != runtime.claude_process_generation
+                or event.get("session_id") != runtime.claude_session_id):
             return False
-        runtime.claude_handshake_report_recovery = {
-            'event_id': event['event_id'], 'ack_event_id': runtime.claude_handshake_ack_event_id,
-            'task_id': event['report_ready_task_id'], 'recovered_at': time.time(),
-            'original_status': row['status'], 'input_count': 0,
-        }
-        self._clear_claude_handshake(runtime)
-        runtime.claude_completed_latched = True
-        runtime.claude_report_ready_task_id = event['report_ready_task_id']
-        runtime.claude_completion_event_id = event['event_id']
-        runtime.claude_completed_at = event['created_at']
-        self._clear_claude_deferred(runtime, reason='report_ready')
-        self._clear_claude_fallback_episode(runtime)
-        self._reset_claude_repeat_warning(runtime)
-        runtime.error_type = None
-        runtime.state = 'claude_report_ready'
-        self.logger.info('surface=%s recovered suppressed report=%s; no input', surface_id[:8], event['event_id'])
-        return True
+        return self._validated_claude_report_source(source_id, target, runtime) is not None
+
+    def _recover_claude_report_stop(self, surface_id: str, runtime: TargetRuntime) -> bool:
+        """Migrate one proven obsolete report latch through the normal sender.
+
+        Reserve a deterministic derived event before changing runtime. Keep
+        every existing field of the original ledger row. A newer reserved or
+        sent derived row wins over a stale state.json after a crash.
+        """
+        with self._surface_lock(surface_id):
+            source_id = str(runtime.claude_completion_event_id or "")
+            if (not self._legacy_claude_report_latch(runtime)
+                    or runtime.claude_last_event_id != source_id
+                    or runtime.claude_submit_phase != "none" or runtime.claude_submit_write_unknown
+                    or runtime.claude_deferred_event or runtime.claude_handshake_wait
+                    or runtime.claude_handshake_provider_conflict):
+                return False
+            target = copy.deepcopy(self._event_target(surface_id))
+            if not target:
+                return False
+            source = self._validated_claude_report_source(source_id, target, runtime)
+            if source is None or source.get("report_ready_task_id") != runtime.claude_report_ready_task_id:
+                return False
+            provenance = {
+                "report_migration_source_event_id": source_id,
+                "report_migration_turn_started_at": runtime.claude_turn_started_at,
+                "report_migration_generation_id": str(runtime.claude_generation_id or ""),
+            }
+            identity = {**provenance, **{key: source[key] for key in (
+                "surface_id", "workspace_id", "session_id", "agent_pid", "process_generation")}}
+            derived_id = "report-resume-v1-" + hashlib.sha256(
+                json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            event = {**source, **provenance, "event_id": derived_id, "episode_id": derived_id}
+            with self.claude_event_ledger._lock:
+                existing = self.claude_event_ledger.events.get(derived_id)
+                if existing is not None:
+                    if (existing.get("status") != "deferred_report_migration"
+                            or self.claude_event_ledger._identity(existing) != self.claude_event_ledger._identity(event)):
+                        return False
+                elif self.claude_event_ledger.claim_detailed(event, status="deferred_report_migration") != CLAUDE_CLAIMED:
+                    return False
+            self._clear_legacy_claude_report_latch(runtime)
+            self._defer_claude_event(surface_id, runtime, event, "report_migration")
+            runtime.state = "claude_event_pending"
+            self.save()
+            return True
 
     def _handle_claude_event_locked(
         self,
@@ -9646,7 +9751,12 @@ class WatchDaemon:
                     and event.get('event_name') == 'UserPromptSubmit'
                     and event.get('prompt_kind') != 'human'):
                 echo_runtime = self.runtime.get(str(event.get('surface_id') or ''))
-                if echo_runtime is not None:
+                if (echo_runtime is not None
+                        and type(event.get("created_at")) in (int, float)
+                        and math.isfinite(event["created_at"])
+                        and 0 < event["created_at"] <= time.time() + 1
+                        and event["created_at"] >= max(echo_runtime.claude_last_hook_at,
+                                                      echo_runtime.claude_turn_started_at)):
                     # Reserve before claim_detailed's sole ledger write. If
                     # that write and the exception handler's write both fail,
                     # restart can replay the unclaimed Hook. If either lands,
@@ -9688,6 +9798,16 @@ class WatchDaemon:
             self._mark_claude_event(event, runtime, "unmapped", detail="missing Claude session_id")
             return
         assert runtime is not None
+        stamp = event.get("created_at")
+        synthetic_fallback = bool(event.get("synthetic_fallback"))
+        if not synthetic_fallback and (
+            type(stamp) not in (int, float) or not math.isfinite(stamp)
+            or not 0 < stamp <= time.time() + 1
+            or stamp < max(runtime.claude_last_hook_at, runtime.claude_turn_started_at)
+        ):
+            self.claude_event_ledger.mark(event, "stale_native_event",
+                                          detail="event predates the accepted native watermark or has invalid time")
+            return
         # A Claude session is a process identity, not merely a string carried
         # by the Hook.  CMUX can leave a detached/forked Claude process alive
         # after its terminal moved, and that process may retain a stale
@@ -9756,47 +9876,7 @@ class WatchDaemon:
         report_task = event.get("report_ready_task_id") if event_name == "Stop" else None
         if not isinstance(report_task, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,159}", report_task):
             report_task = None
-        # A submit transaction owns this episode. Do not let a duplicate Stop
-        # event or the screen fallback enqueue another copy while the first
-        # prompt is still sitting in the composer. The watchdog's own prompt
-        # confirms the transaction; a real user prompt cancels it and wins.
-        if runtime.claude_submit_phase != "none" and not protocol_event:
-            prompt_kind = str(event.get("prompt_kind") or "")
-            if event_name == "UserPromptSubmit" and prompt_kind == "human":
-                self._clear_claude_submit(runtime, reason="human_prompt_override")
-            elif event_name == "UserPromptSubmit":
-                # Byte-identical to our prompt.  With a transaction pending this
-                # is almost certainly our echo, but confirm by correlation so a
-                # human paste during the window is not silently mislabelled.
-                attribution = self._attribute_exact_prompt(runtime, event)
-                runtime.claude_last_prompt_attribution = attribution
-                if attribution == "human_exact_prompt":
-                    self._clear_claude_submit(runtime, reason="human_prompt_override")
-                    self._apply_human_prompt_reset(
-                        surface_id, runtime, event, attribution=attribution,
-                    )
-                    return
-                self._clear_claude_submit(runtime, reason="hook_confirmed")
-                self._mark_claude_event(event, runtime, "watchdog_confirmed", detail=attribution)
-                return
-            elif report_task:
-                # Identity and freshness are checked below. Never mark a
-                # pending text/Enter as confirmed merely because a report exists.
-                pass
-            elif event_name in {"Stop", "StopFailure"} and bool(event.get("completed")):
-                # A real completion report is stronger than a pending submit;
-                # latch it and stop all further continuation for this turn.
-                self._clear_claude_submit(runtime, reason="completion_reported")
-            elif event_name in {"Stop", "StopFailure"}:
-                self._mark_claude_event(
-                    event,
-                    runtime,
-                    "submit_duplicate_suppressed",
-                    detail="Claude submit transaction already pending",
-                )
-                return
         event_pid = int(event.get("agent_pid") or 0)
-        synthetic_fallback = bool(event.get("synthetic_fallback"))
         if (
             not synthetic_fallback
             and event_name in {"Stop", "StopFailure"}
@@ -9918,11 +9998,7 @@ class WatchDaemon:
             if runtime.claude_session_id != session_id:
                 self._clear_claude_handshake(runtime)
                 runtime.__dict__.pop("_live_claude_hook_identity", None)
-                if runtime.claude_report_ready_task_id:
-                    runtime.claude_report_ready_task_id = None
-                    runtime.claude_completed_latched = False
-                    runtime.claude_completion_event_id = None
-                    runtime.claude_completed_at = 0.0
+                self._clear_legacy_claude_report_latch(runtime)
                 runtime.claude_turn_started_at = float(event.get("created_at") or time.time())
             runtime.claude_hook_health = "healthy"
             runtime.claude_hook_provenance = "live_event"
@@ -9968,6 +10044,29 @@ class WatchDaemon:
                     event_id[:8],
                 )
                 return
+        # Only identity-checked, current native events may settle a submit.
+        # REPORT_READY is not completion or proof of delivery: a pending or
+        # unknown transaction keeps ownership and suppresses duplicate Stops.
+        if runtime.claude_submit_phase != "none" and not protocol_event:
+            prompt_kind = str(event.get("prompt_kind") or "")
+            if event_name == "UserPromptSubmit" and prompt_kind == "human":
+                self._clear_claude_submit(runtime, reason="human_prompt_override")
+            elif event_name == "UserPromptSubmit":
+                attribution = self._attribute_exact_prompt(runtime, event)
+                runtime.claude_last_prompt_attribution = attribution
+                if attribution == "human_exact_prompt":
+                    self._clear_claude_submit(runtime, reason="human_prompt_override")
+                    self._apply_human_prompt_reset(surface_id, runtime, event, attribution=attribution)
+                    return
+                self._clear_claude_submit(runtime, reason="hook_confirmed")
+                self._mark_claude_event(event, runtime, "watchdog_confirmed", detail=attribution)
+                return
+            elif event_name in {"Stop", "StopFailure"} and bool(event.get("completed")):
+                self._clear_claude_submit(runtime, reason="completion_reported")
+            elif event_name in {"Stop", "StopFailure"}:
+                self._mark_claude_event(event, runtime, "submit_duplicate_suppressed",
+                                        detail="Claude submit transaction already pending")
+                return
         if not synthetic_fallback and event_name in {"Stop", "StopFailure"}:
             # A real lifecycle event is fresh evidence for this process.  It
             # supersedes any synthetic gap retry budget from an older missing
@@ -9976,22 +10075,39 @@ class WatchDaemon:
         if runtime.claude_session_id != session_id:
             self._clear_claude_handshake(runtime)
             runtime.__dict__.pop("_live_claude_hook_identity", None)
-            if runtime.claude_report_ready_task_id:
-                # A verified root-session rebind can arrive without SessionStart.
-                # The old report closes only its original session/turn.
-                runtime.claude_report_ready_task_id = None
-                runtime.claude_completed_latched = False
-                runtime.claude_completion_event_id = None
-                runtime.claude_completed_at = 0.0
-                runtime.claude_turn_started_at = float(event.get("created_at") or time.time())
+            self._clear_legacy_claude_report_latch(runtime)
+            runtime.claude_turn_started_at = float(stamp)
         runtime.claude_session_id = session_id
         if not synthetic_fallback:
             runtime.claude_hook_health = "healthy"
             runtime.claude_hook_provenance = "live_event"
             runtime.claude_hook_unverified_since = 0.0
             runtime.claude_hook_process_generation = runtime.claude_process_generation or event_generation or None
-            runtime.claude_last_hook_at = float(event.get("created_at") or time.time())
             self._record_live_claude_hook_identity(runtime, event, target)
+
+        if event_name in {"Stop", "StopFailure"} and bool(event.get("completed")):
+            # Business completion outranks report diagnostics and handshake
+            # waits. It never confirms a callback or manufactures a new input.
+            self._clear_claude_fallback_episode(runtime)
+            runtime.claude_completed_latched = True
+            runtime.claude_report_ready_task_id = report_task
+            runtime.claude_completion_event_id = event_id
+            runtime.claude_completed_at = float(stamp)
+            runtime.claude_completion_fingerprint = str(event.get("message_hash") or "") or None
+            self._clear_claude_deferred(runtime, reason="completion_reported")
+            runtime.error_type = None
+            self._reset_claude_repeat_warning(runtime)
+            runtime.state = "claude_completed"
+            self._mark_claude_event(event, runtime, "completed")
+            self.logger.info("surface=%s state=claude_completed source=hook", surface_id[:8])
+            return
+        if not synthetic_fallback and event_name in {"Stop", "StopFailure"}:
+            # A new verified Stop supersedes the old report-only mistake.
+            # Genuine completed rows cannot use this migration exception.
+            if self._legacy_claude_report_latch(runtime):
+                self._clear_legacy_claude_report_latch(runtime)
+            if report_task:
+                runtime.claude_report_ready_task_id = report_task
 
         if protocol_event and self._handle_claude_handshake(runtime, event, target):
             return
@@ -10020,42 +10136,6 @@ class WatchDaemon:
                 )
                 return
             self._mark_claude_event(event, runtime, "watchdog_prompt", detail=attribution)
-            return
-
-        if report_task:
-            reported_at = float(event.get("created_at") or 0.0)
-            if not math.isfinite(reported_at) or not (runtime.claude_turn_started_at <= reported_at <= time.time() + 1):
-                self._mark_claude_event(event, runtime, "stale_report_ready", detail="report predates current human turn or has invalid time")
-                return
-            self._clear_claude_fallback_episode(runtime)
-            runtime.claude_completed_latched = True
-            runtime.claude_report_ready_task_id = report_task
-            runtime.claude_completion_event_id = event_id
-            runtime.claude_completed_at = time.time()
-            self._clear_claude_deferred(runtime, reason="report_ready")
-            runtime.error_type = None
-            self._reset_claude_repeat_warning(runtime)
-            runtime.state = "claude_report_ready"
-            self._mark_claude_event(event, runtime, "report_ready", detail="callback unconfirmed; supervisor reconciliation required")
-            self.logger.info("surface=%s state=claude_report_ready task=%s source=hook", surface_id[:8], report_task)
-            return
-        if runtime.claude_report_ready_task_id:
-            runtime.state = "claude_report_ready"
-            self._mark_claude_event(event, runtime, "suppressed_report_ready")
-            return
-        if bool(event.get("completed")):
-            self._clear_claude_fallback_episode(runtime)
-            runtime.claude_completed_latched = True
-            runtime.claude_completion_event_id = event_id
-            runtime.claude_completed_at = time.time()
-            # A real completion report outranks any parked Stop: that Stop
-            # described output this report has now closed out.
-            self._clear_claude_deferred(runtime, reason="completion_reported")
-            runtime.error_type = None
-            self._reset_claude_repeat_warning(runtime)
-            runtime.state = "claude_completed"
-            self._mark_claude_event(event, runtime, "completed")
-            self.logger.info("surface=%s state=claude_completed source=hook", surface_id[:8])
             return
 
         if event_name == "Stop" and bool(event.get("stop_hook_active")):
@@ -10524,8 +10604,16 @@ class WatchDaemon:
         runtime.claude_candidate_key = None
         runtime.claude_candidate_since = 0.0
         runtime.claude_candidate_focused = False
-        if runtime.claude_handshake_wait and state.kind == 'claude_report_ready':
-            self._recover_claude_handshake_report(surface_id, runtime)
+        self._recover_claude_report_stop(surface_id, runtime)
+        legacy_report = self._legacy_claude_report_latch(runtime)
+        if runtime.claude_completed_latched and not legacy_report:
+            return ScreenState(
+                "claude_completed", fingerprint=runtime.claude_completion_event_id,
+                screen_signature=state.screen_signature,
+                reason="Claude completion remains latched until a real user prompt or verified later Stop-hook continuation",
+                message_kind="claude", content_fingerprint=state.content_fingerprint,
+                claude_context=getattr(state, "claude_context", None),
+            )
         if runtime.claude_handshake_wait:
             return ScreenState(
                 "claude_handshake_wait", fingerprint=runtime.claude_handshake_ack_event_id,
@@ -10534,19 +10622,17 @@ class WatchDaemon:
                 message_kind="claude", content_fingerprint=state.content_fingerprint,
                 claude_context=getattr(state, "claude_context", None),
             )
-        if runtime.claude_completed_latched:
+        if legacy_report:
             return ScreenState(
-                "claude_report_ready" if runtime.claude_report_ready_task_id else "claude_completed",
+                "claude_report_ready",
                 fingerprint=runtime.claude_completion_event_id,
                 screen_signature=state.screen_signature,
-                reason=("Claude report awaits supervisor reconciliation; callback unconfirmed"
-                        if runtime.claude_report_ready_task_id else
-                        "Claude completion remains latched until a real user prompt or verified later Stop-hook continuation"),
+                reason="Legacy report recovery awaits a current verified Stop and no pending submission; task completion is unproven",
                 message_kind="claude",
                 content_fingerprint=state.content_fingerprint,
                 claude_context=getattr(state, "claude_context", None),
             )
-        if state.kind in {"claude_model_unavailable", "claude_report_ready"}:
+        if state.kind == "claude_model_unavailable":
             return state
         if runtime.claude_hook_health == "legacy_override":
             return ScreenState(
@@ -12383,8 +12469,11 @@ def registration_readiness(
                              and row.get("agent_pid") == runtime.get("claude_process_pid"))
             if kind == "codex" or (kind == "claude" and hook_verified):
                 status = "ready"
-                reason = ("report_ready" if runtime.get("claude_report_ready_task_id") else
-                          "completed" if runtime.get("claude_completed_latched") else "observation_and_hooks_ready")
+                if runtime.get("state") == "claude_report_ready":
+                    status, reason = "unknown", "report_recovery_pending"
+                else:
+                    reason = ("completed" if runtime.get("claude_completed_latched")
+                              else "observation_and_hooks_ready")
             elif kind == "claude":
                 status, reason = "unknown", "claude_hook_unverified"
             else:
@@ -12457,11 +12546,12 @@ def claude_hook_coverage_from_inventory(state, records, labels, targets, inspect
             health = "unverified"
         disposition = (
             "paused" if target.get("paused") or not target.get("enabled", True) else
-            "report_ready" if same_process and runtime.get("claude_report_ready_task_id") else
+            "needs_verification" if same_process and runtime.get("state") == "claude_report_ready" else
             "completed" if same_process and runtime.get("claude_completed_latched") else
             "verified" if verified else "needs_verification")
         rows.append({"surface_id": sid, "surface_ref": record["ref"],
                      "hook_health": health, "hook_verified": verified,
+                     "report_task_id": runtime.get("claude_report_ready_task_id") if same_process else None,
                      "disposition": disposition})
     missing = [row["surface_ref"] for row in rows if row["disposition"] == "needs_verification"]
     return {"status": "degraded" if missing or unregistered else "ok",
