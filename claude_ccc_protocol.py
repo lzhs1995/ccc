@@ -106,11 +106,11 @@ def handshake_ack(value: str) -> dict[str, str] | None:
     return (dict(zip(('task_id', 'agent', 'ack_nonce'), match.groups())) if match else None)
 
 
-def handshake_challenge(value: str) -> dict[str, str] | None:
+def handshake_challenge(value: str, *, _provider: str = 'claude') -> dict[str, str] | None:
     if not value.startswith('DELIVERY_NONCE='):
         return None
     fields = {}
-    for key, pattern in [('ACK_TASK_ID', _TASK_TOKEN), ('ACK_AGENT', r'claude:identity'),
+    for key, pattern in [('ACK_TASK_ID', _TASK_TOKEN), ('ACK_AGENT', re.escape(_provider + ':identity')),
                          ('ACK_STATUS', 'READY'), ('ACK_REPORT', 'INLINE'),
                          ('ACK_NONCE', _NONCE_TOKEN)]:
         # Count declarations before validating their values. An invalid second
@@ -126,7 +126,7 @@ def handshake_challenge(value: str) -> dict[str, str] | None:
               rf'harness handshake from supervisor surface:\d+ for task {re.escape(task)}\. ')
     if not re.match(prefix, value):
         return None
-    for key, expected in [('task_id', task), ('executor_provider', 'claude'), ('ack_nonce', nonce)]:
+    for key, expected in [('task_id', task), ('executor_provider', _provider), ('ack_nonce', nonce)]:
         # Match the expected token exactly: the sentence's final dot is not
         # part of a nonce, while dots inside a task id are legitimate.
         if (len(re.findall(rf'\b{key} == ', value)) != 1
@@ -216,12 +216,20 @@ def build_event(payload: Mapping[str, Any], environ: Mapping[str, str] | None = 
             'DELIVERY_NONCE=', 'PREFLIGHT_ACK|', 'TASK_DISPATCH', 'TASK_PACK=',
         ))
         event['handshake_challenge'] = handshake_challenge(prompt)
+        # A harness naming Codex on a Claude process must hold, never authorize.
+        event['handshake_provider_mismatch'] = handshake_challenge(prompt, _provider='codex')
         event['task_dispatch'] = task_dispatch(prompt)
     elif event_name == "Stop":
         event["completed"] = completion_reported(assistant_message)
         event["report_ready_task_id"] = report_ready_task(assistant_message)
         event["stop_hook_active"] = bool(payload.get("stop_hook_active"))
         event['handshake_ack'] = handshake_ack(assistant_message)
+        foreign = re.fullmatch(
+            rf'PREFLIGHT_ACK\|({_TASK_TOKEN})\|codex:identity\|READY\|INLINE\|({_NONCE_TOKEN})',
+            assistant_message.strip('\r\n'),
+        )
+        event['handshake_provider_mismatch'] = (
+            dict(zip(('task_id', 'ack_nonce'), foreign.groups())) if foreign else None)
     else:
         event["completed"] = completion_reported(assistant_message)
         lowered = error.lower()

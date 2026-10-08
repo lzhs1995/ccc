@@ -3955,14 +3955,21 @@ class WatchTests(unittest.TestCase):
                 client,
                 claude_repeat_warning_after=2,
             )
+            # Native Hook delivery carries the live process identity; the old
+            # minimal fixture omitted it and cannot own a durable echo receipt.
+            runtime = daemon.runtime.setdefault("surface-uuid", TargetRuntime())
+            runtime.claude_process_pid = 1234
+            runtime.claude_process_generation = "fixture-birth-1234"
             with mock.patch.object(daemon, "_notify_async") as notify:
                 daemon._handle_claude_event(claude_hook_event("stop-1"), client)
                 daemon._handle_claude_event(
-                    claude_hook_event("watchdog-1", "UserPromptSubmit", prompt_kind="watchdog"), client
+                    {**claude_hook_event("watchdog-1", "UserPromptSubmit", prompt_kind="watchdog"),
+                     "agent_pid": 1234}, client
                 )
                 daemon._handle_claude_event(claude_hook_event("stop-2"), client)
                 daemon._handle_claude_event(
-                    claude_hook_event("watchdog-2", "UserPromptSubmit", prompt_kind="watchdog"), client
+                    {**claude_hook_event("watchdog-2", "UserPromptSubmit", prompt_kind="watchdog"),
+                     "agent_pid": 1234}, client
                 )
                 daemon._handle_claude_event(claude_hook_event("stop-3"), client)
             runtime = daemon.runtime["surface-uuid"]

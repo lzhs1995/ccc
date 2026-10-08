@@ -633,6 +633,7 @@ class TargetRuntime:
     # receipt of the task pack and must never trigger the generic watchdog.
     claude_handshake_challenge: dict[str, Any] | None = None
     claude_handshake_wait: bool = False
+    claude_handshake_provider_conflict: bool = False
     claude_handshake_ack_at: float = 0.0
     claude_handshake_ack_event_id: str | None = None
     claude_handshake_report_recovery: dict[str, Any] = dataclasses.field(default_factory=dict)
@@ -769,6 +770,7 @@ class TargetRuntime:
     claude_last_submit_session_id: str | None = None
     claude_last_submit_generation: str | None = None
     claude_last_submit_at: float = 0.0
+    claude_last_submit_has_receipt: bool = False
     # How the most recent byte-identical prompt was attributed.  Purely
     # diagnostic; never an authorization input.
     claude_last_prompt_attribution: str | None = None
@@ -3383,9 +3385,19 @@ class ClaudeEventLedger:
             return
         protected: dict[str, dict[str, Any]] = {}
         removable: list[tuple[str, dict[str, Any]]] = []
+        # Retain the latest unresolved send per surface across long compactions.
+        latest_delivery: dict[str, tuple[float, str]] = {}
+        for event_id, row in self.events.items():
+            receipt = row.get('watchdog_submission')
+            if isinstance(receipt, dict) and not receipt.get('consumed_by') and row.get('status') == 'sent':
+                surface = str(row.get('surface_id') or '')
+                candidate = (float(receipt.get('submitted_at') or 0), event_id)
+                if candidate > latest_delivery.get(surface, (0, '')):
+                    latest_delivery[surface] = candidate
+        unresolved = {item[1] for item in latest_delivery.values()}
         for event_id, row in self.events.items():
             status = str(row.get("status") or "")
-            if self._is_active_status(status):
+            if self._is_active_status(status) or event_id in unresolved:
                 protected[event_id] = row
             else:
                 removable.append((event_id, row))
@@ -6580,6 +6592,7 @@ class WatchDaemon:
             runtime.claude_last_submit_session_id = None
             runtime.claude_last_submit_generation = None
             runtime.claude_last_submit_at = 0.0
+            runtime.claude_last_submit_has_receipt = False
             runtime.claude_submit_last_reason = None
             runtime.claude_submit_confirmed_at = 0.0
             self._clear_claude_fallback_episode(runtime)
@@ -8489,6 +8502,12 @@ class WatchDaemon:
             "claude_echo_clock_tolerance_sec", CLAUDE_ECHO_CLOCK_TOLERANCE_SEC,
         ))
         age = float(event.get("created_at") or time.time()) - sent_at
+        # New sends have a durable, single-consumer receipt. Native compaction
+        # may queue the prompt for minutes after the composer transaction ends.
+        # Consume that receipt before applying the legacy time-only heuristic.
+        durable = self._consume_claude_echo_receipt(runtime, event)
+        if durable is not None:
+            return durable
         if age > window:
             return "human_exact_prompt"
         if age < -tolerance:
@@ -8531,6 +8550,67 @@ class WatchDaemon:
         # so plainly rather than claiming certainty.
         return "ambiguous_exact_prompt" if age <= 1.0 else "watchdog_echo_correlated"
 
+    def _consume_claude_echo_receipt(self, runtime: TargetRuntime, event: Mapping[str, Any]) -> str | None:
+        """Correlate one native prompt with one accepted Enter, never text alone.
+
+        A consumed receipt cannot suppress a later human paste, even inside the
+        legacy window. New human/task boundaries invalidate old receipts. The
+        original sent outcome is retained; consumption is additional evidence.
+        """
+        source_id = str(runtime.claude_last_submit_event_id or "")
+        with self.claude_event_ledger._lock:
+            row = self.claude_event_ledger.events.get(source_id, {})
+            receipt = row.get('watchdog_submission')
+            if not isinstance(receipt, dict):
+                if runtime.claude_last_submit_has_receipt:
+                    return 'human_exact_prompt'
+                return None  # Old versions did not persist delivery provenance.
+            sid = str(event.get('surface_id') or '')
+            session = str(event.get('session_id') or '')
+            generation = runtime.claude_process_generation
+            event_id = str(event.get('event_id') or '')
+            stamp = float(event.get('created_at') or 0)
+            submitted = float(receipt.get('submitted_at') or 0)
+            tolerance = float(self.config.get('claude_echo_clock_tolerance_sec', CLAUDE_ECHO_CLOCK_TOLERANCE_SEC))
+            if (row.get('status') != 'sent' or not event_id or not sid or not session or not generation
+                    or row.get('surface_id') != sid or receipt.get('surface_id') != sid
+                    or row.get('session_id') != session or receipt.get('session_id') != session
+                    or session != runtime.claude_session_id or session != runtime.claude_last_submit_session_id
+                    or receipt.get('generation') != generation or runtime.claude_last_submit_generation != generation
+                    or event.get('process_generation', generation) != generation
+                    or event.get('agent_pid') != runtime.claude_process_pid
+                    or receipt.get('agent_pid') != runtime.claude_process_pid
+                    or receipt.get('turn_id') != runtime.claude_generation_id
+                    or receipt.get('turn_started_at') != runtime.claude_turn_started_at
+                    or not math.isfinite(stamp) or not math.isfinite(submitted)
+                    or not 0 < submitted <= stamp + tolerance or stamp > time.time() + tolerance
+                    or receipt.get('message_hash') != runtime.claude_last_submit_message_hash
+                    or not self._hashes_agree(str(receipt.get('message_hash') or ''), str(event.get('message_hash') or ''))
+                    or receipt.get('consumed_by') not in (None, event_id)
+                    or receipt.get('reserved_by') not in (None, event_id)):
+                return 'human_exact_prompt'
+            if not receipt.get('consumed_by'):
+                if not receipt.get('reserved_by'):
+                    # Pin the credit to this Hook before attempting consumption.
+                    # The safe handler can persist this reservation along with
+                    # a failed outcome if either write raises. A replay remains
+                    # deduplicated, but a later human paste cannot steal the
+                    # unconsumed credit after a restart. Reservation is evidence
+                    # of ownership only, never a successful consumption/send.
+                    receipt = {**receipt, 'reserved_by': event_id, 'reserved_at': stamp}
+                    row = {**row, 'watchdog_submission': receipt}
+                    self.claude_event_ledger.events[source_id] = row
+                    atomic_write_json(self.claude_event_ledger.path,
+                                      {'version': 1, 'events': self.claude_event_ledger.events})
+                updated = {**row, 'watchdog_submission': {**receipt,
+                    'consumed_by': event_id, 'consumed_at': stamp}}
+                events = {**self.claude_event_ledger.events, source_id: updated}
+                # Persist before changing the latch/counter or acknowledging the
+                # Hook. A storage failure must never fall back to a human reset.
+                atomic_write_json(self.claude_event_ledger.path, {'version': 1, 'events': events})
+                self.claude_event_ledger.events = events
+            return 'watchdog_echo_durable_correlated'
+
     def _clear_claude_submit(self, runtime: TargetRuntime, *, reason: str = "") -> None:
         if (reason in {"confirmed", "hook_confirmed", "completion_reported"}
                 and (runtime.claude_deferred_event or {}).get("event_id") == runtime.claude_submit_event_id):
@@ -8559,6 +8639,18 @@ class WatchDaemon:
                 return  # legacy orphan key: no event provenance to invent
             event = {**row, "event_id": event_id}
             already = row.get("status") == "sent" or runtime.claude_last_resume_event_id == event_id
+            if (not already and event_id == runtime.claude_last_submit_event_id
+                    and runtime.claude_last_submit_at > 0):
+                # Only this successful-send path creates receipts. Hook payloads
+                # cannot manufacture one, and retrying Enter grants no new credit.
+                row['watchdog_submission'] = {
+                    'surface_id': row.get('surface_id'), 'session_id': runtime.claude_last_submit_session_id,
+                    'generation': runtime.claude_last_submit_generation, 'agent_pid': runtime.claude_process_pid,
+                    'message_hash': runtime.claude_last_submit_message_hash,
+                    'submitted_at': runtime.claude_last_submit_at,
+                    'turn_id': runtime.claude_generation_id, 'turn_started_at': runtime.claude_turn_started_at,
+                }
+            runtime.claude_last_submit_has_receipt = isinstance(row.get('watchdog_submission'), dict)
             if not already:
                 now = time.time()
                 runtime.last_send_at = now
@@ -8597,7 +8689,8 @@ class WatchDaemon:
 
         surface_id = str(target["surface_id"])
         echo_fields = ('claude_last_submit_event_id', 'claude_last_submit_message_hash',
-                       'claude_last_submit_session_id', 'claude_last_submit_generation', 'claude_last_submit_at')
+                       'claude_last_submit_session_id', 'claude_last_submit_generation', 'claude_last_submit_at',
+                       'claude_last_submit_has_receipt')
         previous_echo = {key: getattr(runtime, key) for key in echo_fields}
         try:
             if runtime.claude_submit_write_unknown or runtime.claude_handshake_wait:
@@ -8647,6 +8740,7 @@ class WatchDaemon:
                 runtime.claude_last_submit_session_id = runtime.claude_session_id
                 runtime.claude_last_submit_generation = runtime.claude_process_generation
                 runtime.claude_last_submit_at = time.time()
+                runtime.claude_last_submit_has_receipt = False
                 # Crash / lost response cannot be interpreted as an unsent key.
                 runtime.claude_submit_not_sent = False
                 runtime.claude_submit_write_unknown = True
@@ -9264,6 +9358,7 @@ class WatchDaemon:
     def _clear_claude_handshake(runtime: TargetRuntime) -> None:
         runtime.claude_handshake_challenge = None
         runtime.claude_handshake_wait = False
+        runtime.claude_handshake_provider_conflict = False
         runtime.claude_handshake_ack_at = 0.0
         runtime.claude_handshake_ack_event_id = None
 
@@ -9366,6 +9461,25 @@ class WatchDaemon:
         stamp = float(event["created_at"])
         boundary = max(runtime.claude_turn_started_at, runtime.claude_handshake_ack_at,
                        float((challenge or {}).get("created_at", 0)))
+        mismatch = event.get('handshake_provider_mismatch')
+        if isinstance(mismatch, dict):
+            if (stamp <= boundary or (name == 'UserPromptSubmit'
+                    and mismatch.get('executor') != target.get('ref'))):
+                self._mark_claude_event(event, runtime, 'stale_handshake_provider_conflict')
+                return True
+            # The exact foreign envelope is a protocol error, never ordinary
+            # unfinished work. Do not accept its ACK, dispatch or clear an
+            # unknown write. A fresh valid challenge / explicit human prompt
+            # can resolve this hold through the existing identity-checked path.
+            runtime.claude_handshake_wait = True
+            runtime.claude_handshake_provider_conflict = True
+            runtime.claude_handshake_ack_at = stamp
+            runtime.state = 'claude_handshake_wait'
+            self._clear_claude_deferred(runtime, reason='handshake_provider_conflict')
+            self._clear_claude_fallback_episode(runtime)
+            self._mark_claude_event(event, runtime, 'handshake_provider_conflict',
+                                    detail='Codex handshake on a verified Claude process; correct provider binding')
+            return True
         if name == "UserPromptSubmit" and isinstance(incoming, dict):
             if incoming.get("executor") != target.get("ref") or stamp <= boundary:
                 self._mark_claude_event(event, runtime, "stale_handshake_challenge")
@@ -9407,7 +9521,8 @@ class WatchDaemon:
             return True
         if name == "UserPromptSubmit" and (challenge or runtime.claude_handshake_wait):
             dispatch = event.get("task_dispatch")
-            if (runtime.claude_handshake_wait and isinstance(dispatch, dict) and stamp > boundary
+            if (runtime.claude_handshake_wait and not runtime.claude_handshake_provider_conflict
+                    and isinstance(dispatch, dict) and stamp > boundary
                     and self._claude_dispatch_matches(challenge or {}, dispatch, target)):
                 if runtime.claude_submit_phase != "none":
                     self._clear_claude_submit(runtime, reason="human_prompt_override")
@@ -9588,7 +9703,8 @@ class WatchDaemon:
             runtime.claude_handshake_challenge or runtime.claude_handshake_wait)
         protocol_event = event_name != "SessionStart" and bool(
             runtime.claude_handshake_challenge or runtime.claude_handshake_wait
-            or event.get("collaboration_protocol") or event.get("handshake_ack"))
+            or event.get("collaboration_protocol") or event.get("handshake_ack")
+            or event.get('handshake_provider_mismatch'))
         if handshake_session_start or (protocol_event and not event.get("process_generation")):
             # Native Hooks carry PID/session, not the daemon's generation.
             # Derive missing metadata only from a fresh process inspection;
