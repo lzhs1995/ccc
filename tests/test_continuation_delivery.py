@@ -101,7 +101,7 @@ class DeliveryTests(unittest.TestCase):
                 self.assertEqual(persisted["mode"], "armed")
                 daemon._process_snapshots.close()
 
-    def test_timeout_after_delivery_is_confirmed_by_working_without_duplicate(self):
+    def test_timeout_followed_by_working_keeps_unknown_delivery_without_duplicate(self):
         with tempfile.TemporaryDirectory() as directory:
             client = TimeoutClient(delivered=True)
             daemon = armed_daemon(directory, client)
@@ -110,7 +110,9 @@ class DeliveryTests(unittest.TestCase):
             self.assertEqual(runtime.delivery_status, "unknown")
             self.assertEqual(runtime.send_count, 0)
             daemon.process_once(client)
-            self.assertEqual(runtime.delivery_status, "confirmed")
+            self.assertEqual(runtime.delivery_status, "unknown")
+            self.assertEqual(runtime.delivery_confirmed_at, 0)
+            self.assertTrue(runtime.last_send_error)
             self.assertEqual(runtime.state, "working")
             self.assertEqual(client.attempts, 1)
 

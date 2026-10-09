@@ -10838,13 +10838,11 @@ class WatchDaemon:
                     # exit. Keep observation and original turn de-duplication;
                     # a fresh native identity still gates every actual send.
                     new_targets[sid] = {**old, **record}
-            explicit_ids = {str(t.get("surface_id")) for t in current.get("targets", [])}
+            # Discovery controls observation and send authorization, not the
+            # delivery lifecycle. Keep both agents' attempt/revision history
+            # through removal and re-enrollment; discarding Codex runtime
+            # loses de-duplication and makes the next durable write stale.
             with self._runtime_lock:
-                for sid in old_ids - set(new_targets) - explicit_ids:
-                    # Losing discovery is not a new lifecycle. Retain Claude
-                    # submit/episode state through revocation and re-enrollment.
-                    if self.dynamic_targets[sid].get("follow_agent") != "claude":
-                        self.runtime.pop(sid, None)
                 for sid in set(new_targets) - old_ids:
                     if new_targets[sid].get("follow_agent") == "claude":
                         self._registration_due[sid] = 0.0
@@ -11927,7 +11925,7 @@ class WatchDaemon:
         return final_state, fresh_tree
 
     def _reconcile_codex_delivery(self, surface_id, runtime, state) -> bool:
-        if runtime.delivery_status not in {"sending", "unknown", "accepted", "failed"}:
+        if runtime.delivery_status not in {"sending", "unknown"}:
             return False
         if self._runtime_is_claude(runtime, state):
             return False
@@ -11938,9 +11936,8 @@ class WatchDaemon:
             runtime.state = "delivery_unknown"
             return True
         if state.kind in {"working", "queued_followup"}:
-            runtime.delivery_status = "confirmed"
-            runtime.delivery_confirmed_at = time.time()
-            runtime.last_send_error = ""
+            # UI activity cannot identify the input that caused it. Preserve
+            # this attempt's outcome; only record the current observation.
             return False
         if runtime.delivery_status in {"sending", "unknown"}:
             if runtime.codex_input_phase:
@@ -11953,9 +11950,9 @@ class WatchDaemon:
                         and turn.get('session_id') == runtime.codex_sent_turn_key.split(':', 1)[0]
                         and key != runtime.codex_sent_turn_key
                         and float(turn.get('at') or 0) >= runtime.send_started_at):
-                    runtime.delivery_status = 'confirmed'
-                    runtime.delivery_confirmed_at = time.time()
-                    runtime.last_send_error = ''
+                    # A different authenticated turn lets _codex_turn_ready
+                    # evaluate a new failure. It does not prove this older
+                    # input arrived, so keep its outcome and error unchanged.
                     return False
                 # An empty composer cannot disprove input still queued in the
                 # controller/native process after a lost ACK. Only subsequent
@@ -12252,6 +12249,7 @@ class WatchDaemon:
         runtime.send_attempt_evidence = state.content_fingerprint
         runtime.codex_sent_turn_key = runtime.codex_observed_turn_key
         runtime.delivery_status = "sending"
+        runtime.delivery_confirmed_at = 0.0
         # Invalidate the zero-write proof durably before any new I/O. A crash
         # or lost ACK after this point must retain the normal pending guard.
         runtime.codex_input_not_sent = {}
@@ -12637,6 +12635,7 @@ def write_plist(
             "USER": os.environ.get("USER", ""),
             "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
             "LANG": "en_US.UTF-8",
+            "PYTHONDONTWRITEBYTECODE": "1",
         },
         "StandardOutPath": str(DEFAULT_LOG_DIR / "launchd.out.log"),
         "StandardErrorPath": str(DEFAULT_LOG_DIR / "launchd.err.log"),

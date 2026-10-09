@@ -162,6 +162,25 @@ print('staged daemon constructed without running watch loop')
         self.assertNotIn(str(self.source), self.plist.read_text())
         self.assertIn("&amp;", self.plist.read_text())
 
+    def test_launchd_environment_does_not_add_bytecode_to_release(self):
+        release = core.stage_runtime_release()
+        core.write_plist(runtime_dir=release)
+        document = plistlib.loads(self.plist.read_bytes())
+        before = {str(p.relative_to(release)): p.read_bytes()
+                  for p in release.rglob("*") if p.is_file()}
+        # Deliberately omit -B: launchd must enforce this for the daemon itself.
+        result = subprocess.run(
+            [core.DEFAULT_PYTHON, "-s", "-c",
+             "import cmux_codex_watch, sys; assert sys.dont_write_bytecode"],
+            cwd=document["WorkingDirectory"], env=document["EnvironmentVariables"],
+            capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(before, {str(p.relative_to(release)): p.read_bytes()
+                                 for p in release.rglob("*") if p.is_file()})
+        self.assertFalse(list(release.rglob("__pycache__")))
+        self.launch.assert_not_called()
+
     def test_bootstrap_failure_restores_old_runtime_plist_and_data(self):
         old, old_plist = self.old_install()
         protected = {}

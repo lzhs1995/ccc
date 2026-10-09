@@ -2567,11 +2567,17 @@ class WatchTests(unittest.TestCase):
             daemon.process_once(client)
             self.assertEqual(set(daemon.dynamic_targets), {"codex-a"})
             self.assertEqual(client.sent, [("workspace-uuid", "codex-a", "任务请继续")])
+            runtime = daemon.runtime["codex-a"]
+            delivery_revision = runtime.delivery_revision
+            send_attempt_id = runtime.send_attempt_id
 
             client.top_data = {"windows": []}
             daemon.process_once(client)
             self.assertEqual(daemon.dynamic_targets, {})
-            self.assertNotIn("codex-a", daemon.runtime)
+            self.assertIs(daemon.runtime["codex-a"], runtime)
+            self.assertEqual(runtime.delivery_revision, delivery_revision)
+            self.assertEqual(runtime.send_attempt_id, send_attempt_id)
+            self.assertEqual(client.sent, [("workspace-uuid", "codex-a", "任务请继续")])
 
     def test_failed_workspace_discovery_keeps_last_known_targets(self):
         with tempfile.TemporaryDirectory() as directory:
