@@ -176,7 +176,7 @@ def _native_dispatch(event: dict, stop: dict | None, *, previous: dict | None = 
                       "prompt_uuid": next(iter(prompts)), "message_hash": event["message_hash"]}
 
 
-def _task_files(challenge: dict, dispatch: dict, target: Mapping[str, Any]) -> list[dict]:
+def _task_files(challenge: dict, dispatch: dict, target: Mapping[str, Any]) -> tuple[list[dict], dict]:
     receipt_path = Path(challenge["receipt_path"])
     pack_path = receipt_path.parent / "task-pack.json"
     if dispatch.get("task_pack") != str(pack_path):
@@ -216,8 +216,17 @@ def _task_files(challenge: dict, dispatch: dict, target: Mapping[str, Any]) -> l
             or row.get("executor_ack") is not True or row.get("ack_nonce") != nonce
             or row.get("ack_line") != ack or row.get("ack_line_expected") != ack):
         raise ValueError("finalized task/ACK/skill/callback binding mismatch")
-    return [{"path": str(pack_path), "stat": pack_stat},
-            {"path": str(receipt_path), "stat": receipt_stat}]
+    # Recover the task from the same bytes whose ACK/skill/callback pins were
+    # just verified. Clearing the legacy handshake without this binding would
+    # make a returned callback look like unfinished work to the closeout guard.
+    task_binding = {
+        "task_id": task, "completion_nonce": pack["completion_nonce"],
+        "task_pack": str(pack_path), "artifact_root": str(pack_path.parent),
+        "task_pack_sha256": hashlib.sha256(pack_bytes).hexdigest(),
+        "callback_target": pack["callback_target"],
+    }
+    return ([{"path": str(pack_path), "stat": pack_stat},
+             {"path": str(receipt_path), "stat": receipt_stat}], task_binding)
 
 
 def ordered_events(events: list[dict]) -> list[dict]:
@@ -306,8 +315,16 @@ def plan(*, events: list[dict], ledger: Mapping[str, dict], challenge: dict,
         raise ValueError("turn/compact generation mismatch")
     stop = latest if latest.get("event_name") in ("Stop", "StopFailure") else None
     dispatch, native_file = _native_dispatch(dispatch_event, stop)
-    files = _task_files(challenge, dispatch, target)
+    files, task_binding = _task_files(challenge, dispatch, target)
+    task_binding.update(
+        workspace_id=target["workspace_id"], surface_id=target["surface_id"],
+        session_id=binding["session_id"], agent_pid=binding["pid"],
+        process_generation=binding["process_generation"],
+        dispatch_event_id=dispatch_event["event_id"],
+        dispatch_created_at=dispatch_event["created_at"],
+    )
     return copy.deepcopy({"version": 1, "binding": binding, "challenge": challenge,
+            "task_binding": task_binding,
             "dispatch_event_id": dispatch_event["event_id"], "ack_event_id": ack_id,
             "source_rows": source_rows, "events": events, "files": [native_file, *files],
             "stop": stop, "recovered_at": now})
