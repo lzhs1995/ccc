@@ -3,6 +3,7 @@
 import json
 import os
 import plistlib
+import shlex
 import shutil
 import subprocess
 import sys
@@ -329,6 +330,7 @@ print('staged daemon constructed without running watch loop')
             self.assertEqual(result.returncode, 0, result.stderr)
             commands.append(result.stdout.strip())
         self.assertEqual(commands[0], commands[1])
+        self.assertEqual(shlex.split(commands[0])[1], "-B")
         self.assertIn("/runtime/current/claude_ccc_event_hook.py", commands[0])
         self.assertNotIn("Documents", commands[0])
 

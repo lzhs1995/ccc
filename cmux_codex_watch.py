@@ -299,7 +299,7 @@ CLAUDE_HOOK_DRIFT_WARNING_PER_DAY = 20
 CLAUDE_HOOK_SETTINGS_BACKUP_KEEP = 20
 CLAUDE_HOOK_EVENTS = ("SessionStart", "Stop", "StopFailure", "UserPromptSubmit")
 CLAUDE_HOOK_COMMAND = (
-    f'{DEFAULT_PYTHON} "{DEFAULT_RUNTIME_ROOT / "current" / "claude_ccc_event_hook.py"}"'
+    f'{DEFAULT_PYTHON} -B "{DEFAULT_RUNTIME_ROOT / "current" / "claude_ccc_event_hook.py"}"'
 )
 CLAUDE_PROCESS_INSPECTION_CACHE_SEC = 30.0
 # Process inspection is used only when a current recoverable-error candidate
