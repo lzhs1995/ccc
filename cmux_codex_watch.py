@@ -41,6 +41,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from claude_ccc_protocol import EVENT_JOURNAL_PATH, EVENT_SOCKET_PATH, completion_reported, report_ready_task
+import claude_dispatch_recovery as dispatch_recovery
 import ccc_observation as observation_health
 import ccc_network_client as network_health
 from ccc_codex_queue import NativeCompletionWatcher, QueueRecovery
@@ -69,6 +70,7 @@ DEFAULT_RUNTIME_ROOT = DEFAULT_APP_DIR / "runtime"
 RUNTIME_FILES = ("cmux_codex_watch.py", "ccc_provider_retry.py", "claude_ccc_protocol.py", "claude_ccc_event_hook.py", "ccc_observation.py", "ccc_scheduling.py", "ccc_native_lanes.py", "ccc_delivery.py", "ccc_codex_queue.py", "ccc_codex_goal.py", "ccc_workspace_batch.py", "ccc_private_check.py", "ccc_inventory.py", "ccc_batch_guard.py", "ccc_guard_transport.py", "ccc_guard_watchdog.py", "ccc_guard_scope.py", "ccc_guard_migration.py", "ccc_codex_launcher.py", "ccc_network_client.py", "ccc_network_guard.py", "ccc_mihomo.py", "ccc_native_processes.py", "ccc_access_budget.py", "ccc_access_gateway.py", "ccc_access_service.py", "ccc_batch_timing.py")
 RUNTIME_FILES += ("ccc_native_standby.py", "ccc_standby_identity.py", "ccc_standby_transport.py", "ccc_standby_launch.py")
 RUNTIME_FILES += ("ccc_standby_generation.py", "ccc_standby_manager.py")
+RUNTIME_FILES += ("claude_dispatch_recovery.py",)
 RUNTIME_FILES += ("ccc_client_thread_observation.py", "ccc_request_key_binding.py",
                   "ccc_request_observation_policy.py", "ccc_shared_codex_turn.py")
 RUNTIME_FILES += ("ccc_standby_sources.py", "ccc_standby_rollouts.py", "ccc_standby_readiness.py",
@@ -640,6 +642,7 @@ class TargetRuntime:
     claude_handshake_ack_at: float = 0.0
     claude_handshake_ack_event_id: str | None = None
     claude_handshake_report_recovery: dict[str, Any] = dataclasses.field(default_factory=dict)
+    claude_dispatch_recovery: dict[str, Any] = dataclasses.field(default_factory=dict)
     claude_turn_started_at: float = 0.0
     claude_completion_fingerprint: str | None = None
     claude_completed_at: float = 0.0
@@ -1519,6 +1522,8 @@ CLAUDE_FOOTER_RE = re.compile(
     re.IGNORECASE,
 )
 CLAUDE_PROMPT_RE = re.compile(r"^\s*❯")
+CLAUDE_QUEUED_COMPOSER_RE = re.compile(r"^\s*❯\s*Press up to edit queued messages\s*$")
+CLAUDE_ACTIVITY_TIP_RE = re.compile(r"^\s*⎿\s+Tip:\s+\S.*$")
 # Codex's composer prompt.  A row starting with › is Codex's own input line.
 CODEX_PROMPT_RE = re.compile(r"^\s*›")
 # Claude working / chrome.  Copied from the read-only sampler so this module
@@ -1912,6 +1917,11 @@ def _claude_native_activity(lines: Sequence[str], end: int) -> str | None:
                 or CLAUDE_CONTEXT_LINE_RE.fullmatch(stripped)
                 or CLAUDE_COMPACTION_PROGRESS_RE.fullmatch(stripped)):
             continue
+        if not tail and CLAUDE_ACTIVITY_TIP_RE.fullmatch(stripped):
+            # Claude renders this hint below its live spinner. It is neither
+            # assistant output nor a new turn boundary. Newer content already
+            # accumulated in tail must still prevent matching an old spinner.
+            continue
         if (not stripped or CLAUDE_RULE_RE.fullmatch(stripped)
                 or CLAUDE_FOOTER_RE.search(stripped)
                 or CLAUDE_ASK_FOOTER_RE.fullmatch(stripped)
@@ -2194,6 +2204,12 @@ def classify_claude_grid(grid: Grid, *, claude_message: str = CLAUDE_MESSAGE) ->
     native_activity = _claude_native_activity(
         grid.lines, prompt_row if composer_kind in {"empty", "busy"} else grid.rows,
     )
+    if (composer_kind == "empty"
+            and CLAUDE_QUEUED_COMPOSER_RE.fullmatch(grid.lines[prompt_row])):
+        # Only the faint placeholder of the live composer proves a queue.
+        # Queued prompts above it hide the spinner from the normal backwards
+        # scan. Neither those prompts nor an accepted Enter prove consumption.
+        native_activity = "queued"
 
     if any(
         CLAUDE_QUESTION_RE.search(text) and not CLAUDE_ASK_FOOTER_RE.search(text)
@@ -3427,6 +3443,7 @@ class ClaudeEventLedger:
             "evidence_fingerprint", "synthetic_fallback", "agent_pid", "workspace_id", "created_at",
             "report_migration_source_event_id", "report_migration_turn_started_at",
             "report_migration_generation_id",
+            "dispatch_migration_source_event_id",
         ):
             if key in event and event.get(key) not in (None, ""):
                 row[key] = event[key]
@@ -8275,7 +8292,7 @@ class WatchDaemon:
         }
         for key in ("synthetic_fallback", "attempt_number", "evidence_fingerprint", "workspace_id", "agent_pid", "_registration_revalidation",
                     "report_migration_source_event_id", "report_migration_turn_started_at",
-                    "report_migration_generation_id"):
+                    "report_migration_generation_id", "dispatch_migration_source_event_id"):
             if key in parked_event:
                 runtime.claude_deferred_event[key] = parked_event[key]
         runtime.claude_deferred_reason = reason
@@ -8402,14 +8419,22 @@ class WatchDaemon:
             return False
         if runtime.claude_submit_phase != "none":
             return False
-        if deferred.get("report_migration_source_event_id"):
+        if deferred.get("report_migration_source_event_id") or deferred.get("dispatch_migration_source_event_id"):
             status = self.claude_event_ledger.status_of(str(deferred.get("event_id") or ""))
             # The ledger can be ahead of state.json after a crash. A reserved
             # write is unknown, not permission to replay this migrated Stop.
-            if status != "deferred_report_migration":
+            expected = ("deferred_dispatch_migration" if deferred.get("dispatch_migration_source_event_id")
+                        else "deferred_report_migration")
+            if status != expected:
                 self._clear_claude_deferred(runtime, reason="migration_already_consumed")
                 return False
-            if not self._claude_report_source_current(deferred, target, runtime):
+            if deferred.get("dispatch_migration_source_event_id"):
+                # An append can be revalidated only before a submit starts and
+                # on a stopped frame. Keep the parked event while native work
+                # or a transient read prevents that check; never lose its slot.
+                if not self._refresh_claude_dispatch_recovery(target, runtime, state):
+                    return False
+            elif not self._claude_migration_sources_current(deferred, target, runtime):
                 self._clear_claude_deferred(runtime, reason="migration_source_changed")
                 return False
         max_age = float(self.config.get(
@@ -8502,6 +8527,7 @@ class WatchDaemon:
 
         event_id = str(event.get("event_id") or "")
         self._clear_claude_handshake(runtime)
+        runtime.claude_dispatch_recovery = {}
         # Record this event's own verdict.  Written here rather than read from
         # here: the field is forensics for the turn just started, never the
         # default for the next one.
@@ -8800,10 +8826,10 @@ class WatchDaemon:
                 if runtime.claude_handshake_wait or not identity_check():
                     return False
                 with self.claude_event_ledger._lock:
-                    submit = dict(self.claude_event_ledger.events.get(
-                        str(runtime.claude_submit_event_id or ""), {}))
-                if (submit.get("report_migration_source_event_id")
-                        and not self._claude_report_source_current(submit, target, runtime)):
+                    submit_id = str(runtime.claude_submit_event_id or "")
+                    submit = {**self.claude_event_ledger.events.get(submit_id, {}),
+                              "event_id": submit_id}
+                if not self._claude_migration_sources_current(submit, target, runtime):
                     return False
                 message = str(self.config.get("claude_message") or CLAUDE_MESSAGE)
                 if (runtime.claude_submit_message_hash
@@ -8814,6 +8840,7 @@ class WatchDaemon:
                 return (state.kind == "composer_busy" and state.watchdog_echo
                         and not state.claude_native_activity and identity_check()
                         and not runtime.claude_handshake_wait
+                        and self._claude_migration_sources_current(submit, target, runtime)
                         and str(self.config.get("claude_message") or CLAUDE_MESSAGE) == message)
 
             if not submit_check():
@@ -9006,6 +9033,11 @@ class WatchDaemon:
             # boundary can resolve this. Neither timeout nor an old viewport can.
             runtime.state = "claude_submit_unconfirmed"
             return True
+        if state.claude_native_activity == "queued":
+            # Keep the original transaction, including across daemon restarts.
+            # A queue is not an execution receipt or a reason to type again.
+            runtime.state = "claude_submit_unconfirmed"
+            return True
         if state.claude_native_activity and runtime.claude_submit_phase == "text_written":
             # Native activity may hide the composer without consuming our
             # draft. Preserve the event and text; neither confirm nor expire
@@ -9171,8 +9203,7 @@ class WatchDaemon:
                         and not runtime.claude_handshake_wait
                         and (not event.get("_registration_revalidation")
                              or self._registration_stop_is_latest(event))
-                        and (not event.get("report_migration_source_event_id")
-                             or self._claude_report_source_current(event, target, runtime)))
+                        and self._claude_migration_sources_current(event, target, runtime))
             except (OSError, ValueError, TypeError, CmuxError):
                 return False
         try:
@@ -9198,9 +9229,8 @@ class WatchDaemon:
             return False, "assistant content changed during preflight"
         if event.get("_registration_revalidation") and not self._registration_stop_is_latest(event):
             return False, "registration Stop superseded before submission"
-        if (event.get("report_migration_source_event_id")
-                and not self._claude_report_source_current(event, target, runtime)):
-            return False, "report migration source superseded before submission"
+        if not self._claude_migration_sources_current(event, target, runtime):
+            return False, "migration source superseded before submission"
         _stage("verify_ms")
         # Freeze preflight cost here, at the last preflight stage.  Everything
         # after this line is the submit transaction and is timed on its own.
@@ -9260,10 +9290,12 @@ class WatchDaemon:
             runtime.claude_submit_write_unknown = False
             self.save()
         except InputNotSentError as exc:
-            if event.get("report_migration_source_event_id"):
+            if event.get("report_migration_source_event_id") or event.get("dispatch_migration_source_event_id"):
                 # Only a proven zero-input refusal may reopen this reservation.
                 # Unknown writes and crash-left reserved rows remain consumed.
-                self.claude_event_ledger.mark(event, "deferred_report_migration", detail=str(exc))
+                status = ("deferred_dispatch_migration" if event.get("dispatch_migration_source_event_id")
+                          else "deferred_report_migration")
+                self.claude_event_ledger.mark(event, status, detail=str(exc))
             self._clear_claude_submit(runtime, reason=f"text not sent: {exc}")
             self.save()
             return False, f"Claude input not sent: {exc}"
@@ -9664,6 +9696,262 @@ class WatchDaemon:
             self._mark_claude_event(event, runtime, "stale_task_dispatch")
             return True
         return False
+
+    @staticmethod
+    def _claude_dispatch_binding(runtime: TargetRuntime) -> dict[str, Any]:
+        return {"pid": runtime.claude_process_pid,
+                "process_generation": runtime.claude_process_generation,
+                "session_id": runtime.claude_session_id,
+                "generation_id": runtime.claude_generation_id,
+                "turn_started_at": runtime.claude_turn_started_at,
+                "last_hook_at": runtime.claude_last_hook_at,
+                "last_event_id": runtime.claude_last_event_id}
+
+    def _claude_dispatch_evidence_current(
+        self, proof: Mapping[str, Any], target: Mapping[str, Any], runtime: TargetRuntime,
+    ) -> bool:
+        """Recheck live birth and every original source without replaying a Hook."""
+        binding = proof["binding"]
+        if (runtime.claude_hook_health != "healthy"
+                or runtime.claude_hook_process_generation not in (None, "", binding["process_generation"])
+                or self._foreign_claude_session_owner(str(target["surface_id"]), str(binding["session_id"]))):
+            return False
+        inspected = inspect_claude_process(binding["pid"])
+        started = inspected.get("started_epoch")
+        if (inspected.get("pid") != binding["pid"]
+                or inspected.get("generation") != binding["process_generation"]
+                or type(started) not in (int, float) or not math.isfinite(started)
+                or not 0 < started <= proof["challenge"]["created_at"]):
+            return False
+        cache = runtime.__dict__.setdefault("_dispatch_migration_journal", {})
+        events = dispatch_recovery.journal_events(
+            self.claude_event_inbox.journal_path, str(target["surface_id"]),
+            proof["challenge"]["created_at"], cache)
+        with self.claude_event_ledger._lock:
+            rows = {key: copy.deepcopy(self.claude_event_ledger.events.get(key))
+                    for key in proof["source_rows"]}
+        return dispatch_recovery.sources_current(proof, events, rows)
+
+    def _claude_dispatch_source_current(
+        self, event: Mapping[str, Any], target: Mapping[str, Any], runtime: TargetRuntime,
+    ) -> bool:
+        proof = runtime.claude_dispatch_recovery
+        if (not proof or runtime.claude_handshake_wait
+                or runtime.claude_handshake_provider_conflict or runtime.claude_completed_latched
+                or event.get("event_id") != proof.get("resume_event_id")
+                or event.get("dispatch_migration_source_event_id") != proof["binding"]["last_event_id"]):
+            return False
+        try:
+            expected = proof["binding"]
+            current = self._claude_dispatch_binding(runtime)
+            if (any(current[k] != expected[k] for k in expected if k != "last_event_id")
+                    or current["last_event_id"] not in (expected["last_event_id"], proof["resume_event_id"])):
+                return False
+            guards = self._claude_report_guard_snapshot(runtime)
+            return bool(self._claude_dispatch_evidence_current(proof, target, runtime)
+                        and self._claude_dispatch_binding(runtime) == current
+                        and self._claude_report_guard_snapshot(runtime) == guards
+                        and target == self._event_target(str(target["surface_id"])))
+        except (OSError, ValueError, TypeError, KeyError, RuntimeError):
+            return False
+
+    @staticmethod
+    def _claude_dispatch_resume_event(proof: Mapping[str, Any]) -> dict[str, Any]:
+        source = proof["stop"] or proof["events"][-1]
+        event = {**source, "event_id": proof["resume_event_id"],
+                 "episode_id": proof["resume_event_id"],
+                 "process_generation": proof["binding"]["process_generation"],
+                 "dispatch_migration_source_event_id": source["event_id"]}
+        if not proof["stop"]:
+            event.update(event_name="StopFailure", completed=False,
+                         error_kind="claude_hook_gap", synthetic_fallback=True)
+        return event
+
+    @staticmethod
+    def _claude_dispatch_binding_matches(proof: Mapping[str, Any], runtime: TargetRuntime) -> bool:
+        expected = proof.get("binding", {})
+        current = WatchDaemon._claude_dispatch_binding(runtime)
+        return bool(expected and all(current[k] == expected.get(k) for k in current if k != "last_event_id")
+                    and current["last_event_id"] in (expected.get("last_event_id"), proof.get("resume_event_id")))
+
+    def _refresh_claude_dispatch_recovery(
+        self, target: Mapping[str, Any], runtime: TargetRuntime, state: ScreenState,
+    ) -> bool:
+        """Reprove a native append before a send; write guards never refresh it."""
+        proof = runtime.claude_dispatch_recovery
+        if (not proof or not self._claude_dispatch_binding_matches(proof, runtime)
+                or state.kind not in {"claude_stopped", "recoverable_error"}
+                or state.claude_native_activity or runtime.claude_submit_phase != "none"
+                or runtime.claude_submit_write_unknown or runtime.claude_handshake_wait
+                or runtime.claude_handshake_provider_conflict or runtime.claude_completed_latched
+                or self.stop_requested or self.config.get("mode") != "armed"
+                or self.config.get("global_paused") or not self.config.get("claude_enabled")
+                or target.get("paused") or not target.get("enabled", True)):
+            return False
+        if self.claude_event_ledger.status_of(proof["resume_event_id"]) not in {"", "deferred_dispatch_migration"}:
+            return False
+        event = self._claude_dispatch_resume_event(proof)
+        if self._claude_dispatch_source_current(event, target, runtime):
+            return True
+        try:
+            binding = self._claude_dispatch_binding(runtime)
+            guards = self._claude_report_guard_snapshot(runtime)
+            cache = runtime.__dict__.setdefault("_dispatch_migration_journal", {})
+            events = dispatch_recovery.journal_events(
+                self.claude_event_inbox.journal_path, str(target["surface_id"]),
+                proof["challenge"]["created_at"], cache)
+            with self.claude_event_ledger._lock:
+                rows = {key: copy.deepcopy(self.claude_event_ledger.events.get(key)) for key in proof["source_rows"]}
+            key = (events, rows, [dispatch_recovery.fingerprint(Path(item["path"])) for item in proof["files"]])
+            if runtime.__dict__.get("_dispatch_refresh_rejected") == key:
+                return False
+            try:
+                updated = dispatch_recovery.refresh_append(proof, events, rows)
+            except (ValueError, TypeError, KeyError):
+                runtime.__dict__["_dispatch_refresh_rejected"] = copy.deepcopy(key)
+                raise
+            if (not self._claude_dispatch_evidence_current(updated, target, runtime)
+                    or binding != self._claude_dispatch_binding(runtime)
+                    or guards != self._claude_report_guard_snapshot(runtime)
+                    or proof != runtime.claude_dispatch_recovery
+                    or target != self._event_target(str(target["surface_id"]))
+                    or self.stop_requested or self.config.get("mode") != "armed"
+                    or self.config.get("global_paused") or not self.config.get("claude_enabled")):
+                return False
+            runtime.claude_dispatch_recovery = updated
+            runtime.__dict__.pop("_dispatch_refresh_rejected", None)
+            self.save()
+            return True
+        except (OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:
+            self.logger.debug("surface=%s dispatch append revalidation withheld: %s", str(target["surface_id"])[:8], exc)
+            return False
+
+    def _claude_migration_sources_current(
+        self, event: Mapping[str, Any], target: Mapping[str, Any], runtime: TargetRuntime,
+    ) -> bool:
+        return bool((not event.get("report_migration_source_event_id")
+                     or self._claude_report_source_current(event, target, runtime))
+                    and (not event.get("dispatch_migration_source_event_id")
+                         or self._claude_dispatch_source_current(event, target, runtime)))
+
+    def _recover_claude_dispatch_wait(self, surface_id: str, runtime: TargetRuntime, state: ScreenState) -> bool:
+        """Release an incorrectly suppressed native dispatch, once, in place.
+
+        A dispatch or same-session compaction alone never sends input. An
+        already suppressed unfinished Stop gets a deterministic, separately
+        reserved event and uses the existing deferred sender. Original journal,
+        ledger rows, generation, watermark and consumption records stay intact.
+        """
+        if (not runtime.claude_handshake_wait or state.claude_native_activity
+                or state.kind not in {"claude_stopped", "recoverable_error"}):
+            return False
+        with self._surface_lock(surface_id):
+            challenge = copy.deepcopy(runtime.claude_handshake_challenge)
+            if (not challenge or runtime.claude_handshake_provider_conflict
+                    or not runtime.claude_handshake_ack_event_id or not runtime.claude_handshake_ack_at
+                    or runtime.claude_completed_latched or runtime.claude_submit_phase != "none"
+                    or runtime.claude_submit_write_unknown or runtime.claude_deferred_event
+                    or runtime.claude_hook_health != "healthy" or self.stop_requested
+                    or self.config.get("mode") != "armed" or self.config.get("global_paused")
+                    or not self.config.get("claude_enabled")):
+                return False
+            target = copy.deepcopy(self._event_target(surface_id))
+            if not target or target.get("paused") or not target.get("enabled", True):
+                return False
+            binding = self._claude_dispatch_binding(runtime)
+            if (not binding["pid"] or not binding["process_generation"] or not binding["session_id"]
+                    or challenge.get("agent_pid") != binding["pid"]
+                    or challenge.get("process_generation") != binding["process_generation"]
+                    or challenge.get("session_id") != binding["session_id"]
+                    or challenge.get("executor") != target.get("ref")
+                    or any(challenge.get(k) != target.get(k) for k in ("surface_id", "workspace_id"))):
+                return False
+            guards = self._claude_report_guard_snapshot(runtime)
+            try:
+                cache = runtime.__dict__.setdefault("_dispatch_migration_journal", {})
+                events = dispatch_recovery.journal_events(
+                    self.claude_event_inbox.journal_path, surface_id, challenge["created_at"], cache)
+                with self.claude_event_ledger._lock:
+                    rows = {e["event_id"]: copy.deepcopy(self.claude_event_ledger.events.get(e["event_id"]))
+                            for e in events}
+                # Failed evidence is cached by the actual input bytes' stat
+                # signatures, not a time delay that hides a newly valid stop.
+                paths = [Path(challenge["receipt_path"]), Path(challenge["receipt_path"]).parent / "task-pack.json"]
+                dispatches = [e for e in events if e.get("event_name") == "UserPromptSubmit"
+                              and e["created_at"] > runtime.claude_handshake_ack_at]
+                if len(dispatches) == 1:
+                    paths.append(dispatch_recovery.native_path(dispatches[0]))
+                key = (binding, events, rows, [dispatch_recovery.fingerprint(p) for p in paths],
+                       state.content_fingerprint)
+                if runtime.__dict__.get("_dispatch_migration_rejected") == key:
+                    return False
+                try:
+                    proof = dispatch_recovery.plan(
+                        events=events, ledger=rows, challenge=challenge,
+                        ack_id=runtime.claude_handshake_ack_event_id, ack_at=runtime.claude_handshake_ack_at,
+                        target=target, binding=binding, now=time.time())
+                except (ValueError, TypeError, KeyError):
+                    runtime.__dict__["_dispatch_migration_rejected"] = copy.deepcopy(key)
+                    raise
+                if (not self._claude_dispatch_evidence_current(proof, target, runtime)
+                        or guards != self._claude_report_guard_snapshot(runtime)
+                        or binding != self._claude_dispatch_binding(runtime)
+                        or target != self._event_target(surface_id)
+                        or self.stop_requested or self.config.get("mode") != "armed"
+                        or self.config.get("global_paused") or not self.config.get("claude_enabled")):
+                    return False
+                dispatch = next(e for e in proof["events"] if e["event_id"] == proof["dispatch_event_id"])
+                if runtime.last_send_at > dispatch["created_at"]:
+                    return False
+                identity = {k: dispatch[k] for k in ("event_id", "surface_id", "workspace_id", "session_id", "agent_pid")}
+                identity["process_generation"] = binding["process_generation"]
+                release_id = "dispatch-release-v1-" + hashlib.sha256(
+                    json.dumps(identity, sort_keys=True).encode()).hexdigest()
+                release = {**dispatch, "event_id": release_id, "episode_id": release_id,
+                           "process_generation": binding["process_generation"]}
+                with self.claude_event_ledger._lock:
+                    existing = self.claude_event_ledger.events.get(release_id)
+                    if existing is None:
+                        if self.claude_event_ledger.claim_detailed(release, status="dispatch_wait_released") != CLAUDE_CLAIMED:
+                            return False
+                    elif (existing.get("status") != "dispatch_wait_released"
+                          or self.claude_event_ledger._identity(existing) != self.claude_event_ledger._identity(release)):
+                        return False
+                proof["release_event_id"] = release_id
+                proof["resume_event_id"] = "dispatch-resume-v1-" + hashlib.sha256(
+                    (release_id + ":" + binding["last_event_id"]).encode()).hexdigest()
+                event = None
+                if proof["stop"]:
+                    resume_id = proof["resume_event_id"]
+                    event = self._claude_dispatch_resume_event(proof)
+                    with self.claude_event_ledger._lock:
+                        existing = self.claude_event_ledger.events.get(resume_id)
+                        if existing is None:
+                            if self.claude_event_ledger.claim_detailed(event, status="deferred_dispatch_migration") != CLAUDE_CLAIMED:
+                                return False
+                        elif (existing.get("status") != "deferred_dispatch_migration"
+                              or self.claude_event_ledger._identity(existing) != self.claude_event_ledger._identity(event)):
+                            # A reserved/sent/unknown row wins over stale state
+                            # after a crash. Release the false wait, never retype.
+                            event = None
+                runtime.claude_dispatch_recovery = proof
+                self._clear_claude_handshake(runtime)
+                runtime.claude_deferred_reason = "dispatch_wait_released"
+                runtime.state = "claude_hook_waiting"
+                if event:
+                    runtime.claude_deferred_event = event
+                    runtime.claude_deferred_reason = "dispatch_migration"
+                    runtime.claude_deferred_since = time.time()
+                    runtime.claude_deferred_attempts = 0
+                    runtime.claude_deferred_last_attempt_at = 0.0
+                    runtime.state = "claude_event_pending"
+                self.save()
+                self.logger.info("surface=%s legacy handshake released dispatch=%s pending_stop=%s",
+                                 surface_id[:8], proof["dispatch_event_id"], bool(event))
+                return True
+            except (OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:
+                self.logger.debug("surface=%s legacy dispatch evidence not ready: %s", surface_id[:8], exc)
+                return False
 
     def _legacy_claude_report_latch(self, runtime: TargetRuntime) -> bool:
         if not (runtime.claude_completed_latched and runtime.claude_report_ready_task_id
@@ -10693,6 +10981,7 @@ class WatchDaemon:
         runtime.claude_candidate_since = 0.0
         runtime.claude_candidate_focused = False
         self._recover_claude_report_stop(surface_id, runtime)
+        self._recover_claude_dispatch_wait(surface_id, runtime, state)
         legacy_report = self._legacy_claude_report_latch(runtime)
         if runtime.claude_completed_latched and not legacy_report:
             return dataclasses.replace(
@@ -10770,6 +11059,54 @@ class WatchDaemon:
         runtime.claude_fallback_retry_count = 0
         runtime.claude_fallback_retry_exhausted = False
 
+    def _maybe_send_claude_dispatch_gap(
+        self, target: Mapping[str, Any], runtime: TargetRuntime,
+        state: ScreenState, client: CmuxClient,
+    ) -> bool:
+        """A proven old dispatch owns one rescue even when compact lost Stop."""
+        proof = runtime.claude_dispatch_recovery
+        if (proof.get("stop") or runtime.claude_deferred_event
+                or not self._refresh_claude_dispatch_recovery(target, runtime, state)):
+            self._reset_claude_fallback_candidate(runtime)
+            return False
+        fingerprint = str(state.content_fingerprint)
+        generation = runtime.claude_process_generation
+        if (runtime.claude_fallback_candidate_fingerprint != fingerprint
+                or runtime.claude_fallback_candidate_generation != generation):
+            runtime.claude_fallback_candidate_fingerprint = fingerprint
+            runtime.claude_fallback_candidate_generation = generation
+            runtime.claude_fallback_candidate_polls = 1
+            runtime.state = "claude_hook_gap_candidate"
+            return False
+        runtime.claude_fallback_candidate_polls += 1
+        required = max(2, int(self.config.get("claude_hook_gap_confirm_polls", CLAUDE_HOOK_GAP_CONFIRM_POLLS)))
+        if runtime.claude_fallback_candidate_polls < required:
+            return False
+        event = self._claude_dispatch_resume_event(runtime.claude_dispatch_recovery)
+        if not self._claude_dispatch_source_current(event, target, runtime):
+            self._reset_claude_fallback_candidate(runtime)
+            return False
+        with self.claude_event_ledger._lock:
+            previous = self.claude_event_ledger.events.get(event["event_id"])
+            if previous is None:
+                if self.claude_event_ledger.claim_detailed(event, status="deferred_dispatch_migration") != CLAUDE_CLAIMED:
+                    return False
+            elif (previous.get("status") != "deferred_dispatch_migration"
+                  or self.claude_event_ledger._identity(previous) != self.claude_event_ledger._identity(event)):
+                # Never manufacture a fresh random fallback ID around a saved
+                # reservation, successful send, or unknown transport result.
+                self._reset_claude_fallback_candidate(runtime)
+                return False
+        runtime.claude_deferred_event = event
+        runtime.claude_deferred_reason = "dispatch_migration"
+        runtime.claude_deferred_since = time.time()
+        runtime.claude_deferred_attempts = 0
+        runtime.claude_deferred_last_attempt_at = 0.0
+        runtime.state = "claude_event_pending"
+        self._reset_claude_fallback_candidate(runtime)
+        self.save()
+        return self._maybe_send_deferred_claude_stop(target, runtime, state, client)
+
     def _maybe_send_claude_hook_gap_fallback(
         self,
         target: Mapping[str, Any],
@@ -10783,14 +11120,15 @@ class WatchDaemon:
         This is intentionally narrower than the old idle heartbeat: exact root
         Claude generation, a prior prompt Hook baseline, global CCC hooks
         installed, an unfocused empty composer, and two identical frames are all
-        mandatory. One stable lifecycle episode owns unique per-attempt events;
-        content fingerprints are observations and cannot reset its retry budget.
+        mandatory. One stable lifecycle episode may submit only once; elapsed
+        time, changed content, and daemon restarts cannot authorize a second
+        submission without a new verified lifecycle boundary.
         """
 
         if runtime.claude_handshake_wait or not bool(self.config.get("claude_hook_gap_fallback_enabled", True)):
             self._reset_claude_fallback_candidate(runtime)
             return False
-        if runtime.claude_submit_phase != "none":
+        if runtime.claude_submit_phase != "none" or runtime.claude_submit_write_unknown or state.claude_native_activity:
             # The explicit submit transaction owns this stop; fallback must
             # never manufacture a second event while its Enter is pending.
             self._reset_claude_fallback_candidate(runtime)
@@ -10798,6 +11136,8 @@ class WatchDaemon:
         if not bool(self._claude_hook_config_health.get("healthy")):
             self._reset_claude_fallback_candidate(runtime)
             return False
+        dispatch_migration = bool(runtime.claude_dispatch_recovery
+                                  and self._claude_dispatch_binding_matches(runtime.claude_dispatch_recovery, runtime))
         if (
             self.config.get("mode") != "armed"
             or self.config.get("global_paused", False)
@@ -10809,11 +11149,11 @@ class WatchDaemon:
             # stopped state even when its lifecycle Hook was missed.  Keep the
             # fallback guards below intact; this only admits that proven
             # terminal frame into the same two-poll rescue path.
-            or state.kind not in {
+            or (state.kind not in {
                 "claude_hook_waiting",
                 "claude_hook_missing",
                 "claude_stopped",
-            }
+            } and not (dispatch_migration and state.kind == "recoverable_error"))
             or not state.content_fingerprint
         ):
             self._reset_claude_fallback_candidate(runtime)
@@ -10829,12 +11169,12 @@ class WatchDaemon:
             or pid <= 0
             or pid != runtime.claude_process_pid
             or not runtime.claude_session_id
-            or runtime.claude_last_event_status not in {
+            or (not dispatch_migration and runtime.claude_last_event_status not in {
                 "human_prompt",
                 "watchdog_prompt",
                 "sent",
                 "cancelled",
-            }
+            })
         ):
             self._reset_claude_fallback_candidate(runtime)
             return False
@@ -10845,31 +11185,28 @@ class WatchDaemon:
         except CmuxError:
             self._reset_claude_fallback_candidate(runtime)
             return False
+        if dispatch_migration:
+            return self._maybe_send_claude_dispatch_gap(target, runtime, state, client)
         fingerprint = str(state.content_fingerprint)
-        # A missing Hook leaves us without a lifecycle boundary.  Upstream retry
-        # chrome can nevertheless change the visible content fingerprint every
-        # poll; treating that as a fresh episode reopens attempt=1 and bypasses
-        # both the 120s backoff and the bounded retry budget.  Until a real Hook,
-        # human prompt, confirmation, completion, or process generation change
-        # arrives, keep the confirmation-timeout episode intact and only use the
-        # current fingerprint to make this attempt's ledger ID unique.
+        # A missing Hook leaves us without a consumption receipt. A timeout,
+        # changed retry banner, or daemon restart cannot make an already sent
+        # prompt safe to paste again. Keep this episode until a real lifecycle
+        # boundary arrives; Enter-only recovery still owns an exact saved draft.
         episode_matches = bool(
             runtime.claude_fallback_episode_id
             and runtime.claude_fallback_episode_generation == generation
             and runtime.claude_fallback_episode_session_id == runtime.claude_session_id
         )
-        legacy_unconfirmed_send = bool(
+        legacy_send = bool(
             not runtime.claude_fallback_episode_id
             and runtime.claude_fallback_last_fingerprint
             and runtime.claude_fallback_sent_at > 0
-            and runtime.claude_submit_last_reason == "confirmation_timeout"
             and runtime.claude_last_hook_at <= runtime.claude_fallback_sent_at
         )
-        if legacy_unconfirmed_send:
+        if legacy_send:
             # State written before fallback episodes existed can still contain
-            # a real, unconfirmed rescue and its retry budget.  Give that state
-            # an episode identity in place: clearing it here would reinterpret
-            # the timeout as a brand-new first send and reopen the budget.
+            # a real rescue. Give that state an episode identity in place;
+            # clearing it would reinterpret an old send as a new first attempt.
             runtime.claude_fallback_episode_id = uuid.uuid4().hex
             runtime.claude_fallback_episode_started_at = (
                 runtime.claude_fallback_sent_at or time.time()
@@ -10887,57 +11224,9 @@ class WatchDaemon:
             runtime.claude_fallback_episode_generation = generation
             runtime.claude_fallback_episode_session_id = runtime.claude_session_id
             episode_matches = True
-        retry_episode = bool(
-            episode_matches
-            and runtime.claude_fallback_last_fingerprint
-            and runtime.claude_fallback_sent_at > 0
-            and runtime.claude_submit_last_reason == "confirmation_timeout"
-            and runtime.claude_last_hook_at <= runtime.claude_fallback_sent_at
-        )
-        if episode_matches and runtime.claude_fallback_sent_at > 0 and not retry_episode:
+        if episode_matches and runtime.claude_fallback_sent_at > 0:
             self._reset_claude_fallback_candidate(runtime)
             return False
-        if retry_episode:
-            retry_after = float(self.config.get(
-                "claude_hook_gap_retry_after_sec", CLAUDE_HOOK_GAP_RETRY_AFTER_SEC,
-            ))
-            max_retries = int(self.config.get(
-                "claude_hook_gap_max_retries", CLAUDE_HOOK_GAP_MAX_RETRIES,
-            ))
-            retry_due = (
-                runtime.claude_submit_last_reason == "confirmation_timeout"
-                and runtime.claude_fallback_sent_at > 0
-                and time.time() - runtime.claude_fallback_sent_at >= retry_after
-                and runtime.claude_last_hook_at <= runtime.claude_fallback_sent_at
-            )
-            if not retry_due:
-                self._reset_claude_fallback_candidate(runtime)
-                return False
-            if runtime.claude_fallback_retry_count >= max_retries:
-                first_notice = not runtime.claude_fallback_retry_exhausted
-                runtime.claude_fallback_retry_exhausted = True
-                runtime.state = "claude_hook_gap_exhausted"
-                runtime.error_type = "claude_hook_gap_exhausted"
-                self._reset_claude_fallback_candidate(runtime)
-                if first_notice:
-                    self.logger.error(
-                        "surface=%s Claude hook-gap retry exhausted retries=%d "
-                        "continuing_to_monitor=true",
-                        str(target["surface_id"])[:8],
-                        runtime.claude_fallback_retry_count,
-                    )
-                return True
-            # Treat the old synthetic rescue as covered only after a real Hook
-            # arrives.  Until then require the normal two-poll confirmation
-            # again, but keep the fingerprint so this remains a bounded retry
-            # rather than being mistaken for a fresh first attempt.
-            self.logger.warning(
-                "surface=%s Claude hook-gap rescue unconfirmed; retrying after %.0fs "
-                "retry=%d/%d",
-                str(target["surface_id"])[:8], retry_after,
-                runtime.claude_fallback_retry_count + 1,
-                max_retries,
-            )
         if (
             runtime.claude_fallback_candidate_fingerprint != fingerprint
             or runtime.claude_fallback_candidate_generation != generation
@@ -10956,7 +11245,7 @@ class WatchDaemon:
         if runtime.claude_fallback_candidate_polls < required:
             runtime.state = "claude_hook_gap_candidate"
             return False
-        attempt_number = runtime.claude_fallback_retry_count + 2 if retry_episode else 1
+        attempt_number = 1
         episode_id = str(runtime.claude_fallback_episode_id or "")
         attempt_token = str(runtime.claude_fallback_attempt_token or uuid.uuid4().hex)
         event_id = hashlib.sha256(

@@ -22,6 +22,8 @@ ACTIVE = (
     "✻ Reconnecting…",
     "✻ API error · Retrying in 18s · attempt 10/10",
 )
+QUEUE_HINT = 'Press up to edit queued messages'
+TIP = '  ⎿ Tip: Use /clear to start fresh when switching topics and free up context'
 
 
 def activity_frame(status=WAIT, *, echo=False, metadata=True):
@@ -44,6 +46,17 @@ def activity_frame(status=WAIT, *, echo=False, metadata=True):
 
 def state(payload):
     return w.classify_claude_grid(w.Grid.from_rpc(payload, 'surface-uuid'))
+
+
+def queued_frame(*, faint=True):
+    payload = activity_frame(ACTIVE[1] + '\n' + TIP, metadata=False)
+    grid = payload['render_grid']
+    prompt = grid['cursor']['row']
+    grid['row_spans'].extend([
+        span(prompt - 1, 0, '❯ ' + w.CLAUDE_MESSAGE, 0),
+        span(prompt, 2, QUEUE_HINT, 1 if faint else 0),
+    ])
+    return payload
 
 
 def hidden_activity_frame(status=WAIT, *, newer=None):
@@ -73,6 +86,47 @@ def hidden_activity_frame(status=WAIT, *, newer=None):
 
 
 class NativeActivityTests(unittest.TestCase):
+    def test_tip_below_spinner_does_not_hide_current_activity(self):
+        current = state(activity_frame(ACTIVE[1] + '\n' + TIP))
+        self.assertEqual((current.kind, current.claude_native_activity), ('working', 'working'))
+
+    def test_tip_does_not_erase_a_new_answer_or_stop_boundary(self):
+        for newer in ('⏺ New unfinished answer.', 'API Error: 524 request failed', '✻ Worked for 3m'):
+            with self.subTest(newer=newer):
+                for lines in ((ACTIVE[1], TIP, newer), (ACTIVE[1], newer, TIP)):
+                    current = state(activity_frame('\n'.join(lines)))
+                    self.assertIsNone(current.claude_native_activity)
+                    self.assertNotEqual(current.kind, 'working')
+
+    def test_queued_placeholder_blocks_new_input_but_is_not_consumption(self):
+        current = state(queued_frame())
+        self.assertEqual((current.kind, current.claude_native_activity), ('working', 'queued'))
+        self.assertFalse(current.watchdog_echo)
+
+    def test_queue_hint_in_user_input_or_transcript_does_not_prove_queue(self):
+        typed = state(queued_frame(faint=False))
+        self.assertEqual(typed.kind, 'composer_busy')
+        self.assertIsNone(typed.claude_native_activity)
+        historical = state(claude_grid_payload(lines=['❯ ' + QUEUE_HINT, '⏺ New unfinished answer.']))
+        self.assertEqual(historical.kind, 'claude_stopped')
+        self.assertIsNone(historical.claude_native_activity)
+
+    def test_queued_submit_survives_timeout_and_restart_without_confirmation(self):
+        with tempfile.TemporaryDirectory() as root:
+            d,t,r,e,c = submit_tests.SubmitNotSentTests().setup_case(root)
+            r.claude_submit_phase = 'enter_sent'
+            r.claude_submit_since = time.time() - 1000
+            d.save()
+            restarted = w.WatchDaemon(d.config_path, d.state_path, client=c)
+            recovered = restarted.runtime[t['surface_id']]
+            with mock.patch.object(c, 'send_text', side_effect=AssertionError('duplicate paste')), \
+                    mock.patch.object(c, 'send_key', side_effect=AssertionError('duplicate Enter')):
+                for _ in range(3):
+                    self.assertTrue(restarted._reconcile_claude_submit(t, recovered, state(queued_frame()), c))
+            self.assertEqual(recovered.claude_submit_event_id, e['event_id'])
+            self.assertEqual(recovered.claude_submit_phase, 'enter_sent')
+            self.assertEqual(recovered.claude_submit_confirmed_at, 0)
+
     def test_hidden_composer_footer_cannot_hide_native_activity(self):
         for status, expected in zip(ACTIVE, ('retry', 'working', 'compacting', 'retry', 'retry')):
             with self.subTest(status=status):
@@ -154,46 +208,54 @@ class NativeActivityTests(unittest.TestCase):
                 self.assertEqual(c.sent_keys, [])
 
     def test_connected_enter_rechecks_native_activity(self):
-        with tempfile.TemporaryDirectory() as root, server(lambda c,r:send(c,response(r))) as (transport,requests):
-            d,t,r,e,c = submit_tests.SubmitNotSentTests().setup_case(root)
-            live = socket_tests.ControlSocketTests().client(transport)
-            before = c.replay(t['workspace_id'],t['surface_id'])
-            after = activity_frame(echo=True)
-            with mock.patch.object(live,'replay',side_effect=[before,after]):
-                self.assertFalse(d._send_claude_enter(t,r,live,reason='connected',input_check=lambda:True))
-            self.assertEqual(requests, [])
-            self.assertFalse(r.claude_submit_write_unknown)
-            self.assertTrue(r.claude_submit_not_sent)
+        for after in (activity_frame(echo=True), queued_frame()):
+            with self.subTest(activity=state(after).claude_native_activity), \
+                    tempfile.TemporaryDirectory() as root, \
+                    server(lambda c,r:send(c,response(r))) as (transport,requests):
+                d,t,r,e,c = submit_tests.SubmitNotSentTests().setup_case(root)
+                live = socket_tests.ControlSocketTests().client(transport)
+                before = c.replay(t['workspace_id'],t['surface_id'])
+                with mock.patch.object(live,'replay',side_effect=[before,after]):
+                    self.assertFalse(d._send_claude_enter(t,r,live,reason='connected',input_check=lambda:True))
+                self.assertEqual(requests, [])
+                self.assertFalse(r.claude_submit_write_unknown)
+                self.assertTrue(r.claude_submit_not_sent)
+                self.assertEqual(r.claude_submit_event_id, e['event_id'])
+                self.assertEqual(r.claude_submit_confirmed_at, 0)
 
     def test_text_boundary_rechecks_activity_after_preflight(self):
-        with tempfile.TemporaryDirectory() as root:
-            d,t,r,e,c = delivery_tests.DeliveryRecoveryTests().setup_case(root)
-            original_mark = d.claude_event_ledger.mark
-            def reserve(*args, **kwargs):
-                result = original_mark(*args, **kwargs)
-                c.payload = activity_frame()
-                return result
-            with mock.patch.object(d.claude_event_ledger,'mark',side_effect=reserve):
-                sent, _ = d._send_claude_event(e,t,r,c)
-            self.assertFalse(sent)
-            self.assertEqual(c.sent_text, [])
-            self.assertEqual(c.sent_keys, [])
-            self.assertFalse(r.claude_submit_write_unknown)
+        for after in (activity_frame(), queued_frame()):
+            with self.subTest(activity=state(after).claude_native_activity), tempfile.TemporaryDirectory() as root:
+                d,t,r,e,c = delivery_tests.DeliveryRecoveryTests().setup_case(root)
+                original_mark = d.claude_event_ledger.mark
+                def reserve(*args, **kwargs):
+                    result = original_mark(*args, **kwargs)
+                    c.payload = after
+                    return result
+                with mock.patch.object(d.claude_event_ledger,'mark',side_effect=reserve):
+                    sent, _ = d._send_claude_event(e,t,r,c)
+                self.assertFalse(sent)
+                self.assertEqual(c.sent_text, [])
+                self.assertEqual(c.sent_keys, [])
+                self.assertFalse(r.claude_submit_write_unknown)
 
     def test_connected_text_guard_uses_fresh_frame(self):
-        with tempfile.TemporaryDirectory() as root, server(lambda c,r:send(c,response(r))) as (transport,requests):
-            d,t,r,e,c = delivery_tests.DeliveryRecoveryTests().setup_case(root)
-            live = socket_tests.ControlSocketTests().client(transport)
-            before = copy.deepcopy(c.payload)
-            frames = [before, before, before, activity_frame()]
-            with mock.patch.object(live,'tree',side_effect=c.tree), \
-                    mock.patch.object(live,'top',side_effect=c.top), \
-                    mock.patch.object(live,'read_screen',side_effect=c.read_screen), \
-                    mock.patch.object(live,'replay',side_effect=frames):
-                sent, _ = d._send_claude_event(e,t,r,live)
-            self.assertFalse(sent)
-            self.assertEqual(requests, [])
-            self.assertFalse(r.claude_submit_write_unknown)
+        for after in (activity_frame(), queued_frame()):
+            with self.subTest(activity=state(after).claude_native_activity), \
+                    tempfile.TemporaryDirectory() as root, \
+                    server(lambda c,r:send(c,response(r))) as (transport,requests):
+                d,t,r,e,c = delivery_tests.DeliveryRecoveryTests().setup_case(root)
+                live = socket_tests.ControlSocketTests().client(transport)
+                before = copy.deepcopy(c.payload)
+                frames = [before, before, before, after]
+                with mock.patch.object(live,'tree',side_effect=c.tree), \
+                        mock.patch.object(live,'top',side_effect=c.top), \
+                        mock.patch.object(live,'read_screen',side_effect=c.read_screen), \
+                        mock.patch.object(live,'replay',side_effect=frames):
+                    sent, _ = d._send_claude_event(e,t,r,live)
+                self.assertFalse(sent)
+                self.assertEqual(requests, [])
+                self.assertFalse(r.claude_submit_write_unknown)
 
     def test_retry_ending_releases_original_enter_once_without_repasting(self):
         with tempfile.TemporaryDirectory() as root:

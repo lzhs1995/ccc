@@ -3019,8 +3019,8 @@ class WatchTests(unittest.TestCase):
             ))
             self.assertEqual(client.sent, [])
 
-    def test_hook_gap_fallback_retries_same_fingerprint_after_unconfirmed_send(self):
-        """A timeout must not permanently suppress the unchanged stopped frame."""
+    def test_hook_gap_fallback_preserves_legacy_unconfirmed_send(self):
+        """A legacy timeout is not proof the original prompt was never queued."""
         with tempfile.TemporaryDirectory() as directory, mock.patch(
             "cmux_codex_watch.CLAUDE_EVENT_PREFLIGHT_SETTLE_SEC", 0
         ):
@@ -3050,13 +3050,16 @@ class WatchTests(unittest.TestCase):
             self.assertFalse(daemon._maybe_send_claude_hook_gap_fallback(
                 daemon.config["targets"][0], runtime, state, observation, client,
             ))
-            self.assertTrue(daemon._maybe_send_claude_hook_gap_fallback(
+            self.assertFalse(daemon._maybe_send_claude_hook_gap_fallback(
                 daemon.config["targets"][0], runtime, state, observation, client,
             ))
-            self.assertEqual(len(client.sent), 1)
+            self.assertEqual(client.sent, [])
+            self.assertTrue(runtime.claude_fallback_episode_id)
+            self.assertEqual(runtime.claude_fallback_episode_generation, "generation-a")
+            self.assertEqual(runtime.claude_fallback_episode_session_id, "session-uuid")
 
-    def test_hook_gap_fallback_uses_unique_bounded_retries_and_then_stops(self):
-        """An unconfirmed synthetic rescue cannot become an infinite prompt loop."""
+    def test_hook_gap_fallback_never_repastes_unconfirmed_send_after_restart(self):
+        """Elapsed time and restart cannot turn missing consumption into a retry."""
         with tempfile.TemporaryDirectory() as directory, mock.patch(
             "cmux_codex_watch.CLAUDE_EVENT_PREFLIGHT_SETTLE_SEC", 0
         ):
@@ -3080,40 +3083,39 @@ class WatchTests(unittest.TestCase):
                 content_fingerprint="content-a", screen_signature="screen-a",
             )
 
-            # Initial rescue plus exactly three confirmation-timeout retries.
+            # One rescue; repeated timeouts keep exactly that original event.
             self.assertFalse(daemon._maybe_send_claude_hook_gap_fallback(
                 daemon.config["targets"][0], runtime, state, observation, client,
             ))
             self.assertTrue(daemon._maybe_send_claude_hook_gap_fallback(
                 daemon.config["targets"][0], runtime, state, observation, client,
             ))
-            for expected_retry in range(1, 4):
+            original_event = runtime.claude_fallback_last_event_id
+            original_episode = runtime.claude_fallback_episode_id
+            for elapsed in (121.0, 1000.0, 86400.0):
                 daemon._clear_claude_submit(runtime, reason="confirmation_timeout")
-                runtime.claude_fallback_sent_at = time.time() - 121.0
-                self.assertFalse(daemon._maybe_send_claude_hook_gap_fallback(
-                    daemon.config["targets"][0], runtime, state, observation, client,
-                ))
-                self.assertTrue(daemon._maybe_send_claude_hook_gap_fallback(
-                    daemon.config["targets"][0], runtime, state, observation, client,
-                ))
-                self.assertEqual(runtime.claude_fallback_retry_count, expected_retry)
+                runtime.claude_fallback_sent_at = time.time() - elapsed
+                daemon.save()
+                daemon = WatchDaemon(daemon.config_path, daemon.state_path, client=client)
+                daemon._check_claude_hook_settings(force=True)
+                runtime = daemon.runtime["surface-uuid"]
+                for _ in range(3):
+                    self.assertFalse(daemon._maybe_send_claude_hook_gap_fallback(
+                        daemon.config["targets"][0], runtime, state, observation, client,
+                    ))
+                self.assertEqual(runtime.claude_fallback_last_event_id, original_event)
+                self.assertEqual(runtime.claude_fallback_episode_id, original_episode)
+                self.assertEqual(runtime.claude_fallback_retry_count, 0)
 
-            daemon._clear_claude_submit(runtime, reason="confirmation_timeout")
-            runtime.claude_fallback_sent_at = time.time() - 121.0
-            self.assertTrue(daemon._maybe_send_claude_hook_gap_fallback(
-                daemon.config["targets"][0], runtime, state, observation, client,
-            ))
-            self.assertTrue(runtime.claude_fallback_retry_exhausted)
-            self.assertEqual(runtime.state, "claude_hook_gap_exhausted")
-            self.assertEqual(len(client.sent), 4)
+            self.assertEqual(len(client.sent), 1)
             sent_rows = [
                 row for row in daemon.claude_event_ledger.events.values()
                 if row.get("surface_id") == "surface-uuid" and row.get("status") == "sent"
             ]
-            self.assertEqual(len(sent_rows), 4)
+            self.assertEqual(len(sent_rows), 1)
 
-    def test_hook_gap_retry_budget_survives_upstream_fingerprint_change(self):
-        """Retry chrome changes are not a new lifecycle episode."""
+    def test_hook_gap_unconfirmed_send_survives_upstream_fingerprint_change(self):
+        """Retry chrome changes cannot authorize a second prompt."""
         with tempfile.TemporaryDirectory() as directory, mock.patch(
             "cmux_codex_watch.CLAUDE_EVENT_PREFLIGHT_SETTLE_SEC", 0
         ):
@@ -3151,11 +3153,11 @@ class WatchTests(unittest.TestCase):
             self.assertFalse(daemon._maybe_send_claude_hook_gap_fallback(
                 daemon.config["targets"][0], runtime, changed_state, observation, client,
             ))
-            self.assertTrue(daemon._maybe_send_claude_hook_gap_fallback(
+            self.assertFalse(daemon._maybe_send_claude_hook_gap_fallback(
                 daemon.config["targets"][0], runtime, changed_state, observation, client,
             ))
-            self.assertEqual(runtime.claude_fallback_retry_count, 1)
-            self.assertEqual(len(client.sent), 2)
+            self.assertEqual(runtime.claude_fallback_retry_count, 0)
+            self.assertEqual(len(client.sent), 1)
             self.assertNotEqual(
                 daemon.claude_event_ledger.status_of(runtime.claude_fallback_last_event_id),
                 "",
@@ -6158,10 +6160,13 @@ class ClaudeEpisodeLedgerInvariantTests(unittest.TestCase):
             ))
             first_event = runtime.claude_fallback_last_event_id
             first_episode = runtime.claude_fallback_episode_id
-            daemon._clear_claude_submit(runtime, reason="hook_confirmed")
-            daemon._clear_claude_fallback_episode(runtime)
-            runtime.claude_last_event_status = "human_prompt"
-            runtime.claude_last_hook_at = time.time()
+            daemon._handle_claude_event(claude_hook_event(
+                "new-user-task", "UserPromptSubmit", prompt_kind="human",
+            ), client)
+            self.assertEqual(runtime.claude_last_event_status, "human_prompt")
+            self.assertEqual(runtime.claude_submit_phase, "none")
+            self.assertIsNone(runtime.claude_fallback_episode_id)
+            self.assertEqual(daemon.claude_event_ledger.status_of(first_event), "sent")
             self.assertFalse(daemon._maybe_send_claude_hook_gap_fallback(
                 daemon.config["targets"][0], runtime, stopped, observation, client,
             ))

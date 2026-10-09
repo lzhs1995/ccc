@@ -84,6 +84,19 @@ def report_text(task=TASK):
             'REPORT=/tmp/executor-report.md supervisor_reconciliation_required')
 
 
+def business_dispatch(directory, *, marker=MARKER):
+    return f'STATUS: BUSINESS_DISPATCH {marker}\r' + pack_first_dispatch(directory, marker=marker)
+
+
+def skill_first_dispatch(directory, *, marker=MARKER):
+    return ('READ_AND_OBEY_REQUIRED_SKILL_FIRST\n'
+            f'TASK_PACK={directory}/task-pack.json\n'
+            'REQUIRED_SKILL=/tmp/ccc-offline/SKILL.md\n'
+            'CALLBACK_TARGET=surface:9\n'
+            f'COMPLETION_CALLBACK=DONE|{TASK}|{marker}|REPORT={directory}/executor-report.md\n'
+            '只读复核后提交报告。')
+
+
 def native_event(event_id, event_name, text='', *, created_at=None, **changes):
     payload = {'hook_event_name': event_name, 'session_id': 'session-uuid'}
     payload['prompt' if event_name == 'UserPromptSubmit' else 'last_assistant_message'] = text
@@ -96,6 +109,39 @@ def native_event(event_id, event_name, text='', *, created_at=None, **changes):
 
 
 class HandshakeProtocolTests(unittest.TestCase):
+    def test_business_and_skill_first_native_envelopes_keep_exact_bindings_without_io(self):
+        for build in (business_dispatch, skill_first_dispatch):
+            for separator in ('\r', '\n', '\r\n'):
+                value = separator.join(build('/tmp/with spaces').splitlines())
+                with self.subTest(build=build.__name__, separator=repr(separator)), mock.patch.object(
+                        Path, 'read_text', side_effect=AssertionError('unexpected disk read')):
+                    event = native_event('new-dispatch', 'UserPromptSubmit', value)
+                    self.assertTrue(event['collaboration_protocol'])
+                    self.assertEqual(event['task_dispatch'], {
+                        'task_id': TASK, 'marker': MARKER,
+                        'task_pack': '/tmp/with spaces/task-pack.json',
+                        'required_skill': '/tmp/ccc-offline/SKILL.md', 'callback_target': 'surface:9',
+                        'completion_tail': f'DONE|{TASK}|{MARKER}|REPORT=/tmp/with spaces/executor-report.md'})
+
+    def test_new_envelopes_reject_quoted_missing_duplicate_or_mismatched_fields(self):
+        for build in (business_dispatch, skill_first_dispatch):
+            value = '\n'.join(build('/tmp/new-dispatch').splitlines())
+            bad = ['> ' + value, '```\n' + value + '\n```', 'Example:\n' + value,
+                   value.replace('TASK_PACK=/tmp', 'TASK_PACK=relative'),
+                   value.replace('READ_AND_OBEY_REQUIRED_SKILL_FIRST\n', ''),
+                   value.replace('CALLBACK_TARGET=surface:9', 'CALLBACK_TARGET=other'),
+                   value + '\nTASK_PACK=/tmp/other/task-pack.json',
+                   value + '\nREQUIRED_SKILL=/tmp/OTHER.md',
+                   value + '\nREAD_AND_OBEY_REQUIRED_SKILL_FIRST',
+                   value + '\nCALLBACK_TARGET=surface:99',
+                   value + f'\nDONE|{TASK}|{MARKER}|REPORT=/tmp/other.md',
+                   value + f'\nCOMPLETION_CALLBACK=DONE|{TASK}|{MARKER}|REPORT=/tmp/other.md']
+            if build == business_dispatch:
+                bad.append(value.replace(f'BUSINESS_DISPATCH {MARKER}', 'BUSINESS_DISPATCH different785'))
+            for text in bad:
+                with self.subTest(build=build.__name__, text=text):
+                    self.assertIsNone(protocol.task_dispatch(text))
+
     def test_pack_first_native_dispatch_handles_cr_lf_and_spaced_paths_without_io(self):
         for separator in ('\r', '\n', '\r\n'):
             with self.subTest(separator=repr(separator)), mock.patch.object(
@@ -332,6 +378,26 @@ class HandshakeWaitTests(unittest.TestCase):
         self.handle(stop)
         self.assertEqual(len(self.client.sent_text), 1)
         self.assertEqual(len(self.client.sent_keys), 1)
+
+    def test_measured_dispatch_formats_release_wait_and_retry_only_new_native_failure(self):
+        for index, build in enumerate((business_dispatch, skill_first_dispatch)):
+            with self.subTest(build=build.__name__):
+                base = index * 5
+                self.challenge(offset=base, nonce=f'new785{index}xx')
+                self.ack(offset=base + 1, nonce=f'new785{index}xx')
+                self.write_pack(callback=ack_text(nonce=f'new785{index}xx'))
+                self.assert_waiting()
+                before = (len(self.client.sent_text), len(self.client.sent_keys))
+                dispatch = self.event('UserPromptSubmit', build(self.tmp.name), offset=base + 2)
+                self.handle(dispatch)
+                self.assertFalse(self.runtime.claude_handshake_wait)
+                self.assertEqual((len(self.client.sent_text), len(self.client.sent_keys)), before)
+                self.assertEqual(self.daemon.claude_event_ledger.status_of(dispatch['event_id']), 'task_dispatch')
+                stop = self.event('StopFailure', offset=base + 3, error_kind='claude_api')
+                self.handle(stop)
+                self.handle(stop)
+                self.assertEqual((len(self.client.sent_text), len(self.client.sent_keys)),
+                                 (before[0] + 1, before[1] + 1))
 
     def test_pack_first_dispatch_then_report_continues_once_without_completion_or_confirmation(self):
         self.wait()

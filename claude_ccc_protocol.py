@@ -27,6 +27,11 @@ DEFAULT_CLAUDE_MESSAGE = (
 )
 COMPLETION_SUFFIX = "完成,建议检查usage:/context"
 TRAILING_PUNCTUATION_RE = re.compile(r"[。.!！?？'\"’”）)】」』]+$")
+COMPLETION_SENTENCE_RE = re.compile(
+    r"(?:\A|(?<=[\n。.!！?？;；]))[ \t]{0,3}"
+    r"完成\s*,\s*建议检查\s*usage\s*:\s*/context"
+    r"[\s。.!！'\"’”）)】」』]*\Z", re.IGNORECASE,
+)
 
 
 def _compact(value: str) -> str:
@@ -43,11 +48,7 @@ def completion_reported(value: str) -> bool:
     Whitespace, terminal wraps and full-width punctuation remain compatible.
     """
     text = unicodedata.normalize("NFKC", value or "")
-    match = re.search(
-        r"(?:\A|(?<=[\n。.!！?？;；]))[ \t]{0,3}"
-        r"完成\s*,\s*建议检查\s*usage\s*:\s*/context"
-        r"[\s。.!！'\"’”）)】」』]*\Z", text, re.IGNORECASE,
-    )
+    match = COMPLETION_SENTENCE_RE.search(text)
     if not match:
         return False
     fence = None
@@ -87,7 +88,13 @@ def report_ready_task(value: str) -> str | None:
             candidate = index
     if candidate is None:
         return None
-    compact = re.sub(r"\s+", "", "\n".join(lines[candidate:]))
+    declaration = "\n".join(lines[candidate:])
+    # Keep callback diagnostics even when the executor separately declares its
+    # bounded task complete. Report readiness itself never implies completion.
+    footer = COMPLETION_SENTENCE_RE.search(unicodedata.normalize("NFKC", declaration))
+    if footer:
+        declaration = unicodedata.normalize("NFKC", declaration)[:footer.start()]
+    compact = re.sub(r"\s+", "", declaration)
     match = re.fullmatch(
         r"STATUS:REPORT_READYTASK_ID=([A-Za-z0-9][A-Za-z0-9._:-]{0,159})"
         r"CALLBACK_UNCONFIRMEDREPORT=(/[^\x00-\x1f]+)"
@@ -165,27 +172,52 @@ def task_dispatch(value: str) -> dict[str, str] | None:
     # submit_task_pack accepts both the original multiline envelope and the
     # single-line DELIVERY_NONCE envelope used by the live harness. Parse only
     # explicit, unique fields; never open a prompt-selected file in a Hook.
-    if value.startswith('TASK_PACK='):
+    if value.startswith(('TASK_PACK=', 'STATUS: BUSINESS_DISPATCH ',
+                         'READ_AND_OBEY_REQUIRED_SKILL_FIRST')):
         # The bridge's older finalized envelope uses CR (or LF) separators
         # and a bare callback. It has no DELIVERY_NONCE/TASK_DISPATCH header.
         lines = value.splitlines()
+        header_marker = None
+        skill_first = lines[0] == 'READ_AND_OBEY_REQUIRED_SKILL_FIRST'
+        if lines[0].startswith('STATUS: BUSINESS_DISPATCH '):
+            header = re.fullmatch(rf'STATUS: BUSINESS_DISPATCH ({_NONCE_TOKEN})', lines.pop(0))
+            if not header:
+                return None
+            header_marker = header[1]
+        if skill_first:
+            # The current bridge also puts the read requirement first, then
+            # the three fields and a named callback. Normalize only this exact
+            # layout; arbitrary prose/quoted examples remain inadmissible.
+            if len(lines) < 5:
+                return None
+            lines = [lines[1], lines[2], lines[0], *lines[3:]]
         keys = ('TASK_PACK', 'REQUIRED_SKILL', 'CALLBACK_TARGET')
         if (len(lines) < 5 or re.search(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', value)
                 or lines[2] != 'READ_AND_OBEY_REQUIRED_SKILL_FIRST'
+                or sum(line == 'READ_AND_OBEY_REQUIRED_SKILL_FIRST' for line in lines) != 1
                 or any(len(re.findall(rf'\b{key}=', value)) != 1 for key in keys)
-                or any(token in value for token in ('DELIVERY_NONCE=', 'TASK_DISPATCH', 'COMPLETION_CALLBACK='))
-                or sum(line.startswith(('DONE|', 'BLOCKED|')) for line in lines) != 1):
+                or any(token in value for token in ('DELIVERY_NONCE=', 'TASK_DISPATCH'))
+                or value.count('STATUS: BUSINESS_DISPATCH ') != int(header_marker is not None)
+                or len(re.findall(r'\bCOMPLETION_CALLBACK=', value)) != int(skill_first)
+                or sum(line.startswith(('DONE|', 'BLOCKED|', 'COMPLETION_CALLBACK=')) for line in lines) != 1):
             return None
         pack = re.fullmatch(r'TASK_PACK=(/[^\x00-\x1f]+)', lines[0])
         skill = re.fullmatch(r'REQUIRED_SKILL=(/[^\x00-\x1f]+)', lines[1])
         target = re.fullmatch(r'CALLBACK_TARGET=(surface:\d+)', lines[3])
+        tail = lines[4]
+        if skill_first:
+            if not tail.startswith('COMPLETION_CALLBACK='):
+                return None
+            tail = tail[len('COMPLETION_CALLBACK='):]
         callback = re.fullmatch(
-            rf'(?:DONE|BLOCKED)\|({_TASK_TOKEN})\|({_NONCE_TOKEN})\|REPORT=/[^\x00-\x1f]+', lines[4])
+            rf'(?:DONE|BLOCKED)\|({_TASK_TOKEN})\|({_NONCE_TOKEN})\|REPORT=/[^\x00-\x1f]+', tail)
         if not all((pack, skill, target, callback)):
+            return None
+        if header_marker is not None and header_marker != callback[2]:
             return None
         return {'task_id': callback[1], 'marker': callback[2], 'task_pack': pack[1],
                 'required_skill': skill[1], 'callback_target': target[1],
-                'completion_tail': lines[4]}
+                'completion_tail': tail}
     if value.startswith('DELIVERY_NONCE='):
         keys = ('DELIVERY_NONCE', 'REQUIRED_SKILL', 'TASK_PACK',
                 'CALLBACK_TARGET', 'COMPLETION_CALLBACK')
