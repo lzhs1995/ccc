@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.31 (unreleased)
+
+- Reuse a proven zero-input Codex continuation attempt after a newer failed turn supersedes an old stalled Goal. Keep native turn, process, provider, admission and duplicate-input checks; a current blocked Goal still takes its own recovery path.
+- Recognize a Claude executor's original native `WAITING_SUPERVISOR` Stop even when the older daemon did not retain a task binding. Validate the frozen report and original callback against the marker at the time of that Stop; never recreate a receipt or refresh the wait deadline.
+- Read bounded, fingerprinted native transcript tails so long-running sessions over 128 MiB can retain wait and human-takeover evidence. Preserve original hook provenance and verify the live process when native events omit its generation.
+
 ## 0.2.30 (unreleased)
 
 - Reduce repeated parsing under the shared batch startup lock with a bounded cache of unchanged jobs that cannot contribute startup capacity. Invalidate on file replacement or modification; retain four initialization permits, the 0.5-second interval, the 30-second lease and a fresh authorization check before reservation.

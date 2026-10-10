@@ -3449,6 +3449,7 @@ class ClaudeEventLedger:
             "report_migration_source_event_id", "report_migration_turn_started_at",
             "report_migration_generation_id",
             "dispatch_migration_source_event_id",
+            "transcript_id", "message_hash",
         ):
             if key in event and event.get(key) not in (None, ""):
                 row[key] = event[key]
@@ -8304,7 +8305,8 @@ class WatchDaemon:
         }
         for key in ("synthetic_fallback", "attempt_number", "evidence_fingerprint", "workspace_id", "agent_pid", "_registration_revalidation",
                     "report_migration_source_event_id", "report_migration_turn_started_at",
-                    "report_migration_generation_id", "dispatch_migration_source_event_id"):
+                    "report_migration_generation_id", "dispatch_migration_source_event_id",
+                    "transcript_id", "message_hash"):
             if key in parked_event:
                 runtime.claude_deferred_event[key] = parked_event[key]
         runtime.claude_deferred_reason = reason
@@ -8815,12 +8817,65 @@ class WatchDaemon:
         self.save()
 
 
+    def _native_claude_supervisor_wait(self, target, runtime, identity, event):
+        """Discover an actual Stop summary, including one appended after its Hook.
+
+        Older ledgers omitted the native source. Recover that exact accepted
+        event from the bounded journal; never replay it or create a dispatch.
+        """
+        try:
+            source_proof = None
+            if event is None:
+                event_id = str(runtime.claude_last_event_id or "")
+                with self.claude_event_ledger._lock:
+                    accepted = {**self.claude_event_ledger.events.get(event_id, {}),
+                                "event_id": event_id}
+                if not event_id or accepted.get("synthetic_fallback"):
+                    return None
+                if accepted.get("transcript_id"):
+                    event = accepted
+                else:
+                    event, source_proof = supervisor_closeout.native_event_from_journal(
+                        self.claude_event_inbox.journal_path, accepted)
+            event = dict(event)
+            if event.get("synthetic_fallback") or not event.get("transcript_id"):
+                return None
+            # inspect_claude_process records ps lstart in local time without a
+            # zone, unlike native journal timestamps, which must have one.
+            started = dt.datetime.fromisoformat(runtime.claude_process_started_at or "").timestamp()
+            if not event.get("process_generation"):
+                # Native Hooks do not carry the daemon's generation. Inspect
+                # the live process before enriching, never copy saved metadata.
+                inspected = inspect_claude_process(int(event.get("agent_pid") or 0))
+                started = inspected.get("started_epoch")
+                if (inspected.get("generation") != identity["process_generation"]
+                        or not supervisor_closeout._number(started)
+                        or not supervisor_closeout._number(event.get("created_at"))
+                        or not 0 < started <= event["created_at"]):
+                    return None
+                event["process_generation"] = inspected["generation"]
+            if not self._claude_protocol_identity(runtime, event, target):
+                return None
+            # Only a verified successor dispatch or audited human takeover can
+            # retire an old wait. Generic watchdog turns must not hide it.
+            after = float((runtime.claude_task_binding or {}).get("dispatch_created_at") or 0)
+            takeover = runtime.claude_supervisor_human_takeover or {}
+            after = max(after, float(takeover.get("native_prompt", {}).get("created_at") or 0))
+            wait = self.claude_closeout.native_wait(
+                identity, event=event, process_started_at=started, after=after,
+                watchdog_message=str(self.config.get("claude_message") or CLAUDE_MESSAGE))
+            if wait is not None and source_proof is not None:
+                wait["original_hook_source"] = source_proof
+            return wait
+        except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError):
+            return None
+
     def _claude_supervisor_wait_guard(
         self, target: Mapping[str, Any] | None, runtime: TargetRuntime,
         event: Mapping[str, Any] | None = None,
     ) -> str | None:
         wait = supervisor_closeout.wait_state(runtime.claude_supervisor_wait)
-        if (wait is None and target and runtime.claude_task_binding
+        if (wait is None and target
                 and runtime.claude_hook_health == "healthy"
                 and runtime.claude_hook_process_generation == runtime.claude_process_generation):
             identity = {
@@ -8828,7 +8883,10 @@ class WatchDaemon:
                 "session_id": runtime.claude_session_id, "agent_pid": runtime.claude_process_pid,
                 "process_generation": runtime.claude_process_generation,
             }
-            wait = self.claude_closeout.returned(runtime.claude_task_binding, identity, event=event)
+            if runtime.claude_task_binding:
+                wait = self.claude_closeout.returned(runtime.claude_task_binding, identity, event=event)
+            if wait is None:
+                wait = self._native_claude_supervisor_wait(target, runtime, identity, event)
         if wait is None:
             return None
         changed = wait != runtime.claude_supervisor_wait
@@ -8846,6 +8904,19 @@ class WatchDaemon:
     ) -> tuple[bool, str]:
         """A fresh native human turn cancels the old task, preserving its evidence."""
         wait = runtime.claude_supervisor_wait
+        if wait and not event.get("process_generation"):
+            # A raw human Hook may itself discover a previously unobserved
+            # native wait. Authenticate this closeout operation locally;
+            # ordinary lifecycle Hooks must keep their process-tree handling.
+            try:
+                inspected = inspect_claude_process(int(event.get("agent_pid") or 0))
+                started, stamp = inspected.get("started_epoch"), event.get("created_at")
+                if (inspected.get("generation") == runtime.claude_process_generation
+                        and supervisor_closeout._number(started)
+                        and supervisor_closeout._number(stamp) and 0 < started <= stamp):
+                    event = {**event, "process_generation": inspected["generation"]}
+            except (OSError, ValueError, TypeError, RuntimeError):
+                pass
         if (not wait or not self._claude_protocol_identity(runtime, event, target)
                 or (runtime.claude_task_binding is not None
                     and runtime.claude_task_binding != wait.get("binding"))):
@@ -12023,8 +12094,11 @@ class WatchDaemon:
 
 
     def _unwritten_codex_attempt(self, target, runtime, state):
+        # _codex_turn_ready has already resolved whether the stalled footer
+        # belongs to the current native Goal. A superseded Goal can leave that
+        # footer visible across newer failed turns; it is not an input veto.
         if (state.message_kind != 'codex' or runtime.codex_goal_resume
-                or state.native_goal_stalled or state.requires_goal_proof
+                or state.requires_goal_proof
                 or runtime.codex_private_check
                 or runtime.codex_input_phase != 'input_not_sent'
                 or runtime.delivery_status != 'retryable'

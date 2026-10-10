@@ -13,7 +13,7 @@ import cmux_codex_watch as core
 from ccc_delivery import DeliveryStore
 from ccc_provider_retry import ProviderRetryStore
 from tests import test_native_enter as native
-from tests.test_watch import HIGH_DEMAND_TEXT, grid_payload
+from tests.test_watch import HIGH_DEMAND_TEXT, grid_payload, span
 
 
 ERROR = 'rate limit exceeded: Your requests to gpt-6-astra for gpt-6-astra in eastus2 have exceeded token rate limit.'
@@ -142,6 +142,102 @@ class InputNotSentTests(unittest.TestCase):
 
     def test_same_process_reuses_only_proven_unwritten_attempt(self): self.exercise_recovery()
     def test_restored_delivery_and_provider_reuse_same_attempt(self): self.exercise_recovery(True)
+
+    def stale_goal_footer(self):
+        f = self.f
+        grid = f.client.payload['render_grid']
+        grid['row_spans'].append(span(grid['cursor']['row'] + 1, 0, 'Goal stalled (/goal resume)'))
+        f.state = core.classify_grid(core.Grid.from_rpc(f.client.payload, f.sid))
+        self.assertTrue(f.state.native_goal_stalled)
+        self.assertFalse(f.state.requires_goal_proof)
+        turn = f.daemon.codex_queue_recovery.current_turn(f.target)
+        self.goal = [{**turn, 'kind': 'goal_blocked', 'goal_id': 'old-goal',
+                      'turn_id': 'first', 'at': f.first_start + 1}]
+        self.enterContext(patch.object(f.daemon.codex_queue_recovery, 'process_lookup',
+            return_value={'agent_kind': 'codex', 'agent_pids': [turn['pid']]}))
+        self.enterContext(patch('ccc_codex_goal.blocked_goal', side_effect=lambda *a, **kw: self.goal[0]))
+        # Exercise the real stale-goal filter, not a mocked readiness verdict.
+        self.assertLess(self.goal[0]['at'], turn['at'])
+        self.assertNotEqual(self.goal[0]['turn_id'], turn['turn_id'])
+        self.assertIsNone(f.daemon._current_blocked_goal(f.target))
+
+    def test_stale_goal_footer_reuses_original_unwritten_attempt(self):
+        self.stale_goal_footer()
+        self.exercise_recovery()
+        self.assertFalse(self.f.runtime.codex_goal_resume)
+
+    def test_effective_goal_during_unwritten_retry_withholds_plain_input(self):
+        self.stale_goal_footer()
+        attempt = self.initial_refusal()
+        self.deny = False
+        f = self.f
+        save = f.daemon._save_delivery
+        changed = []
+        def goal_became_current(sid, runtime, *args, **kwargs):
+            result = save(sid, runtime, *args, **kwargs)
+            if runtime.delivery_status == 'sending' and not changed:
+                turn = f.daemon.codex_queue_recovery.current_turn(f.target)
+                self.goal[0] = {**turn, 'kind': 'goal_blocked', 'goal_id': 'current-goal'}
+                changed.append(True)
+            return result
+        with patch.object(f.daemon, '_save_delivery', side_effect=goal_became_current):
+            self.send()
+        self.assertTrue(changed)
+        self.assertIsNotNone(f.daemon._current_blocked_goal(f.target))
+        self.assertFalse(self.pending)
+        self.assertEqual(f.runtime.send_attempt_id, attempt)
+        self.assertEqual(f.runtime.delivery_status, 'cancelled')
+        self.assertEqual(self.episode()['count'], 1)
+
+    def assert_stale_goal_footer_refuses_turn_change(self, change):
+        self.stale_goal_footer()
+        attempt = self.initial_refusal()
+        self.deny = False
+        f = self.f
+        read = f.daemon.codex_queue_recovery.current_turn
+        with patch.object(f.daemon.codex_queue_recovery, 'current_turn',
+                          side_effect=lambda target: {**read(target), **change}):
+            self.assertIsNone(f.daemon._current_blocked_goal(f.target))
+            self.send()
+        self.assertFalse(self.pending)
+        self.assertEqual(f.runtime.send_attempt_id, attempt)
+        self.assertEqual(self.episode()['count'], 1)
+        if change.get('kind') in {'task_started', 'user_message'}:
+            self.assertEqual(f.runtime.state, 'working')
+
+    def test_stale_goal_footer_cannot_authorize_changed_pid(self):
+        self.assert_stale_goal_footer_refuses_turn_change({'pid': 999})
+
+    def test_stale_goal_footer_cannot_authorize_changed_process_start(self):
+        self.assert_stale_goal_footer_refuses_turn_change({'process_start': 1})
+
+    def test_stale_goal_footer_cannot_authorize_changed_provider(self):
+        self.assert_stale_goal_footer_refuses_turn_change({'model_provider': 'another-provider'})
+
+    def test_stale_goal_footer_cannot_authorize_working_turn(self):
+        self.assert_stale_goal_footer_refuses_turn_change({'kind': 'task_started'})
+
+    def test_stale_goal_footer_cannot_authorize_new_user_message(self):
+        self.assert_stale_goal_footer_refuses_turn_change({'kind': 'user_message'})
+
+    def test_new_turn_before_socket_admission_cannot_use_stale_goal_retry(self):
+        self.stale_goal_footer()
+        attempt = self.initial_refusal()
+        self.deny = False
+        control = self.client._control_rpc
+        changed = []
+        def start_turn_before_admission(method, params, **kwargs):
+            self.f.append([{'type': 'event_msg', 'timestamp': self.f.iso(time.time()),
+                            'payload': {'type': 'task_started', 'turn_id': 'new-live-turn'}}])
+            changed.append(True)
+            return control(method, params, **kwargs)
+        with patch.object(self.client, '_control_rpc', side_effect=start_turn_before_admission):
+            self.send()
+        self.assertTrue(changed)
+        self.assertFalse(self.pending)
+        self.assertEqual(self.f.runtime.send_attempt_id, attempt)
+        self.assertEqual(self.f.runtime.codex_input_phase, 'input_not_sent')
+        self.assertEqual(self.episode()['count'], 1)
 
     def test_server_floor_still_blocks_original_attempt(self):
         self.initial_refusal()

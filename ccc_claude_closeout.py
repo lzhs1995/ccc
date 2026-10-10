@@ -4,6 +4,7 @@ from __future__ import annotations
 import builtins
 import copy
 from datetime import datetime
+import fcntl
 import hashlib
 import json
 import math
@@ -24,6 +25,7 @@ import claude_dispatch_recovery as dispatch_recovery
 WAITING = "WAITING_SUPERVISOR"
 TIMED_OUT = "WAITING_SUPERVISOR_TIMEOUT"
 WAIT_SECONDS = 300.0
+NATIVE_TAIL_LIMIT = 4 * 1024 * 1024
 RELEASES_ROOT = Path.home() / ".local/share/multi-agent-collaboration/releases"
 ACTIVE_ROOT = Path("/tmp/multi-agent-collaboration/_active")
 IDENTITY_KEYS = ("workspace_id", "surface_id", "session_id", "agent_pid", "process_generation")
@@ -90,6 +92,67 @@ def snapshot_sha256(value):
                                     separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
 
 
+def native_tail(path):
+    """A locked, bounded suffix of complete native records, with byte provenance.
+
+    This is not a dispatch proof. Whole-file dispatch verification keeps its
+    existing contract; closeout only needs the most recent native turn boundary.
+    A partial final record is uncertain, so it never authorizes a state change.
+    """
+    path = Path(path)
+    if not path.is_absolute() or path.resolve(strict=True) != path:
+        raise ValueError("noncanonical native transcript source")
+    signature = dispatch_recovery.fingerprint(path)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        opened = os.fstat(fd)
+        if (not stat.S_ISREG(opened.st_mode) or opened.st_uid != os.getuid()
+                or opened.st_mode & 0o022 or
+                [getattr(opened, k) for k in dispatch_recovery.STAT_FIELDS] != signature):
+            raise ValueError("untrusted or replaced native source")
+        offset = max(0, opened.st_size - NATIVE_TAIL_LIMIT)
+        stream.seek(max(0, offset - 1))
+        partial_first = offset > 0 and stream.read(1) != b"\n"
+        data = stream.read(NATIVE_TAIL_LIMIT)
+        if partial_first:
+            boundary = data.find(b"\n")
+            if boundary < 0:
+                raise ValueError("no complete native tail record")
+            offset += boundary + 1
+            data = data[boundary + 1:]
+        if data and not data.endswith(b"\n"):
+            raise ValueError("partial native tail record")
+        if ([getattr(os.fstat(fd), k) for k in dispatch_recovery.STAT_FIELDS] != signature
+                or dispatch_recovery.fingerprint(path) != signature):
+            raise ValueError("native source changed during read")
+    return data, {"path": str(path), "stat": signature, "offset_bytes": offset,
+                  "bytes_read": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+
+
+def native_event_from_journal(path, accepted):
+    """Recover only the exact already-accepted Hook, never synthesize/replay it."""
+    data, proof = native_tail(path)
+    matches = []
+    for line in data.splitlines():
+        row = json.loads(line)
+        if isinstance(row, dict) and row.get("event_id") == accepted.get("event_id"):
+            matches.append(row)
+    if len(matches) != 1:
+        raise ValueError("original accepted Hook is outside the bounded journal tail")
+    event = matches[0]
+    for key in ("event_name", "session_id", "agent_pid", "surface_id", "workspace_id", "created_at"):
+        if not accepted.get(key) or event.get(key) != accepted[key]:
+            raise ValueError("original Hook does not match its accepted identity")
+    for key in ("process_generation", "transcript_id", "message_hash"):
+        if (event.get(key) and accepted.get(key)
+                and event[key] != accepted[key]):
+            raise ValueError("original Hook provenance conflicts with the accepted event")
+    if event.get("synthetic_fallback") or not event.get("transcript_id"):
+        raise ValueError("not an original native Hook")
+    return event, proof
+
+
 def native_human_prompt(event, wait, identity, *, watermark, watchdog_message, now=None):
     """证明 callback 之后的新原生输入；Hook 的 human 标签本身没有授权力。
 
@@ -118,7 +181,8 @@ def native_human_prompt(event, wait, identity, *, watermark, watchdog_message, n
     path = dispatch_recovery.native_path(event)
     if not path.is_absolute() or path.resolve(strict=True) != path:
         raise ValueError("noncanonical native transcript source")
-    data, signature = dispatch_recovery.read_file(path, dispatch_recovery.TRANSCRIPT_LIMIT)
+    data, source = native_tail(path)
+    signature = source["stat"]
     matches = []
     latest_input = None
     for index, line in enumerate(data.splitlines()):
@@ -164,7 +228,7 @@ def native_human_prompt(event, wait, identity, *, watermark, watchdog_message, n
     if dispatch_recovery.fingerprint(path) != signature:
         raise ValueError("native source changed during verification")
     _, row, text, native_stamp = matches[0]
-    return {"path": str(path), "stat": signature, "sha256": hashlib.sha256(data).hexdigest(),
+    return {**source,
             "transcript_id": event["transcript_id"], "prompt_uuid": row["uuid"],
             "prompt_sha256": snapshot_sha256(row), "message_hash": message_hash,
             "message_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
@@ -180,8 +244,8 @@ def native_prompt_current(proof, event):
         path = dispatch_recovery.native_path(event)
         if str(path) != proof["path"] or path.resolve(strict=True) != path:
             return False
-        data, signature = dispatch_recovery.read_file(path, dispatch_recovery.TRANSCRIPT_LIMIT)
-        return signature == proof["stat"] and hashlib.sha256(data).hexdigest() == proof["sha256"]
+        _, source = native_tail(path)
+        return all(source.get(k) == proof.get(k) for k in source)
     except (OSError, ValueError, KeyError, TypeError):
         return False
 
@@ -339,6 +403,119 @@ class CloseoutEvidence:
                 "validator": provenance,
             }, now)
         return None
+
+    def native_wait(self, identity, *, event, process_started_at, after=0.0,
+                    watchdog_message=protocol.DEFAULT_CLAUDE_MESSAGE, now=None):
+        """Observe a real native Stop without inventing a lost dispatch binding.
+
+        The marker need only have been live at that native Stop. Expiration now
+        cannot turn an honest historical wait into unfinished executor work.
+        No receipt, dispatch, completion or terminal input is produced here.
+        """
+        now = time.time() if now is None else now
+        try:
+            if (not isinstance(event, dict) or event.get("synthetic_fallback")
+                    or type(identity.get("agent_pid")) is not int
+                    or any(not identity.get(k) or event.get(k) != identity[k] for k in IDENTITY_KEYS)
+                    or not _number(process_started_at) or not _number(after)
+                    or not _number(now) or not 0 < process_started_at <= now
+                    or not _number(event.get("created_at"))
+                    or not process_started_at <= event["created_at"] <= now + 1):
+                return None
+            path = dispatch_recovery.native_path(event)
+            data, source = native_tail(path)
+            rows = []
+            selected = None
+            offset = source["offset_bytes"]
+            for line in data.splitlines(keepends=True):
+                row = json.loads(line)
+                if not isinstance(row, dict):
+                    return None
+                if row.get("type") in ("system", "user", "assistant") and row.get("isSidechain") is not True:
+                    if row.get("sessionId") != identity["session_id"] or row.get("isSidechain") is not False:
+                        return None
+                    rows.append(row)
+                    if row.get("type") == "system" and row.get("subtype") == "stop_hook_summary":
+                        selected = (len(rows) - 1, row, offset)
+                offset += len(line)
+            if selected is None:
+                return None
+            index, row, offset = selected
+            stamp = _epoch(row.get("timestamp"))
+            if (not _number(stamp) or not max(process_started_at, after) < stamp <= now + 1
+                    or row.get("session_id", identity["session_id"]) != identity["session_id"]
+                    or row.get("preventedContinuation") is not True or row.get("hookErrors") != []
+                    or not str(row.get("stopReason", "")).startswith(WAITING + ":")
+                    or not row.get("uuid")):
+                return None
+            # A newer real task owns the session. The triggering human event
+            # may still discover this wait so the existing audited takeover
+            # runs; earlier generic watchdog echoes cannot hide a real Stop.
+            for later in rows[index + 1:]:
+                if later.get("type") != "user" or later.get("isCompactSummary"):
+                    continue
+                text = dispatch_recovery._text(later)
+                content = later.get("message", {}).get("content")
+                has_text = isinstance(content, str) or (isinstance(content, list) and any(
+                    isinstance(b, dict) and b.get("type") == "text" for b in content))
+                if not has_text:
+                    continue
+                candidate = (text is not None and event.get("event_name") == "UserPromptSubmit"
+                             and dispatch_recovery.digest(text) == event.get("message_hash")
+                             and _number(_epoch(later.get("timestamp")))
+                             and abs(_epoch(later["timestamp"]) - event["created_at"]) <= 2)
+                if not candidate and (text is None or not any(
+                        protocol.prompt_kind(text, configured) == "watchdog"
+                        for configured in (watchdog_message, protocol.DEFAULT_CLAUDE_MESSAGE))):
+                    return None
+            hooks = []
+            for info in row.get("hookInfos", []):
+                command = shlex.split(info.get("command", ""))
+                if (len(command) != 3 or command[1] != "-B"
+                        or not Path(command[0]).is_absolute()
+                        or not Path(command[0]).name.startswith("python")):
+                    continue
+                hook = Path(command[2])
+                if hook.name != "cmux_consensus_stop_guard.py":
+                    continue
+                relative = hook.relative_to(self.releases_root)
+                if (len(relative.parts) != 4 or relative.parts[1:3] != ("source", "scripts")
+                        or hook.resolve(strict=True) != hook):
+                    return None
+                hooks.append({"path": str(hook), "sha256": hashlib.sha256(_read(hook)).hexdigest()})
+            loaded = self._validator()
+            if len(hooks) != 1 or loaded is None:
+                return None
+            validator, provenance = loaded
+            matches = []
+            for marker_path, raw, marker in self._markers(identity["workspace_id"], stamp):
+                if marker.get("artifact_root") != row.get("cwd"):
+                    continue
+                evidence = validator.terminal_report(marker, identity["workspace_id"], identity["surface_id"])
+                if (not isinstance(evidence, dict)
+                        or not _epoch(marker["armed_at"]) <= evidence["started_at_epoch"]
+                        <= evidence["ended_at_epoch"] <= stamp
+                        or _read(marker_path) != raw):
+                    continue
+                matches.append((marker_path, raw, evidence))
+            if len(matches) != 1 or not native_prompt_current(source, event):
+                return None
+            marker_path, raw, evidence = matches[0]
+            return wait_state({
+                "status": WAITING, "task_id": evidence["task_id"],
+                "origin": "native_stop_summary", "observed_at": now,
+                "deadline_at": evidence["ended_at_epoch"] + WAIT_SECONDS,
+                "binding": dict(identity), "evidence": evidence, "validator": provenance,
+                "native_summary": {**source, "record_offset_bytes": offset,
+                                   "record_sha256": snapshot_sha256(row),
+                                   "uuid": row["uuid"], "timestamp": row["timestamp"],
+                                   "process_started_at": process_started_at, "hook": hooks[0]},
+                "historical_marker": {"path": str(marker_path),
+                                      "sha256": hashlib.sha256(raw).hexdigest(),
+                                      "validated_at_native_stop": stamp},
+            }, now)
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            return None
 
     def admits_successor(self, wait, binding, *, now=None):
         """只解除同主管的已验证后继派包；复用共享 superseded 规则。"""
