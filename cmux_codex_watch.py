@@ -7220,6 +7220,7 @@ class WatchDaemon:
             token = runtime._observation_timing_token = object()
         previous = runtime.observation_completed_at
         started, stages, outcome = None, {}, "error"
+        reconcile_detail_ms, reconcile_detail_calls = {}, {}
         current = is_current
         try:
             if not runtime.native_failure_at:
@@ -7242,6 +7243,8 @@ class WatchDaemon:
                 is_current=current,
                 authorization_current=lambda: generation == self._config_mtime(),
                 observation_timings=stages,
+                reconcile_detail_ms=reconcile_detail_ms,
+                reconcile_detail_calls=reconcile_detail_calls,
             )
             outcome = "completed"
             return result
@@ -7257,6 +7260,10 @@ class WatchDaemon:
                             "started_at": started_at, "completed_at": now,
                             "total_ms": round(total_ms, 3),
                             "stages_ms": {key: round(value, 3) for key, value in stages.items()},
+                            "reconcile_detail_ms": {key: round(value, 3) for key, value in reconcile_detail_ms.items()},
+                            "reconcile_detail_calls": dict(reconcile_detail_calls),
+                            "reconcile_unattributed_ms": round(max(0, stages.get("reconcile", 0)
+                                - sum(reconcile_detail_ms.values())), 3),
                             "unattributed_ms": round(max(0, total_ms - sum(stages.values())), 3),
                         }
                         if started is not None:
@@ -7280,6 +7287,7 @@ class WatchDaemon:
             runtime = self.runtime.setdefault(sid, TargetRuntime())
             token = runtime._observation_timing_token = object()
         read_duration_ms, stages, outcome = None, {}, "error"
+        reconcile_detail_ms, reconcile_detail_calls = {}, {}
         read_completed_at = 0.0
         lock_started, lock_acquired = time.monotonic(), False
         try:
@@ -7309,7 +7317,8 @@ class WatchDaemon:
                         return
                     self._process_one_target(active, client, tree, "", is_current=current,
                         authorization_current=lambda: generation == self._config_mtime(),
-                        observation_timings=stages)
+                        observation_timings=stages, reconcile_detail_ms=reconcile_detail_ms,
+                        reconcile_detail_calls=reconcile_detail_calls)
                     outcome = "completed"
                 finally:
                     # The legacy measurement ended before releasing this lock.
@@ -7329,6 +7338,10 @@ class WatchDaemon:
                             "started_at": started_at, "completed_at": now,
                             "total_ms": round(total_ms, 3),
                             "stages_ms": {key: round(value, 3) for key, value in stages.items()},
+                            "reconcile_detail_ms": {key: round(value, 3) for key, value in reconcile_detail_ms.items()},
+                            "reconcile_detail_calls": dict(reconcile_detail_calls),
+                            "reconcile_unattributed_ms": round(max(0, stages.get("reconcile", 0)
+                                - sum(reconcile_detail_ms.values())), 3),
                             "unattributed_ms": round(max(0, total_ms - sum(stages.values())), 3),
                         }
                         if read_duration_ms is not None:
@@ -7680,6 +7693,8 @@ class WatchDaemon:
         is_current: Callable[[], bool] | None = None,
         authorization_current: Callable[[], bool] | None = None,
         observation_timings: dict[str, float] | None = None,
+        reconcile_detail_ms: dict[str, float] | None = None,
+        reconcile_detail_calls: dict[str, int] | None = None,
     ) -> ScreenState | None:
         def record_stage(name, started):
             if observation_timings is not None:
@@ -7696,6 +7711,19 @@ class WatchDaemon:
         def measured(name, operation, *args, **kwargs):
             with timed(name):
                 return operation(*args, **kwargs)
+
+        def measured_reconcile(name, operation, *args, **kwargs):
+            # Twelve fixed boundaries, local to this observation. Nested work
+            # must not enter stages_ms again or hide the reconcile residual.
+            started = time.monotonic() if reconcile_detail_ms is not None else 0.0
+            try:
+                return operation(*args, **kwargs)
+            finally:
+                if reconcile_detail_ms is not None:
+                    reconcile_detail_ms[name] = (reconcile_detail_ms.get(name, 0.0)
+                        + (time.monotonic() - started) * 1000)
+                if reconcile_detail_calls is not None:
+                    reconcile_detail_calls[name] = reconcile_detail_calls.get(name, 0) + 1
 
         @contextlib.contextmanager
         def surface_locked():
@@ -7750,28 +7778,38 @@ class WatchDaemon:
             with surface_locked(), timed("reconcile"):
                 if not current():
                     return None
-                self._apply_claude_process_observation(runtime, observation)
-                self._reconcile_claude_hook_identity(target, runtime, observation)
+                measured_reconcile("apply_process_observation",
+                    self._apply_claude_process_observation, runtime, observation)
+                measured_reconcile("hook_identity",
+                    self._reconcile_claude_hook_identity, target, runtime, observation)
                 # Must run on the pre-guard kind: the guards below rewrite an
                 # unreadable viewport into claude_hook_missing and friends,
                 # which would hide the blind spot entirely.
-                self._refresh_claude_unreadable_clock(
+                measured_reconcile("unreadable_clock", self._refresh_claude_unreadable_clock,
                     surface_id, runtime, state.kind, entry="returned_main",
                 )
-                state = self._apply_claude_runtime_guards(surface_id, runtime, state)
-                state = self._apply_claude_context_guard(surface_id, runtime, state)
-                state = self._recover_stranded_codex_queue(target, runtime, state, client, current)
-                if self._reconcile_codex_delivery(surface_id, runtime, state):
+                state = measured_reconcile("runtime_guards",
+                    self._apply_claude_runtime_guards, surface_id, runtime, state)
+                state = measured_reconcile("context_guard",
+                    self._apply_claude_context_guard, surface_id, runtime, state)
+                state = measured_reconcile("codex_queue_recovery",
+                    self._recover_stranded_codex_queue, target, runtime, state, client, current)
+                if measured_reconcile("codex_delivery",
+                        self._reconcile_codex_delivery, surface_id, runtime, state):
                     return None
-                if self._runtime_is_claude(runtime, state) and not current(fresh=True):
+                if self._runtime_is_claude(runtime, state) and not measured_reconcile(
+                        "fresh_authorization", current, fresh=True):
                     return None
-                if self._reconcile_claude_submit(target, runtime, state, client):
+                if measured_reconcile("claude_submit",
+                        self._reconcile_claude_submit, target, runtime, state, client):
                     return
-                self._restore_expired_claude_deferred(runtime)
-                if self._maybe_send_deferred_claude_stop(target, runtime, state, client):
+                measured_reconcile("restore_deferred", self._restore_expired_claude_deferred, runtime)
+                if measured_reconcile("deferred_stop",
+                        self._maybe_send_deferred_claude_stop, target, runtime, state, client):
                     return
-                if self._runtime_is_claude(runtime, state) and self._maybe_send_claude_hook_gap_fallback(
-                    target, runtime, state, observation, client
+                if self._runtime_is_claude(runtime, state) and measured_reconcile(
+                    "hook_gap_fallback", self._maybe_send_claude_hook_gap_fallback,
+                    target, runtime, state, observation, client,
                 ):
                     return
                 if state.kind not in SEND_ELIGIBLE_STATES:
@@ -7847,25 +7885,35 @@ class WatchDaemon:
                     with surface_locked(), timed("reconcile"):
                         if not current():
                             return None
-                        self._apply_claude_process_observation(runtime, observation)
-                        self._reconcile_claude_hook_identity(target, runtime, observation)
-                        self._refresh_claude_unreadable_clock(
+                        measured_reconcile("apply_process_observation",
+                            self._apply_claude_process_observation, runtime, observation)
+                        measured_reconcile("hook_identity",
+                            self._reconcile_claude_hook_identity, target, runtime, observation)
+                        measured_reconcile("unreadable_clock", self._refresh_claude_unreadable_clock,
                             surface_id, runtime, state.kind, entry="returned_retry",
                         )
-                        state = self._apply_claude_runtime_guards(surface_id, runtime, state)
-                        state = self._apply_claude_context_guard(surface_id, runtime, state)
-                        state = self._recover_stranded_codex_queue(target, runtime, state, client, current)
-                        if self._reconcile_codex_delivery(surface_id, runtime, state):
+                        state = measured_reconcile("runtime_guards",
+                            self._apply_claude_runtime_guards, surface_id, runtime, state)
+                        state = measured_reconcile("context_guard",
+                            self._apply_claude_context_guard, surface_id, runtime, state)
+                        state = measured_reconcile("codex_queue_recovery",
+                            self._recover_stranded_codex_queue, target, runtime, state, client, current)
+                        if measured_reconcile("codex_delivery",
+                                self._reconcile_codex_delivery, surface_id, runtime, state):
                             return None
-                        if self._runtime_is_claude(runtime, state) and not current(fresh=True):
+                        if self._runtime_is_claude(runtime, state) and not measured_reconcile(
+                                "fresh_authorization", current, fresh=True):
                             return None
-                        if self._reconcile_claude_submit(target, runtime, state, client):
+                        if measured_reconcile("claude_submit",
+                                self._reconcile_claude_submit, target, runtime, state, client):
                             return
-                        self._restore_expired_claude_deferred(runtime)
-                        if self._maybe_send_deferred_claude_stop(target, runtime, state, client):
+                        measured_reconcile("restore_deferred", self._restore_expired_claude_deferred, runtime)
+                        if measured_reconcile("deferred_stop",
+                                self._maybe_send_deferred_claude_stop, target, runtime, state, client):
                             return
-                        if self._runtime_is_claude(runtime, state) and self._maybe_send_claude_hook_gap_fallback(
-                            target, runtime, state, observation, client
+                        if self._runtime_is_claude(runtime, state) and measured_reconcile(
+                            "hook_gap_fallback", self._maybe_send_claude_hook_gap_fallback,
+                            target, runtime, state, observation, client,
                         ):
                             return
                         if state.kind not in SEND_ELIGIBLE_STATES:

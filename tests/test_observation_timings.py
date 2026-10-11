@@ -48,6 +48,7 @@ class ObservationTimingTests(unittest.TestCase):
         # All external observations and input boundaries are in-memory fixtures.
         # Keep _process_one_target's actual branching, locking and error paths.
         self.daemon._observation_client = Mock(return_value=self.client)
+        self.daemon._notify = Mock()
         self.daemon._argv_startup_observation_held = Mock(return_value=False)
         self.daemon._active_send_target = Mock(side_effect=self.cost(31, self.target))
         self.client.tree = Mock(side_effect=self.cost(29, {}))
@@ -102,6 +103,148 @@ class ObservationTimingTests(unittest.TestCase):
                 if outer:
                     self.clock.advance(release_ms)
         self.daemon._surface_lock = acquire
+
+    def reconcile_costs(self, *, kind="recoverable_error", claude=True, retry=False):
+        self.state = core.ScreenState(kind, message_kind="claude" if claude else "codex")
+        self.daemon._observe_target_viewport.side_effect = self.cost(11, self.state)
+        if retry:
+            errors = iter((core.CmuxError("fixture lookup failed"), None))
+            def viewport(*args):
+                return self.cost(11, self.state, error=next(errors))()
+            self.daemon._observe_target_viewport.side_effect = viewport
+            self.client.ping = Mock(side_effect=self.cost(5, True))
+            self.daemon._refresh_workspace = Mock(side_effect=self.cost(7, True))
+        self.daemon._runtime_is_claude = Mock(return_value=claude)
+        phases = (
+            ("apply_process_observation", "_apply_claude_process_observation", None),
+            ("hook_identity", "_reconcile_claude_hook_identity", None),
+            ("unreadable_clock", "_refresh_claude_unreadable_clock", None),
+            ("runtime_guards", "_apply_claude_runtime_guards", self.state),
+            ("context_guard", "_apply_claude_context_guard", self.state),
+            ("codex_queue_recovery", "_recover_stranded_codex_queue", self.state),
+            ("codex_delivery", "_reconcile_codex_delivery", False),
+            ("fresh_authorization", "_active_send_target", self.target),
+            ("claude_submit", "_reconcile_claude_submit", False),
+            ("restore_deferred", "_restore_expired_claude_deferred", None),
+            ("deferred_stop", "_maybe_send_deferred_claude_stop", False),
+            ("hook_gap_fallback", "_maybe_send_claude_hook_gap_fallback", False),
+        )
+        costs, methods = {}, {}
+        for milliseconds, (name, method, result) in enumerate(phases, 1):
+            costs[name] = milliseconds
+            methods[name] = Mock(side_effect=self.cost(milliseconds, result))
+            setattr(self.daemon, method, methods[name])
+        return costs, methods
+
+    def test_reconcile_details_leave_predicates_and_recording_in_a_separate_residual(self):
+        for source in ("periodic", "native"):
+            with self.subTest(source=source):
+                costs, methods = self.reconcile_costs(kind="idle")
+                self.daemon._runtime_is_claude.side_effect = self.cost(7, True)
+                self.daemon._record_state = Mock(side_effect=self.cost(43))
+                self.assertIsNone(self.observe(source))
+                timing = self.runtime.observation_timings
+                self.assertEqual(timing["reconcile_detail_ms"], costs)
+                self.assertEqual(timing["reconcile_detail_calls"], dict.fromkeys(costs, 1))
+                self.assertEqual(timing["reconcile_unattributed_ms"], 57)
+                self.assertEqual(timing["stages_ms"]["reconcile"], sum(costs.values()) + 57)
+                self.assertEqual(timing["total_ms"], sum(timing["stages_ms"].values()))
+                self.assertEqual(timing["unattributed_ms"], 0)
+                self.assertEqual(methods["fresh_authorization"].call_count, 2 if source == "native" else 1)
+                self.daemon._record_state.assert_called_once()
+
+    def test_reconcile_details_accumulate_main_and_refresh_retry_once_each(self):
+        for source in ("periodic", "native"):
+            with self.subTest(source=source):
+                costs, methods = self.reconcile_costs()
+                errors = iter((core.CmuxError("fixture lookup failed"), None))
+                def fallback(*args):
+                    return self.cost(costs["hook_gap_fallback"], False, error=next(errors))()
+                methods["hook_gap_fallback"].side_effect = fallback
+                self.client.ping = Mock(side_effect=self.cost(5, True))
+                self.daemon._refresh_workspace = Mock(side_effect=self.cost(7, True))
+                self.observe(source)
+                timing = self.runtime.observation_timings
+                self.assertEqual(timing["reconcile_detail_ms"], {key: 2 * ms for key, ms in costs.items()})
+                self.assertEqual(timing["reconcile_detail_calls"], dict.fromkeys(costs, 2))
+                self.assertEqual(timing["stages_ms"]["reconcile"], 2 * sum(costs.values()))
+                self.assertEqual(timing["reconcile_unattributed_ms"], 0)
+                self.assertEqual(timing["total_ms"], sum(timing["stages_ms"].values()))
+                self.assertEqual(timing["unattributed_ms"], 0)
+                self.assertEqual([call.kwargs["entry"] for call in methods["unreadable_clock"].call_args_list],
+                                 ["returned_main", "returned_retry"])
+                self.assertEqual(methods["fresh_authorization"].call_count, 3 if source == "native" else 2)
+
+    def test_reconcile_phase_exceptions_keep_the_completed_prefix_and_failed_duration(self):
+        names = list(self.reconcile_costs()[0])
+        for retry in (False, True):
+            for index, name in enumerate(names):
+                with self.subTest(retry=retry, phase=name):
+                    costs, methods = self.reconcile_costs(retry=retry)
+                    error = RuntimeError(name + " failed")
+                    methods[name].side_effect = self.cost(costs[name], error=error)
+                    with self.assertRaises(RuntimeError) as raised:
+                        self.observe()
+                    self.assertIs(raised.exception, error)
+                    expected = {key: costs[key] for key in names[:index + 1]}
+                    timing = self.runtime.observation_timings
+                    self.assertEqual(timing["outcome"], "error")
+                    self.assertEqual(timing["reconcile_detail_ms"], expected)
+                    self.assertEqual(timing["reconcile_detail_calls"], dict.fromkeys(expected, 1))
+                    self.assertEqual(timing["stages_ms"]["reconcile"], sum(expected.values()))
+                    self.assertEqual(timing["stages_ms"]["viewport_classify"], 22 if retry else 11)
+                    self.assertEqual(timing["reconcile_unattributed_ms"], 0)
+                    for later in names[index + 1:]:
+                        methods[later].assert_not_called()
+
+    def test_reconcile_short_circuit_returns_do_not_count_later_phases(self):
+        for retry in (False, True):
+            for name, result in (("codex_delivery", True), ("fresh_authorization", None),
+                                 ("claude_submit", True), ("deferred_stop", True),
+                                 ("hook_gap_fallback", True)):
+                with self.subTest(retry=retry, phase=name):
+                    costs, methods = self.reconcile_costs(retry=retry)
+                    names = list(costs)
+                    methods[name].side_effect = self.cost(costs[name], result)
+                    self.assertIsNone(self.observe())
+                    expected = {key: costs[key] for key in names[:names.index(name) + 1]}
+                    timing = self.runtime.observation_timings
+                    self.assertEqual(timing["outcome"], "completed")
+                    self.assertEqual(timing["reconcile_detail_ms"], expected)
+                    self.assertEqual(timing["reconcile_detail_calls"], dict.fromkeys(expected, 1))
+                    self.assertEqual(timing["stages_ms"]["reconcile"], sum(expected.values()))
+                    self.assertEqual(timing["stages_ms"]["viewport_classify"], 22 if retry else 11)
+                    for later in names[names.index(name) + 1:]:
+                        methods[later].assert_not_called()
+        self.daemon._codex_turn_ready.assert_not_called()
+        self.daemon._handle_state.assert_not_called()
+
+    def test_codex_does_not_gain_claude_authorization_calls_or_detail_keys(self):
+        for source in ("periodic", "native"):
+            with self.subTest(source=source):
+                costs, methods = self.reconcile_costs(claude=False)
+                self.observe(source)
+                expected = {key: ms for key, ms in costs.items()
+                            if key not in {"fresh_authorization", "hook_gap_fallback"}}
+                timing = self.runtime.observation_timings
+                self.assertEqual(timing["reconcile_detail_ms"], expected)
+                self.assertEqual(timing["reconcile_detail_calls"], dict.fromkeys(expected, 1))
+                self.assertEqual(methods["fresh_authorization"].call_count, int(source == "native"))
+                methods["hook_gap_fallback"].assert_not_called()
+
+    def test_skipped_observation_clears_previous_reconcile_details_without_a_new_read(self):
+        self.observe()
+        self.assertTrue(self.runtime.observation_timings["reconcile_detail_calls"])
+        before = self.metrics()[1:]
+        self.runtime.native_failure_at = 0
+        self.daemon._standby_periodic_hint = Mock()
+        self.daemon._standby_periodic_hint.covered.return_value = True
+        self.observe()
+        timing = self.runtime.observation_timings
+        self.assertEqual(timing["reconcile_detail_ms"], {})
+        self.assertEqual(timing["reconcile_detail_calls"], {})
+        self.assertEqual(timing["reconcile_unattributed_ms"], 0)
+        self.assertEqual(self.metrics()[1:], before)
 
     def test_periodic_stages_exclude_lock_wait_from_reconciliation(self):
         self.surface_lock_cost(wait_ms=7)
