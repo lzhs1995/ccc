@@ -127,7 +127,12 @@ class DispatchRecoveryTests(unittest.TestCase):
         self.history(helpers.skill_first_dispatch, 'StopFailure')
         self.recover()
         self.assertTrue(self.deferred())
-        self.deferred()
+        self.no_input()
+        self.assertFalse(self.runtime.claude_deferred_event)
+        with mock.patch.object(core.time, 'time', return_value=self.runtime.claude_provider_guard['retry_after'] + 1):
+            self.recover()
+            self.assertTrue(self.deferred())
+            self.deferred()
         self.assert_one_resume()
         self.originals_unchanged()
 

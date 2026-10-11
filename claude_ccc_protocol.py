@@ -161,18 +161,16 @@ def classify_stop_failure(error: Any, error_details: Any = "") -> dict[str, Any]
     codes = {match[1] for match in _ERROR_STATUS_RE.finditer(evidence)}
     codes.update(match[1] for match in _REJECTED_STATUS_RE.finditer(folded))
     kind, reason = "claude_api", "provider_error"
-    if enum in {"authentication_failed", "oauth_org_not_allowed", "cloud_credential_error"}:
-        kind, reason = "claude_auth", "authentication_rejected"
-    elif enum in {"billing_error", "account_on_hold"}:
-        kind, reason = "claude_billing", "billing_rejected"
-    elif enum == "model_not_found":
-        kind, reason = "claude_model_unavailable", "model_unavailable"
-    elif re.search(
+    if re.search(
         r"insufficient.{0,32}(?:credit|balance|quota)|credit balance.{0,32}(?:low|exhaust|insufficient)|"
         r"(?:billing|payment)[_ ](?:error|required)|account[_ ]on[_ ]hold|"
         r"余额不足|余额已耗尽|预扣费.{0,16}(?:失败|拒绝|不足)|欠费|额度不足", folded,
-    ) or "402" in codes:
+    ) or "402" in codes or enum in {"billing_error", "account_on_hold"}:
         kind, reason = "claude_billing", "billing_rejected"
+    elif enum in {"authentication_failed", "oauth_org_not_allowed", "cloud_credential_error"}:
+        kind, reason = "claude_auth", "authentication_rejected"
+    elif enum == "model_not_found":
+        kind, reason = "claude_model_unavailable", "model_unavailable"
     elif re.search(
         r"authentication[_ ](?:failed|error)|oauth_org_not_allowed|cloud_credential_error|"
         r"invalid[_ ](?:api[_ ]?)?key|(?:api[_ ]?key|credentials?).{0,32}(?:expired|revoked|invalid)|"

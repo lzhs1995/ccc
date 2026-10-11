@@ -376,6 +376,10 @@ class HandshakeWaitTests(unittest.TestCase):
         stop = self.event('StopFailure', offset=3, error_kind='claude_429')
         self.handle(stop)
         self.handle(stop)
+        self.assert_no_input()
+        with mock.patch.object(core.time, 'time', return_value=self.runtime.claude_provider_guard['retry_after'] + 1):
+            self.daemon._maybe_send_deferred_claude_stop(self.target, self.runtime, self.screen(), self.client)
+            self.daemon._maybe_send_deferred_claude_stop(self.target, self.runtime, self.screen(), self.client)
         self.assertEqual(len(self.client.sent_text), 1)
         self.assertEqual(len(self.client.sent_keys), 1)
 

@@ -26,6 +26,7 @@ class ProviderFailureClassificationTests(unittest.TestCase):
             ("unknown", "HTTP 405 Method Not Allowed", "claude_request_invalid"),
             ("server_error", "API Error: 403 API Key 所属分组已删除", "claude_auth"),
             ("server_error", "HTTP 403 预扣费失败：余额不足", "claude_billing"),
+            ("authentication_failed", "HTTP 403 /login 预扣费失败：余额不足", "claude_billing"),
             ("unknown", {"error": {"status": 403, "message": "API Key 所属分组已删除"}}, "claude_auth"),
             ("", "API Error: 401", "claude_auth"),
             ("", "API Error: 403", "claude_auth"),
