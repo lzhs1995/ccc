@@ -3633,7 +3633,9 @@ class ClaudeEventLedger:
         unresolved = {item[1] for item in latest_delivery.values()}
         for event_id, row in self.events.items():
             status = str(row.get("status") or "")
-            if self._is_active_status(status) or event_id in unresolved:
+            if (self._is_active_status(status) or event_id in unresolved
+                    or isinstance(row.get("provider_superseded_submission"), Mapping)
+                    or isinstance(row.get("provider_native_receipt"), Mapping)):
                 protected[event_id] = row
             else:
                 removable.append((event_id, row))
@@ -8388,6 +8390,137 @@ class WatchDaemon:
             return ScreenState(outcome, reason=outcome, message_kind="codex")
         return state
 
+    @staticmethod
+    def _claude_provider_submission_snapshot(runtime: TargetRuntime) -> dict[str, Any]:
+        """Keep the old input facts and budgets after its active slot retires."""
+        return {key: copy.deepcopy(value) for key, value in runtime.to_dict().items()
+                if key.startswith(("claude_submit_", "claude_last_submit_", "claude_orphan_", "claude_fallback_"))
+                or key in {"send_count", "last_send_at", "claude_consecutive_resumes",
+                           "claude_generation_id", "claude_turn_started_at"}}
+
+    def _retire_claude_provider_submission(
+        self, surface_id: str, runtime: TargetRuntime, guard: Mapping[str, Any],
+    ) -> None:
+        """A durable task boundary retires an old slot, never its input evidence.
+
+        Replaying this after a ledger-before-state crash is idempotent. An
+        archived reservation remains reserved; an unknown write is not changed
+        into a send receipt. Only the active slot belongs to the new task.
+        """
+        source_id = str(runtime.claude_submit_event_id or "")
+        if not source_id or (runtime.claude_submit_phase == "none" and not runtime.claude_submit_write_unknown):
+            return
+        with self.claude_event_ledger._lock:
+            row = self.claude_event_ledger.events.get(source_id)
+            if not row or row.get("surface_id") != surface_id:
+                return
+            receipt = row.get("provider_native_receipt")
+            archived = row.get("provider_superseded_submission")
+            if isinstance(receipt, Mapping):
+                reason = "hook_confirmed"
+            elif isinstance(archived, Mapping):
+                reason = "provider_task_superseded"
+            else:
+                boundary = float(guard.get("release_created_at") or 0)
+                created, submitted = row.get("created_at"), runtime.claude_submit_since
+                if (guard.get("status") != "released" or boundary <= 0
+                        or row.get("workspace_id") != guard.get("workspace_id")
+                        or any(type(stamp) not in (int, float) or not math.isfinite(stamp)
+                               or not 0 < stamp <= boundary for stamp in (created, submitted))):
+                    return
+                audit = {"version": 1, "archived_at": time.time(),
+                         "event": {**row, "event_id": source_id},
+                         "pending_submit": self._claude_provider_submission_snapshot(runtime),
+                         "release": {key: copy.deepcopy(value) for key, value in guard.items()
+                                     if key.startswith("release_") and key != "release_candidate"}}
+                audit["sha256"] = supervisor_closeout.snapshot_sha256(audit)
+                events = {**self.claude_event_ledger.events,
+                          source_id: {**row, "provider_superseded_submission": audit}}
+                # A storage failure leaves every active field and budget intact.
+                self.claude_event_ledger._write(events)
+                self.claude_event_ledger.events = events
+                reason = "provider_task_superseded"
+        self._clear_claude_submit(runtime, reason=reason)
+
+    def _confirm_claude_provider_submission(
+        self, target: Mapping[str, Any], runtime: TargetRuntime, event: Mapping[str, Any],
+    ) -> bool:
+        """Settle an identity-checked native watchdog receipt without release."""
+        source_id = str(runtime.claude_submit_event_id or "")
+        stamp, submitted = event.get("created_at"), runtime.claude_last_submit_at
+        pending_hash = str(runtime.claude_submit_message_hash or "")
+        submitted_hash = str(runtime.claude_last_submit_message_hash or "")
+        event_hash = str(event.get("message_hash") or "")
+        tolerance = float(self.config.get("claude_echo_clock_tolerance_sec", CLAUDE_ECHO_CLOCK_TOLERANCE_SEC))
+        if (event.get("event_name") != "UserPromptSubmit" or event.get("prompt_kind") != "watchdog"
+                or event.get("synthetic_fallback") or not source_id
+                or (runtime.claude_submit_phase == "none" and not runtime.claude_submit_write_unknown)
+                or source_id != runtime.claude_last_submit_event_id
+                or runtime.claude_last_submit_session_id != event.get("session_id")
+                or runtime.claude_last_submit_generation != event.get("process_generation")
+                or not self._claude_protocol_identity(runtime, event, target)
+                or len(pending_hash) < 16 or len(submitted_hash) < 16 or len(event_hash) < len(pending_hash)
+                or not self._hashes_agree(pending_hash, event_hash)
+                or not self._hashes_agree(pending_hash, submitted_hash)
+                or type(submitted) not in (int, float) or not math.isfinite(submitted)
+                or type(stamp) not in (int, float) or not math.isfinite(stamp)
+                or not 0 < submitted <= stamp + tolerance
+                or stamp < max(runtime.claude_turn_started_at, runtime.claude_last_hook_at,
+                               float((runtime.claude_provider_guard or {}).get("release_created_at") or 0))):
+            return False
+        pending = self._claude_provider_submission_snapshot(runtime)
+        identity = {"surface_id": target["surface_id"], "workspace_id": target["workspace_id"],
+                    "session_id": runtime.claude_session_id, "agent_pid": runtime.claude_process_pid,
+                    "process_generation": runtime.claude_process_generation}
+        # Watchdog labels and matching Hook hashes are not native reception.
+        # The ordinary typed-user verifier also accepts our exact watchdog
+        # body; here its boundary is this Enter, never a provider release.
+        boundary = {"binding": identity, "evidence": {"ended_at_epoch": submitted}}
+        try:
+            proof = supervisor_closeout.native_human_prompt(
+                event, boundary, identity,
+                watermark=max(runtime.claude_turn_started_at, runtime.claude_last_hook_at,
+                              float((runtime.claude_provider_guard or {}).get("release_created_at") or 0)),
+                watchdog_message=str(self.config.get("claude_message") or CLAUDE_MESSAGE))
+            if not self._hashes_agree(pending_hash, proof["message_sha256"]):
+                return False
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            return False
+        with self.claude_event_ledger._lock:
+            row = self.claude_event_ledger.events.get(source_id)
+            if (not row or row.get("surface_id") != target["surface_id"]
+                    or row.get("session_id") != runtime.claude_session_id
+                    or row.get("provider_superseded_submission")):
+                return False
+            receipt = row.get("watchdog_submission")
+            if isinstance(receipt, Mapping):
+                if self._consume_claude_echo_receipt(runtime, event, read_only=True) != "watchdog_echo_durable_correlated":
+                    return False
+                row = {**row, "watchdog_submission": {**receipt,
+                       "consumed_by": event["event_id"], "consumed_at": stamp}}
+            audit = {"version": 1, "confirmed_at": time.time(), "event": dict(event),
+                     "source_event_id": source_id,
+                     "pending_submit": pending, "native_prompt": proof}
+            audit["sha256"] = supervisor_closeout.snapshot_sha256(audit)
+            events = {**self.claude_event_ledger.events,
+                      source_id: {**row, "provider_native_receipt": audit},
+                      str(event["event_id"]): {
+                          **self.claude_event_ledger.events.get(str(event["event_id"]), {}),
+                          **self.claude_event_ledger._row_from_event(
+                              event, status="watchdog_confirmed", detail="watchdog_pending_correlated"),
+                      }}
+            if (self._claude_provider_submission_snapshot(runtime) != pending
+                    or not self._validated_claude_provider_event(target, runtime, event)
+                    or not supervisor_closeout.native_prompt_current(proof, event)):
+                return False
+            self.claude_event_ledger._write(events)
+            self.claude_event_ledger.events = events
+        # _sync also applies this durable receipt after a state-save crash.
+        self._sync_claude_provider_guard(str(target["surface_id"]), runtime)
+        self._mark_claude_event(event, runtime, "watchdog_confirmed", detail="watchdog_pending_correlated")
+        self._claude_provider_guard_reason(target, runtime)
+        return True
+
     def _sync_claude_provider_guard(self, surface_id: str, runtime: TargetRuntime) -> dict[str, Any] | None:
         """The ledger wins over an older state snapshot, including releases."""
         guard = self.claude_event_ledger.provider_guard(surface_id)
@@ -8395,6 +8528,8 @@ class WatchDaemon:
             value = self.claude_event_ledger._normalise_provider_guard(surface_id, runtime.claude_provider_guard)
             guard = self.claude_event_ledger.put_provider_guard(surface_id, value)
         runtime.claude_provider_guard = guard
+        if guard:
+            self._retire_claude_provider_submission(surface_id, runtime, guard)
         if not guard or guard.get("status") != "retry_wait":
             return guard
         event = guard.get("retry_event")
@@ -8643,6 +8778,7 @@ class WatchDaemon:
                "release_session_id": runtime.claude_session_id,
                "released_screen_fingerprint": str(guard.get("screen_fingerprint") or "")}
         runtime.claude_provider_guard = self.claude_event_ledger.put_provider_guard(surface_id, row)
+        self._sync_claude_provider_guard(surface_id, runtime)
         return True
 
     def _release_claude_provider_generation(self, runtime: TargetRuntime, observation: Mapping[str, Any]) -> None:
@@ -8665,6 +8801,7 @@ class WatchDaemon:
             "release_agent_pid": observation["pid"], "release_process_generation": generation,
             "release_session_id": "", "released_screen_fingerprint": str(guard.get("screen_fingerprint") or ""),
         })
+        self._sync_claude_provider_guard(surface_id, runtime)
 
     def _mark_claude_event(
         self,
@@ -8812,9 +8949,13 @@ class WatchDaemon:
         # *before* releasing the slot.  Only advance a status that is still the
         # provisional ``deferred_*`` one, or the record of a real delivery would
         # be overwritten by its own cleanup.
-        current = self.claude_event_ledger.status_of(held)
+        with self.claude_event_ledger._lock:
+            row = self.claude_event_ledger.events.get(held, {})
+            current = str(row.get("status") or "")
+            archived = any(isinstance(row.get(key), Mapping) for key in (
+                "provider_superseded_submission", "provider_native_receipt"))
         final = current
-        if current.startswith("deferred_"):
+        if current.startswith("deferred_") and not archived:
             # ``undeferrable: <detail>`` embeds the cancel detail, so it cannot
             # be a dict key; it and any future reason both mean "not retried".
             final = self._DEFERRED_TERMINAL_STATUS.get(reason, "deferred_dropped")
@@ -8878,6 +9019,12 @@ class WatchDaemon:
             self._mark_claude_event(event, runtime, "suppressed_waiting_supervisor")
             return
 
+        if (event.get("event_id") == runtime.claude_submit_event_id
+                and (runtime.claude_submit_phase != "none" or runtime.claude_submit_write_unknown)
+                and self.claude_event_ledger.status_of(str(event.get("event_id") or "")) in {"reserved", "sent"}):
+            # An existing transaction owns reconciliation. A deferred retry
+            # must not replace its durable reservation or unknown-write facts.
+            return
 
         superseded = self._clear_claude_deferred(runtime, reason="superseded")
         parked_episode_id = str(
@@ -11461,8 +11608,10 @@ class WatchDaemon:
                 and not (event_name in {"Stop", "StopFailure"} and bool(event.get("completed")))):
             self._mark_claude_event(event, runtime, "suppressed_waiting_supervisor", detail=waiting)
             return
-        if (not synthetic_fallback and event_name == "UserPromptSubmit" and not protocol_event
+        if (event_name == "UserPromptSubmit" and not protocol_event
                 and runtime.claude_provider_guard):
+            if self._confirm_claude_provider_submission(target, runtime, event):
+                return
             # Validate the native task boundary before the legacy prompt path
             # can clear a pending/unknown transaction. A provider release is
             # not a delivery receipt for that original reserved input.

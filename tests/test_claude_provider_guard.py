@@ -14,7 +14,8 @@ import cmux_codex_watch as w
 from claude_ccc_protocol import classify_stop_failure
 from tests import test_claude_delivery_recovery as recovery
 from tests import test_claude_submit_not_sent as not_sent
-from tests.test_watch import claude_grid_payload, claude_wrapped_composer_payload, wrap_to_cells
+from tests.test_watch import (claude_grid_payload, claude_hook_event, claude_idle_screen,
+                              claude_wrapped_composer_payload, wrap_to_cells)
 
 
 AUTH = "⏺ API Error: 403 API Key 所属分组已删除"
@@ -84,6 +85,68 @@ class ProviderGuardTests(unittest.TestCase):
 
     def assert_no_input(self, c, before=(0, 0)):
         self.assertEqual((len(c.sent_text), len(c.sent_keys)), before)
+
+    def old_pending(self, root, *, unknown=True):
+        d, t, r, e, c = self.case(root, pending=True)
+        now = time.time()
+        e["created_at"] = r.claude_submit_since = now - 20
+        d.claude_event_ledger.mark(e, "reserved")
+        r.claude_submit_write_unknown = unknown
+        r.claude_submit_attempts = 1
+        r.claude_submit_last_attempt_at = now - 15
+        r.claude_last_submit_event_id = e["event_id"]
+        r.claude_last_submit_message_hash = r.claude_submit_message_hash
+        r.claude_last_submit_session_id = r.claude_session_id
+        r.claude_last_submit_generation = r.claude_process_generation
+        r.claude_last_submit_at = now - 15
+        r.claude_orphan_enter_count, r.claude_orphan_enter_at = 2, now - 16
+        r.claude_fallback_retry_count = 2
+        r.send_count, r.last_send_at = 3, now - 30
+        self.hold(d, t, r, e, stamp=now - 10)
+        return d, t, r, e, c
+
+    @staticmethod
+    def idle(c):
+        # A real new human task consumed/replaced the prior composer. Leaving
+        # FakeClient's old echo here would correctly prevent a new paste.
+        c._submit_echo = False
+        c.payload = claude_grid_payload()
+        c._base_payload = copy.deepcopy(c.payload)
+        c.text = claude_idle_screen()
+
+    def receipt_case(self, root, mode, *, lost_ack=True):
+        d, t, r, e, c = self.case(root)
+        now = time.time()
+        if mode == "released":
+            self.hold(d, t, r, e, stamp=now - 10)
+            prompt, path = self.native_prompt(root, e, stamp=now - 1)
+            with mock.patch.object(w.dispatch_recovery, "native_path", return_value=path):
+                d._handle_claude_event(prompt, c)
+        elif mode == "retry_wait":
+            d._handle_claude_event(self.failure(e, RPM, stamp=now - 10), c)
+            now = r.claude_provider_guard["retry_after"] + 1
+        stop = dict(claude_hook_event("receipt-source", "Stop", created_at=now),
+                    agent_pid=1234, process_generation="generation-a")
+        raw_key = c.send_key
+        def accepted_but_ack_lost(*args):
+            raw_key(*args)
+            raise w.UncertainDeliveryError("accepted key, ACK lost")
+        with mock.patch.object(w.time, "time", return_value=now), \
+             (mock.patch.object(c, "send_key", side_effect=accepted_but_ack_lost)
+              if lost_ack else contextlib.nullcontext()):
+            if mode == "retry_wait":
+                d._maybe_send_deferred_claude_stop(t, r, w.ScreenState("claude_stopped", message_kind="claude"), c)
+            else:
+                d._handle_claude_event(stop, c)
+        self.assertEqual((len(c.sent_text), len(c.sent_keys)), (1, 1))
+        self.assertEqual(r.claude_submit_write_unknown, lost_ack)
+        if mode in {"blocked", "active_retry_wait"}:
+            with mock.patch.object(w.time, "time", return_value=now + 1):
+                d._handle_claude_event(self.failure(
+                    e, AUTH if mode == "blocked" else RPM, stamp=now + 1), c)
+        prompt, path = self.native_prompt(root, e, text=w.CLAUDE_MESSAGE, stamp=now + 2)
+        prompt.update(event_id="native-watchdog-receipt", prompt_kind="watchdog")
+        return d, t, r, c, prompt, path, now
 
     def test_current_native_errors_survive_real_wraps_and_busy_composer(self):
         for columns in (40, 80):
@@ -353,18 +416,272 @@ class ProviderGuardTests(unittest.TestCase):
     def test_native_human_release_requires_current_record_and_preserves_unknown(self):
         for valid in (False, True):
             with self.subTest(valid=valid), tempfile.TemporaryDirectory() as root:
-                d, t, r, e, c = self.case(root, pending=True)
-                r.claude_submit_write_unknown = True
-                r.claude_orphan_enter_count = 2
-                self.hold(d, t, r, e)
+                d, t, r, e, c = self.old_pending(root)
                 prompt, path = self.native_prompt(root, e, isMeta=not valid)
                 before = {k: v for k, v in r.to_dict().items() if k.startswith(("claude_submit_", "claude_orphan_"))}
                 with mock.patch.object(w.dispatch_recovery, "native_path", return_value=path):
                     d._handle_claude_event(prompt, c)
                 self.assertEqual(r.claude_provider_guard["status"], "released" if valid else "blocked")
-                self.assertEqual({k: getattr(r, k) for k in before}, before)
+                if valid:
+                    archived = d.claude_event_ledger.events[e["event_id"]]["provider_superseded_submission"]
+                    self.assertEqual({k: archived["pending_submit"][k] for k in before}, before)
+                    self.assertEqual(r.claude_submit_phase, "none")
+                    self.assertIsNone(r.claude_submit_event_id)
+                else:
+                    self.assertEqual({k: getattr(r, k) for k in before}, before)
                 self.assertEqual(d.claude_event_ledger.status_of(e["event_id"]), "reserved")
                 self.assert_no_input(c, (1, 0))
+
+    def test_new_human_task_retires_old_slot_and_resumes_exactly_once(self):
+        for unknown in (False, True):
+            with self.subTest(unknown=unknown), tempfile.TemporaryDirectory() as root:
+                d, t, r, e, c = self.old_pending(root, unknown=unknown)
+                original = copy.deepcopy(d.claude_event_ledger.events[e["event_id"]])
+                pending = copy.deepcopy(r.to_dict())
+                prompt, path = self.native_prompt(root, e)
+                with mock.patch.object(w.dispatch_recovery, "native_path", return_value=path):
+                    d._handle_claude_event(prompt, c)
+                audit = d.claude_event_ledger.events[e["event_id"]]["provider_superseded_submission"]
+                self.assertEqual(audit["event"], {**original, "event_id": e["event_id"]})
+                for key, value in audit["pending_submit"].items():
+                    self.assertEqual(value, pending[key], key)
+                self.assertEqual(audit["pending_submit"]["claude_submit_write_unknown"], unknown)
+                self.assertEqual(audit["pending_submit"]["claude_submit_attempts"], 1)
+                self.assertEqual(audit["pending_submit"]["send_count"], 3)
+                self.assertEqual(audit["sha256"], w.supervisor_closeout.snapshot_sha256(
+                    {k: v for k, v in audit.items() if k != "sha256"}))
+                self.assertEqual(r.claude_orphan_enter_count, 2)
+                self.assertEqual(r.claude_submit_confirmed_at, 0)
+                self.assertEqual(d.claude_event_ledger.status_of(e["event_id"]), "reserved")
+                self.idle(c)
+                stop = dict(claude_hook_event("new-task-stop", "Stop"),
+                            agent_pid=1234, process_generation="generation-a")
+                d._handle_claude_event(stop, c)
+                d._handle_claude_event(stop, c)
+                self.assertEqual(d.claude_event_ledger.status_of(stop["event_id"]), "sent")
+                self.assertEqual(r.claude_submit_event_id, stop["event_id"])
+                self.assertEqual((len(c.sent_text), len(c.sent_keys)), (2, 1))
+                self.assertEqual(d.claude_event_ledger.events[e["event_id"]]["provider_superseded_submission"], audit)
+
+    def test_release_archive_failure_preserves_slot_then_restart_retires_idempotently(self):
+        with tempfile.TemporaryDirectory() as root:
+            d, t, r, e, c = self.old_pending(root)
+            d.save()  # Deliberately keep this old runtime throughout the test.
+            before = copy.deepcopy(r.to_dict())
+            original = copy.deepcopy(d.claude_event_ledger.events[e["event_id"]])
+            prompt, path = self.native_prompt(root, e)
+            raw_write = d.claude_event_ledger._write
+            def disk_full(events=None):
+                if events and events.get(e["event_id"], {}).get("provider_superseded_submission"):
+                    raise OSError("archive fsync failed")
+                return raw_write(events)
+            with mock.patch.object(w.dispatch_recovery, "native_path", return_value=path), \
+                 mock.patch.object(d.claude_event_ledger, "_write", side_effect=disk_full), \
+                 self.assertRaises(OSError):
+                d._release_claude_provider_guard(t["surface_id"], r, prompt, reason="native_human_prompt")
+            self.assertEqual(d.claude_event_ledger.provider_guard(t["surface_id"])["status"], "released")
+            for key, value in before.items():
+                if key != "claude_provider_guard":
+                    self.assertEqual(getattr(r, key), value, key)
+            self.assertEqual(d.claude_event_ledger.events[e["event_id"]], original)
+            self.assert_no_input(c, (1, 0))
+            d2, r2 = self.restart(d, c)
+            audit = copy.deepcopy(d2.claude_event_ledger.events[e["event_id"]]["provider_superseded_submission"])
+            self.assertTrue(audit["pending_submit"]["claude_submit_write_unknown"])
+            self.assertEqual(r2.claude_submit_phase, "none")
+            self.assertEqual(r2.claude_orphan_enter_count, 2)
+            self.assertEqual(d2.claude_event_ledger.status_of(e["event_id"]), "reserved")
+            # The same old state plus a now-durable archive must not rewrite
+            # its first evidence or reclaim an input budget on any restart.
+            for _ in range(2):
+                d2, r2 = self.restart(d, c)
+                d2._sync_claude_provider_guard(t["surface_id"], r2)
+                self.assertEqual(d2.claude_event_ledger.events[e["event_id"]]["provider_superseded_submission"], audit)
+                self.assertEqual(r2.claude_submit_phase, "none")
+            with mock.patch.object(w, "CLAUDE_EVENT_LEDGER_LIMIT", 1):
+                d2.claude_event_ledger.mark(e, "deferred_expired")
+                for i in range(4):
+                    d2.claude_event_ledger.mark(dict(e, event_id=f"unrelated-{i}"), "completed")
+            self.assertEqual(d2.claude_event_ledger.events[e["event_id"]]["provider_superseded_submission"], audit)
+            self.assert_no_input(c, (1, 0))
+
+    def test_old_event_echo_and_orphan_composer_cannot_reopen_archived_input(self):
+        with tempfile.TemporaryDirectory() as root:
+            d, t, r, e, c = self.old_pending(root)
+            prompt, path = self.native_prompt(root, e)
+            with mock.patch.object(w.dispatch_recovery, "native_path", return_value=path):
+                d._handle_claude_event(prompt, c)
+            audit = copy.deepcopy(d.claude_event_ledger.events[e["event_id"]]["provider_superseded_submission"])
+            old_echo = dict(claude_hook_event("old-echo", "UserPromptSubmit", prompt_kind="watchdog",
+                           created_at=e["created_at"] + 1), agent_pid=1234, process_generation="generation-a")
+            d._handle_claude_event(old_echo, c)
+            d._handle_claude_event(e, c)
+            self.assertFalse(d._send_claude_event(e, t, r, c)[0])
+            state = w.ScreenState("composer_busy", watchdog_echo=True, message_kind="claude")
+            with mock.patch.object(w.time, "time", return_value=time.time() + 10000):
+                d._reconcile_claude_submit(t, r, state, c)
+                d._recover_orphan_watchdog_submit(t, r, state, c)
+            self.assertEqual(d.claude_event_ledger.status_of(old_echo["event_id"]), "stale_native_event")
+            self.assertIsNone(r.claude_submit_event_id)
+            self.assertEqual(r.claude_orphan_enter_count, 2)
+            self.assertEqual(d.claude_event_ledger.events[e["event_id"]]["provider_superseded_submission"], audit)
+            self.assert_no_input(c, (1, 0))
+
+    def test_native_receipt_settles_only_its_submit_and_keeps_provider_policy(self):
+        for mode in ("released", "retry_wait", "active_retry_wait", "blocked"):
+            for lost_ack in (False, True):
+                with self.subTest(mode=mode, lost_ack=lost_ack), tempfile.TemporaryDirectory() as root:
+                    d, t, r, c, prompt, path, now = self.receipt_case(root, mode, lost_ack=lost_ack)
+                    source = r.claude_submit_event_id
+                    prior_guard = copy.deepcopy(r.claude_provider_guard)
+                    prior_count = r.send_count
+                    with mock.patch.object(w.time, "time", return_value=now + 3), \
+                         mock.patch.object(w.dispatch_recovery, "native_path", return_value=path):
+                        d._handle_claude_event(prompt, c)
+                        d._handle_claude_event(prompt, c)
+                    self.assertEqual(r.claude_submit_phase, "none")
+                    self.assertFalse(r.claude_submit_write_unknown)
+                    self.assertEqual(r.claude_provider_guard, prior_guard)
+                    self.assertEqual(r.send_count, prior_count)
+                    self.assertEqual(d.claude_event_ledger.status_of(prompt["event_id"]), "watchdog_confirmed")
+                    row = d.claude_event_ledger.events[source]
+                    self.assertEqual(row["status"], "reserved" if lost_ack else "sent")
+                    self.assertEqual(row["provider_native_receipt"]["event"]["event_id"], prompt["event_id"])
+                    self.assertEqual(row["provider_native_receipt"]["pending_submit"]["claude_submit_write_unknown"], lost_ack)
+                    proof = row["provider_native_receipt"]["native_prompt"]
+                    self.assertEqual(proof["path"], str(path))
+                    self.assertEqual(proof["prompt_uuid"], "new-native-prompt")
+                    self.assertEqual(proof["message_hash"], prompt["message_hash"])
+                    if not lost_ack:
+                        self.assertEqual(row["watchdog_submission"]["consumed_by"], prompt["event_id"])
+                    self.assert_no_input(c, (1, 1))
+                    self.idle(c)
+                    stop = dict(claude_hook_event("after-receipt", "Stop", created_at=now + 4),
+                                agent_pid=1234, process_generation="generation-a")
+                    with mock.patch.object(w.time, "time", return_value=now + 4):
+                        d._handle_claude_event(stop, c)
+                        d._handle_claude_event(stop, c)
+                    self.assertEqual((len(c.sent_text), len(c.sent_keys)),
+                                     (1, 1) if mode in {"blocked", "active_retry_wait"} else (2, 2))
+
+    def test_provider_receipt_rejects_wrong_hash_identity_time_and_unrelated_anchor(self):
+        changes = ({"message_hash": "f" * 64}, {"message_hash": "too-short"},
+                   {"agent_pid": 777}, {"agent_pid": 0}, {"workspace_id": "other"},
+                   {"session_id": "other"}, {"process_generation": "other"},
+                   {"created_at": 1.0}, {"synthetic_fallback": True},
+                   {"anchor": "absent"}, {"anchor": "other-event"}, {"anchor": "short-hash"})
+        for change in changes:
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as root:
+                d, t, r, c, prompt, path, now = self.receipt_case(root, "released")
+                source = r.claude_submit_event_id
+                if change.get("anchor") == "absent":
+                    r.claude_last_submit_at = 0
+                elif change.get("anchor") == "other-event":
+                    r.claude_last_submit_event_id = "different-submit"
+                elif change.get("anchor") == "short-hash":
+                    r.claude_last_submit_message_hash = r.claude_submit_message_hash[:1]
+                before = copy.deepcopy(r.to_dict())
+                with mock.patch.object(w.time, "time", return_value=now + 3), \
+                     mock.patch.object(w.dispatch_recovery, "native_path", return_value=path):
+                    d._handle_claude_event({**prompt, **change}, c)
+                self.assertTrue(r.claude_submit_write_unknown)
+                for key, value in before.items():
+                    if key.startswith(("claude_submit_", "claude_last_submit_", "claude_orphan_")):
+                        self.assertEqual(getattr(r, key), value, key)
+                self.assertNotIn("provider_native_receipt", d.claude_event_ledger.events[source])
+                self.assert_no_input(c, (1, 1))
+
+    def test_provider_receipt_requires_exact_current_native_user(self):
+        for change in ("missing", "body", "old", "meta", "sidechain", "synthetic",
+                       "session", "ambiguous", "changed_after_proof"):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as root:
+                d, t, r, c, prompt, path, now = self.receipt_case(root, "blocked")
+                source = r.claude_submit_event_id
+                before = d._claude_provider_submission_snapshot(r)
+                row_before = copy.deepcopy(d.claude_event_ledger.events[source])
+                guard_before = copy.deepcopy(r.claude_provider_guard)
+                native = json.loads(path.read_text())
+                if change == "missing":
+                    path.unlink()
+                elif change == "body":
+                    native["message"]["content"] = "unrelated native body"
+                elif change == "old":
+                    native["timestamp"] = dt.datetime.fromtimestamp(now - 1, dt.timezone.utc).isoformat()
+                elif change in {"meta", "sidechain", "synthetic"}:
+                    native[{"meta": "isMeta", "sidechain": "isSidechain", "synthetic": "isSynthetic"}[change]] = True
+                elif change == "session":
+                    native["sessionId"] = "unrelated-session"
+                if change != "missing":
+                    path.write_text((json.dumps(native, ensure_ascii=False) + "\n") *
+                                    (2 if change == "ambiguous" else 1))
+                verify = w.supervisor_closeout.native_human_prompt
+                def source_change(*args, **kwargs):
+                    proof = verify(*args, **kwargs)
+                    if change == "changed_after_proof":
+                        path.write_text(path.read_text() + "{}\n")
+                    return proof
+                with mock.patch.object(w.time, "time", return_value=now + 3), \
+                     mock.patch.object(w.dispatch_recovery, "native_path", return_value=path), \
+                     mock.patch.object(w.supervisor_closeout, "native_human_prompt", side_effect=source_change):
+                    d._handle_claude_event(prompt, c)
+                self.assertEqual(d._claude_provider_submission_snapshot(r), before)
+                self.assertEqual(d.claude_event_ledger.events[source], row_before)
+                self.assertEqual(r.claude_provider_guard, guard_before)
+                self.assert_no_input(c, (1, 1))
+
+    def test_provider_receipt_write_failure_retains_unknown_and_original_budget(self):
+        with tempfile.TemporaryDirectory() as root:
+            d, t, r, c, prompt, path, now = self.receipt_case(root, "blocked")
+            source = r.claude_submit_event_id
+            before = copy.deepcopy(r.to_dict())
+            raw_write = d.claude_event_ledger._write
+            def disk_full(events=None):
+                if events and events.get(source, {}).get("provider_native_receipt"):
+                    raise OSError("receipt fsync failed")
+                return raw_write(events)
+            with mock.patch.object(w.time, "time", return_value=now + 3), \
+                 mock.patch.object(w.dispatch_recovery, "native_path", return_value=path), \
+                 mock.patch.object(d.claude_event_ledger, "_write", side_effect=disk_full), \
+                 self.assertRaises(OSError):
+                d._handle_claude_event(prompt, c)
+            for key, value in before.items():
+                if key.startswith(("claude_submit_", "claude_last_submit_", "claude_orphan_")) or key == "send_count":
+                    self.assertEqual(getattr(r, key), value, key)
+            self.assertNotIn("provider_native_receipt", d.claude_event_ledger.events[source])
+            d2, r2 = self.restart(d, c)
+            self.assertTrue(r2.claude_submit_write_unknown)
+            self.assertEqual(r2.claude_submit_event_id, source)
+            self.assert_no_input(c, (1, 1))
+
+    def test_native_receipt_before_state_crash_retires_once_and_survives_prune(self):
+        for mode in ("released", "retry_wait", "blocked"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as root:
+                d, t, r, c, prompt, path, now = self.receipt_case(root, mode)
+                source = r.claude_submit_event_id
+                d.save()
+                def crash_after_receipt(*args, **kwargs):
+                    raise RuntimeError("crash before runtime settlement")
+                with mock.patch.object(w.time, "time", return_value=now + 3), \
+                     mock.patch.object(w.dispatch_recovery, "native_path", return_value=path), \
+                     mock.patch.object(d, "_clear_claude_submit", side_effect=crash_after_receipt), \
+                     self.assertRaises(RuntimeError):
+                    d._handle_claude_event(prompt, c)
+                audit = copy.deepcopy(d.claude_event_ledger.events[source]["provider_native_receipt"])
+                for _ in range(2):
+                    with mock.patch.object(w.time, "time", return_value=now + 4):
+                        d2, r2 = self.restart(d, c)
+                        d2._handle_claude_event(prompt, c)
+                        d2._sync_claude_provider_guard(t["surface_id"], r2)
+                    self.assertEqual(r2.claude_submit_phase, "none")
+                    self.assertFalse(r2.claude_submit_write_unknown)
+                    self.assertEqual(d2.claude_event_ledger.status_of(source), "reserved")
+                    self.assertEqual(d2.claude_event_ledger.status_of(prompt["event_id"]), "watchdog_confirmed")
+                    self.assertEqual(d2.claude_event_ledger.events[source]["provider_native_receipt"], audit)
+                with mock.patch.object(w, "CLAUDE_EVENT_LEDGER_LIMIT", 1):
+                    d2.claude_event_ledger.events[source]["status"] = "deferred_expired"
+                    d2.claude_event_ledger.mark(dict(prompt, event_id="unrelated"), "completed")
+                self.assertEqual(d2.claude_event_ledger.events[source]["provider_native_receipt"], audit)
+                self.assert_no_input(c, (1, 1))
 
     def test_native_release_rejects_synthetic_old_wrong_identity_and_watchdog(self):
         cases = ({"synthetic_fallback": True}, {"agent_pid": 0}, {"agent_pid": 777},
@@ -424,18 +741,15 @@ class ProviderGuardTests(unittest.TestCase):
 
     def test_release_watermark_blocks_old_deferred_pending_and_stale_snapshot(self):
         with tempfile.TemporaryDirectory() as root:
-            d, t, r, e, c = self.case(root, pending=True)
-            e["created_at"] = time.time() - 20
-            d.claude_event_ledger.mark(e, "reserved")
-            self.hold(d, t, r, e)
+            d, t, r, e, c = self.old_pending(root)
             d.save()  # An old blocked state is weaker than the release ledger.
             prompt, path = self.native_prompt(root, e)
             with mock.patch.object(w.dispatch_recovery, "native_path", return_value=path):
                 self.assertTrue(d._release_claude_provider_guard(t["surface_id"], r, prompt, reason="native_human_prompt"))
             d2, r2 = self.restart(d, c)
             self.assertEqual(r2.claude_provider_guard["status"], "released")
-            self.assertEqual(d2._claude_provider_guard_reason(t, r2), "claude_provider_event_superseded")
-            r2.claude_submit_event_id, r2.claude_submit_phase = None, "none"
+            self.assertIsNone(r2.claude_submit_event_id)
+            self.assertEqual(d2._claude_provider_guard_reason(t, r2, event=e), "claude_provider_event_superseded")
             d2.claude_event_ledger.mark(e, "deferred_expired")
             r2.claude_last_event_id, r2.claude_deferred_reason = e["event_id"], "expired"
             self.assertFalse(d2._restore_expired_claude_deferred(r2))
