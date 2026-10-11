@@ -120,6 +120,97 @@ def _digest(value: str) -> str:
     return hashlib.sha256((value or "").encode("utf-8", errors="replace")).hexdigest()[:24]
 
 
+CLAUDE_PROVIDER_BLOCKED_KINDS = frozenset({
+    "claude_auth", "claude_billing", "claude_model_unavailable", "claude_request_invalid",
+})
+STOP_FAILURE_ENUMS = frozenset({
+    "authentication_failed", "oauth_org_not_allowed", "cloud_credential_error",
+    "billing_error", "account_on_hold", "model_not_found", "invalid_request",
+    "rate_limit", "overloaded", "server_error", "unknown", "max_output_tokens",
+})
+STOP_FAILURE_METADATA = (
+    "error_kind", "stop_failure_error", "error_reason", "error_evidence_hash", "provider_blocked",
+)
+_ERROR_STATUS_RE = re.compile(
+    r"(?:\b(?:HTTP(?:/\d(?:\.\d)?)?(?:\s+Error)?|API\s+Error|status(?:_code)?|error)"
+    r"\s*[\"':= -]*|^\s*)([45]\d\d)\b", re.IGNORECASE | re.MULTILINE,
+)
+_REJECTED_STATUS_RE = re.compile(r"\brequest\s+rejected\s*\(\s*([45]\d\d)\s*\)", re.IGNORECASE)
+_ERROR_ANSI_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
+
+
+def classify_stop_failure(error: Any, error_details: Any = "") -> dict[str, Any]:
+    """Classify native failure evidence without retaining response text.
+
+    Hook enums and response details are independent evidence. A generic enum
+    must not hide a permanent rejection, and a number mentioned inside prose
+    must not turn an invalid request into a retryable provider outage.
+    """
+    def text(value: Any) -> str:
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, ensure_ascii=False, sort_keys=True)
+        return str(value or "")
+
+    raw_error, details = text(error), text(error_details)
+    enum = raw_error.strip().lower()
+    if enum.endswith("_error") and enum[:-6] in STOP_FAILURE_ENUMS:
+        enum = enum[:-6]
+    normalized_enum = enum if enum in STOP_FAILURE_ENUMS else "unknown"
+    evidence = _ERROR_ANSI_RE.sub("", unicodedata.normalize("NFKC", raw_error + "\n" + details))
+    folded = re.sub(r"\s+", " ", evidence).lower()
+    codes = {match[1] for match in _ERROR_STATUS_RE.finditer(evidence)}
+    codes.update(match[1] for match in _REJECTED_STATUS_RE.finditer(folded))
+    kind, reason = "claude_api", "provider_error"
+    if enum in {"authentication_failed", "oauth_org_not_allowed", "cloud_credential_error"}:
+        kind, reason = "claude_auth", "authentication_rejected"
+    elif enum in {"billing_error", "account_on_hold"}:
+        kind, reason = "claude_billing", "billing_rejected"
+    elif enum == "model_not_found":
+        kind, reason = "claude_model_unavailable", "model_unavailable"
+    elif re.search(
+        r"insufficient.{0,32}(?:credit|balance|quota)|credit balance.{0,32}(?:low|exhaust|insufficient)|"
+        r"(?:billing|payment)[_ ](?:error|required)|account[_ ]on[_ ]hold|"
+        r"余额不足|余额已耗尽|预扣费.{0,16}(?:失败|拒绝|不足)|欠费|额度不足", folded,
+    ) or "402" in codes:
+        kind, reason = "claude_billing", "billing_rejected"
+    elif re.search(
+        r"authentication[_ ](?:failed|error)|oauth_org_not_allowed|cloud_credential_error|"
+        r"invalid[_ ](?:api[_ ]?)?key|(?:api[_ ]?key|credentials?).{0,32}(?:expired|revoked|invalid)|"
+        r"permission[_ ]error|unauthorized|forbidden|所属分组.{0,12}(?:已删除|不存在|禁用)|"
+        r"无效.{0,8}(?:密钥|令牌)|(?:密钥|令牌).{0,8}(?:失效|过期|禁用)|无权访问|认证失败", folded,
+    ) or codes.intersection({"401", "403"}):
+        kind, reason = "claude_auth", "authentication_rejected"
+    elif re.search(
+        r"model[_ ]not[_ ]found|(?:model|selected model).{0,120}"
+        r"(?:does not exist|not found|not available|unavailable|not have access|may not exist)|"
+        r"(?:模型).{0,20}(?:不存在|不可用|无权|未授权)", folded,
+    ):
+        kind, reason = "claude_model_unavailable", "model_unavailable"
+    elif ("405" in codes or re.search(
+        r"method not allowed|unsupported (?:endpoint|method|route)|"
+        r"(?:endpoint|route).{0,24}(?:not found|incompatible)|"
+        r"prompt (?:is )?too long|context (?:length|window).{0,24}(?:exceed|limit)|"
+        r"请求.{0,8}(?:不合法|无效)|不支持.{0,8}(?:端点|请求方法)", folded,
+    )):
+        kind, reason = "claude_request_invalid", "request_rejected"
+    elif (enum == "rate_limit" or "429" in codes or re.search(
+        r"rate[_ ]limit(?:ed|ing|_error)?\b|(?:group\s+)?requests\s*-\s*per\s*-\s*minute\s+limit\s+exceeded",
+        folded,
+    )):
+        kind, reason = "claude_429", "rate_limited"
+    elif enum == "overloaded" or "503" in codes or re.search(r"\boverloaded(?:_error)?\b", folded):
+        kind, reason = "claude_503", "provider_overloaded"
+    elif enum == "invalid_request":
+        kind, reason = "claude_request_invalid", "request_rejected"
+    elif re.search(r"connection|stream|network|econnreset|etimedout", folded):
+        kind, reason = "claude_stream", "transport_interrupted"
+    return {
+        "error_kind": kind, "stop_failure_error": normalized_enum,
+        "error_reason": reason, "provider_blocked": kind in CLAUDE_PROVIDER_BLOCKED_KINDS,
+        "error_evidence_hash": _digest(raw_error + "\n" + details),
+    }
+
+
 _TASK_TOKEN = r"[A-Za-z0-9][A-Za-z0-9._:-]{0,159}"
 _NONCE_TOKEN = r"[A-Za-z0-9_-]{8,160}"
 
@@ -261,7 +352,8 @@ def build_event(payload: Mapping[str, Any], environ: Mapping[str, str] | None = 
     transcript_path = str(payload.get("transcript_path") or "")
     assistant_message = str(payload.get("last_assistant_message") or "")
     prompt = str(payload.get("prompt") or payload.get("user_prompt") or "")
-    error = str(payload.get("error") or payload.get("error_details") or "")
+    error = payload.get("error") or ""
+    error_details = payload.get("error_details") or ""
     try:
         agent_pid = int(env.get("CLAUDE_PID") or os.getppid())
     except (TypeError, ValueError):
@@ -280,7 +372,7 @@ def build_event(payload: Mapping[str, Any], environ: Mapping[str, str] | None = 
         # health-generation hint and is never an authorization credential.
         "agent_pid": agent_pid,
         "cwd_hash": _digest(str(payload.get("cwd") or "")),
-        "message_hash": _digest(assistant_message or prompt or error),
+        "message_hash": _digest(assistant_message or prompt or str(error) + "\n" + str(error_details)),
     }
     if event_name == "SessionStart":
         event["source"] = str(payload.get("source") or "startup")
@@ -306,15 +398,7 @@ def build_event(payload: Mapping[str, Any], environ: Mapping[str, str] | None = 
             dict(zip(('task_id', 'ack_nonce'), foreign.groups())) if foreign else None)
     else:
         event["completed"] = completion_reported(assistant_message)
-        lowered = error.lower()
-        if "429" in lowered or "rate limit" in lowered:
-            event["error_kind"] = "claude_429"
-        elif "503" in lowered or "overloaded" in lowered:
-            event["error_kind"] = "claude_503"
-        elif "connection" in lowered or "stream" in lowered:
-            event["error_kind"] = "claude_stream"
-        else:
-            event["error_kind"] = "claude_api"
+        event.update(classify_stop_failure(error, error_details))
     return event
 
 
