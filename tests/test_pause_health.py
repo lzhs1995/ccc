@@ -115,6 +115,47 @@ class PauseProjectionTests(unittest.TestCase):
         self.assertEqual(report["targets"][0]["pause_age_sec"], 20)
         self.assertEqual(snapshot, original)
 
+    def test_workspace_pause_metadata_agrees_across_effective_targets_and_readers(self):
+        rule = {"workspace_id": "w", "paused": True, "pause_origin": "user",
+                "paused_reason": "original workspace reason", "paused_at": 80}
+        for own_pause in (False, True):
+            with self.subTest(own_pause=own_pause):
+                item = target(paused=own_pause, paused_reason="original manual reason")
+                config = {"targets": [item], "workspace_rules": [rule]}
+                original_config = copy.deepcopy(config)
+                expected = health.pause_metadata(item if own_pause else {**item, **rule}, now=101)
+                effective = core.effective_targets(config, [dict(item, source="workspace_rule")])[0]
+                snapshot = {"config_key": core.monitoring_config_key(config),
+                            "rows": [observe(effective)], "monitored_targets": [effective]}
+                original_snapshot = copy.deepcopy(snapshot)
+                with mock.patch.object(core.time, "time", return_value=101):
+                    rows = [core.observation_status(config, {}, snapshot)["targets"][0],
+                            core.continuation_status(config, {}, snapshot)["targets"][0]]
+                for projected in (effective, core.apply_workspace_pause(config, item)):
+                    self.assertEqual(health.pause_metadata(projected, now=101), expected)
+                for row in rows:
+                    self.assertEqual(row["status"], "paused")
+                    self.assertEqual({key: row[key] for key in expected}, expected)
+                self.assertEqual(config, original_config)
+                self.assertEqual(snapshot, original_snapshot)
+
+    def test_unobserved_workspace_pause_keeps_rule_metadata_and_not_old_target_time(self):
+        for at in (None, 80):
+            rule = {"workspace_id": "w", "paused": True, "pause_origin": "user",
+                    "paused_reason": "original workspace reason"}
+            if at is not None:
+                rule["paused_at"] = at
+            item = target(paused=False)
+            config = {"targets": [item], "workspace_rules": [rule]}
+            expected = health.pause_metadata({**item, **rule, "paused_at": at}, now=101)
+            for snapshot in ({}, {"config_key": core.monitoring_config_key(config), "rows": []}):
+                with self.subTest(at=at, snapshot=snapshot), mock.patch.object(core.time, "time", return_value=101):
+                    observation = core.observation_status(config, {}, snapshot)
+                    continuation = core.continuation_status(config, {}, snapshot)
+                for report in (observation, continuation):
+                    self.assertEqual(report["status"], "paused")
+                    self.assertEqual({key: report["targets"][0][key] for key in expected}, expected)
+
 
 class PauseDisplayTests(unittest.TestCase):
     def candidate(self, item):

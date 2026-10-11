@@ -5369,6 +5369,15 @@ def discover_all_targets(client, config):
     return [t for t in targets if dynamic_target_authorized(config, t)]
 
 
+def _project_workspace_pause(target, rule):
+    """Keep an existing pause's provenance, otherwise describe the pool pause."""
+    if target.get("paused") or rule is None:
+        return target
+    return {**target, "paused": True,
+            "paused_reason": rule.get("paused_reason", "workspace interrupt pause"),
+            "pause_origin": rule.get("pause_origin", ""), "paused_at": rule.get("paused_at")}
+
+
 def effective_targets(
     config: Mapping[str, Any],
     dynamic_targets: Iterable[Mapping[str, Any]],
@@ -5387,7 +5396,10 @@ def effective_targets(
     # Build the workspace gate once. A fleet pass runs on the scheduler and
     # native-event threads: rescanning hundreds of historical rules for each
     # surface held the target lock long enough to starve both of them.
-    paused_workspaces = {r.get("workspace_id") for r in config.get("workspace_rules", []) if r.get("paused")}
+    paused_workspaces = {}
+    for rule in config.get("workspace_rules", []):
+        if rule.get("paused"):
+            paused_workspaces.setdefault(rule.get("workspace_id"), rule)
     excluded_surfaces = set(config.get("discovery_excluded_surface_ids", []))
     for sid, target in combined.items():
         if sid in excluded_surfaces:
@@ -5395,18 +5407,16 @@ def effective_targets(
         elif (target.get("source") in {"claude_auto", "pane_follow"}
                 and not dynamic_target_authorized(config, target)):
             combined[sid] = {**target, "paused": True, "paused_reason": "discovery authorization revoked"}
-    return sorted(({**target, "paused": True, "paused_reason": "workspace interrupt pause"}
-                   if target.get("workspace_id") in paused_workspaces else target
+    return sorted((_project_workspace_pause(target, paused_workspaces.get(target.get("workspace_id")))
                    for target in combined.values()),
                   key=lambda target: _ref_number(str(target.get("ref") or "")))
 
 
 def apply_workspace_pause(config, target):
     """A pool pause overrides explicit, discovered and future registrations."""
-    if any(r.get("workspace_id") == target.get("workspace_id") and r.get("paused")
-           for r in config.get("workspace_rules", [])):
-        return {**target, "paused": True, "paused_reason": "workspace interrupt pause"}
-    return target
+    rule = next((r for r in config.get("workspace_rules", [])
+                 if r.get("workspace_id") == target.get("workspace_id") and r.get("paused")), None)
+    return _project_workspace_pause(target, rule)
 
 
 def workspace_input_lock(config_path, workspace_id, *, shared=False):
@@ -13349,6 +13359,7 @@ def monitoring_config_key(config: Mapping[str, Any]) -> str:
 def observation_status(config: Mapping[str, Any], state: Mapping[str, Any], snapshot: Mapping[str, Any]) -> dict[str, Any]:
     now = time.time()
     stale_after = max(30.0, 3 * float(config.get("poll_interval_sec", 1)))
+    targets = effective_targets(config, [])
     def unobserved(target, reason):
         status, pause_reason = observation_health.pause_health(target)
         held = (target.get("paused") or not target.get("enabled", True)) and status in {"paused", "disabled"}
@@ -13359,12 +13370,12 @@ def observation_status(config: Mapping[str, Any], state: Mapping[str, Any], snap
                 "observation_reason_code": reason}
     rows = snapshot.get("rows", []) if isinstance(snapshot.get("rows"), list) else []
     if snapshot.get("config_key") != monitoring_config_key(config):
-        rows = [unobserved(t, "configuration_not_observed") for t in config.get("targets", [])]
+        rows = [unobserved(t, "configuration_not_observed") for t in targets]
     else:
         # A correctly keyed snapshot must still account for every explicit target.
         by_id = {r.get("surface_id"): dict(r) for r in rows if isinstance(r, Mapping)}
         rows = list(by_id.values())
-        for target in config.get("targets", []):
+        for target in targets:
             row = by_id.get(target["surface_id"])
             if row is None or row.get("workspace_id") != target["workspace_id"]:
                 rows = [r for r in rows if r.get("surface_id") != target["surface_id"]]
@@ -13372,7 +13383,8 @@ def observation_status(config: Mapping[str, Any], state: Mapping[str, Any], snap
             else:
                 # Reason/time changes do not grant new authorization and are
                 # intentionally absent from config_key. Project their current
-                # values without modifying the daemon's persisted snapshot.
+                # effective values, including workspace pauses, without
+                # modifying the daemon's persisted snapshot.
                 row.update(observation_health.pause_metadata(target, now=now))
     report = observation_health.summarize_observation(rows, now=now, stale_after=stale_after)
     if not rows and (config.get("targets") or config.get("workspace_rules")):
