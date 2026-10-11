@@ -3,7 +3,7 @@ from pathlib import Path
 import tempfile
 import unittest
 import cmux_supervisor_tui as tui
-import test_supervisor as geometry
+from tests import test_supervisor as geometry
 
 class FocusKeyTests(unittest.TestCase):
     def setUp(self):

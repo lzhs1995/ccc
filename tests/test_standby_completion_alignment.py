@@ -3,7 +3,7 @@ import threading
 import time
 import unittest
 
-from test_standby_manager import ManagerTests
+from tests.test_standby_manager import ManagerTests
 from ccc_native_standby import ObservationExpired
 
 

@@ -14,8 +14,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import ccc_mihomo as io
 import ccc_network_guard as network
 import ccc_network_client as client
-import test_network_guard as loop_fixtures
-from test_network_guard import fixtures, Publisher
+from tests import test_network_guard as loop_fixtures
+from tests.test_network_guard import fixtures, Publisher
 
 
 class Link:

@@ -5,7 +5,7 @@ from unittest.mock import patch
 import unittest
 
 import cmux_supervisor_tui as tui
-import test_supervisor_request_key as fixtures
+from tests import test_supervisor_request_key as fixtures
 
 
 class RequestObservationDiagnosticsTests(unittest.TestCase):
