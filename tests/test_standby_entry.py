@@ -175,10 +175,18 @@ class EntryTests(unittest.TestCase):
 
     def test_periodic_hint_cached_reply_cannot_survive_descriptor_change(self):
         hint, targets = self.hint_fixture()
-        self.assertTrue(hint.covered(self.config, targets[0]))
-        spec = core.load_json(self.endpoint.spec_path, {})
-        core.atomic_write_json(self.endpoint.spec_path, {**spec, 'nonce': 'replacement'})
-        self.assertFalse(hint.covered(self.config, targets[0]))
+        # Keep the cache fresh and isolate revocation from the live status
+        # RPC's best-effort 50 ms deadline. Deadline fallback is tested above.
+        with patch.object(entry, 'time') as clock, \
+                patch.object(entry, 'request', return_value=self.owner.status()) as rpc:
+            clock.monotonic.return_value = 100.0
+            self.assertTrue(hint.covered(self.config, targets[0]))
+            self.assertTrue(hint.covered(self.config, targets[0]))
+            spec = core.load_json(self.endpoint.spec_path, {})
+            core.atomic_write_json(self.endpoint.spec_path, {**spec, 'nonce': 'replacement'})
+            self.assertFalse(hint.covered(self.config, targets[0]))
+            rpc.assert_called_once_with(self.endpoint.spec_path, self.endpoint.sha256,
+                                        'status', status_timeout=.05)
 
     def test_status_total_deadline_expires_despite_individual_reads_progressing(self):
         from unittest.mock import MagicMock
