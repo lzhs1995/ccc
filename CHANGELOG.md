@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.34
+
+- Classify Claude's structured StopFailure details and current wrapped API error block together. Recognize request-limit 429 errors, and give explicit billing rejection priority over generic authentication hints without treating quoted historical errors as current failures.
+- Persist provider holds and 60–900 second rate-limit backoff across daemon restarts. Recheck both text and Enter paths, preserve pending/unknown deliveries and original retry budgets, and release holds only against authenticated new task or process evidence. Keep handshake recovery independent of deferred retry ownership.
+- Report disabled targets and effective surface/workspace pauses with their source and timestamp. Publish current effective target snapshots and twelve reconcile-stage timings so observation delays can be investigated without claiming the underlying delay is fixed.
+- Restore Python 3.10 compatibility and isolate regression desktop notifications. Preserve existing native clients, sessions and continuation ledgers during immutable runtime upgrades.
+
 ## 0.2.33
 
 - Preserve an attempt's proven zero-input cancellation across process checks, provider admission, workspace-lock contention and daemon restarts. Commit that proof before retrying the same attempt; uncertain input and failures after lock entry never acquire a zero-input exemption.
