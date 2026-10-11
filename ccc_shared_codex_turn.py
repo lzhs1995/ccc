@@ -136,7 +136,7 @@ def _rollout_row(database, sid, root):
     return path
 
 
-def _writer_files(pid):
+def writer_files(pid):
     """Retry a changing complete inventory, never combine partial evidence.
 
     A shared app-server opens and moves other sessions' files concurrently.
@@ -171,7 +171,7 @@ def binding(target, pid, sessions_root):
             born = scope.birth(writer, codex=True)
             if not born or not connected_writer(pid, writer, process['birth'], born):
                 continue
-            files = _writer_files(writer)
+            files = writer_files(writer)
             locks = [p for p in files if p.parent.name == 'thread-writer-locks'
                      and p.name == sid + '.lock'
                      and (p.parent.parent / 'sessions').resolve() == root]
@@ -221,7 +221,7 @@ def valid(target, proof):
                 or read_foreground(pid, request_observation_directory_matches) != proof['selection']
                 or not connected_writer(pid, writer, process['birth'], proof['writer_birth'])):
             return False
-        files = _writer_files(writer)
+        files = writer_files(writer)
         if any(files.get(p) != identity or not _linked(p, identity)
                for p, identity in proof['paths'].items()):
             return False
@@ -233,7 +233,7 @@ def valid(target, proof):
                     or _protected_metadata(proof['path'], proof['session_id'],
                                            proof['rollout_identity']) != proof['protected_metadata']):
                 return False
-            after = _writer_files(writer)
+            after = writer_files(writer)
             if ({p for p in after if _held_rollout(p, proof['session_id'],
                                                  Path(proof['sessions_root']))} != {proof['path']}
                     or any(after.get(p) != identity or not _linked(p, identity)

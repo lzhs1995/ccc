@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.33
+
+- Preserve an attempt's proven zero-input cancellation across process checks, provider admission, workspace-lock contention and daemon restarts. Commit that proof before retrying the same attempt; uncertain input and failures after lock entry never acquire a zero-input exemption.
+- Reconcile Goal and ordinary continuation keys against the same authenticated session and turn. Wake a new failed turn from current native evidence without replaying an old unknown delivery or duplicating input already accepted for that turn.
+- Serialize file-backed delivery journals across processes, retain prior-attempt archives and fsync their directory chain. Migrate legacy JSON heads into SQLite before accepting writes, preserve newer SQL evidence and isolate corrupt or conflicting records to their own surfaces.
+- Use bounded complete native file-inventory retries for Goal lookups. Expose generation-bound observation stages and provider retry reasons so a queued, budget-limited or unconfirmed continuation cannot be reported as healthy progress.
+- Add regressions for pre-input persistence failures, real file-lock contention, journal migration and rollback, native retry wakeups, stale timings and provider decisions. The integrated macOS Python 3.14 suite passes 4153 tests; provider service availability and compact completion remain separate live checks.
+
 ## 0.2.32 (unreleased)
 
 - Keep authenticated shared app-server foreground sessions in native wakeup coverage while the process inventory refreshes. Reuse only the original locator; recheck the process, selected session, reciprocal connection, writer lock, transcript and current turn before acting.

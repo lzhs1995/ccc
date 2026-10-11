@@ -60,7 +60,9 @@ class DeliveryTests(unittest.TestCase):
             runtime = core.TargetRuntime()
             daemon.runtime["surface-uuid"] = runtime
             state = core.classify_grid(core.Grid.from_rpc(error_frame(), "surface-uuid"))
-            with mock.patch.object(daemon, "save", side_effect=OSError("disk unavailable")):
+            # The per-surface journal is the input barrier; the fleet snapshot
+            # is only an observer publication and can fail after this commits.
+            with mock.patch.object(daemon._delivery_store, "persist", side_effect=OSError("disk unavailable")):
                 daemon._handle_state(target, runtime, state, client, send_guard_tree=client.tree())
             self.assertEqual(client.sent, [])
             self.assertEqual(runtime.delivery_status, "failed")

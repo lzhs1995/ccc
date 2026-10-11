@@ -268,7 +268,9 @@ class CodexReconnectRecoveryTests(unittest.TestCase):
                 now[0] += 200
                 daemon.process_once(client)
                 self.assertEqual(len(client.sent), 4)
-                self.assertIn('shared retry slot' if '429' in error else 'four-remedy budget', runtime.paused_reason)
+                self.assertEqual(runtime.provider_retry_status['reason_code'], 'provider_retry_budget_exhausted')
+                self.assertEqual(runtime.provider_retry_status['retry_at'], 0)
+                self.assertIn('provider_retry_budget_exhausted', runtime.paused_reason)
 
     def test_typographic_apostrophe_recovers_but_preserves_input_guards(self):
         error = HIGH_DEMAND_TEXT.replace("'", "’")

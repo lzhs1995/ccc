@@ -5,6 +5,7 @@ owns the verdict; controllers only project its public fields.
 """
 from __future__ import annotations
 
+import copy
 import errno
 import math
 import subprocess
@@ -13,6 +14,17 @@ from typing import Any
 
 
 HEALTH_PUBLISH_INTERVAL_SEC = 1.0
+PROVIDER_RETRY_HEALTH = {
+    'provider_retry_failure_reserved': 'waiting',
+    'provider_retry_server_floor': 'waiting',
+    'provider_retry_local_cooldown': 'waiting',
+    'provider_retry_shared_slot': 'waiting',
+    'provider_retry_fair_queue': 'waiting',
+    'provider_retry_budget_exhausted': 'blocked',
+    'provider_retry_evidence_missing': 'unknown',
+    'provider_retry_ledger_unavailable': 'unavailable',
+    'provider_retry_attempt_mismatch': 'blocked',
+}
 
 
 def transient_observation_error(error: BaseException | str) -> bool:
@@ -252,6 +264,23 @@ def continuation_row(target, runtime, *, now, poll_interval=1.0, observation=Non
         deadline_age = published_at - checked
         publication_age = now - published_at
         reason = "current_published_observation"
+    # A newer viewport/state invalidates an old provider decision. Never infer
+    # the reason by parsing paused_reason or perform another reservation here.
+    provider_retry = runtime.get('provider_retry_status')
+    provider_checked = provider_retry.get('checked_at') if isinstance(provider_retry, Mapping) else None
+    observed_at = runtime.get('observed_at', 0)
+    if type(observed_at) not in (int, float) or not math.isfinite(observed_at):
+        observed_at = 0
+    if (not isinstance(provider_retry, Mapping)
+            or not isinstance(provider_retry.get('reason_code'), str)
+            or provider_retry.get('reason_code') not in PROVIDER_RETRY_HEALTH
+            or type(provider_checked) not in (int, float) or not math.isfinite(provider_checked)
+            or not max(checked, observed_at) <= provider_checked <= now
+            or ('observed_turn_key' in provider_retry
+                and provider_retry['observed_turn_key'] != runtime.get('codex_observed_turn_key', ''))):
+        provider_retry = {}
+    else:
+        provider_retry = dict(provider_retry)
     if current and observed.get("status") == "missing":
         status, reason = "missing", "surface_closed_owner_exited"
     elif current and observed.get("status") == "dormant":
@@ -289,16 +318,22 @@ def continuation_row(target, runtime, *, now, poll_interval=1.0, observation=Non
         status, reason = "unknown", phase
     elif phase in {"claude_hook_config_degraded", "claude_hook_gap_exhausted", "claude_model_unavailable"}:
         status, reason = "blocked", phase
+    elif phase == "queue_recovery_unconfirmed":
+        status, reason = "delivery_unknown", phase
+    elif phase == "missing_or_error":
+        status, reason = "unavailable", phase
+    elif provider_retry:
+        reason = provider_retry['reason_code']
+        status = PROVIDER_RETRY_HEALTH[reason]
+    elif phase == "awaiting_transition":
+        status, reason = "waiting", "awaiting_native_turn_transition"
     elif phase in {"error_superseded", "queued_followup"}:
         # Waiting on the agent is not a failed watcher. This explicitly does
         # not claim successful model access, task completion or queue delivery.
         status, reason = "waiting", "previous_error_superseded" if phase == "error_superseded" else "followup_queued"
     elif phase in {"unknown", "queue_recovery_submitted"}:
         status, reason = "unknown", "task_progress_unconfirmed"
-    elif phase == "missing_or_error":
-        status, reason = "unavailable", phase
-    elif phase == "queue_recovery_unconfirmed":
-        status, reason = "delivery_unknown", phase
+    timings = runtime.get('observation_timings')
     return {
         "surface_id": str(target["surface_id"]), "workspace_id": str(target["workspace_id"]),
         "status": status, "reason_code": reason, "state": phase,
@@ -310,6 +345,9 @@ def continuation_row(target, runtime, *, now, poll_interval=1.0, observation=Non
         "observation_interval_ms": runtime.get("observation_interval_ms", 0),
         "scheduler_lag_ms": runtime.get("scheduler_lag_ms", 0),
         "read_duration_ms": runtime.get("read_duration_ms", 0),
+        # Nested stage totals belong to this published snapshot. Later worker
+        # updates or consumer edits must not mutate the other side's metrics.
+        "observation_timings": copy.deepcopy(dict(timings)) if isinstance(timings, Mapping) else {},
         "send_queue_ms": runtime.get("send_queue_ms", 0),
         "send_duration_ms": runtime.get("send_duration_ms", 0),
         "send_persist_duration_ms": runtime.get("send_persist_duration_ms", 0),
@@ -318,6 +356,7 @@ def continuation_row(target, runtime, *, now, poll_interval=1.0, observation=Non
         "send_io_started_at": runtime.get("send_io_started_at", 0),
         "send_completed_at": runtime.get("send_completed_at", 0),
         "last_send_error": runtime.get("last_send_error", ""),
+        "provider_retry_status": provider_retry,
     }
 
 

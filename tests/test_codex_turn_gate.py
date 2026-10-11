@@ -1,11 +1,13 @@
 import tempfile
 import contextlib
+import dataclasses
 import unittest
 from unittest.mock import Mock
 from unittest.mock import patch
 
 from tests.test_codex_status_chrome import status_payload, visible_text, ERRORS
 from tests.test_watch import FakeClient, armed_daemon
+import cmux_codex_watch as core
 
 
 class CodexTurnGateTests(unittest.TestCase):
@@ -128,6 +130,31 @@ class CodexTurnGateTests(unittest.TestCase):
         self.daemon.process_once(self.client)
         self.assertEqual(len(self.client.sent), 2)
 
+    def test_same_turn_status_and_key_format_are_not_non_delivery_proof(self):
+        target = self.daemon.config['targets'][0]
+        state = core.ScreenState('recoverable_error', message_kind='codex', error_type='high_demand')
+        for status in ('accepted', 'confirmed', 'failed', 'cancelled', 'retryable', 'unknown'):
+            for key in ('original:one:100', 'goal:original:g:one:99'):
+                for at in (100, 101):
+                    with self.subTest(status=status, key=key, at=at):
+                        runtime = core.TargetRuntime(delivery_status=status, codex_sent_turn_key=key,
+                            codex_input_phase='text_pending', send_attempt_id='unproved')
+                        self.turn.return_value = {**self.finished, 'at': at}
+                        self.assertFalse(self.daemon._codex_turn_ready(target, runtime, state))
+
+    def test_goal_cannot_repeat_same_native_turn_after_plain_or_goal_send(self):
+        target = self.daemon.config['targets'][0]
+        state = core.ScreenState('recoverable_error', message_kind='codex',
+                                 error_type='high_demand', native_goal_stalled=True)
+        goal = {**self.finished, 'kind': 'goal_blocked', 'goal_id': 'g', 'at': 99}
+        for status in ('accepted', 'confirmed', 'failed', 'cancelled', 'retryable', 'unknown'):
+            for key in ('original:one:100', 'goal:original:g:one:99', 'goal:original:old:one:98'):
+                with self.subTest(status=status, key=key):
+                    runtime = core.TargetRuntime(delivery_status=status, codex_sent_turn_key=key,
+                        codex_input_phase='text_pending', send_attempt_id='unproved')
+                    with patch.object(self.daemon, '_current_blocked_goal', return_value=goal):
+                        self.assertFalse(self.daemon._codex_turn_ready(target, runtime, state))
+
     def test_native_turn_deduplication_survives_restart(self):
         self.daemon.process_once(self.client)
         restarted = armed_daemon(self.tmp.name, self.client)
@@ -164,6 +191,79 @@ class CodexTurnGateTests(unittest.TestCase):
             with patch("cmux_codex_watch.time.time", return_value=now):
                 self.daemon.process_once(self.client)
         self.assertEqual(len(self.client.sent), 1)
+
+    def uncertain_attempt(self, key='goal:original:goal:one:100'):
+        runtime = self.daemon.runtime.setdefault('surface-uuid', core.TargetRuntime())
+        runtime.delivery_status = 'unknown'
+        runtime.codex_input_phase = 'text_pending'
+        runtime.codex_sent_turn_key = key
+        runtime.send_attempt_id = 'original-uncertain-attempt'
+        runtime.send_started_at = 150
+        runtime.last_send_error = 'original input outcome remains unknown'
+        self.turn.return_value = {**self.finished, 'turn_id': 'two', 'at': 200,
+                                  'signature': [1, 100, 200]}
+        return runtime, core.ScreenState('recoverable_error', message_kind='codex', error_type='high_demand')
+
+    def test_later_native_failure_is_not_blocked_by_unknown_goal_input(self):
+        for key in ('goal:original:goal:one:100', 'original:one:100'):
+            with self.subTest(key=key):
+                runtime, state = self.uncertain_attempt(key)
+                self.assertFalse(self.daemon._reconcile_codex_delivery('surface-uuid', runtime, state))
+                self.assertEqual(runtime.delivery_status, 'unknown')
+                self.assertEqual(runtime.send_attempt_id, 'original-uncertain-attempt')
+                self.assertEqual(runtime.last_send_error, 'original input outcome remains unknown')
+                self.assertEqual(self.client.sent, [])
+
+    def test_unknown_goal_only_yields_to_a_distinct_authenticated_failure(self):
+        cases = ({'turn_id': 'one'}, {'session_id': 'another'}, {'at': 149},
+                 {'at': float('nan')}, {'at': float('inf')}, {'at': '200'},
+                 {'kind': 'task_started'}, {'kind': 'turn_aborted'},
+                 {'signature': None}, {'turn_id': ''}, {'error': None},
+                 {'error': {'message': ERRORS['rate_limit']}})
+        for key in ('goal:original:goal:one:100', 'original:one:100'):
+            for change in cases:
+                with self.subTest(key=key, change=change):
+                    runtime, state = self.uncertain_attempt(key)
+                    self.turn.return_value.update(change)
+                    self.assertTrue(self.daemon._reconcile_codex_delivery('surface-uuid', runtime, state))
+                    self.assertEqual(runtime.delivery_status, 'unknown')
+                    self.assertEqual(self.client.sent, [])
+
+    def test_retained_draft_and_queue_never_yield_to_a_new_failure(self):
+        for key in ('goal:original:goal:one:100', 'original:one:100'):
+            for phase, kind in (('text_retained', 'recoverable_error'),
+                                ('text_pending', 'queued_followup'), ('text_pending', 'composer_busy')):
+                with self.subTest(key=key, phase=phase, kind=kind):
+                    runtime, state = self.uncertain_attempt(key)
+                    runtime.codex_input_phase = phase
+                    state = dataclasses.replace(state, kind=kind)
+                    self.assertTrue(self.daemon._reconcile_codex_delivery('surface-uuid', runtime, state))
+                    self.assertEqual(runtime.send_attempt_id, 'original-uncertain-attempt')
+
+    def test_only_a_fresh_bound_goal_can_unblock_unknown_goal_input(self):
+        proof = {'kind': 'goal_blocked', 'session_id': 'original', 'turn_id': 'two',
+                 'goal_id': 'goal', 'at': 200, 'log_id': 2, 'submission_digest': 'digest',
+                 'error': {'message': ERRORS['high_demand']}}
+        for change, expected in (({}, False), ({'turn_id': 'one'}, True),
+                                 ({'session_id': 'another'}, True), ({'at': 149}, True)):
+            with self.subTest(change=change):
+                runtime, state = self.uncertain_attempt()
+                state = dataclasses.replace(state, native_goal_stalled=True)
+                self.turn.return_value = {'kind': 'unknown'}
+                with patch.object(self.daemon, '_current_blocked_goal', return_value={**proof, **change}):
+                    self.assertEqual(self.daemon._reconcile_codex_delivery('surface-uuid', runtime, state), expected)
+                self.assertEqual(runtime.delivery_status, 'unknown')
+
+    def test_unbound_goal_or_malformed_original_identity_cannot_clear_unknown(self):
+        for key in ('', 'goal:original', 'original', 'goal:original:goal:one:nan'):
+            with self.subTest(key=key):
+                runtime, state = self.uncertain_attempt(key)
+                self.assertTrue(self.daemon._reconcile_codex_delivery('surface-uuid', runtime, state))
+        runtime, state = self.uncertain_attempt()
+        state = dataclasses.replace(state, native_goal_stalled=True)
+        self.turn.return_value = {'kind': 'unknown'}
+        with patch.object(self.daemon, '_current_blocked_goal', return_value=None):
+            self.assertTrue(self.daemon._reconcile_codex_delivery('surface-uuid', runtime, state))
 
 
 if __name__ == "__main__":

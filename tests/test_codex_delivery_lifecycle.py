@@ -97,13 +97,15 @@ class CodexDeliveryLifecycleTests(unittest.TestCase):
                 ('surface-uuid',)).fetchone()[0])
         self.assertEqual(record['runtime']['send_attempt_id'], 'prior-input')
 
-    def test_native_progress_allows_observation_without_fabricating_receipt(self):
+    def test_native_progress_preserves_unknown_input_without_fabricating_receipt(self):
         runtime = self.daemon.runtime['surface-uuid'] = core.TargetRuntime(
             send_attempt_id='lost-ack', delivery_status='unknown', codex_input_phase='text_pending',
             codex_sent_turn_key='original:failed-one:200.0', send_started_at=1000,
             last_send_error='ack timed out')
         self.turn.update(kind='task_started', turn_id='new-turn', at=1001.0)
-        self.assertFalse(self.daemon._reconcile_codex_delivery('surface-uuid', runtime,
+        # A task_started event does not prove that the exact original payload
+        # arrived. Keep the pending-input guard while the new turn is active.
+        self.assertTrue(self.daemon._reconcile_codex_delivery('surface-uuid', runtime,
             core.ScreenState('idle', message_kind='codex')))
         self.assertEqual(runtime.delivery_status, 'unknown')
         self.assertEqual(runtime.delivery_confirmed_at, 0)
@@ -126,7 +128,7 @@ class CodexDeliveryLifecycleTests(unittest.TestCase):
         self.assertEqual(runtime.delivery_status, 'accepted')
         self.assertEqual(runtime.delivery_confirmed_at, 0)
 
-    def test_failed_goal_persistence_can_resume_same_goal_after_unrelated_working_ui(self):
+    def test_failed_goal_persistence_without_native_identity_cannot_authorize_retry(self):
         row = self.frame['render_grid']['cursor']['row']
         self.frame['render_grid']['row_spans'].append(
             span(row + 2, 2, 'GPT-6-Astra · Goal stalled (/goal resume)', 1))
@@ -144,10 +146,10 @@ class CodexDeliveryLifecycleTests(unittest.TestCase):
             self.daemon.process_once(self.client)
             self.assertEqual(runtime.delivery_status, 'failed')
             self.client.payload, self.client.text = self.frame, visible_text(self.frame)
-            runtime.send_started_at = 0
             self.daemon.process_once(self.client)
             self.daemon.process_once(self.client)
-        self.assertEqual([r[-1] for r in self.client.sent], ['/goal resume'])
+        self.assertEqual(self.client.sent, [])
+        self.assertFalse(runtime.codex_input_not_sent)
         self.assertEqual(runtime.delivery_confirmed_at, 0)
 
 

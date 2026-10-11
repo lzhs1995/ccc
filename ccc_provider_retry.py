@@ -4,6 +4,7 @@ Reservations precede input. An uncertain input consumes its reservation; neither
 an idle frame nor a process restart refunds it. This module never sends input.
 """
 from contextlib import contextmanager
+from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
 import hashlib
 import json
@@ -18,6 +19,14 @@ import time
 RETRYABLE = frozenset({'rate_limit', 'http_500', 'http_502', 'http_503', 'http_504', 'http_524'})
 RATE_LIMIT_RECOVERY_INTERVAL = 0.25
 RATE_LIMIT_PROVIDER_SPACING = 0.05
+
+
+@dataclass(frozen=True)
+class ProviderRetryDecision:
+    """One transaction's result; never a shared last-verdict or send grant."""
+    allowed: bool
+    reason_code: str
+    retry_at: float = 0.0
 
 
 def retry_after(message, observed_at):
@@ -133,18 +142,46 @@ class ProviderRetryStore:
     def ready(self, evidence, attempt=None):
         return self._admit(evidence, attempt, dry_run=True)
 
+    def evaluate(self, evidence, attempt=None, *, reserve=False):
+        """Return a decision from the same check that may reserve one remedy.
+
+        A preview keeps the existing ready() fair-waiter lease but never
+        consumes a remedy. Callers must use this result directly, not call
+        reserve() a second time to obtain the reason for its first result.
+        Unlike the legacy bool APIs, malformed evidence and ledger failures
+        are represented as fail-closed decisions.
+        """
+        if (not isinstance(evidence, dict)
+                or any(not isinstance(evidence.get(key), str) or not evidence[key]
+                       for key in ('identity', 'provider', 'stamp'))
+                or reserve and not attempt):
+            return ProviderRetryDecision(False, 'provider_retry_evidence_missing')
+        try:
+            return self._admit_result(dict(evidence), attempt, dry_run=not reserve)
+        except (OSError, ValueError, TypeError, KeyError, RuntimeError, sqlite3.Error):
+            # A damaged JSON row is an unavailable ledger, not absent native
+            # evidence. The transaction rolls back before this verdict exists.
+            return ProviderRetryDecision(False, 'provider_retry_ledger_unavailable')
+
     def _admit(self, evidence, attempt, *, dry_run=False):
+        return self._admit_result(evidence, attempt, dry_run=dry_run).allowed
+
+    def _admit_result(self, evidence, attempt, *, dry_run=False):
         with self.transaction() as connection:
             row = connection.execute('SELECT record FROM episodes WHERE identity=?', (evidence['identity'],)).fetchone()
             if not row:
-                return False
+                return ProviderRetryDecision(False, 'provider_retry_evidence_missing')
             record = json.loads(row[0])
             self._pin_legacy_anchor(connection, evidence['identity'], record)
             now = self.clock()
             floor = connection.execute('SELECT until FROM server_floors WHERE provider=?', (evidence['provider'],)).fetchone()
             # Idempotency is only for the same in-flight operation (paste/Enter).
             if attempt and record.get('attempt') == attempt:
-                return not (floor and now < floor[0]) and record.get('reserved_stamp') == evidence['stamp']
+                if record.get('reserved_stamp') != evidence['stamp']:
+                    return ProviderRetryDecision(False, 'provider_retry_attempt_mismatch')
+                if floor and now < floor[0]:
+                    return ProviderRetryDecision(False, 'provider_retry_server_floor', floor[0])
+                return ProviderRetryDecision(True, 'provider_retry_same_attempt')
             cooldown = connection.execute('SELECT until FROM cooldowns WHERE provider=?', (evidence['provider'],)).fetchone()
             sustained_rate_limit = evidence.get('error_type') == 'rate_limit'
             # Rate-limit recovery follows the original failure timestamp. Old
@@ -156,10 +193,12 @@ class ProviderRetryStore:
                 due = max(record['failure_at'], record.get('last_reserved_at', 0)) + RATE_LIMIT_RECOVERY_INTERVAL
             else:
                 due = record.get('due', float('inf'))
-            if (evidence['stamp'] not in record['seen']
-                    or record['count'] >= 4 and not sustained_rate_limit
-                    or record.get('reserved_stamp') == evidence['stamp']):
-                return False
+            if evidence['stamp'] not in record['seen']:
+                return ProviderRetryDecision(False, 'provider_retry_evidence_missing')
+            if record.get('reserved_stamp') == evidence['stamp']:
+                return ProviderRetryDecision(False, 'provider_retry_failure_reserved')
+            if record['count'] >= 4 and not sustained_rate_limit:
+                return ProviderRetryDecision(False, 'provider_retry_budget_exhausted')
             # Eligible live callers keep their place across provider cooldowns.
             # A fast polling session must not repeatedly win every shared slot.
             # Leases prevent a paused/exited caller from blocking other sessions.
@@ -171,12 +210,16 @@ class ProviderRetryStore:
                 (evidence['identity'], evidence['provider'], evidence['stamp'], now, now))
             first = connection.execute('SELECT identity FROM waiters WHERE provider=? ORDER BY queued_at, identity LIMIT 1',
                                        (evidence['provider'],)).fetchone()
-            if ((floor and now < floor[0]) or (cooldown and now < cooldown[0])
-                    or now < due
-                    or first[0] != evidence['identity']):
-                return False
+            if floor and now < floor[0]:
+                return ProviderRetryDecision(False, 'provider_retry_server_floor', floor[0])
+            if cooldown and now < cooldown[0]:
+                return ProviderRetryDecision(False, 'provider_retry_shared_slot', cooldown[0])
+            if now < due:
+                return ProviderRetryDecision(False, 'provider_retry_local_cooldown', due)
+            if first[0] != evidence['identity']:
+                return ProviderRetryDecision(False, 'provider_retry_fair_queue')
             if attempt is None or dry_run:
-                return True
+                return ProviderRetryDecision(True, 'provider_retry_ready')
             record['count'] += 1
             record['attempt'] = attempt
             record['reserved_stamp'] = evidence['stamp']
@@ -190,7 +233,7 @@ class ProviderRetryStore:
                                    (evidence['provider'], now + RATE_LIMIT_PROVIDER_SPACING))
             else:
                 connection.execute('INSERT INTO cooldowns VALUES (?, ?) ON CONFLICT(provider) DO UPDATE SET until=MAX(until,excluded.until)', (evidence['provider'], record['due']))
-            return True
+            return ProviderRetryDecision(True, 'provider_retry_reserved')
 
     def success(self, session, provider, *, at, completed_turn, last_agent_message, error):
         """Reset only on a later native completion containing an actual answer.

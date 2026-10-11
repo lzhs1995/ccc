@@ -580,6 +580,7 @@ class TargetRuntime:
     observation_cadence_sec: float = 1.0
     scheduler_lag_ms: float = 0.0
     read_duration_ms: float = 0.0
+    observation_timings: dict[str, Any] = dataclasses.field(default_factory=dict)
     candidate_observed_at: float = 0.0
     send_queue_ms: float = 0.0
     send_started_at: float = 0.0
@@ -593,6 +594,7 @@ class TargetRuntime:
     native_failure_at: float = 0.0
     native_failure_turn_key: str = ""
     native_complete_to_send_ms: float = 0.0
+    native_send_latency_measured: bool = False
     native_send_deadline_missed: bool = False
     delivery_confirmed_at: float = 0.0
     send_attempt_id: str = ""
@@ -610,6 +612,7 @@ class TargetRuntime:
     network_service_host: str = ""
     network_phase: str = ""
     network_checked_at: float = 0.0
+    provider_retry_status: dict[str, Any] = dataclasses.field(default_factory=dict)
     registration_revalidation: dict[str, Any] = dataclasses.field(default_factory=dict)
     observed_screen_signature: str | None = None
     observed_evidence_row: int | None = None
@@ -7009,15 +7012,27 @@ class WatchDaemon:
         else:
             self._save_now()
 
-    def _save_delivery(self, surface_id, runtime, codex, *, wait=True):
+    def _save_delivery(self, surface_id, runtime, codex, *, wait=True, pre_input=None):
         if not codex:
             return self.save(wait=wait)
         # Only this input record must reach disk before this surface proceeds.
         # A full-fleet JSON snapshot is for observers, never a send barrier.
-        self._delivery_store.persist(surface_id, runtime)
+        if pre_input is None:
+            self._delivery_store.persist(surface_id, runtime)
+        else:
+            pre_input.persist()
+        self._publish_delivery_snapshot(surface_id)
+
+    def _publish_delivery_snapshot(self, surface_id):
         if self._state_writer is None:
             # Synchronous compatibility callers have no publishing heartbeat.
-            self.save(wait=False)
+            try:
+                self.save(wait=False)
+            except Exception as exc:
+                # A failed observer publication cannot turn a committed input
+                # record into a failed transaction or authorize another input.
+                self.logger.warning("surface=%s delivery committed; observer snapshot failed: %s",
+                                    surface_id[:8], exc)
         # The production loop publishes the full snapshot once per second.
         # Re-requesting it on every input spends O(fleet) CPU at O(inputs)
         # frequency even with an asynchronous coalescing writer.
@@ -7104,6 +7119,8 @@ class WatchDaemon:
     def _native_retry_needed(self, sid, wid, failed_at):
         if self._native_dispatch is not None and self._native_dispatch.owns(sid):
             return False
+        if type(failed_at) not in (int, float) or not math.isfinite(failed_at) or failed_at <= 0:
+            return False
         if self.config.get("global_paused") or self.config.get("mode") != "armed":
             return False
         target = self._event_target(sid)
@@ -7111,14 +7128,46 @@ class WatchDaemon:
             return False
         with self._runtime_lock:
             runtime = self.runtime.get(sid)
-        if runtime is None or runtime.observed_at < failed_at:
+        if runtime is None:
             return True
         if runtime.delivery_status == "unknown":
-            return False
+            # A cached hint may wake observation of a distinct newer failure.
+            # It neither settles nor replays the older uncertain operation;
+            # the fresh native, composer and input gates still run afterwards.
+            original = self._codex_turn_key_identity(runtime.codex_sent_turn_key)
+            hint = self._codex_turn_key_identity(runtime.native_failure_turn_key)
+            return bool(original and hint and original[0] == hint[0]
+                and original[1] != hint[1]
+                and hint[2] == failed_at == runtime.native_failure_at
+                and type(runtime.send_started_at) in (int, float)
+                and math.isfinite(runtime.send_started_at)
+                and original[2] <= runtime.send_started_at < failed_at
+                and runtime.codex_input_phase != 'text_retained'
+                and runtime.observed_state not in {'composer_busy', 'menu', 'queued_followup'})
+        if runtime.observed_at < failed_at:
+            return True
         if (runtime.send_io_started_at >= failed_at
                 and runtime.delivery_status in {"sending", "accepted", "confirmed"}):
             return False
         return runtime.observed_state not in {"composer_busy", "menu", "queued_followup"}
+
+    def _record_send_io_started(self, runtime):
+        runtime.send_io_started_at = time.time()
+        runtime.detection_to_send_ms = round(max(0, runtime.send_io_started_at -
+            (runtime.candidate_observed_at or runtime.observed_at)) * 1000, 3)
+        key = runtime.codex_sent_turn_key
+        if runtime.codex_goal_resume:
+            # Goal updates and native completion have different timestamps.
+            # Use the native failure clock only for this exact proved goal turn.
+            goal = runtime.codex_goal_proof
+            key = (f"{goal.get('session_id')}:{goal.get('turn_id')}:{runtime.native_failure_at}"
+                   if goal and key == self._goal_turn_key(goal) else "")
+        measured = bool(key and key == runtime.native_failure_turn_key
+                        and 0 < runtime.native_failure_at <= runtime.send_io_started_at)
+        runtime.native_send_latency_measured = measured
+        runtime.native_complete_to_send_ms = (round(
+            (runtime.send_io_started_at - runtime.native_failure_at) * 1000, 3) if measured else 0.0)
+        runtime.native_send_deadline_missed = measured and runtime.native_complete_to_send_ms >= 1000
 
     def _record_dispatch(self, target, phase, delay):
         sid = str(target["surface_id"])
@@ -7143,36 +7192,60 @@ class WatchDaemon:
         self.logger.error("surface=%s phase=%s worker failed: %s", sid[:8], phase, exc)
 
     def _scheduled_observe(self, target, is_current):
+        total_started, started_at = time.monotonic(), time.time()
         if self.stop_requested or not is_current():
             return None
         sid = str(target["surface_id"])
         with self._runtime_lock:
             runtime = self.runtime.setdefault(sid, TargetRuntime())
-        if not runtime.native_failure_at:
-            from ccc_standby_entry import PeriodicObservationHint
-            with self._runtime_lock:
-                hint = getattr(self, '_standby_periodic_hint', None)
-                if hint is None:
-                    hint = self._standby_periodic_hint = PeriodicObservationHint()
-            if hint.covered(self.config_path, target) and is_current() and not runtime.native_failure_at:
-                # This is no screen observation and grants no sending evidence.
-                return None
+            # A superseded periodic worker may finish after a newer native
+            # observation. Its finally block must not replace that result.
+            token = runtime._observation_timing_token = object()
         previous = runtime.observation_completed_at
-        started = time.monotonic()
-        generation = self._config_mtime_ns
-        policy_key = self._observation_policy.key(target)
+        started, stages, outcome = None, {}, "error"
+        current = is_current
         try:
-            return self._process_one_target(
+            if not runtime.native_failure_at:
+                from ccc_standby_entry import PeriodicObservationHint
+                with self._runtime_lock:
+                    hint = getattr(self, '_standby_periodic_hint', None)
+                    if hint is None:
+                        hint = self._standby_periodic_hint = PeriodicObservationHint()
+                if hint.covered(self.config_path, target) and current() and not runtime.native_failure_at:
+                    # This is no screen observation and grants no sending evidence.
+                    outcome = "standby_covered"
+                    return None
+            started = time.monotonic()
+            generation = self._config_mtime_ns
+            policy_key = self._observation_policy.key(target)
+            current = lambda: is_current() and policy_key == self._observation_policy.key(target)
+            result = self._process_one_target(
                 target, self._observation_client(), None, "",
                 defer_send=True,
-                is_current=lambda: is_current() and policy_key == self._observation_policy.key(target),
+                is_current=current,
                 authorization_current=lambda: generation == self._config_mtime(),
+                observation_timings=stages,
             )
+            outcome = "completed"
+            return result
         finally:
-            now = time.time()
-            runtime.read_duration_ms = round((time.monotonic() - started) * 1000, 3)
-            runtime.observation_completed_at = now
-            runtime.observation_interval_ms = round(max(0, now - previous) * 1000, 3) if previous else 0
+            finished, now = time.monotonic(), time.time()
+            total_ms = (finished - total_started) * 1000
+            if current():
+                with self._runtime_lock:
+                    if (self.runtime.get(sid) is runtime
+                            and runtime._observation_timing_token is token):
+                        runtime.observation_timings = {
+                            "source": "periodic", "outcome": outcome,
+                            "started_at": started_at, "completed_at": now,
+                            "total_ms": round(total_ms, 3),
+                            "stages_ms": {key: round(value, 3) for key, value in stages.items()},
+                            "unattributed_ms": round(max(0, total_ms - sum(stages.values())), 3),
+                        }
+                        if started is not None:
+                            runtime.read_duration_ms = round((finished - started) * 1000, 3)
+                            runtime.observation_completed_at = now
+                            runtime.observation_interval_ms = round(max(0, now - previous) * 1000, 3) if previous else 0
 
     def _scheduled_native(self, target, is_current):
         """One current observation and input transaction for a native failure.
@@ -7180,27 +7253,70 @@ class WatchDaemon:
         A superseded periodic read may finish, but its generation has no input
         authority. The per-surface lock still serializes every actual input.
         """
+        total_started, started_at = time.monotonic(), time.time()
         sid = str(target["surface_id"])
         policy_key = self._observation_policy.key(target)
         current = lambda: is_current() and policy_key == self._observation_policy.key(target)
-        with self._surface_lock(sid):
-            active = self._active_send_target(target, current)
-            if active is None:
-                return
-            client = self._observation_client()
-            with self._runtime_lock:
-                runtime = self.runtime.setdefault(sid, TargetRuntime())
-            generation = self._config_mtime_ns
-            started = time.monotonic()
-            try:
-                tree = client.tree()
-                if not current():
+        if not current():
+            return
+        with self._runtime_lock:
+            runtime = self.runtime.setdefault(sid, TargetRuntime())
+            token = runtime._observation_timing_token = object()
+        read_duration_ms, stages, outcome = None, {}, "error"
+        read_completed_at = 0.0
+        lock_started, lock_acquired = time.monotonic(), False
+        try:
+            with self._surface_lock(sid):
+                stages["surface_lock_wait"] = (time.monotonic() - lock_started) * 1000
+                lock_acquired = True
+                admission_started = time.monotonic()
+                try:
+                    active = self._active_send_target(target, current)
+                finally:
+                    stages["admission"] = (time.monotonic() - admission_started) * 1000
+                if active is None:
+                    outcome = "admission_rejected"
                     return
-                self._process_one_target(active, client, tree, "", is_current=current,
-                    authorization_current=lambda: generation == self._config_mtime())
-            finally:
-                runtime.read_duration_ms = round((time.monotonic() - started) * 1000, 3)
-                runtime.observation_completed_at = time.time()
+                client = self._observation_client()
+                generation = self._config_mtime_ns
+                # Retain the legacy read_duration_ms scope. The new total_ms
+                # also includes admission and the outer surface lock wait.
+                started = time.monotonic()
+                try:
+                    tree_started = time.monotonic()
+                    try:
+                        tree = client.tree()
+                    finally:
+                        stages["tree"] = (time.monotonic() - tree_started) * 1000
+                    if not current():
+                        return
+                    self._process_one_target(active, client, tree, "", is_current=current,
+                        authorization_current=lambda: generation == self._config_mtime(),
+                        observation_timings=stages)
+                    outcome = "completed"
+                finally:
+                    # The legacy measurement ended before releasing this lock.
+                    read_duration_ms = round((time.monotonic() - started) * 1000, 3)
+                    read_completed_at = time.time()
+        finally:
+            finished, now = time.monotonic(), time.time()
+            if not lock_acquired:
+                stages["surface_lock_wait"] = (finished - lock_started) * 1000
+            total_ms = (finished - total_started) * 1000
+            if current():
+                with self._runtime_lock:
+                    if (self.runtime.get(sid) is runtime
+                            and runtime._observation_timing_token is token):
+                        runtime.observation_timings = {
+                            "source": "native", "outcome": outcome,
+                            "started_at": started_at, "completed_at": now,
+                            "total_ms": round(total_ms, 3),
+                            "stages_ms": {key: round(value, 3) for key, value in stages.items()},
+                            "unattributed_ms": round(max(0, total_ms - sum(stages.values())), 3),
+                        }
+                        if read_duration_ms is not None:
+                            runtime.read_duration_ms = read_duration_ms
+                            runtime.observation_completed_at = read_completed_at
 
     def _active_send_target(self, target, is_current=None):
         if self.stop_requested or (is_current is not None and not is_current()):
@@ -7546,7 +7662,36 @@ class WatchDaemon:
         defer_send: bool = False,
         is_current: Callable[[], bool] | None = None,
         authorization_current: Callable[[], bool] | None = None,
+        observation_timings: dict[str, float] | None = None,
     ) -> ScreenState | None:
+        def record_stage(name, started):
+            if observation_timings is not None:
+                observation_timings[name] = observation_timings.get(name, 0.0) + (time.monotonic() - started) * 1000
+
+        @contextlib.contextmanager
+        def timed(name):
+            started = time.monotonic() if observation_timings is not None else 0.0
+            try:
+                yield
+            finally:
+                record_stage(name, started)
+
+        def measured(name, operation, *args, **kwargs):
+            with timed(name):
+                return operation(*args, **kwargs)
+
+        @contextlib.contextmanager
+        def surface_locked():
+            started, acquired = time.monotonic() if observation_timings is not None else 0.0, False
+            try:
+                with self._surface_lock(surface_id):
+                    record_stage("surface_lock_wait", started)
+                    acquired = True
+                    yield
+            finally:
+                if not acquired:
+                    record_stage("surface_lock_wait", started)
+
         def current(*, fresh=False):
             if is_current is None:
                 return True
@@ -7570,22 +7715,22 @@ class WatchDaemon:
         if (diagnostic.get("status") == "dormant"
                 and diagnostic.get("workspace_id") == target.get("workspace_id")
                 and 0 <= time.time() - float(diagnostic.get("observed_at") or 0) < 5):
-            with self._surface_lock(surface_id):
+            with surface_locked():
                 if not current():
                     return None
                 self._record_state(surface_id, runtime, ScreenState(
                     "terminal_dormant", reason="native terminal runtime uninitialized; no live agent"))
             return
         try:
-            state = self._observe_target_viewport(target, runtime, client)
+            state = measured("viewport_classify", self._observe_target_viewport, target, runtime, client)
             if not current():
                 return None
             observation = (
                 None
                 if state.kind in {"working", "menu"} and not self._runtime_is_claude(runtime, state)
-                else self._claude_process_observation(target, client)
+                else measured("process_identity", self._claude_process_observation, target, client)
             )
-            with self._surface_lock(surface_id):
+            with surface_locked(), timed("reconcile"):
                 if not current():
                     return None
                 self._apply_claude_process_observation(runtime, observation)
@@ -7616,13 +7761,13 @@ class WatchDaemon:
                     self._record_state(surface_id, runtime, state)
                     return
         except GlobalIncompatibleError as exc:
-            with self._surface_lock(surface_id):
+            with surface_locked():
                 if not current(fresh=True):
                     return None
                 self._mark_global_incompatible(runtime, str(exc))
             return
         except IncompatibleError as exc:
-            with self._surface_lock(surface_id):
+            with surface_locked():
                 if not current(fresh=True):
                     return None
                 if isinstance(exc, UnanchoredFrameError):
@@ -7652,7 +7797,7 @@ class WatchDaemon:
             if not current():
                 return None
             if self._is_transient_observation_error(exc):
-                with self._surface_lock(surface_id):
+                with surface_locked():
                     # A terminal can remain live while cmux temporarily
                     # cannot materialize its viewport.  Do not turn that
                     # observation gap into a durable pause: the next poll
@@ -7663,8 +7808,8 @@ class WatchDaemon:
                     ))
                     runtime.state = "cmux_unavailable"
                 return
-            if not client.ping():
-                with self._surface_lock(surface_id):
+            if not measured("ping", client.ping):
+                with surface_locked():
                     if not current():
                         return None
                     # Deliberately *not* a parser blind spot: cmux being gone
@@ -7672,17 +7817,17 @@ class WatchDaemon:
                     # restart into a fake "viewport unreadable" report.
                     self._record_state(surface_id, runtime, ScreenState("cmux_unavailable", reason="socket disappeared during poll"))
                 return
-            if self._refresh_workspace(target, client, is_current=lambda: current(fresh=True)):
+            if measured("workspace_refresh", self._refresh_workspace, target, client, is_current=lambda: current(fresh=True)):
                 try:
-                    state = self._observe_target_viewport(target, runtime, client)
+                    state = measured("viewport_classify", self._observe_target_viewport, target, runtime, client)
                     if not current():
                         return None
                     observation = (
                         None
                         if state.kind in {"working", "menu"} and not self._runtime_is_claude(runtime, state)
-                        else self._claude_process_observation(target, client)
+                        else measured("process_identity", self._claude_process_observation, target, client)
                     )
-                    with self._surface_lock(surface_id):
+                    with surface_locked(), timed("reconcile"):
                         if not current():
                             return None
                         self._apply_claude_process_observation(runtime, observation)
@@ -7710,13 +7855,13 @@ class WatchDaemon:
                             self._record_state(surface_id, runtime, state)
                             return
                 except GlobalIncompatibleError as retry_exc:
-                    with self._surface_lock(surface_id):
+                    with surface_locked():
                         if not current(fresh=True):
                             return None
                         self._mark_global_incompatible(runtime, str(retry_exc))
                     return
                 except IncompatibleError as retry_exc:
-                    with self._surface_lock(surface_id):
+                    with surface_locked():
                         if not current(fresh=True):
                             return None
                         if isinstance(retry_exc, UnanchoredFrameError):
@@ -7743,31 +7888,31 @@ class WatchDaemon:
                     if not current():
                         return None
                     if self._is_transient_observation_error(retry_exc):
-                        with self._surface_lock(surface_id):
+                        with surface_locked():
                             self._record_observation(surface_id, runtime, ScreenState(
                                 "cmux_unavailable",
                                 reason="cmux viewport unavailable after refresh; still monitoring",
                             ))
                             runtime.state = "cmux_unavailable"
                         return
-                    if not client.ping():
-                        with self._surface_lock(surface_id):
+                    if not measured("ping", client.ping):
+                        with surface_locked():
                             if not current():
                                 return None
                             self._record_state(surface_id, runtime, ScreenState("cmux_unavailable", reason="socket disappeared during retry"))
                         return
-                    with self._surface_lock(surface_id):
+                    with surface_locked():
                         if not current(fresh=True):
                             return None
                         self._pause_missing_or_error(target, runtime, str(retry_exc))
                     return
             else:
-                with self._surface_lock(surface_id):
+                with surface_locked():
                     if not current(fresh=True):
                         return None
                     self._pause_missing_or_error(target, runtime, str(exc))
                 return
-        with self._surface_lock(surface_id):
+        with surface_locked():
             if not current():
                 return None
             if defer_send:
@@ -7776,12 +7921,13 @@ class WatchDaemon:
                 # turn before it occupies a send slot and refreshes topology.
                 # The send path repeats this check, including after durable
                 # persistence: an observation never grants input permission.
-                if not self._codex_turn_ready(target, runtime, state):
+                if not measured("turn_gate", self._codex_turn_ready, target, runtime, state):
                     return None
                 self._record_observation(surface_id, runtime, state)
                 runtime.candidate_observed_at = runtime.viewport_checked_at
                 return state
-            self._handle_state(
+            runtime.candidate_observed_at = runtime.viewport_checked_at
+            measured("handle_state", self._handle_state,
                 target,
                 runtime,
                 state,
@@ -7862,6 +8008,9 @@ class WatchDaemon:
 
     def _provider_retry_gate(self, target, runtime, state, *, attempt=None, dry_run=False):
         """One persistent budget for plain, goal and queue error remedies."""
+        runtime.provider_retry_status = {}
+        if runtime.paused_reason and runtime.paused_reason.startswith('provider retry '):
+            runtime.paused_reason = ''
         turn = self.codex_queue_recovery.current_turn(target) or {}
         original = turn
         if turn.get('kind') == 'unknown':
@@ -7880,18 +8029,20 @@ class WatchDaemon:
                 provider = provider_for_turn(target, original)
             evidence = self._provider_retry.observe(original.get('session_id'), provider,
                 original.get('turn_id'), error_type, message, original.get('at'))
-            allowed = bool(evidence and (self._provider_retry.reserve(evidence, attempt)
-                           if attempt and not dry_run else self._provider_retry.ready(evidence, attempt)))
+            decision = self._provider_retry.evaluate(evidence, attempt,
+                reserve=bool(attempt and not dry_run))
         except (OSError, ValueError, TypeError, RuntimeError, sqlite3.Error):
-            runtime.paused_reason = 'provider retry evidence or durable ledger unavailable; session preserved'
-            return False
-        if not allowed:
-            runtime.paused_reason = ('provider retry cooldown or waiting for a shared retry slot; session preserved'
-                                     if error_type == 'rate_limit' else
-                                     'provider retry cooldown or four-remedy budget; session preserved')
-        elif runtime.paused_reason and runtime.paused_reason.startswith('provider retry '):
-            runtime.paused_reason = ''
-        return allowed
+            from ccc_provider_retry import ProviderRetryDecision
+            decision = ProviderRetryDecision(False, 'provider_retry_ledger_unavailable')
+        if not decision.allowed:
+            key = (self._goal_turn_key(original) if original.get('goal_id') else
+                   f"{original.get('session_id')}:{original.get('turn_id')}:{original.get('at')}")
+            if self._codex_turn_key_identity(key) == self._codex_turn_key_identity(runtime.codex_observed_turn_key):
+                key = runtime.codex_observed_turn_key
+            runtime.provider_retry_status = dict(reason_code=decision.reason_code,
+                retry_at=decision.retry_at, checked_at=time.time(), observed_turn_key=key)
+            runtime.paused_reason = 'provider retry ' + decision.reason_code + '; session preserved'
+        return decision.allowed
 
     def _provider_retry_success(self, target):
         if not self._provider_retry.path.exists():
@@ -11747,8 +11898,12 @@ class WatchDaemon:
                 and generation == self._config_mtime_ns and self.config.get('mode') == 'armed'
                 and not self.config.get('global_paused'))
 
-    def _goal_input_ready(self, target, runtime, state, client, is_current, draft):
+    def _goal_input_ready(self, target, runtime, state, client, is_current, draft, *, input_identity=None):
         """Recheck the pinned goal and live input after each socket admission."""
+        def same_identity():
+            return (not input_identity or self._current_codex_input_identity(target, runtime) == input_identity)
+        if not same_identity():
+            return False
         if not self._provider_retry_gate(target, runtime, state, attempt=runtime.send_attempt_id):
             return False
         if (not runtime.codex_goal_resume
@@ -11771,7 +11926,7 @@ class WatchDaemon:
                 and self._provider_retry_gate(target, runtime, state, attempt=runtime.send_attempt_id)
                 and self._active_send_target(target, is_current) is not None
                 and generation == self._config_mtime_ns and self.config.get('mode') == 'armed'
-                and not self.config.get('global_paused'))
+                and not self.config.get('global_paused') and same_identity())
 
     def _submit_native_draft(self, target, runtime, state, client, message, proof, is_current,
                              *, persisted_input_phase=None, retry_identity=None):
@@ -11845,11 +12000,7 @@ class WatchDaemon:
             if (not ready or self._active_send_target(target, is_current) is None
                     or self.config.get('mode') != 'armed' or self.config.get('global_paused')):
                 raise UncertainDeliveryError('native draft retained; Enter authorization changed')
-            runtime.send_io_started_at = time.time()
-            if (runtime.native_failure_turn_key == runtime.codex_sent_turn_key
-                    and 0 < runtime.native_failure_at <= runtime.send_io_started_at):
-                runtime.native_complete_to_send_ms = round((runtime.send_io_started_at-runtime.native_failure_at)*1000,3)
-                runtime.native_send_deadline_missed = runtime.native_complete_to_send_ms >= 1000
+            self._record_send_io_started(runtime)
             key_attempted = True
             check_enter = lambda: authorized(message)
             with base.input_guard(check_enter):
@@ -12014,13 +12165,27 @@ class WatchDaemon:
             if runtime.codex_input_phase:
                 target = self._event_target(surface_id)
                 turn = self.codex_queue_recovery.current_turn(target) if target else None
-                key = (f"{turn.get('session_id')}:{turn.get('turn_id')}:{turn.get('at')}"
-                       if turn else "")
+                original = self._codex_turn_key_identity(runtime.codex_sent_turn_key)
+                goal = (self._current_blocked_goal(target)
+                        if target and state.native_goal_stalled else None)
+                def later_failure(proof, *, authenticated):
+                    at = proof.get('at') if isinstance(proof, Mapping) else None
+                    error = proof.get('error') if isinstance(proof, Mapping) else None
+                    return bool(original and authenticated
+                        and proof.get('session_id') == original[0]
+                        and proof.get('turn_id') and proof['turn_id'] != original[1]
+                        and type(runtime.send_started_at) in (int, float)
+                        and math.isfinite(runtime.send_started_at)
+                        and runtime.send_started_at >= original[2]
+                        and type(at) in (int, float) and math.isfinite(at)
+                        and at > runtime.send_started_at
+                        and isinstance(error, Mapping)
+                        and _match_error_block('■ ' + str(error.get('message') or '')) == state.error_type)
                 if (runtime.codex_input_phase != 'text_retained'
-                        and turn and turn.get('signature') and turn.get('turn_id')
-                        and turn.get('session_id') == runtime.codex_sent_turn_key.split(':', 1)[0]
-                        and key != runtime.codex_sent_turn_key
-                        and float(turn.get('at') or 0) >= runtime.send_started_at):
+                        and state.kind == 'recoverable_error' and state.error_type
+                        and (later_failure(goal, authenticated=bool(goal))
+                            or later_failure(turn, authenticated=bool(turn
+                                and turn.get('kind') == 'task_complete' and turn.get('signature'))))):
                     # A different authenticated turn lets _codex_turn_ready
                     # evaluate a new failure. It does not prove this older
                     # input arrived, so keep its outcome and error unchanged.
@@ -12072,9 +12237,28 @@ class WatchDaemon:
         return False
 
     @staticmethod
-    def _codex_input_identity(target, turn):
+    def _codex_turn_key_identity(key):
+        """Read the original session/turn from either persisted key format."""
+        if not isinstance(key, str):
+            return None
+        parts = key.split(':')
+        if len(parts) == 5 and parts[0] == 'goal' and parts[2]:
+            session, turn, at = parts[1], parts[3], parts[4]
+        elif len(parts) == 3:
+            session, turn, at = parts
+        else:
+            return None
+        try:
+            at = float(at)
+        except ValueError:
+            return None
+        return (session, turn, at) if session and turn and math.isfinite(at) and at > 0 else None
+
+    @staticmethod
+    def _codex_input_identity(target, turn, *, goal=False):
         """Pin a verified original process and failed turn, never a UI label."""
-        if (not isinstance(turn, Mapping) or turn.get('kind') != 'task_complete'
+        if (not isinstance(turn, Mapping) or turn.get('kind') != ('goal_blocked' if goal else 'task_complete')
+                or goal and (not isinstance(turn.get('goal_id'), str) or not turn['goal_id'])
                 or not turn.get('session_id') or not turn.get('turn_id')
                 or type(turn.get('pid')) is not int or turn['pid'] <= 0
                 or type(turn.get('process_start')) not in (int, float)
@@ -12088,30 +12272,76 @@ class WatchDaemon:
             provider = provider_for_turn(target, turn)
         if not isinstance(provider, str) or not provider.strip():
             return {}
-        return dict(surface_id=target['surface_id'], workspace_id=target['workspace_id'],
+        identity = dict(surface_id=target['surface_id'], workspace_id=target['workspace_id'],
                     model_provider=provider,
                     **{k: turn.get(k) for k in ('session_id', 'turn_id', 'at', 'pid', 'process_start')})
+        if goal:
+            identity['goal_id'] = turn['goal_id']
+        return identity
 
+    def _current_codex_input_identity(self, target, runtime):
+        if runtime.codex_goal_resume:
+            goal = self._current_blocked_goal(target)
+            if not goal or goal != runtime.codex_goal_proof:
+                return {}
+            return self._codex_input_identity(target, goal, goal=True)
+        return self._codex_input_identity(target, self.codex_queue_recovery.current_turn(target))
 
-    def _unwritten_codex_attempt(self, target, runtime, state):
+    def _codex_input_matches_key(self, identity, key):
+        return bool(identity and key == (self._goal_turn_key(identity) if 'goal_id' in identity else
+                    f"{identity['session_id']}:{identity['turn_id']}:{identity['at']}"))
+
+    def _unwritten_codex_attempt(self, target, runtime, state, *, goal=None):
         # _codex_turn_ready has already resolved whether the stalled footer
         # belongs to the current native Goal. A superseded Goal can leave that
         # footer visible across newer failed turns; it is not an input veto.
-        if (state.message_kind != 'codex' or runtime.codex_goal_resume
-                or state.requires_goal_proof
+        if (state.message_kind != 'codex'
                 or runtime.codex_private_check
                 or runtime.codex_input_phase != 'input_not_sent'
                 or runtime.delivery_status != 'retryable'
                 or not runtime.codex_sent_turn_key
                 or runtime.codex_sent_turn_key != runtime.codex_observed_turn_key):
             return None
-        identity = self._codex_input_identity(target, self.codex_queue_recovery.current_turn(target))
+        if goal is not None:
+            if not state.native_goal_stalled or goal != runtime.codex_goal_proof:
+                return None
+            identity = self._codex_input_identity(target, goal, goal=True)
+        else:
+            if state.requires_goal_proof and not runtime.codex_goal_resume:
+                return None
+            identity = self._current_codex_input_identity(target, runtime)
         proof = runtime.codex_input_not_sent
         if (identity and proof.get('identity') == identity
                 and proof.get('attempt_id') == runtime.send_attempt_id
                 and proof.get('turn_key') == runtime.codex_sent_turn_key):
             return runtime.send_attempt_id
         return None
+
+
+    def _cancel_before_input(self, surface_id, runtime, state, input_identity, reason):
+        """Persist a refusal reached before this control flow calls any input."""
+        initial_phase = runtime.codex_input_phase
+        runtime.delivery_status = 'cancelled'
+        runtime.last_send_error = 'input not sent: ' + reason
+        if (input_identity and initial_phase in {'text_pending', 'paste_submit_pending'}
+                and self._codex_input_matches_key(input_identity, runtime.codex_sent_turn_key)):
+            # Preserve the original attempt/reservation, even if a live gate
+            # has changed. Reuse still requires the same authenticated process,
+            # turn, transport and all current authorizations. This branch is
+            # never used to infer non-delivery from a historical cancelled row.
+            runtime.codex_input_not_sent = dict(identity=input_identity,
+                attempt_id=runtime.send_attempt_id, turn_key=runtime.codex_sent_turn_key)
+            runtime.codex_input_phase = 'input_not_sent'
+            runtime.delivery_status = 'retryable'
+        try:
+            self._save_delivery(surface_id, runtime, state.message_kind == 'codex')
+        except (OSError, RuntimeError):
+            runtime.codex_input_not_sent = {}
+            runtime.codex_input_phase = initial_phase
+            runtime.delivery_status = 'cancelled'
+            raise
+        self.logger.info('surface=%s attempt=%s cancelled before input: %s',
+                         surface_id[:8], runtime.send_attempt_id, reason)
 
 
     def _handle_state(
@@ -12307,9 +12537,9 @@ class WatchDaemon:
         outgoing_message = private_check["message"] if private_check else None
         runtime.codex_private_check = private_check or {}
         checked_attempt = self._unwritten_codex_attempt(target, runtime, state)
-        input_identity = (self._codex_input_identity(target, self.codex_queue_recovery.current_turn(target))
+        input_identity = (self._current_codex_input_identity(target, runtime)
                           if state.message_kind == 'codex' and not private_check
-                          and not runtime.codex_goal_resume and self._connected_native_input(client) else {})
+                          and self._connected_native_input(client) else {})
         if (checked_attempt != retry_attempt
                 or (retry_attempt and input_identity != retry_identity)):
             runtime.paused_reason = 'zero-write recovery changed before persistence; session preserved'
@@ -12318,6 +12548,9 @@ class WatchDaemon:
         # the viewport rather than blindly treating the attempt as never made.
         runtime.send_started_at = time.time()
         runtime.send_io_started_at = 0.0
+        runtime.native_complete_to_send_ms = 0.0
+        runtime.native_send_latency_measured = False
+        runtime.native_send_deadline_missed = False
         runtime.send_completed_at = 0.0
         runtime.send_attempt_id = retry_attempt or uuid.uuid4().hex
         runtime.send_attempt_evidence = state.content_fingerprint
@@ -12337,8 +12570,27 @@ class WatchDaemon:
         runtime.last_send_error = ""
         persisted_at = time.monotonic()
         try:
-            self._save_delivery(surface_id, runtime, state.message_kind == "codex")
+            if input_identity and self._codex_input_matches_key(input_identity, runtime.codex_sent_turn_key):
+                # This live capability ends before any terminal operation.
+                # It can recover only this first pending write, with an exact
+                # durable head comparison; no historical failure can mint it.
+                with self._delivery_store.pre_input(surface_id, runtime, identity=input_identity) as pending:
+                    try:
+                        self._save_delivery(surface_id, runtime, True, pre_input=pending)
+                    except (OSError, RuntimeError) as exc:
+                        error = f"attempt persistence failed; input not sent: {exc}"
+                        pending.recover_input_not_sent(dict(identity=input_identity,
+                            attempt_id=runtime.send_attempt_id, turn_key=runtime.codex_sent_turn_key),
+                            error=error)
+                        self._publish_delivery_snapshot(surface_id)
+                        self.logger.warning("surface=%s %s; original attempt retained",
+                                            surface_id[:8], error)
+                        return
+            else:
+                self._save_delivery(surface_id, runtime, state.message_kind == "codex")
         except (OSError, RuntimeError) as exc:
+            runtime.codex_input_not_sent = {}
+            runtime.codex_input_phase = initial_input_phase
             runtime.delivery_status = "failed"
             runtime.state = "send_failed"
             runtime.last_send_error = f"attempt persistence failed; input not sent: {exc}"
@@ -12349,37 +12601,41 @@ class WatchDaemon:
         # at the actual input boundary, including a pause written during fsync.
         if (self._active_send_target(target, is_current) is None
                 or self.config.get("mode") != "armed" or self.config.get("global_paused", False)):
-            runtime.delivery_status = "cancelled"
-            self._save_delivery(surface_id, runtime, state.message_kind == "codex", wait=False)
+            self._cancel_before_input(surface_id, runtime, state, input_identity,
+                                      'placement or pause changed after persistence')
             return
         if not self._codex_turn_ready(target, runtime, state, reserved=True):
-            runtime.delivery_status = "cancelled"
-            self._save_delivery(surface_id, runtime, state.message_kind == "codex", wait=False)
+            self._cancel_before_input(surface_id, runtime, state, input_identity,
+                                      'native turn changed after persistence')
             return
-        runtime.send_io_started_at = time.time()
-        runtime.detection_to_send_ms = round(max(0, runtime.send_io_started_at -
-            (runtime.candidate_observed_at or runtime.observed_at)) * 1000, 3)
         send_started = time.monotonic()
         private_reserved = input_attempted = False
         try:
-            with workspace_input_lock(self.config_path, target["workspace_id"], shared=True):
+            with contextlib.ExitStack() as input_scope:
+                try:
+                    input_scope.enter_context(workspace_input_lock(
+                        self.config_path, target["workspace_id"], shared=True))
+                except (OSError, RuntimeError) as exc:
+                    # Only acquisition is provably before all terminal I/O.
+                    # Body and __exit__ failures must never create this proof.
+                    raise InputNotSentError(f'workspace input lock unavailable; input not sent: {exc}') from exc
                 if (self._active_send_target(target, is_current) is None
                         or self.config.get('mode') != 'armed' or self.config.get('global_paused')):
-                    runtime.delivery_status = "cancelled"
-                    self._save_delivery(surface_id, runtime, state.message_kind == "codex", wait=False)
+                    self._cancel_before_input(surface_id, runtime, state, input_identity,
+                                              'placement or pause changed while acquiring workspace lock')
                     return
                 if not self._codex_turn_ready(target, runtime, state, reserved=True):
-                    runtime.delivery_status = "cancelled"
-                    self._save_delivery(surface_id, runtime, state.message_kind == "codex", wait=False)
+                    self._cancel_before_input(surface_id, runtime, state, input_identity,
+                                              'native turn changed while acquiring workspace lock')
                     return
                 if retry_identity and (not self._connected_native_input(client)
-                        or self._codex_input_identity(target, self.codex_queue_recovery.current_turn(target))
+                        or self._current_codex_input_identity(target, runtime)
                         != retry_identity):
                     raise InputNotSentError('original zero-write identity or transport changed; input not sent')
                 if (state.message_kind == 'codex' and not self._provider_retry_gate(
                         target, runtime, state, attempt=runtime.send_attempt_id)):
-                    runtime.delivery_status = 'cancelled'
-                    self._save_delivery(surface_id, runtime, True, wait=False)
+                    self._cancel_before_input(surface_id, runtime, state, input_identity,
+                                              'provider retry is not ready')
                     return
                 if private_check:
                     self.private_checks.reserve(private_check, runtime.send_attempt_id)
@@ -12387,18 +12643,11 @@ class WatchDaemon:
                     if (not self._connected_native_input(client)
                             and not self._private_check_ready(private_check, target, runtime, state, client, is_current)):
                         raise CmuxError("原 b 检查来源、任务或输入授权已变化；本次未发送")
-                runtime.send_io_started_at = time.time()
-                runtime.detection_to_send_ms = round(max(0, runtime.send_io_started_at -
-                    (runtime.candidate_observed_at or runtime.observed_at)) * 1000, 3)
-                if (runtime.native_failure_turn_key == runtime.codex_sent_turn_key
-                        and 0 < runtime.native_failure_at <= runtime.send_io_started_at):
-                    runtime.native_complete_to_send_ms = round(
-                        (runtime.send_io_started_at - runtime.native_failure_at) * 1000, 3)
-                    runtime.native_send_deadline_missed = runtime.native_complete_to_send_ms >= 1000
+                self._record_send_io_started(runtime)
                 if runtime.codex_goal_resume:
                     client.resume_codex_goal(str(target["workspace_id"]), surface_id,
                         authorize=lambda draft: self._goal_input_ready(
-                            target, runtime, state, client, is_current, draft))
+                            target, runtime, state, client, is_current, draft, input_identity=input_identity))
                 else:
                     input_attempted = True
                     message = outgoing_message if private_check else self._outgoing_message(state)
@@ -12422,17 +12671,16 @@ class WatchDaemon:
             runtime.delivery_status = "unknown" if uncertain else "failed"
             runtime.state = "delivery_unknown" if uncertain else "send_failed"
             if (isinstance(exc, InputNotSentError) and not uncertain and input_identity
-                    and not private_reserved and not runtime.codex_goal_resume
+                    and not private_reserved
                     and runtime.codex_input_phase in {'text_pending', 'paste_submit_pending'}
-                    and runtime.codex_sent_turn_key ==
-                        f"{input_identity['session_id']}:{input_identity['turn_id']}:{input_identity['at']}"):
+                    and self._codex_input_matches_key(input_identity, runtime.codex_sent_turn_key)):
                 # _control_rpc proves no input sendall was attempted. The
                 # split Enter path wraps every post-text failure as uncertain.
                 runtime.codex_input_not_sent = dict(identity=input_identity,
                     attempt_id=runtime.send_attempt_id, turn_key=runtime.codex_sent_turn_key)
                 runtime.codex_input_phase = 'input_not_sent'
                 runtime.delivery_status = 'retryable'
-            self.logger.error("surface=%s send failed: %s", surface_id[:8], exc)
+            self.logger.error("surface=%s attempt=%s send failed: %s", surface_id[:8], runtime.send_attempt_id, exc)
             try:
                 self._save_delivery(surface_id, runtime, state.message_kind == "codex")
             except (OSError, RuntimeError):
@@ -12469,10 +12717,11 @@ class WatchDaemon:
         runtime.state = "claude_pending_input" if state.message_kind == "claude" else "awaiting_transition"
         if state.message_kind == "claude":
             runtime.awaiting = False
-        self.logger.info("surface=%s sent=%s count=%d scheduler_lag_ms=%.1f detect_to_send_ms=%.1f send_ms=%.1f native_complete_to_send_ms=%.3f native_deadline_missed=%s attempt=%s",
+        self.logger.info("surface=%s sent=%s count=%d scheduler_lag_ms=%.1f detect_to_send_ms=%.1f send_ms=%.1f native_complete_to_send_ms=%.3f native_latency_measured=%s native_deadline_missed=%s attempt=%s",
                          surface_id[:8], state.error_type, runtime.send_count, runtime.scheduler_lag_ms,
                          runtime.detection_to_send_ms, runtime.send_duration_ms,
-                         runtime.native_complete_to_send_ms, runtime.native_send_deadline_missed,
+                         runtime.native_complete_to_send_ms, runtime.native_send_latency_measured,
+                         runtime.native_send_deadline_missed,
                          runtime.send_attempt_id)
         self._save_delivery(surface_id, runtime, state.message_kind == "codex")
 
@@ -12527,16 +12776,20 @@ class WatchDaemon:
         if state.message_kind != "codex":
             runtime.codex_goal_resume = False
             return True
+        original = self._codex_turn_key_identity(runtime.codex_sent_turn_key)
+        def already_sent(proof):
+            return bool(original and original[:2] == (proof.get('session_id'), proof.get('turn_id')))
         if state.native_goal_stalled:
             goal = self._current_blocked_goal(target)
             if goal and _match_error_block("■ " + goal["error"]["message"]) == state.error_type:
                 key = self._goal_turn_key(goal)
                 if self.codex_queue_recovery.blocks_turn(target, goal):
                     return False
+                retryable = bool(key == runtime.codex_sent_turn_key
+                                 and self._unwritten_codex_attempt(target, runtime, state, goal=goal))
                 if ((reserved and runtime.codex_goal_resume and runtime.codex_observed_turn_key == key
                         and runtime.codex_goal_proof == goal)
-                        or (not reserved and (runtime.codex_sent_turn_key != key
-                            or runtime.delivery_status in {"failed", "cancelled", "retryable"}))):
+                        or (not reserved and (not already_sent(goal) or retryable))):
                     if not self._network_turn_ready(target, runtime, goal):
                         return False
                     runtime.codex_goal_resume = True
@@ -12580,13 +12833,13 @@ class WatchDaemon:
             if self.codex_queue_recovery.blocks_turn(target, turn):
                 return False
             key = f"{turn.get('session_id')}:{turn.get('turn_id')}:{turn.get('at')}"
-            already_sent = key == runtime.codex_sent_turn_key
             # The renderer can retain an old error after accepting input.
             # Only a new failed turn or independently proved non-delivery may
             # authorize another prompt; accepted/unknown are not retry proofs.
-            retryable = runtime.delivery_status in {"failed", "cancelled", "retryable"}
+            retryable = bool(key == runtime.codex_sent_turn_key
+                             and self._unwritten_codex_attempt(target, runtime, state))
             if (reserved and key == runtime.codex_observed_turn_key) or (
-                    not reserved and (not already_sent or retryable)):
+                    not reserved and (not already_sent(turn) or retryable)):
                 runtime.codex_observed_turn_key = key
                 return True
         phase = "working" if turn.get("kind") in {"task_started", "user_message"} else "awaiting_transition"
