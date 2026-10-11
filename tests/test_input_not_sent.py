@@ -301,9 +301,13 @@ class InputNotSentTests(unittest.TestCase):
         turn = f.daemon.codex_queue_recovery.current_turn(f.target)
         self.goal = [{**turn, 'kind': 'goal_blocked', 'goal_id': 'old-goal',
                       'turn_id': 'first', 'at': f.first_start + 1}]
-        self.enterContext(patch.object(f.daemon.codex_queue_recovery, 'process_lookup',
-            return_value={'agent_kind': 'codex', 'agent_pids': [turn['pid']]}))
-        self.enterContext(patch('ccc_codex_goal.blocked_goal', side_effect=lambda *a, **kw: self.goal[0]))
+        process_patch = patch.object(f.daemon.codex_queue_recovery, 'process_lookup',
+            return_value={'agent_kind': 'codex', 'agent_pids': [turn['pid']]})
+        process_patch.start()
+        self.addCleanup(process_patch.stop)
+        goal_patch = patch('ccc_codex_goal.blocked_goal', side_effect=lambda *a, **kw: self.goal[0])
+        goal_patch.start()
+        self.addCleanup(goal_patch.stop)
         # Exercise the real stale-goal filter, not a mocked readiness verdict.
         self.assertLess(self.goal[0]['at'], turn['at'])
         self.assertNotEqual(self.goal[0]['turn_id'], turn['turn_id'])

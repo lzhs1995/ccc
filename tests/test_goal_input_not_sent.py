@@ -23,7 +23,9 @@ class GoalInputNotSentTests(unittest.TestCase):
         turn = f.daemon.codex_queue_recovery.current_turn(f.target)
         self.process_pid = turn['pid']
         self.goal = [{**turn, 'kind': 'goal_blocked', 'goal_id': 'original-goal'}]
-        self.enterContext(patch('ccc_codex_goal.blocked_goal', side_effect=lambda *a, **kw: self.goal[0]))
+        goal_patch = patch('ccc_codex_goal.blocked_goal', side_effect=lambda *a, **kw: self.goal[0])
+        goal_patch.start()
+        self.addCleanup(goal_patch.stop)
         self.bind_process()
 
     def bind_process(self):
