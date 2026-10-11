@@ -12501,7 +12501,12 @@ class WatchDaemon:
         pids = label.get('agent_pids', [])
         turn = self.codex_queue_recovery.current_turn(target)
         binding = turn if turn and turn.get('kind') == 'task_complete' else None
-        goal = blocked_goal(target, pids[0], current_turn=binding) if label.get('agent_kind') == 'codex' and len(pids) == 1 else None
+        # Inventory is a locator. A freshly authenticated shared foreground
+        # turn can still identify its original client during a refresh gap;
+        # blocked_goal independently revalidates the entire writer binding.
+        pid = binding.get('pid') if binding and binding.get('shared_writer') else (
+            pids[0] if label.get('agent_kind') == 'codex' and len(pids) == 1 else None)
+        goal = blocked_goal(target, pid, current_turn=binding) if pid is not None else None
         if not goal:
             return None
         if self.codex_queue_recovery.current_turn(target) != turn:

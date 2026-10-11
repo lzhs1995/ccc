@@ -136,6 +136,22 @@ def _rollout_row(database, sid, root):
     return path
 
 
+def _writer_files(pid):
+    """Retry a changing complete inventory, never combine partial evidence.
+
+    A shared app-server opens and moves other sessions' files concurrently.
+    A rejected snapshot conveys no ownership; each retry starts both native
+    passes again. Short reads and persistent drift still fail closed, and
+    callers retain all process, connection, selected lock and rollout checks.
+    """
+    for attempt in range(3):
+        try:
+            return native.process_writable_files(pid, identities=True)
+        except native.VnodeInventoryChanged:
+            if attempt == 2:
+                raise
+
+
 def binding(target, pid, sessions_root):
     """Return binding plus diagnostic; absence never authorizes input."""
     try:
@@ -155,7 +171,7 @@ def binding(target, pid, sessions_root):
             born = scope.birth(writer, codex=True)
             if not born or not connected_writer(pid, writer, process['birth'], born):
                 continue
-            files = native.process_writable_files(writer, identities=True)
+            files = _writer_files(writer)
             locks = [p for p in files if p.parent.name == 'thread-writer-locks'
                      and p.name == sid + '.lock'
                      and (p.parent.parent / 'sessions').resolve() == root]
@@ -205,7 +221,7 @@ def valid(target, proof):
                 or read_foreground(pid, request_observation_directory_matches) != proof['selection']
                 or not connected_writer(pid, writer, process['birth'], proof['writer_birth'])):
             return False
-        files = native.process_writable_files(writer, identities=True)
+        files = _writer_files(writer)
         if any(files.get(p) != identity or not _linked(p, identity)
                for p, identity in proof['paths'].items()):
             return False
@@ -217,7 +233,7 @@ def valid(target, proof):
                     or _protected_metadata(proof['path'], proof['session_id'],
                                            proof['rollout_identity']) != proof['protected_metadata']):
                 return False
-            after = native.process_writable_files(writer, identities=True)
+            after = _writer_files(writer)
             if ({p for p in after if _held_rollout(p, proof['session_id'],
                                                  Path(proof['sessions_root']))} != {proof['path']}
                     or any(after.get(p) != identity or not _linked(p, identity)
@@ -247,6 +263,7 @@ def current_turn(target, pid, sessions_root):
             return {'kind': 'unknown', 'reason': 'native foreground lifecycle missing or changed'}
         return {**snapshot, 'pid': pid, 'process_start': process['process_start'],
                 'birth': process['birth'], 'session_id': proof['session_id'],
+                'transcript_path': str(proof['path']),
                 'shared_writer': {'pid': proof['writer_pid'], 'birth': proof['writer_birth'],
                                   'sessions_root': proof['sessions_root']}}
     except (OSError, ValueError, KeyError, TypeError):

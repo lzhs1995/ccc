@@ -865,18 +865,10 @@ class QueueRecovery:
                         "turn_id": guarded.get("turn_id"), "at": guarded.get("at", 0),
                         "error": guarded.get("turn_error"),
                         "signature": [guarded.get("start_id"), guarded.get("turn_id"), guarded.get("at")]}
-        # A native foreground observation outranks historical Hook bindings:
-        # /resume can change selection without changing the client's PID.
         if self.process_lookup is not None:
-            from ccc_client_thread_observation import read_foreground
-            from ccc_request_observation_policy import request_observation_directory_matches
-            label = self.process_lookup(target)
-            pids = label.get('agent_pids', [])
-            if label.get('agent_kind') == 'codex' and len(pids) == 1:
-                status, _, _ = read_foreground(pids[0], request_observation_directory_matches)
-                if status != 'absent':
-                    from ccc_shared_codex_turn import current_turn
-                    return current_turn(target, pids[0], self.sessions_root)
+            turn = self._foreground_process_turn(target, self.process_lookup(target))
+            if turn is not None:
+                return turn
         try:
             records = self.records()
         except FileNotFoundError:
@@ -903,6 +895,54 @@ class QueueRecovery:
         if not matches:
             return self._open_process_turn(target)
         return matches[0] if len(matches) == 1 else {"kind": "unknown"}
+
+    def _foreground_process_turn(self, target, label):
+        """Keep a locator through inventory gaps, never a cached native verdict.
+
+        Shared app-server clients do not hold their own rollout open. Their
+        authenticated foreground path must also feed the native wakeup scanner
+        and outrank historical Hooks while the GUI process inventory refreshes.
+        Every use still verifies the foreground, client, connected writer, lock,
+        file identity and current lifecycle through the shared native reader.
+        """
+        from ccc_client_thread_observation import read_foreground
+        from ccc_request_observation_policy import request_observation_directory_matches
+        from ccc_shared_codex_turn import current_turn
+
+        with self.lock:
+            known = dict(self.open_file_sources.get(str(target['surface_id']), {}))
+        if (not known.get('native_foreground')
+                or known.get('workspace_id') != str(target['workspace_id'])):
+            known = {}
+        pids = label.get('agent_pids', [])
+        hinted = label.get('agent_kind') != 'codex' or len(pids) != 1
+        if hinted:
+            if not known:
+                return None
+            if label.get('summary') not in {'process refresh pending', 'process lookup unavailable'}:
+                return {'kind': 'unknown', 'reason': 'current process inventory conflicts with native client'}
+            pids = [known['pid']]
+        pid = pids[0]
+        status, _, _ = read_foreground(pid, request_observation_directory_matches)
+        if status == 'absent' and not (hinted or known.get('pid') == pid):
+            return None  # A client without native foreground support uses the legacy reader.
+        turn = current_turn(target, pid, self.sessions_root)
+        if turn.get('kind') == 'unknown':
+            return turn
+        if hinted and any(turn.get(key) != known.get(key) for key in
+                          ('pid', 'process_start', 'birth', 'session_id', 'shared_writer')):
+            return {'kind': 'unknown', 'reason': 'original native client or selection changed during inventory refresh'}
+        path = turn.get('transcript_path')
+        if not path or (hinted and path != str(known.get('path'))):
+            return {'kind': 'unknown', 'reason': 'original native transcript changed during inventory refresh'}
+        with self.lock:
+            self.open_file_sources[str(target['surface_id'])] = {
+                'surface_id': str(target['surface_id']), 'workspace_id': str(target['workspace_id']),
+                'session_id': turn['session_id'], 'path': Path(path), 'pid': pid,
+                'process_start': turn['process_start'], 'birth': turn['birth'],
+                'shared_writer': turn['shared_writer'], 'native_foreground': True,
+            }
+        return turn
 
     def _open_process_turn(self, target):
         """Recover read-only identity when a real SessionStart Hook was lost.

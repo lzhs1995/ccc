@@ -100,6 +100,72 @@ class SharedTurnTests(unittest.TestCase):
         self.connection.return_value = False
         self.assertEqual(self.read()['kind'], 'unknown')
 
+    def test_transient_inventory_drift_requires_a_new_complete_snapshot(self):
+        rejected = False
+        def inventory(pid, **kw):
+            nonlocal rejected
+            if pid == 81 and not rejected:
+                rejected = True
+                raise shared.native.VnodeInventoryChanged('concurrent descriptor change')
+            return dict(self.files) if pid == 81 else {}
+        self.inventory.side_effect = inventory
+        turn = self.read()
+        self.assertTrue(rejected)
+        self.assertEqual(turn['kind'], 'task_complete')
+        self.assertEqual(turn['session_id'], self.sid)
+        self.assertEqual(turn['shared_writer']['pid'], 81)
+
+    def test_persistent_inventory_drift_stays_unknown_after_three_reads(self):
+        calls = []
+        def inventory(pid, **kw):
+            if pid == 81:
+                calls.append(pid)
+                raise shared.native.VnodeInventoryChanged('still changing')
+            return {}
+        self.inventory.side_effect = inventory
+        self.assertEqual(self.read()['kind'], 'unknown')
+        self.assertEqual(len(calls), 3)
+
+    def test_incomplete_inventory_is_not_retried_or_used(self):
+        calls = []
+        def inventory(pid, **kw):
+            if pid == 81:
+                calls.append(pid)
+                raise shared.native.IncompleteVnodeRead('short native descriptor read')
+            return {}
+        self.inventory.side_effect = inventory
+        self.assertEqual(self.read()['kind'], 'unknown')
+        self.assertEqual(len(calls), 1)
+
+    def test_foreground_change_during_inventory_retry_stays_unknown(self):
+        rejected = False
+        def inventory(pid, **kw):
+            nonlocal rejected
+            if pid == 81 and not rejected:
+                rejected = True
+                self.selection = ('ok', self.other, ('new-foreground',))
+                raise shared.native.VnodeInventoryChanged('concurrent descriptor change')
+            return dict(self.files) if pid == 81 else {}
+        self.inventory.side_effect = inventory
+        self.assertEqual(self.read()['kind'], 'unknown')
+
+    def test_lock_change_during_validation_retry_stays_unknown(self):
+        proof, reason = shared.binding(self.target, 41, self.sessions)
+        self.assertIsNotNone(proof, reason)
+        lock = self.root / 'thread-writer-locks' / (self.sid + '.lock')
+        rejected = False
+        def inventory(pid, **kw):
+            nonlocal rejected
+            if not rejected:
+                rejected = True
+                lock.rename(lock.with_suffix('.old'))
+                lock.touch()
+                self.hold(lock)
+                raise shared.native.VnodeInventoryChanged('selected lock changed')
+            return dict(self.files)
+        self.inventory.side_effect = inventory
+        self.assertFalse(shared.valid(self.target, proof))
+
     def test_selection_change_after_snapshot_rejects(self):
         original = shared.native.task_snapshot
         def read(*args):
@@ -230,6 +296,97 @@ class SharedTurnTests(unittest.TestCase):
         with patch('ccc_client_thread_observation.read_foreground', side_effect=lambda *a: self.selection), \
                 patch.object(queue, 'records', side_effect=AssertionError('old hooks must not win')):
             self.assertEqual(queue.current_turn(self.target)['session_id'], self.sid)
+
+    def foreground_queue(self):
+        queue = QueueRecovery(self.root / 'ledger', self.root / 'hooks', self.sessions, 'continue')
+        self.label = {'agent_kind': 'codex', 'agent_pids': [41]}
+        queue.process_lookup = lambda _: self.label
+        patcher = patch('ccc_client_thread_observation.read_foreground',
+                        side_effect=lambda *a: self.selection)
+        self.addCleanup(patcher.stop)
+        patcher.start()
+        return queue
+
+    def test_shared_foreground_registers_native_failure_wakeup(self):
+        queue = self.foreground_queue()
+        self.assertEqual(queue.current_turn(self.target)['kind'], 'task_complete')
+        with patch.object(shared.native, 'codex_process_starts', return_value={41: 100}):
+            sources = queue.wakeup_sources([self.target])
+        self.assertEqual(len(sources), 1)
+        self.assertEqual((sources[0]['session_id'], sources[0]['path'], sources[0]['pid']),
+                         (self.sid, self.path, 41))
+        self.assertTrue(sources[0]['identity_current'])
+
+    def test_shared_foreground_survives_process_refresh_gap(self):
+        queue = self.foreground_queue()
+        original = queue.current_turn(self.target)
+        for reason in ('process refresh pending', 'process lookup unavailable'):
+            self.label = {'agent_kind': 'unknown', 'summary': reason}
+            with patch.object(queue, 'records', side_effect=AssertionError('old hooks must not win')):
+                self.assertEqual(queue.current_turn(self.target), original)
+
+    def test_refresh_gap_reads_current_turn_instead_of_cached_failure(self):
+        queue = self.foreground_queue()
+        queue.current_turn(self.target)
+        self.label = {'agent_kind': 'unknown', 'summary': 'process refresh pending'}
+        self.write_turn('task_started')
+        self.assertEqual(queue.current_turn(self.target)['kind'], 'task_started')
+
+    def test_stalled_goal_uses_authenticated_client_during_inventory_refresh(self):
+        from types import SimpleNamespace
+        from cmux_codex_watch import WatchDaemon
+        self.make_goal()
+        queue = self.foreground_queue()
+        queue.current_turn(self.target)
+        self.label = {'agent_kind': 'unknown', 'summary': 'process refresh pending'}
+        daemon = SimpleNamespace(codex_queue_recovery=queue)
+        proof = WatchDaemon._current_blocked_goal(daemon, self.target)
+        self.assertIsNotNone(proof)
+        self.assertEqual(proof['session_id'], self.sid)
+        self.write_turn('task_started')
+        self.assertIsNone(WatchDaemon._current_blocked_goal(daemon, self.target))
+
+    def test_refresh_gap_revalidates_socket_and_original_client_birth(self):
+        queue = self.foreground_queue()
+        queue.current_turn(self.target)
+        self.label = {'agent_kind': 'unknown', 'summary': 'process refresh pending'}
+        self.connection.return_value = False
+        self.assertEqual(queue.current_turn(self.target)['kind'], 'unknown')
+        self.connection.return_value = True
+        self.process['birth'] = [100, 5]
+        self.assertEqual(queue.current_turn(self.target)['kind'], 'unknown')
+
+    def test_refresh_gap_cannot_redirect_to_a_different_selected_session(self):
+        queue = self.foreground_queue()
+        queue.current_turn(self.target)
+        self.sid = self.other
+        self.path = self.sessions / ('rollout-' + self.sid + '.jsonl')
+        self.write_turn('task_complete')
+        self.hold(self.path)
+        self.selection = ('ok', self.sid, ('switched',))
+        self.label = {'agent_kind': 'unknown', 'summary': 'process refresh pending'}
+        self.assertEqual(queue.current_turn(self.target)['kind'], 'unknown')
+        self.label = {'agent_kind': 'codex', 'agent_pids': [41]}
+        self.assertEqual(queue.current_turn(self.target)['session_id'], self.sid)
+
+    def test_fresh_conflicting_process_label_and_cleared_selection_veto_hint(self):
+        queue = self.foreground_queue()
+        queue.current_turn(self.target)
+        for label in ({'agent_kind': 'shell'}, {'agent_kind': 'codex', 'agent_pids': [41, 42]}):
+            self.label = label
+            with self.subTest(label=label):
+                self.assertEqual(queue.current_turn(self.target)['kind'], 'unknown')
+        self.label = {'agent_kind': 'unknown', 'summary': 'process refresh pending'}
+        for status in ('absent', 'invalid'):
+            self.selection = (status, None, None)
+            with self.subTest(status=status):
+                self.assertEqual(queue.current_turn(self.target)['kind'], 'unknown')
+
+    def test_native_hint_is_scoped_to_its_original_workspace(self):
+        queue = self.foreground_queue()
+        queue.current_turn(self.target)
+        self.label = {'agent_kind': 'unknown', 'summary': 'process refresh pending'}
+        self.assertEqual(queue.current_turn({**self.target, 'workspace_id': 'other'})['kind'], 'unknown')
 
 
 if __name__ == '__main__':

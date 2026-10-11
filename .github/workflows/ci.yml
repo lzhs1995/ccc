@@ -33,6 +33,12 @@ jobs:
         run: |
           python -B scripts/fetch_cmux_test_wrapper.py --output "$RUNNER_TEMP/ccc-test-claude-wrapper"
           echo "CCC_TEST_CLAUDE_WRAPPER=$RUNNER_TEMP/ccc-test-claude-wrapper" >> "$GITHUB_ENV"
+      - name: Fetch pinned collaboration scripts for isolated closeout tests
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python -B scripts/fetch_shared_test_fixtures.py --output "$RUNNER_TEMP/ccc-test-collaboration"
+          echo "SHARED_SOURCE_UNDER_TEST=$RUNNER_TEMP/ccc-test-collaboration" >> "$GITHUB_ENV"
       - name: Secure isolated CI handoff dependencies
         run: |
           python -B - <<'PYTHON'

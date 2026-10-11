@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.32 (unreleased)
+
+- Keep authenticated shared app-server foreground sessions in native wakeup coverage while the process inventory refreshes. Reuse only the original locator; recheck the process, selected session, reciprocal connection, writer lock, transcript and current turn before acting.
+- Re-establish a current blocked Goal from that verified foreground binding during inventory gaps. Conflicting inventory, changed selection and uncertain delivery continue to withhold input.
+- Retry at most three complete native file inventories when concurrent descriptor changes invalidate a snapshot. Never merge partial snapshots or accept short reads, persistent drift or a changed selected lock.
+- Fetch immutable collaboration test fixtures with blob and SHA-256 checks in CI so the complete closeout and native-wait suites run on clean runners.
+
 ## 0.2.31 (unreleased)
 
 - Reuse a proven zero-input Codex continuation attempt after a newer failed turn supersedes an old stalled Goal. Keep native turn, process, provider, admission and duplicate-input checks; a current blocked Goal still takes its own recovery path.
