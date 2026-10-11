@@ -6024,9 +6024,14 @@ class WatchDaemon:
         return json.dumps(
             self._runtime_snapshot(), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
-    def _runtime_snapshot(self) -> dict[str, Any]:
+    def _runtime_snapshot(self, surface_ids: Iterable[str] | None = None) -> dict[str, Any]:
+        """Copy selected records, or all history for persistence when unfiltered."""
+        keys = None if surface_ids is None else dict.fromkeys(surface_ids)
         with self._runtime_lock:
-            items = list(self.runtime.items())
+            if keys is None:
+                items = list(self.runtime.items())
+            else:
+                items = [(key, self.runtime[key]) for key in keys if key in self.runtime]
         # Do not hold the fleet lock while copying every runtime record.
         return {key: value.to_dict() for key, value in items}
 
@@ -6302,7 +6307,9 @@ class WatchDaemon:
         with self._targets_lock:
             dynamic = list(self.dynamic_targets.values())
         targets = effective_targets(config, dynamic)
-        state = self._runtime_snapshot()
+        # Health uses every effective target, including paused/disabled ones,
+        # but does not need to copy archived runtime records every heartbeat.
+        state = self._runtime_snapshot(str(t["surface_id"]) for t in targets)
         with self._metadata_lock:
             metadata = self._observation_metadata
         records, labels = metadata.get("records", {}), metadata.get("labels", {})
