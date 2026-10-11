@@ -2,6 +2,7 @@
 
 ## 0.2.34
 
+- Classify Codex's structured provider errors even without a literal HTTP status. Preserve specific rate-limit and prompt-cache remedies, and report resource ownership, encrypted-content, authentication and unknown request failures as blockers across ordinary, Goal and queued recovery without spending retry budgets.
 - Classify Claude's structured StopFailure details and current wrapped API error block together. Recognize request-limit 429 errors, and give explicit billing rejection priority over generic authentication hints without treating quoted historical errors as current failures.
 - Persist provider holds and 60–900 second rate-limit backoff across daemon restarts. Recheck both text and Enter paths, preserve pending/unknown deliveries and original retry budgets, and release holds only against authenticated new task or process evidence. Keep handshake recovery independent of deferred retry ownership.
 - Report disabled targets and effective surface/workspace pauses with their source and timestamp. Publish current effective target snapshots and twelve reconcile-stage timings so observation delays can be investigated without claiming the underlying delay is fixed.

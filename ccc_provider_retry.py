@@ -17,8 +17,80 @@ import time
 
 
 RETRYABLE = frozenset({'rate_limit', 'http_500', 'http_502', 'http_503', 'http_504', 'http_524'})
+BLOCKED_REASONS = {
+    'token_exhausted': 'provider token out of quota; needs a new key or a top-up',
+    'invalid_encrypted_content': 'provider rejected encrypted session content; repair required; session preserved',
+    'http_400': 'provider request rejected (400); inspect parameters/protocol; session preserved',
+    'http_401': 'provider authentication rejected (401); verify credentials/quota; session preserved',
+    'http_403': 'provider permission rejected (403); verify access policy; session preserved',
+    'resource_mismatch': 'provider rejected an item from a different OpenAI resource; restore original resource affinity; session preserved',
+    'invalid_request': 'provider rejected the request; inspect parameters/protocol; session preserved',
+    'provider_error_unknown': 'unrecognized structured provider error; inspect original failure before retrying; session preserved',
+}
+BLOCKED = frozenset(BLOCKED_REASONS)
 RATE_LIMIT_RECOVERY_INTERVAL = 0.25
 RATE_LIMIT_PROVIDER_SPACING = 0.05
+
+
+def structured_error_type(message):
+    """Classify a complete provider error object, including hard-wrapped JSON.
+
+    Callers must first establish a live error card or a native failed turn.
+    This is not a detector for arbitrary transcript, documentation or drafts.
+    The error's type/code and resource ownership take priority over a generic
+    stream-disconnected wrapper; a missing HTTP status must not imply health.
+    """
+    compact = re.sub(r'\s+', '', str(message)).lower()
+    start = compact.find('{')
+    if start < 0:
+        return None
+    prefix = compact[:start].lstrip('■⚠└')
+    if prefix.startswith(('documentation:', 'example:', 'quoted:', 'sample:')):
+        return None
+    try:
+        payload, _ = json.JSONDecoder().raw_decode(compact[start:])
+    except ValueError:
+        return None
+    error = payload.get('error') if isinstance(payload, dict) else None
+    if not isinstance(error, dict) or not error:
+        return None
+    codes = {error[key] for key in ('code', 'type') if isinstance(error.get(key), str)}
+    detail = error.get('message') if isinstance(error.get('message'), str) else ''
+    if (codes & {'resource_mismatch', 'resource_mismatch_error'} or (
+            'therequesteditemwascreatedunderadifferent' in detail
+            and 'openairesource' in detail and 'usethesameresource' in detail)):
+        return 'resource_mismatch'
+    if 'insufficient_quota' in codes:
+        return 'token_exhausted'
+    if 'invalid_encrypted_content' in codes:
+        return 'invalid_encrypted_content'
+    # Whitespace has been removed to join native hard wraps, so a status
+    # description immediately follows the last digit (429TooManyRequests).
+    # A word boundary would reject this normal banner; reject another digit.
+    status = re.search(
+        r'(?:unexpectedstatus(?:code)?|unknownstatuscode|http(?:/\d(?:\.\d)?)?|laststatus)'
+        r'[:=]?(400|401|403|429|500|502|503|504|524)(?!\d)', prefix)
+    if status and status[1] in {'401', '403'}:
+        if status[1] == '401' and any(token in compact for token in (
+                '额度已用尽', 'remainquota', 'insufficient_quota', 'quotaexceeded')):
+            return 'token_exhausted'
+        return 'http_' + status[1]
+    # Preserve the known parameter remedy even when providers emit a null
+    # code and only put the 400 status in the message. Ownership, encrypted
+    # content, quota and authentication failures above remain blockers.
+    if ((error.get('param') == 'prompt_cache_retention' or 'prompt_cache_retention' in detail)
+            and ('invalid_parameter' in codes or re.search(r'(?<!\d)400(?!\d)', compact))):
+        return 'prompt_cache'
+    # A specific rate-limit code is more informative than the generic
+    # invalid_request_error type used by some providers for every failure.
+    if codes & {'rate_limit_exceeded', 'rate_limit_error', 'rate_limited'}:
+        return 'rate_limit'
+    if codes & {'invalid_request_error', 'invalid_request', 'invalid_parameter'}:
+        return 'invalid_request'
+    # Explicit status still classifies message-only/unknown envelopes.
+    if status:
+        return 'rate_limit' if status[1] == '429' else 'http_' + status[1]
+    return 'provider_error_unknown'
 
 
 @dataclass(frozen=True)

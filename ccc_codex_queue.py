@@ -24,6 +24,8 @@ import time
 import uuid
 import weakref
 
+from ccc_provider_retry import BLOCKED as PROVIDER_BLOCKED, structured_error_type
+
 
 def epoch(value):
     return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
@@ -114,7 +116,10 @@ def task_snapshot(path, session_id):
 def _retryable_completed_message(message):
     normalized = " ".join(message.lower().split())
     compact = re.sub(r'\s+', '', normalized)
-    if (('"error":{' in compact and '"insufficient_quota"' in compact)
+    if compact.lstrip('■⚠└').startswith(('documentation:', 'example:', 'quoted:', 'sample:')):
+        return False
+    if (structured_error_type(message) in PROVIDER_BLOCKED
+            or ('"error":{' in compact and '"insufficient_quota"' in compact)
             or 'invalid_encrypted_content' in normalized
             or re.search(r'(?:unexpected\s+status(?:\s+code)?|unknown\s+status\s+code|http(?:/\d(?:\.\d)?)?|last\s+status)\s*[:=]?\s*(?:400|401|403)\b', normalized)
             or '401' in normalized and any(x in normalized for x in (

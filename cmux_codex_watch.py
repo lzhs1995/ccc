@@ -52,7 +52,11 @@ from ccc_codex_queue import NativeCompletionWatcher, QueueRecovery
 from ccc_native_processes import NativeProcessIndex
 from ccc_scheduling import CoalescingWriter, SnapshotCache, SnapshotClient, SurfaceScheduler, TreeSnapshot
 from ccc_delivery import DeliveryStore
-from ccc_provider_retry import ProviderRetryStore, RETRYABLE as PROVIDER_RETRYABLE
+from ccc_provider_retry import (
+    ProviderRetryStore, RETRYABLE as PROVIDER_RETRYABLE,
+    BLOCKED as PROVIDER_BLOCKED, BLOCKED_REASONS as PROVIDER_BLOCKED_REASONS,
+    structured_error_type,
+)
 import sqlite3
 
 
@@ -1078,6 +1082,9 @@ def _provider_rate_limit_banner(compact: str) -> bool:
 def _match_error_block(block_text: str) -> str | None:
     lower = re.sub(r"\s+", " ", block_text).strip().lower()
     compact = re.sub(r"\s+", "", lower)
+    structured = structured_error_type(block_text)
+    if structured is not None:
+        return structured
     if ('"error":{' in compact and '"insufficient_quota"' in compact) or (
             '401' in lower and any(token in lower for token in (
                 '额度已用尽', 'remainquota', 'insufficient_quota', 'quota exceeded'))):
@@ -2426,37 +2433,24 @@ def classify_text_prefilter(value: str | Iterable[str]) -> ScreenState:
     return ScreenState("idle", reason="no visible error candidate")
 
 
-def classify_grid(grid: Grid) -> ScreenState:
+def _codex_error_scan(
+    grid: Grid, composer_row: int, *, content_end: int | None = None,
+) -> tuple[ErrorScan | None, frozenset[int], int | None]:
+    """Scan one current error card using the same viewport structure everywhere.
+
+    Queue recovery excludes its own UI tail, never scans documentation or an
+    earlier provider failure as if it belonged to the newest error card.
+    """
     lines = grid.lines
-    if _menu_present(lines):
-        return ScreenState("menu", screen_signature=grid.signature(), reason="interactive menu")
-    composer_kind, composer_row = _composer_status(grid)
-    # The renamed queue banner contains "esc to interrupt".  That used to match
-    # Working first, so the queue gate never ran and high-demand stalls looked
-    # busy while Codex already held 任务请继续.
-    queue_row = composer_row if composer_row is not None else len(lines)
-    if composer_kind != "composer_busy" and _queued_followup_present(lines, queue_row):
-        return ScreenState(
-            "queued_followup",
-            screen_signature=grid.signature(),
-            reason="Codex already holds queued follow-up input",
-        )
-    if _current_working_present(lines):
-        return ScreenState("working", screen_signature=grid.signature(), reason="Codex is working")
-    if composer_kind == "incompatible" or composer_row is None:
-        return ScreenState("incompatible", screen_signature=grid.signature(), reason="composer cursor/prompt not verified")
-    if not _is_codexish(lines, composer_row):
-        return ScreenState("non_codex_or_unknown", screen_signature=grid.signature(), reason="Codex UI fingerprint missing")
-    if composer_kind == "composer_busy":
-        return ScreenState("composer_busy", screen_signature=grid.signature(), reason="composer contains user text")
+    limit = composer_row if content_end is None else content_end
     chrome_rows = (_codex_status_chrome_rows(grid, composer_row)
                    | _spinner_chrome_rows(grid, composer_row)
                    | _codex_hook_failure_rows(grid, composer_row)
                    | _codex_startup_notice_rows(grid, composer_row))
-    marker_rows = [row for row, line in enumerate(lines[:composer_row])
+    marker_rows = [row for row, line in enumerate(lines[:limit])
                    if row not in chrome_rows and _is_error_marker(line)]
     if not marker_rows:
-        return ScreenState("idle", screen_signature=grid.signature(), reason="empty composer without current recoverable error")
+        return None, chrome_rows, None
     marker_row = marker_rows[-1]
     marker_style_ids = {
         span.style_id
@@ -2531,17 +2525,43 @@ def classify_grid(grid: Grid) -> ScreenState:
 
     error = _find_last_error(
         lines,
-        composer_row,
+        limit,
         marker_validator=marker_validator,
         continuation_validator=continuation_validator,
         ignored_rows=chrome_rows,
     )
+    return error, chrome_rows, marker_row
+
+
+def classify_grid(grid: Grid) -> ScreenState:
+    lines = grid.lines
+    if _menu_present(lines):
+        return ScreenState("menu", screen_signature=grid.signature(), reason="interactive menu")
+    composer_kind, composer_row = _composer_status(grid)
+    # The renamed queue banner contains "esc to interrupt".  That used to match
+    # Working first, so the queue gate never ran and high-demand stalls looked
+    # busy while Codex already held 任务请继续.
+    queue_row = composer_row if composer_row is not None else len(lines)
+    if composer_kind != "composer_busy" and _queued_followup_present(lines, queue_row):
+        return ScreenState(
+            "queued_followup",
+            screen_signature=grid.signature(),
+            reason="Codex already holds queued follow-up input",
+        )
+    if _current_working_present(lines):
+        return ScreenState("working", screen_signature=grid.signature(), reason="Codex is working")
+    if composer_kind == "incompatible" or composer_row is None:
+        return ScreenState("incompatible", screen_signature=grid.signature(), reason="composer cursor/prompt not verified")
+    if not _is_codexish(lines, composer_row):
+        return ScreenState("non_codex_or_unknown", screen_signature=grid.signature(), reason="Codex UI fingerprint missing")
+    if composer_kind == "composer_busy":
+        return ScreenState("composer_busy", screen_signature=grid.signature(), reason="composer contains user text")
+    error, chrome_rows, marker_row = _codex_error_scan(grid, composer_row)
     if error is None:
         return ScreenState("idle", screen_signature=grid.signature(), reason="empty composer without current recoverable error")
     goal_stalled = any('Goal stalled (/goal resume)' in line
                        for line in lines[composer_row + 1:composer_row + 4])
-    goal_candidate = goal_stalled and error.error_type not in {
-        'token_exhausted', 'invalid_encrypted_content', 'http_400', 'http_401', 'http_403'}
+    goal_candidate = goal_stalled and error.error_type not in PROVIDER_BLOCKED
     if error.superseded and not goal_candidate:
         # Not plain "idle": the error is real, we are choosing not to act on it
         # because Codex printed something after it.  Reporting that choice keeps
@@ -2570,17 +2590,12 @@ def classify_grid(grid: Grid) -> ScreenState:
             reason="provider token out of quota; needs a new key or a top-up",
             ignored_chrome_rows=tuple(sorted(chrome_rows)),
         )
-    if error.error_type in {"invalid_encrypted_content", "http_400", "http_401", "http_403"}:
+    if error.error_type in PROVIDER_BLOCKED:
         return ScreenState(
             "provider_blocked", error_type=error.error_type,
             fingerprint=_short_hash(_stable_error_block(error.block)),
             screen_signature=grid.signature(),
-            reason={
-                'invalid_encrypted_content': 'provider rejected encrypted session content (400); repair required; session preserved',
-                'http_400': 'provider request rejected (400); inspect parameters/protocol; session preserved',
-                'http_401': 'provider authentication rejected (401); verify credentials/quota; session preserved',
-                'http_403': 'provider permission rejected (403); verify access policy; session preserved',
-            }[error.error_type],
+            reason=PROVIDER_BLOCKED_REASONS[error.error_type],
             message_kind="codex",
         )
     fingerprint = _short_hash(_stable_error_block(error.block))
@@ -8244,7 +8259,12 @@ class WatchDaemon:
         error = original.get('error')
         message = str(error.get('message') or '') if isinstance(error, dict) else ''
         error_type = _match_error_block(message) or (state.error_type if state else None)
-        if error_type in {'token_exhausted', 'http_400', 'http_401', 'http_403', 'invalid_encrypted_content'}:
+        if error_type in PROVIDER_BLOCKED:
+            self._record_state(str(target['surface_id']), runtime, ScreenState(
+                'token_exhausted' if error_type == 'token_exhausted' else 'provider_blocked',
+                message_kind='codex', error_type=error_type,
+                reason=PROVIDER_BLOCKED_REASONS[error_type],
+            ))
             return False
         if error_type not in PROVIDER_RETRYABLE:
             return True
@@ -8299,16 +8319,25 @@ class WatchDaemon:
         queue_message = private_check.get("message") if private_check else self.codex_queue_recovery.message
         private_snapshot = {}
         provider_attempt = None
+        queue_blocker = None
 
-        def provider_blocked(message):
-            return _match_error_block(str(message or '')) in {
-                'token_exhausted', 'http_400', 'http_401', 'http_403', 'invalid_encrypted_content'}
+        def blocked_state(message):
+            kind = _match_error_block(str(message or ''))
+            if kind in PROVIDER_BLOCKED:
+                return ScreenState(
+                    'token_exhausted' if kind == 'token_exhausted' else 'provider_blocked',
+                    message_kind='codex', error_type=kind, reason=PROVIDER_BLOCKED_REASONS[kind])
+            return None
 
         def queue_evidence():
+            nonlocal queue_blocker
+            queue_blocker = None
             turn = self.codex_queue_recovery.current_turn(target)
             error = (turn or {}).get('error')
-            if isinstance(error, dict) and provider_blocked(error.get('message')):
-                return None
+            if isinstance(error, dict):
+                queue_blocker = blocked_state(error.get('message'))
+                if queue_blocker is not None:
+                    return None
             evidence = self.codex_queue_recovery.evidence(target)
             # A late completion for an already resumed goal is still the same
             # turn. Check the persisted send binding before the normal rollout
@@ -8324,8 +8353,10 @@ class WatchDaemon:
             # Only reuse a previously sent, exact CCC queue entry. A blocked
             # native goal can supply terminal evidence when no rollout exists.
             goal = self._current_blocked_goal(target)
-            if (not goal or provider_blocked(goal['error']['message'])
-                    or not _match_error_block('■ ' + goal['error']['message'])
+            if not goal:
+                return None
+            queue_blocker = blocked_state(goal['error']['message'])
+            if (queue_blocker is not None or not _match_error_block('■ ' + goal['error']['message'])
                     or runtime.codex_sent_turn_key.startswith('goal:')
                     and runtime.codex_sent_turn_key == self._goal_turn_key(goal)):
                 return None
@@ -8352,9 +8383,15 @@ class WatchDaemon:
                 if (all(s.column + s.cell_width <= grid.cursor.column for s in entered)
                         and all(not s.text.strip() or _is_spinner_overlay_span(grid, s) for s in trailing)):
                     draft = "".join(s.text for s in entered)
+            error = None
+            if row is not None:
+                error, _, _ = _codex_error_scan(
+                    grid, row, content_end=headers[-1] if headers else row)
+            current_provider_block = (error is not None and not error.superseded
+                                      and error.error_type in PROVIDER_BLOCKED)
             return {"empty": kind == "empty", "draft": draft, "queued": queued,
                     "editable": any("edit last queued message" in x and ("⌥" in x or "alt" in x.lower()) for x in tail),
-                    "busy": provider_blocked('\n'.join(grid.lines))
+                    "busy": current_provider_block
                             or _menu_present(grid.lines) or _working_present(grid.lines)
                             or any(re.search(r"^[•●]?\s*Reconnecting\.{3}", x.strip()) for x in grid.lines)}
 
@@ -8434,7 +8471,10 @@ class WatchDaemon:
 
         initial_evidence = queue_evidence()
         if not initial_evidence:
-            return state
+            # The caller records this returned state after reconciliation.
+            # Returning queued_followup here would hide the native blocker
+            # behind a healthy waiting status, including after daemon restart.
+            return queue_blocker or state
         # Match QueueRecovery's durable identity so an acknowledged Edit can
         # finish after restart without charging a second remedy. Its ledger
         # still forbids replay after an unknown or acknowledged Enter.
@@ -8443,7 +8483,8 @@ class WatchDaemon:
         provider_attempt = 'queue:' + hashlib.sha256(json.dumps(
             [target['surface_id'], provider_turn], sort_keys=True).encode()).hexdigest()
         if not self._provider_retry_gate(target, runtime, None, attempt=provider_attempt, dry_run=True):
-            return state
+            queue_evidence()
+            return queue_blocker or state
         outcome = self.codex_queue_recovery.recover(
             target, runtime, read_view=view,
             edit_queued=lambda: guarded_key(lambda: client.edit_codex_queued_prompt(target["workspace_id"], target["surface_id"]), editing=True),
@@ -8453,7 +8494,7 @@ class WatchDaemon:
         if outcome:
             self.logger.warning("surface=%s %s original_queued_prompt=true", target["surface_id"], outcome)
             return ScreenState(outcome, reason=outcome, message_kind="codex")
-        return state
+        return queue_blocker or state
 
     @staticmethod
     def _claude_provider_submission_snapshot(runtime: TargetRuntime) -> dict[str, Any]:
