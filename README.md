@@ -68,7 +68,7 @@ services. `cmux-stack` mutations require their documented `--apply` switch.
 Run the source-only checks before any LaunchAgent action:
 
 ```sh
-python3 -m unittest discover -s tests -p 'test_*.py'
+python3 -m unittest discover -s tests -t . -p 'test_*.py'
 python3 -B tests/test_cmux_stack.py
 python3 -B tools/ccp_pty_stress.py --script ./ccp_new.py --rounds 3
 bash -n janitor/src/cmux-janitor.sh janitor/src/guard.sh
