@@ -179,8 +179,9 @@ class HealthSnapshotScopeTests(unittest.TestCase):
         self.assertEqual({r["surface_id"] for r in scoped["monitored_targets"]}, self.target_ids)
         continuation = {r["surface_id"]: r for r in scoped["continuation_health"]["targets"]}
         self.assertEqual(set(continuation), self.target_ids)
-        for sid in ("paused", "disabled", "dynamic-paused"):
+        for sid in ("paused", "dynamic-paused"):
             self.assertEqual(continuation[sid]["status"], "paused")
+        self.assertEqual(continuation["disabled"]["status"], "disabled")
         self.assertEqual(scoped["claude_hook_coverage"]["unregistered"], ["surface:100"])
         self.assertEqual(scoped["claude_hook_coverage"]["excluded_live"], ["surface:101"])
 
