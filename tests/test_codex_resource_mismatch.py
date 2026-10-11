@@ -130,6 +130,67 @@ class StructuredProviderEnvelopeTests(unittest.TestCase):
 
 
 class NativeQueueEnvelopeTests(unittest.TestCase):
+    def test_queue_view_blocks_only_current_provider_error_cards(self):
+        high_demand = "We're currently experiencing high demand, which may cause temporary errors."
+        invalid_request = ('{"error":{"type":"invalid_request_error","code":null,"message":'
+                           '"An unsupported request parameter was supplied."}}')
+        target = {"surface_id": "surface-uuid", "workspace_id": "workspace", "enabled": True}
+        # A retryable native snapshot must not override a currently visible
+        # provider blocker; this exercises the independent viewport gate.
+        turn = {"session_id": "s", "model_provider": "p", "turn_id": "latest", "kind": "task_complete",
+                "at": 1250, "error": {"message": high_demand}}
+        evidence = {"session_id": "s", "pid": 123, "process_start": 1,
+                    "turn_id": "latest", "completed_at": 1250}
+        for message in (RESOURCE, invalid_request):
+            for columns in (600, 74):
+                for replacement in ("none", "user", "high_demand", "continue_echo"):
+                    with self.subTest(message=message, columns=columns, replacement=replacement):
+                        marked = "■ " + message
+                        content = [(marked[i:i + columns], 3) for i in range(0, len(marked), columns)]
+                        if replacement == "user":
+                            content.append(("› 请检查另一项任务", 0))
+                        elif replacement == "continue_echo":
+                            content.append(("› 任务请继续", 0))
+                        elif replacement == "high_demand":
+                            marked = "■ " + high_demand
+                            content.extend((marked[i:i + columns], 3)
+                                           for i in range(0, len(marked), columns))
+                        payload = grid_payload([""] * (len(content) + 4), columns=columns)
+                        rows = payload["render_grid"]["row_spans"]
+                        rows.extend(span(i, 0, text, style) for i, (text, style) in enumerate(content))
+                        row = payload["render_grid"]["cursor"]["row"]
+                        rows.extend([span(row - 3, 0, "Queued follow-up input", 0),
+                                     span(row - 2, 0, "↳ 任务请继续", 0),
+                                     span(row - 1, 0, "alt+up to edit last queued message", 0)])
+                        views = []
+
+                        def capture_view(*args, read_view, **kwargs):
+                            views.append(read_view())
+                            return ""
+
+                        daemon = core.WatchDaemon.__new__(core.WatchDaemon)
+                        daemon.logger = Mock()
+                        daemon.codex_queue_recovery = SimpleNamespace(
+                            message="任务请继续", current_turn=Mock(return_value=turn),
+                            evidence=Mock(return_value=evidence), recover=Mock(side_effect=capture_view))
+                        daemon._current_blocked_goal = Mock(return_value=None)
+                        runtime = core.TargetRuntime()
+                        runtime.delivery_status, runtime.send_count = "confirmed", 4
+                        client = Mock()
+                        client.replay.return_value = payload
+                        state = core.classify_grid(core.Grid.from_rpc(payload, "surface-uuid"))
+                        self.assertEqual(state.kind, "queued_followup")
+                        daemon._recover_stranded_codex_queue(
+                            target, runtime, state, client, lambda **kwargs: True)
+                        self.assertEqual(len(views), 1)
+                        self.assertTrue(views[0]["empty"])
+                        self.assertTrue(views[0]["editable"])
+                        self.assertEqual(views[0]["queued"], ["任务请继续"])
+                        self.assertEqual([str(item) for item in client.mock_calls],
+                                         ["call.replay('workspace', 'surface-uuid')"])
+                        self.assertEqual(views[0]["busy"], replacement in {"none", "continue_echo"},
+                                         "current provider errors block; CCC echoes are not newer work")
+
     def test_queue_view_ignores_documented_or_superseded_resource_errors(self):
         high_demand = "We're currently experiencing high demand, which may cause temporary errors."
         target = {"surface_id": "surface-uuid", "workspace_id": "workspace", "enabled": True}
