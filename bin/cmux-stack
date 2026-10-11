@@ -222,19 +222,19 @@ def probe_watcher() -> dict:
     observation = payload.get("observation_coverage")
     if isinstance(observation, dict):
         row["observation_coverage"] = {key: observation.get(key) for key in (
-            "status", "scope", "observed_at", "stale_after_sec")}
+            "status", "scope", "observed_at", "stale_after_sec", "attention_reasons")}
         counts = observation.get("counts", {})
         row["observation_coverage"]["counts"] = {
-            key: counts.get(key) for key in ("readable", "live_unreadable", "dormant", "paused", "missing", "unknown")
+            key: counts.get(key) for key in ("readable", "live_unreadable", "dormant", "paused", "disabled", "missing", "unknown")
         } if isinstance(counts, dict) else {}
 
     targets = payload.get("explicit_targets")
     continuation = payload.get("continuation_health")
     if isinstance(continuation, dict):
-        row["continuation_health"] = {key: continuation.get(key) for key in ("status", "observed_at")}
+        row["continuation_health"] = {key: continuation.get(key) for key in ("status", "observed_at", "attention_reasons")}
         counts = continuation.get("counts", {})
         row["continuation_health"]["counts"] = {
-            key: counts.get(key) for key in ("ok", "paused", "unknown", "delayed", "delivery_unknown",
+            key: counts.get(key) for key in ("ok", "paused", "disabled", "unknown", "delayed", "delivery_unknown",
                                             "send_failed", "unavailable", "blocked", "missing", "inactive", "waiting")
         } if isinstance(counts, dict) else {}
     rules = payload.get("workspace_rules")
@@ -283,10 +283,18 @@ def _watcher_verdict(row: dict) -> tuple[bool | None, str | None]:
         return False, "continuation delayed, delivery unconfirmed, or provider blocked"
     if coverage.get("status") == "degraded" or hooks.get("status") == "degraded":
         return False, "authorized targets have an observation or Hook coverage gap"
-    if continuation.get("status") != "ok":
+    holds = {"ok", "paused", "disabled", "attention"}
+    if continuation.get("status") not in holds:
         return None, "continuation timing or delivery state unknown"
-    if coverage.get("status") != "ok" or hooks.get("status") != "ok":
+    if coverage.get("status") not in holds or hooks.get("status") != "ok":
         return None, "authorized target observation or Hook coverage unknown"
+    for verdict in (continuation.get("status"), coverage.get("status")):
+        if verdict == "paused":
+            return False, "all enabled targets are paused; automatic continuation is suspended"
+        if verdict == "disabled":
+            return False, "all applicable targets are disabled; automatic continuation is disabled"
+        if verdict == "attention":
+            return False, "some authorized targets are paused or disabled; review target attention_reasons"
     # A watcher whose on-disk source differs from the running one is NOT judged
     # unhealthy: it only means a restart would change behaviour, and deciding to
     # restart is a human call.  Surfaced in the row, never folded into healthy.
@@ -547,6 +555,8 @@ def _component_warnings(name: str, row: dict) -> list[str]:
         observation = row.get("observation_coverage", {})
         if observation.get("status") == "degraded":
             warnings.append("terminal_observation_gap")
+        elif observation.get("status") in {"paused", "disabled", "attention"}:
+            warnings.append("targets_paused_or_disabled")
         elif observation.get("status") != "ok":
             warnings.append("terminal_observation_unknown")
     elif name == "janitor":

@@ -75,13 +75,63 @@ def transient_observation_error(error: BaseException | str) -> bool:
 def pause_health(target):
     """A transport message alone cannot establish who requested a pause."""
     if not target.get("enabled", True):
-        return "paused", "explicitly_paused_or_disabled"
+        return "disabled", "monitoring_disabled"
     origin = str(target.get("pause_origin") or "")
     if origin.startswith("automatic_"):
         return "unavailable", "paused_after_observation_error"
     if origin != "user" and transient_observation_error(str(target.get("paused_reason") or "")):
         return "unknown", "pause_origin_unverified"
-    return "paused", "explicitly_paused_or_disabled"
+    return "paused", "monitoring_paused"
+
+
+def pause_metadata(target, *, now):
+    """Project the stored pause without inferring an actor or changing policy.
+
+    The CLI has used origin=user for both human and agent-issued pauses. Keep
+    that original value; it is not authenticated evidence of a human operator.
+    An absent, invalid or future timestamp cannot establish a pause duration.
+    """
+    paused = bool(target.get("paused"))
+    at = target.get("paused_at")
+    age = None
+    if not paused:
+        time_status = "not_paused"
+    elif at is None or (type(at) in (int, float) and at == 0):
+        time_status = "missing"
+    elif type(at) not in (int, float) or not math.isfinite(at) or at < 0:
+        time_status = "invalid"
+    elif at > now:
+        time_status = "future"
+    else:
+        time_status, age = "valid", round(now - at, 3)
+    return {
+        "enabled": bool(target.get("enabled", True)), "paused": paused,
+        "pause_origin": target.get("pause_origin", ""),
+        "paused_reason": target.get("paused_reason", ""), "paused_at": at,
+        "pause_age_sec": age, "pause_time_status": time_status,
+    }
+
+
+def pause_summary(status, rows):
+    """Keep deliberate holds visible without reviving closed or idle targets."""
+    applicable = [row for row in rows if row.get("status") not in {"missing", "inactive", "dormant"}]
+    enabled = [row for row in applicable if row.get("enabled", True) and row.get("status") != "disabled"]
+    paused = sum(bool(row.get("paused") or row.get("status") == "paused") for row in enabled)
+    disabled = len(applicable) - len(enabled)
+    attention = []
+    if paused:
+        attention.append("all_enabled_targets_paused" if paused == len(enabled) else "some_enabled_targets_paused")
+    if disabled:
+        attention.append("all_targets_disabled" if not enabled else "some_targets_disabled")
+    # A known failure or missing evidence still outranks an intentional hold.
+    if status == "ok":
+        if paused and paused == len(enabled):
+            status = "paused"
+        elif disabled and not enabled:
+            status = "disabled"
+        elif attention:
+            status = "attention"
+    return {"status": status, "attention_reasons": attention}
 
 
 def objects(value: Any):
@@ -159,6 +209,7 @@ def observation_row(target, record, process, terminal, runtime, *, owner_alive, 
     fresh = checked > 0 and 0 <= now - checked <= stale_after
     row = {
         "surface_id": sid, "workspace_id": wid,
+        **pause_metadata(target, now=now),
         "agent_kind": kind, "agent_pid": pid,
         "runtime_ready": native, "observed_at": now,
         "viewport_checked_at": checked,
@@ -180,8 +231,9 @@ def observation_row(target, record, process, terminal, runtime, *, owner_alive, 
         # An incomplete OS scan cannot establish that a shell has no agent.
         # Keep that uncertainty separate from stale viewport/Hook failures;
         # positive native ownership still follows the normal observation path.
-        if (target.get("paused") or not target.get("enabled", True)) and pause_health(target)[0] == "paused":
-            row.update(status="paused", reason_code="explicitly_paused_or_disabled")
+        if (target.get("paused") or not target.get("enabled", True)) and pause_health(target)[0] in {"paused", "disabled"}:
+            health, reason = pause_health(target)
+            row.update(status=health, reason_code=reason)
         else:
             row["reason_code"] = "process_inventory_incomplete"
     elif (inventory_complete and process.get("process_snapshot_present")
@@ -213,17 +265,19 @@ def observation_row(target, record, process, terminal, runtime, *, owner_alive, 
 
 
 def summarize_observation(rows, *, now, stale_after):
-    counts = {key: 0 for key in ("readable", "live_unreadable", "dormant", "paused", "missing", "unknown")}
+    counts = {key: 0 for key in ("readable", "live_unreadable", "dormant", "paused", "disabled", "missing", "unknown")}
     projected = []
     for original in rows:
         row = dict(original)
-        if row.get("status") != "paused" and not 0 <= now - float(row.get("observed_at") or 0) <= stale_after:
+        if "paused" in row:
+            row.update(pause_metadata(row, now=now))
+        if row.get("status") not in {"paused", "disabled"} and not 0 <= now - float(row.get("observed_at") or 0) <= stale_after:
             row.update(status="unknown", reason_code="diagnostic_snapshot_stale")
         status = row.get("status", "unknown")
         counts[status if status in counts else "unknown"] += 1
         projected.append(row)
     status = "degraded" if counts["live_unreadable"] else "unknown" if counts["unknown"] else "ok"
-    return {"status": status, "scope": "authorized_targets", "observed_at": now,
+    return {**pause_summary(status, projected), "scope": "authorized_targets", "observed_at": now,
             "stale_after_sec": stale_after, "counts": counts, "targets": projected}
 
 
@@ -286,7 +340,7 @@ def continuation_row(target, runtime, *, now, poll_interval=1.0, observation=Non
     elif current and observed.get("status") == "dormant":
         status, reason = "inactive", str(observed.get("reason_code") or "no_supported_agent")
     elif not target.get("enabled", True):
-        status, reason = "paused", "explicitly_paused_or_disabled"
+        status, reason = "disabled", "monitoring_disabled"
     elif (current and observed.get("status") == "unknown"
           and observed.get("reason_code") == "process_inventory_incomplete"
           and (not target.get("paused") or pause_health(target)[0] != "paused")
@@ -336,6 +390,7 @@ def continuation_row(target, runtime, *, now, poll_interval=1.0, observation=Non
     timings = runtime.get('observation_timings')
     return {
         "surface_id": str(target["surface_id"]), "workspace_id": str(target["workspace_id"]),
+        **pause_metadata(target, now=now),
         "status": status, "reason_code": reason, "state": phase,
         "viewport_checked_at": checked, "observation_age_sec": round(age, 3) if age is not None else None,
         "observation_deadline_age_sec": round(deadline_age, 3) if deadline_age is not None else None,
@@ -365,12 +420,13 @@ def continuation_report(targets, runtime, *, now, poll_interval=1.0, observation
     rows = [continuation_row(t, runtime.get(str(t["surface_id"]), {}), now=now, poll_interval=poll_interval,
                              observation=by_id.get(t["surface_id"]), published_at=published_at)
             for t in targets]
-    counts = {key: 0 for key in ("ok", "paused", "unknown", "delayed", "delivery_unknown",
+    counts = {key: 0 for key in ("ok", "paused", "disabled", "unknown", "delayed", "delivery_unknown",
                                "send_failed", "unavailable", "blocked", "missing", "inactive", "waiting")}
     for row in rows:
         counts[row["status"]] += 1
     bad = sum(counts[key] for key in ("delayed", "delivery_unknown", "send_failed", "unavailable", "blocked"))
-    return {"status": "degraded" if bad else "unknown" if counts["unknown"] else "ok",
+    status = "degraded" if bad else "unknown" if counts["unknown"] else "ok"
+    return {**pause_summary(status, rows),
             "observed_at": now, "scope": "authorized_targets", "counts": counts, "targets": rows}
 
 

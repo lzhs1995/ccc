@@ -13349,23 +13349,31 @@ def monitoring_config_key(config: Mapping[str, Any]) -> str:
 def observation_status(config: Mapping[str, Any], state: Mapping[str, Any], snapshot: Mapping[str, Any]) -> dict[str, Any]:
     now = time.time()
     stale_after = max(30.0, 3 * float(config.get("poll_interval_sec", 1)))
+    def unobserved(target, reason):
+        status, pause_reason = observation_health.pause_health(target)
+        held = (target.get("paused") or not target.get("enabled", True)) and status in {"paused", "disabled"}
+        return {"surface_id": target["surface_id"], "workspace_id": target["workspace_id"],
+                **observation_health.pause_metadata(target, now=now),
+                "status": status if held else "unknown",
+                "reason_code": pause_reason if held else reason, "observed_at": now,
+                "observation_reason_code": reason}
     rows = snapshot.get("rows", []) if isinstance(snapshot.get("rows"), list) else []
     if snapshot.get("config_key") != monitoring_config_key(config):
-        rows = [{"surface_id": t["surface_id"], "workspace_id": t["workspace_id"],
-                 "status": "paused" if t.get("paused") or not t.get("enabled", True) else "unknown",
-                 "reason_code": "configuration_not_observed", "observed_at": now}
-                for t in config.get("targets", [])]
+        rows = [unobserved(t, "configuration_not_observed") for t in config.get("targets", [])]
     else:
         # A correctly keyed snapshot must still account for every explicit target.
-        by_id = {r.get("surface_id"): r for r in rows if isinstance(r, Mapping)}
+        by_id = {r.get("surface_id"): dict(r) for r in rows if isinstance(r, Mapping)}
         rows = list(by_id.values())
         for target in config.get("targets", []):
             row = by_id.get(target["surface_id"])
             if row is None or row.get("workspace_id") != target["workspace_id"]:
                 rows = [r for r in rows if r.get("surface_id") != target["surface_id"]]
-                rows.append({"surface_id": target["surface_id"], "workspace_id": target["workspace_id"],
-                             "status": "paused" if target.get("paused") or not target.get("enabled", True) else "unknown",
-                             "reason_code": "target_not_observed", "observed_at": now})
+                rows.append(unobserved(target, "target_not_observed"))
+            else:
+                # Reason/time changes do not grant new authorization and are
+                # intentionally absent from config_key. Project their current
+                # values without modifying the daemon's persisted snapshot.
+                row.update(observation_health.pause_metadata(target, now=now))
     report = observation_health.summarize_observation(rows, now=now, stale_after=stale_after)
     if not rows and (config.get("targets") or config.get("workspace_rules")):
         report["status"] = "unknown"
