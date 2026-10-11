@@ -130,6 +130,54 @@ class StructuredProviderEnvelopeTests(unittest.TestCase):
 
 
 class NativeQueueEnvelopeTests(unittest.TestCase):
+    def test_queue_view_ignores_documented_or_superseded_resource_errors(self):
+        high_demand = "We're currently experiencing high demand, which may cause temporary errors."
+        target = {"surface_id": "surface-uuid", "workspace_id": "workspace", "enabled": True}
+        turn = {"session_id": "s", "model_provider": "p", "turn_id": "latest", "kind": "task_complete",
+                "at": 1250, "error": {"message": high_demand}}
+        evidence = {"session_id": "s", "pid": 123, "process_start": 1,
+                    "turn_id": "latest", "completed_at": 1250}
+        for previous in ("documentation", "superseded_error", "neutral_control"):
+            with self.subTest(previous=previous):
+                payload = grid_payload(["Earlier task output"], error=high_demand, columns=600)
+                rows = payload["render_grid"]["row_spans"]
+                row = payload["render_grid"]["cursor"]["row"]
+                if previous == "documentation":
+                    rows.append(span(1, 0, "Documentation: " + RESOURCE, 0))
+                elif previous == "superseded_error":
+                    rows.extend([span(1, 0, "■ " + RESOURCE, 3), span(2, 0, "› 任务请继续", 0)])
+                else:
+                    rows.append(span(1, 0, "Documentation: ordinary API example", 0))
+                rows.extend([span(row - 3, 0, "Queued follow-up input", 0),
+                             span(row - 2, 0, "↳ 任务请继续", 0),
+                             span(row - 1, 0, "alt+up to edit last queued message", 0)])
+                views = []
+
+                def capture_view(*args, read_view, **kwargs):
+                    views.append(read_view())
+                    return ""
+
+                daemon = core.WatchDaemon.__new__(core.WatchDaemon)
+                daemon.logger = Mock()
+                daemon.codex_queue_recovery = SimpleNamespace(
+                    message="任务请继续", current_turn=Mock(return_value=turn),
+                    evidence=Mock(return_value=evidence), recover=Mock(side_effect=capture_view))
+                daemon._current_blocked_goal = Mock(return_value=None)
+                runtime = core.TargetRuntime()
+                runtime.delivery_status, runtime.send_count = "confirmed", 4
+                client = Mock()
+                client.replay.return_value = payload
+                state = core.classify_grid(core.Grid.from_rpc(payload, "surface-uuid"))
+                self.assertEqual(state.kind, "queued_followup")
+                daemon._recover_stranded_codex_queue(target, runtime, state, client, lambda **kwargs: True)
+                self.assertEqual(len(views), 1)
+                self.assertTrue(views[0]["empty"])
+                self.assertTrue(views[0]["editable"])
+                self.assertEqual(views[0]["queued"], ["任务请继续"])
+                self.assertFalse(views[0]["busy"], "only the current error card may block queue recovery")
+                self.assertEqual([str(item) for item in client.mock_calls],
+                                 ["call.replay('workspace', 'surface-uuid')"])
+
     def test_real_transcript_and_queue_evidence_share_terminal_error_eligibility(self):
         now = time.time()
         with tempfile.TemporaryDirectory() as directory:
