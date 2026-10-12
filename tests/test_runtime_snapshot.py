@@ -16,6 +16,7 @@ def snapshot_daemon():
     daemon = core.WatchDaemon.__new__(core.WatchDaemon)
     daemon.runtime = {}
     daemon._runtime_lock = threading.Lock()
+    daemon._liveness_guard = None
     return daemon
 
 
