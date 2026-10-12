@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.35
+
+- Keep authenticated protected rollouts in native wakeup coverage. Bound discovery to two concurrent readers, use completion-based backoff, and recheck stale foreground hints against only the named processes.
+- Preserve exact process birth through open, idle, Hook and guard paths. Revalidate precise lane readers before and after reading, reject malformed identities, and keep an upgraded native binding when a legacy Hook omits birth.
+- Revoke a lost native process's lane using fresh checks of its original PID, then wait for the lane's final release before returning ownership to the parent. Inventory gaps and inspection errors do not alone release ownership.
+- Cover process replacement, same-second PID reuse, source disappearance and legacy-to-precise transitions. Separate standby cache semantics from the real service deadline tests.
+
 ## 0.2.34
 
 - Classify Codex's structured provider errors even without a literal HTTP status. Preserve specific rate-limit and prompt-cache remedies, and report resource ownership, encrypted-content, authentication and unknown request failures as blockers across ordinary, Goal and queued recovery without spending retry budgets.

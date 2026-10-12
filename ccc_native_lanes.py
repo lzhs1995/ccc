@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import queue
 from pathlib import Path
+import subprocess
 import threading
 import time
 
@@ -19,11 +20,56 @@ def _binding_matches(value, binding):
                                           for key, expected in binding.items())
 
 
+def _valid_birth(value):
+    return (isinstance(value, list) and len(value) == 2
+            and all(type(part) is int for part in value)
+            and value[0] > 0 and 0 <= value[1] < 1000000)
+
+
 def _binding_process_current(target, binding):
     from ccc_codex_queue import process_placement_start
     from ccc_guard_scope import birth
     return (process_placement_start(binding["pid"], target) == binding["process_start"]
             and ("birth" not in binding or birth(binding["pid"], codex=True) == binding["birth"]))
+
+
+def _bound_native_turn(target, binding, reader):
+    from ccc_codex_queue import process_placement_start
+    from ccc_guard_scope import birth
+
+    def fresh_birth():
+        if process_placement_start(binding["pid"], target) != binding["process_start"]:
+            return None
+        actual = birth(binding["pid"], codex=True)
+        return actual if _valid_birth(actual) and actual == binding["birth"] else None
+
+    try:
+        if "birth" not in binding:
+            value = reader(target)
+            if not _binding_matches(value, binding):
+                return {"kind": "unknown"}
+            # Portable readers may omit birth. An explicit value, however,
+            # cannot be dropped or trusted without a fresh process check.
+            if "birth" in value and (not _valid_birth(value["birth"])
+                    or not _binding_process_current(target, {**binding, "birth": value["birth"]})):
+                return {"kind": "unknown"}
+            return value
+        if not _valid_birth(binding["birth"]) or fresh_birth() is None:
+            return {"kind": "unknown"}
+        value = reader(target)
+        actual = fresh_birth()
+        if actual is None or not isinstance(value, dict):
+            return {"kind": "unknown"}
+        # Older Hook readers omit birth. Revalidate the original process on
+        # both sides of that single read before supplying the fresh sample.
+        # An explicit empty/conflicting birth is evidence, never a missing field.
+        if "birth" not in value:
+            value = {**value, "birth": list(actual)}
+        elif not _valid_birth(value["birth"]):
+            return {"kind": "unknown"}
+        return value if _binding_matches(value, binding) else {"kind": "unknown"}
+    except (OSError, ValueError, RuntimeError, KeyError, TypeError, subprocess.SubprocessError):
+        return {"kind": "unknown"}
 
 
 class AuthorizationCells:
@@ -153,14 +199,40 @@ class NativeDispatcher:
 
     @staticmethod
     def binding(source):
+        if (not isinstance(source, dict)
+                or not all(key in source for key in ("session_id", "pid", "process_start"))
+                or ("birth" in source and not _valid_birth(source["birth"]))):
+            return None
         value = {key:source[key] for key in ("session_id", "pid", "process_start")}
         if "birth" in source:
             value["birth"] = list(source["birth"])
         return value
 
     @staticmethod
+    def _missing_source_lost(target, binding):
+        # Inventory absence alone is not death. Probe only the bound PID;
+        # an unavailable inspector retains exclusion until a later verdict.
+        try:
+            return not _binding_process_current(target, binding)
+        except (OSError, ValueError, RuntimeError, KeyError, TypeError, subprocess.SubprocessError):
+            return False
+
+    @classmethod
+    def _source_binding_changed(cls, target, current, candidate):
+        if current == candidate:
+            return False
+        if ("birth" in current and "birth" not in candidate
+                and all(candidate.get(key) == current.get(key)
+                        for key in ("session_id", "pid", "process_start"))):
+            # A legacy Hook can remain less precise than the native reader
+            # that admitted this lane. Keep the exact assignment and verify
+            # its own PID; missing metadata must not cause constant churn.
+            return cls._missing_source_lost(target, current)
+        return True
+
+    @staticmethod
     def _hint_conflicts(binding, hint):
-        """A native hint can revoke stale ownership, never authorize new input."""
+        """A cached disagreement requests a fresh check, never a verdict."""
         if not hint or hint.get("agent_kind") != "codex" or len(hint.get("agent_pids", [])) != 1:
             return False
         born = hint.get("agent_birth")
@@ -169,6 +241,44 @@ class NativeDispatcher:
                 or (born and "birth" in binding and list(born) != binding["birth"])
                 or (foreground and foreground[0] == "ok"
                     and foreground[1] != binding["session_id"]))
+
+    @classmethod
+    def _current_hint_conflicts(cls, target, binding, hint):
+        """Recheck only the two named processes when an index disagrees.
+
+        The index can describe the old foreground even after a complete native
+        reader has admitted its successor. Its publication time cannot order
+        those observations. These bounded checks may withhold/revoke ownership;
+        only the complete native reader below can admit or authorize input.
+        """
+        if not cls._hint_conflicts(binding, hint):
+            return False
+        from ccc_codex_queue import process_placement_start
+        from ccc_guard_scope import birth
+        from ccc_client_thread_observation import read_foreground
+        from ccc_request_observation_policy import request_observation_directory_matches
+
+        try:
+            if not _binding_process_current(target, binding):
+                return True
+            hinted_pid = hint["agent_pids"][0]
+            if hinted_pid != binding["pid"]:
+                hinted_birth = birth(hinted_pid, codex=True)
+                hinted_start = process_placement_start(hinted_pid, target)
+                if (hinted_birth and hinted_start == hinted_birth[0]
+                        and birth(hinted_pid, codex=True) == hinted_birth):
+                    # Two currently placed clients are ambiguous. A dead or
+                    # moved old PID, however, cannot evict the current source.
+                    return True
+            status, selected, _ = read_foreground(
+                binding["pid"], request_observation_directory_matches)
+            if not _binding_process_current(target, binding):
+                return True
+            # Missing/invalid selection is not proof of a switch. The full
+            # reader retains its unknown veto at admission and before input.
+            return status == "ok" and selected != binding["session_id"]
+        except (OSError, ValueError, RuntimeError, KeyError, TypeError, subprocess.SubprocessError):
+            return False
 
     def _merge(self, sid, cell, value):
         owned = self.owned.get(sid)
@@ -224,8 +334,17 @@ class NativeDispatcher:
         sources = self.daemon.codex_queue_recovery.wakeup_sources(targets)
         bindings = {s["surface_id"]:self.binding(s) for s in sources
                     if s.get("identity_current") and all(k in s for k in ("session_id","pid","process_start"))}
+        # Reuse only this refresh's same target/binding/hint verdict. A stale
+        # conflicting hint otherwise repeats the bounded OS probes twice.
+        conflicts = {}
+        def hint_conflicts(sid, binding):
+            key = (sid, binding["session_id"], binding["pid"], binding["process_start"],
+                   tuple(binding.get("birth", ())))
+            if key not in conflicts:
+                conflicts[key] = self._current_hint_conflicts(active[sid], binding, hints.get(sid))
+            return conflicts[key]
         bindings = {sid:binding for sid,binding in bindings.items()
-                    if sid in active and not self._hint_conflicts(binding, hints.get(sid))}
+                    if binding is not None and sid in active and not hint_conflicts(sid, binding)}
         self._discover_unbound(active, bindings, hints)
         changed = []
         def dirty(state):
@@ -235,8 +354,10 @@ class NativeDispatcher:
             assignment, state = owned["assignment"], owned["state"]
             if (sid not in active or any(active[sid].get(key) != assignment["target"].get(key)
                     for key in ("workspace_id", "source", "source_workspace_id", "pane_id"))
-                    or (sid in bindings and bindings[sid] != assignment["binding"])
-                    or self._hint_conflicts(assignment["binding"], hints.get(sid))):
+                    or (sid in bindings and self._source_binding_changed(
+                        active[sid], assignment["binding"], bindings[sid]))
+                    or hint_conflicts(sid, assignment["binding"])
+                    or (sid not in bindings and self._missing_source_lost(active[sid], assignment["binding"]))):
                 self.cells.revoke(assignment["cell"])
                 if sid in state["assignments"]:
                     del state["assignments"][sid]
@@ -255,8 +376,10 @@ class NativeDispatcher:
                     continue
                 # Hook indexes are advisory. A stale Codex binding must not
                 # steal ownership from a replacement Claude/shell process.
-                native = self.daemon.codex_queue_recovery.current_turn(target)
-                if not _binding_matches(native, bindings[sid]):
+                native = _bound_native_turn(target, bindings[sid],
+                                            self.daemon.codex_queue_recovery.current_turn)
+                if (not _binding_matches(native, bindings[sid])
+                        or native.get("kind") == "unknown"):
                     continue
                 state = next((s for s in self.lanes if not s.get("failed")
                     and s["workspace_id"] == target["workspace_id"] and len(s["assignments"]) < 25), None)
@@ -336,9 +459,9 @@ class NativeDispatcher:
                 if sid not in candidates or candidates[sid][1] != attempt["identity"]:
                     continue
                 state = self._discovery_state[sid]
-                success = (isinstance(value, dict) and value.get("kind") not in (None, "unknown")
-                           and all(key in value for key in ("session_id", "pid", "process_start"))
-                           and not self._hint_conflicts(self.binding(value), hints[sid]))
+                binding = self.binding(value)
+                success = (binding is not None and value.get("kind") not in (None, "unknown")
+                           and not self._current_hint_conflicts(active[sid], binding, hints[sid]))
                 state["failures"] = 0 if success else min(state["failures"] + 1, 4)
                 delay = .25 if success else .25 * 2 ** (state["failures"] - 1)
                 state["due"] = attempt["completion"].get("at", time.monotonic()) + delay
@@ -474,10 +597,7 @@ def run_native_lane(initial, flags, lane_cell, commands, results):
         if not current(target):
             return {"kind":"unknown"}
         bound = assignments[str(target["surface_id"])]["binding"]
-        value = original_turn(target)
-        if not _binding_matches(value, bound):
-            return {"kind":"unknown"}
-        return value
+        return _bound_native_turn(target, bound, original_turn)
     daemon.codex_queue_recovery.current_turn = turn
 
     class Publisher:

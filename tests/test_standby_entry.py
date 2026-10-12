@@ -91,31 +91,47 @@ class EntryTests(unittest.TestCase):
                 {**t, 'job_id': self.jid, 'index': i, 'launch_id': self.job['slots'][i]['launch_id']})
         return entry.PeriodicObservationHint(), targets
 
+    def isolated_hint_status(self):
+        # Cache and authorization tests retain real files, socket identity and
+        # owner callbacks, but must not depend on the best-effort 50 ms RPC.
+        clock = enter_context(self, patch.object(entry, 'time'))
+        clock.monotonic.return_value = 100.0
+        def status(spec_path, sha, operation, *, status_timeout):
+            self.assertEqual((spec_path, sha, operation),
+                             (self.endpoint.spec_path, self.endpoint.sha256, 'status'))
+            self.assertEqual(status_timeout, .05)
+            return self.owner.status()
+        rpc = enter_context(self, patch.object(entry, 'request', side_effect=status))
+        return clock, rpc
+
     def test_periodic_hint_coalesces_original_fifty_without_activation(self):
         hint, targets = self.hint_fixture()
-        with patch.object(entry.time, 'monotonic', return_value=100), \
-                patch.object(entry, 'request', wraps=entry.request) as rpc:
-            self.assertTrue(all(hint.covered(self.config, t) for t in targets))
-            self.assertEqual(rpc.call_count, 1)
+        _, rpc = self.isolated_hint_status()
+        self.assertTrue(all(hint.covered(self.config, t) for t in targets))
+        self.assertEqual(rpc.call_count, 1)
         self.assertEqual(self.owner.calls, [])
 
     def test_periodic_hint_only_covers_pre_activation_phases(self):
         hint, targets = self.hint_fixture()
+        _, rpc = self.isolated_hint_status()
         for phase in ('ready', 'activation_queued', 'preparing', 'activating', 'failed', 'closed'):
             with self.subTest(phase=phase):
                 self.owner.phase = phase
                 hint.cache.clear()
                 self.assertEqual(hint.covered(self.config, targets[0]), phase in {'ready', 'activation_queued'})
+        self.assertEqual(rpc.call_count, 6)
 
     def test_periodic_hint_expiry_observes_phase_change(self):
         hint, targets = self.hint_fixture()
-        with patch.object(entry.time, 'monotonic', return_value=100):
-            self.assertTrue(hint.covered(self.config, targets[0]))
+        clock, rpc = self.isolated_hint_status()
+        self.assertTrue(hint.covered(self.config, targets[0]))
         self.owner.phase = 'activating'
-        with patch.object(entry.time, 'monotonic', return_value=100.101):
-            self.assertFalse(hint.covered(self.config, targets[0]))
+        clock.monotonic.return_value = 100.101
+        self.assertFalse(hint.covered(self.config, targets[0]))
+        self.assertEqual(rpc.call_count, 2)
 
     def test_periodic_hint_hold_release_and_pause_invalidate_cache(self):
+        self.isolated_hint_status()
         for change in ('hold', 'pause', 'target', 'active'):
             with self.subTest(change=change):
                 hint, targets = self.hint_fixture()
@@ -137,11 +153,15 @@ class EntryTests(unittest.TestCase):
 
     def test_periodic_hint_live_callback_drift_rejected(self):
         hint, targets = self.hint_fixture()
+        _, rpc = self.isolated_hint_status()
         self.owner.on_status = lambda: self.store.mutate(lambda c: c.update(global_paused=True))
         self.assertFalse(hint.covered(self.config, targets[0]))
+        self.assertTrue(self.store.load()['global_paused'])
+        self.assertEqual(rpc.call_count, 1)
 
     def test_periodic_hint_registration_boot_and_foreign_owner_rejected(self):
         hint, targets = self.hint_fixture()
+        _, rpc = self.isolated_hint_status()
         self.assertFalse(hint.covered(self.config, {**targets[0], 'workspace_id': str(uuid.uuid4())}))
         with patch.object(entry.ui, 'boot_id', return_value=str(uuid.uuid4())):
             self.assertFalse(hint.covered(self.config, targets[0]))
@@ -153,6 +173,7 @@ class EntryTests(unittest.TestCase):
         receipt.write_bytes(original)
         self.owner.selected = {**self.owner.selected, 'cohort_id': str(uuid.uuid4())}
         self.assertFalse(hint.covered(self.config, targets[0]))
+        self.assertEqual(rpc.call_count, 1)
 
     def test_periodic_hint_missing_or_slow_service_falls_back(self):
         hint, targets = self.hint_fixture()
@@ -169,24 +190,21 @@ class EntryTests(unittest.TestCase):
 
     def test_periodic_hint_cached_reply_cannot_survive_socket_disappearance(self):
         hint, targets = self.hint_fixture()
+        _, rpc = self.isolated_hint_status()
         self.assertTrue(hint.covered(self.config, targets[0]))
         self.endpoint.close()
         self.assertFalse(hint.covered(self.config, targets[0]))
+        self.assertEqual(rpc.call_count, 1)
 
     def test_periodic_hint_cached_reply_cannot_survive_descriptor_change(self):
         hint, targets = self.hint_fixture()
-        # Keep the cache fresh and isolate revocation from the live status
-        # RPC's best-effort 50 ms deadline. Deadline fallback is tested above.
-        with patch.object(entry, 'time') as clock, \
-                patch.object(entry, 'request', return_value=self.owner.status()) as rpc:
-            clock.monotonic.return_value = 100.0
-            self.assertTrue(hint.covered(self.config, targets[0]))
-            self.assertTrue(hint.covered(self.config, targets[0]))
-            spec = core.load_json(self.endpoint.spec_path, {})
-            core.atomic_write_json(self.endpoint.spec_path, {**spec, 'nonce': 'replacement'})
-            self.assertFalse(hint.covered(self.config, targets[0]))
-            rpc.assert_called_once_with(self.endpoint.spec_path, self.endpoint.sha256,
-                                        'status', status_timeout=.05)
+        _, rpc = self.isolated_hint_status()
+        self.assertTrue(hint.covered(self.config, targets[0]))
+        self.assertTrue(hint.covered(self.config, targets[0]))
+        spec = core.load_json(self.endpoint.spec_path, {})
+        core.atomic_write_json(self.endpoint.spec_path, {**spec, 'nonce': 'replacement'})
+        self.assertFalse(hint.covered(self.config, targets[0]))
+        self.assertEqual(rpc.call_count, 1)
 
     def test_status_total_deadline_expires_despite_individual_reads_progressing(self):
         from unittest.mock import MagicMock

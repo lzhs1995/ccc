@@ -274,6 +274,11 @@ class ProtectedTurnTests(unittest.TestCase):
     def dispatcher(self, queue):
         from tests.test_native_dispatch_ownership import FakeLane
         from tests.test_watch import FakeClient, armed_daemon, grid_payload
+        # The dispatcher independently probes the synthetic native client's
+        # placement before and after the real shared-turn reader.
+        self.patch(shared.native, 'process_placement_start', side_effect=lambda pid, target:
+            100 if pid == 41 and target.get('surface_id') == 'surface'
+            and target.get('workspace_id') == 'workspace' else None)
         daemon = armed_daemon(self.root, FakeClient(grid_payload([])), [dict(self.target)])
         daemon.codex_queue_recovery = queue
         daemon._start_scheduler()

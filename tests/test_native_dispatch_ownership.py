@@ -45,6 +45,16 @@ class OwnershipTests(unittest.TestCase):
         self.dispatch._next_refresh=0
         self.dispatch.refresh(self.targets if targets is None else targets)
 
+    def mock_exact_process(self):
+        # These tests use a synthetic PID. Sample its independent OS identity
+        # without bypassing the production pre/post-reader admission checks.
+        for fixture in (
+            patch('ccc_codex_queue.process_placement_start', return_value=1),
+            patch('ccc_guard_scope.birth', return_value=[1, 100]),
+        ):
+            fixture.start()
+            self.addCleanup(fixture.stop)
+
     def test_parent_is_excluded_before_child_can_receive_assignment(self):
         self.refresh()
         self.assertTrue(self.dispatch.owns(self.sid))
@@ -114,12 +124,14 @@ class OwnershipTests(unittest.TestCase):
         self.assertEqual(replacement['binding']['pid'],2)
 
     def test_same_second_pid_reuse_cannot_pass_native_admission(self):
+        self.mock_exact_process()
         self.source['birth'] = [1, 100]
         self.daemon.codex_queue_recovery.current_turn = lambda _: {**self.source, 'birth': [1, 101]}
         self.refresh()
         self.assertFalse(self.dispatch.owns(self.sid))
 
     def test_exact_birth_is_preserved_and_replacement_retires_original_cell(self):
+        self.mock_exact_process()
         self.source['birth'] = [1, 100]
         self.refresh()
         original = self.dispatch.owned[self.sid]['assignment']
@@ -131,12 +143,16 @@ class OwnershipTests(unittest.TestCase):
         self.assertTrue(self.dispatch.owns(self.sid))
 
     def test_foreground_switch_retires_old_owner_before_rediscovery(self):
+        self.mock_exact_process()
         self.source['birth'] = [1, 100]
         self.refresh()
         original = self.dispatch.owned[self.sid]['assignment']
         hint = {'agent_kind': 'codex', 'agent_pids': [1], 'agent_birth': (1, 100),
                 'foreground_generation': ('ok', 'replacement', 'same-client')}
-        with patch.object(self.daemon._native_process_index, 'lookup', return_value=hint):
+        with patch.object(self.daemon._native_process_index, 'lookup', return_value=hint), \
+                patch('ccc_native_lanes._binding_process_current', return_value=True), \
+                patch('ccc_client_thread_observation.read_foreground',
+                      return_value=('ok', 'replacement', 'same-client')):
             self.refresh()
             self.assertEqual(self.dispatch.cells.shared()[original['cell']], 0)
             self.assertTrue(self.dispatch.owns(self.sid))

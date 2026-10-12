@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 import unittest
 import uuid
 from unittest.mock import patch
@@ -31,6 +32,14 @@ class ProcessSessionTests(unittest.TestCase):
         self.queue.process_lookup = lambda _: {"agent_kind": "codex", "agent_pids": [123]}
         self.target = {"surface_id": "s", "workspace_id": "w"}
         self.command = "Tue Sep 22 01:00:00 2026 /opt/homebrew/bin/codex resume original CMUX_SURFACE_ID=s CMUX_WORKSPACE_ID=w"
+        # This synthetic process has a fixed, independent OS birth. Changing
+        # ps output or expected results must not silently change that identity.
+        process_birth = (int(time.mktime(time.strptime("Tue Sep 22 01:00:00 2026",
+                                                     "%a %b %d %H:%M:%S %Y"))), 100)
+        born = patch('ccc_guard_scope.birth',
+                     side_effect=lambda pid, **kw: list(process_birth) if pid == 123 else None)
+        born.start()
+        self.addCleanup(born.stop)
         self.paths = "f44\nau\nn" + str(self.path) + "\n"
 
     def run_command(self, args, **kwargs):

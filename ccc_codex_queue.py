@@ -908,6 +908,7 @@ class QueueRecovery:
             if guarded and guarded.get("session_id"):
                 return {"session_id": guarded["session_id"], "pid": guarded["pid"],
                         "process_start": guarded["process_start"], "kind": guarded["kind"],
+                        **({"birth": guarded["birth"]} if "birth" in guarded else {}),
                         "turn_id": guarded.get("turn_id"), "at": guarded.get("at", 0),
                         "error": guarded.get("turn_error"),
                         "signature": [guarded.get("start_id"), guarded.get("turn_id"), guarded.get("at")]}
@@ -1000,6 +1001,7 @@ class QueueRecovery:
         """
         if self.process_lookup is None:
             return None
+        from ccc_guard_scope import birth
         # A configured native reader losing its sessions directory is not a
         # legacy client. None permits viewport-only dispatch downstream and
         # could submit while the original turn is still reconnecting.
@@ -1036,9 +1038,14 @@ class QueueRecovery:
 
         try:
             started = identity()
-            if started is None or (hint_started is not None and started != hint_started):
+            exact_birth = birth(pid, codex=True)
+            if (started is None or (hint_started is not None and started != hint_started)
+                    or (exact_birth is None and (sys.platform == "darwin" or _proc_pidinfo is not None))
+                    or (exact_birth is not None and exact_birth[0] != started)
+                    or (hint_source is not None and 'birth' in hint_source
+                        and hint_source['birth'] != exact_birth)):
                 return {"kind": "unknown"}
-            cache_key = (pid, started)
+            cache_key = (pid, started, tuple(exact_birth or ()))
             with self.lock:
                 cached = self.open_file_cache.get(cache_key)
             if cached and time.monotonic() - cached[0] < 1:
@@ -1063,16 +1070,20 @@ class QueueRecovery:
                     or path != Path(str(hint_source.get("path") or "")).resolve()):
                 return {"kind": "unknown"}
             snapshot = task_snapshot(path, sid)
-            if identity() != started:
+            if identity() != started or birth(pid, codex=True) != exact_birth:
                 return {"kind": "unknown"}
+            # Legacy platforms can lack microsecond birth inspection. When
+            # available, carry this freshly checked identity through every
+            # open/idle transition; never fill it from the source cache.
+            generation = {'birth': list(exact_birth)} if exact_birth is not None else {}
             with self.lock:
                 self.open_file_sources[str(target["surface_id"])] = {
                     "surface_id": str(target["surface_id"]), "workspace_id": str(target["workspace_id"]),
                     "session_id": sid, "path": path, "process_start": started,
-                    "pid": pid,
+                    "pid": pid, **generation,
                 }
             return {"session_id": sid, "pid": pid, "process_start": started,
-                    **(snapshot or {"kind": "unknown"})}
+                    **generation, **(snapshot or {"kind": "unknown"})}
         except (OSError, ValueError, subprocess.SubprocessError):
             return {"kind": "unknown"}
 
@@ -1152,6 +1163,7 @@ class QueueRecovery:
                 self.open_file_sources[str(target["surface_id"])] = {
                     "surface_id": str(target["surface_id"]), "workspace_id": str(target["workspace_id"]),
                     "session_id": sid, "path": path, "process_start": process["process_start"], "pid": pid,
+                    "birth": list(process["birth"]),
                 }
             return {"session_id": sid, "pid": pid, "process_start": process["process_start"],
                     "birth": process["birth"], **snapshot}
