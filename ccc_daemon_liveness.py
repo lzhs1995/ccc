@@ -1,7 +1,7 @@
 """Separate-process progress watchdog for the launchd CCC daemon only.
 
-KeepAlive cannot detect a live, wedged interpreter. Two independent progress
-tokens are required: a completed scheduling pass and a published health snapshot.
+KeepAlive cannot detect a live, wedged interpreter. Independent progress tokens
+track the scheduling loop, completed observations, and health publication.
 No terminal, client process, task, delivery record or provider state is changed.
 """
 from __future__ import annotations
@@ -20,6 +20,46 @@ STALL_SECONDS = 90.0
 TERM_GRACE_SECONDS = 15.0
 IDENTITY_RETRY_SECONDS = 0.25
 IDENTITY_LOG_SECONDS = 30.0
+MAX_STALL_SECONDS = 900.0
+
+
+def retry_timeout(journal, *, now=None):
+    """Back off repeated daemon stalls, independently of provider retry state."""
+    now = time.time() if now is None else now
+    try:
+        with Path(journal).open('rb') as stream:
+            stream.seek(0, os.SEEK_END)
+            stream.seek(max(0, stream.tell() - 65536))
+            raw = stream.read(65536)
+        rows = []
+        for line in raw.splitlines():
+            try:
+                value = json.loads(line)
+            except (ValueError, UnicodeError):
+                continue
+            if (isinstance(value, dict) and value.get('event') == 'stalled'
+                    and type(value.get('at')) in (float, int)
+                    and 0 <= now - value['at'] < 3600):
+                rows.append(value)
+        if not rows or now - rows[-1]['at'] >= 1800:
+            return STALL_SECONDS
+        return min(MAX_STALL_SECONDS, STALL_SECONDS * (2 ** min(len(rows), 4)))
+    except OSError:
+        return STALL_SECONDS
+
+
+def observations_current(targets, state, *, now, cadence=1):
+    """A fresh health file alone cannot prove that observation work completed."""
+    for target in targets:
+        if not target.get('enabled', True) or target.get('paused', False):
+            continue
+        row = state.get(str(target['surface_id']), {})
+        timing = row.get('observation_timings') or {}
+        stamp = timing.get('completed_at', 0)
+        if (type(stamp) not in (int, float) or not 0 < stamp <= now
+                or now - stamp > max(30, 3 * cadence)):
+            return False
+    return True
 
 
 def process_birth(pid):
@@ -40,7 +80,7 @@ def record(path, **value):
 
 
 def monitor(fd, parent, expected_birth, journal, *, timeout=STALL_SECONDS,
-            grace=TERM_GRACE_SECONDS, birth=process_birth):
+            grace=TERM_GRACE_SECONDS, birth=process_birth, channels=(b'M', b'H')):
     """Only our still-live original parent can be signalled, never a PID reuse."""
     last_identity_log = float('-inf')
     def same_parent():
@@ -62,7 +102,7 @@ def monitor(fd, parent, expected_birth, journal, *, timeout=STALL_SECONDS,
         return actual == expected_birth
 
     started = time.monotonic()
-    progress = {b'M': started, b'H': started}
+    progress = dict.fromkeys(channels, started)
     def read_progress(wait):
         ready, _, _ = select.select([fd], [], [], wait)
         if ready:
@@ -83,6 +123,7 @@ def monitor(fd, parent, expected_birth, journal, *, timeout=STALL_SECONDS,
     if not state:
         return 2
     progress = dict.fromkeys(progress, time.monotonic())
+    degraded_at = float('-inf')
     record(journal, event='armed', parent_pid=parent, parent_birth=expected_birth,
            timeout_seconds=timeout, grace_seconds=grace)
     while True:
@@ -98,6 +139,14 @@ def monitor(fd, parent, expected_birth, journal, *, timeout=STALL_SECONDS,
         now = time.monotonic()
         stalled = [token.decode() for token, stamp in progress.items() if now - stamp >= timeout]
         if not stalled:
+            continue
+        if stalled == ['H'] and b'O' in progress:
+            # Observers and main loop are making progress, but health-file
+            # publication fails (for example ENOSPC). Restart cannot fix that.
+            if now - degraded_at >= timeout:
+                record(journal, event='health_publication_degraded', parent_pid=parent,
+                       parent_birth=expected_birth)
+                degraded_at = now
             continue
         record(journal, event='stalled', parent_pid=parent, parent_birth=expected_birth,
                stalled_channels=stalled,
@@ -167,7 +216,7 @@ class LivenessGuard:
         self.fd, self.process = write_fd, child
 
     def progress(self, token):
-        if token not in (b'M', b'H'):
+        if token not in (b'M', b'H', b'O'):
             raise ValueError('unknown progress channel')
         if self.process is None or self.process.poll() is not None:
             # Cleanup can be blocked by the same wedged worker that killed the
@@ -210,7 +259,8 @@ def main():
     parser.add_argument('--birth', required=True)
     parser.add_argument('--journal', type=Path, required=True)
     args = parser.parse_args()
-    return monitor(args.fd, args.parent, json.loads(args.birth), args.journal)
+    return monitor(args.fd, args.parent, json.loads(args.birth), args.journal,
+                   timeout=retry_timeout(args.journal), channels=(b'M', b'H', b'O'))
 
 
 if __name__ == '__main__':

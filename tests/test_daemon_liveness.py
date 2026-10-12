@@ -12,6 +12,24 @@ import ccc_daemon_liveness as live
 
 
 class LivenessIdentityTests(unittest.TestCase):
+    def test_fresh_health_publication_does_not_hide_stale_observation(self):
+        targets = [{'surface_id': 'a'}, {'surface_id': 'b'}]
+        states = {'a': {'observation_timings': {'completed_at': 999}},
+                  'b': {'observation_timings': {'completed_at': 800}}}
+        self.assertFalse(live.observations_current(targets, states, now=1000))
+        targets[1]['paused'] = True
+        self.assertTrue(live.observations_current(targets, states, now=1000))
+        self.assertFalse(live.observations_current(targets, {}, now=1000))
+
+    def test_repeated_stall_backoff_is_bounded_and_expires(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'journal'
+            self.assertEqual(live.retry_timeout(path, now=10000), 90)
+            for count, expected in [(1, 180), (2, 360), (3, 720), (4, 900), (20, 900)]:
+                path.write_text(''.join(json.dumps({'event':'stalled','at':9999})+'\n' for _ in range(count)))
+                self.assertEqual(live.retry_timeout(path, now=10000), expected)
+            self.assertEqual(live.retry_timeout(path, now=12000), 90)
+
     def test_unrelated_parent_never_signalled(self):
         with patch.object(live.os, 'getppid', return_value=12), patch.object(live.os, 'kill') as kill:
             self.assertEqual(live.monitor(-1, 34, [1, 2], Path('/unused'), birth=lambda _: [1, 2]), 2)
@@ -140,7 +158,8 @@ import ccc_daemon_liveness as live
 mode, journal = sys.argv[1:]
 if mode == 'ignore_term': signal.signal(signal.SIGTERM, signal.SIG_IGN)
 read_fd, write_fd = os.pipe()
-code = 'import json,sys; from pathlib import Path; import ccc_daemon_liveness as l; raise SystemExit(l.monitor(int(sys.argv[1]),int(sys.argv[2]),json.loads(sys.argv[3]),Path(sys.argv[4]),timeout=0.6,grace=0.25))'
+channels = "(b'M',b'H',b'O')" if mode in ('stale_observers','health_file_failure') else "(b'M',b'H')"
+code = 'import json,sys; from pathlib import Path; import ccc_daemon_liveness as l; raise SystemExit(l.monitor(int(sys.argv[1]),int(sys.argv[2]),json.loads(sys.argv[3]),Path(sys.argv[4]),timeout=0.6,grace=0.25,channels=' + channels + '))'
 child = subprocess.Popen([sys.executable, '-B', '-c', code, str(read_fd), str(os.getpid()), json.dumps(live.process_birth(os.getpid())), journal], pass_fds=(read_fd,))
 os.close(read_fd)
 until = time.monotonic() + 1.3
@@ -148,6 +167,8 @@ while time.monotonic() < until:
     if mode == 'healthy': os.write(write_fd,b'MH')
     elif mode == 'main_only': os.write(write_fd,b'M')
     elif mode == 'health_only': os.write(write_fd,b'H')
+    elif mode == 'stale_observers': os.write(write_fd,b'MH')
+    elif mode == 'health_file_failure': os.write(write_fd,b'MO')
     elif mode == 'eof': break
     time.sleep(0.05)
 os.close(write_fd)
@@ -164,6 +185,17 @@ child.wait(timeout=3)
         result, rows = self.run_parent('stalled')
         self.assertEqual(result.returncode, -signal.SIGTERM, result.stderr)
         self.assertIn('stalled', [r['event'] for r in rows])
+
+    def test_real_observer_stall_not_hidden_by_main_and_health(self):
+        result, rows = self.run_parent('stale_observers')
+        self.assertEqual(result.returncode, -signal.SIGTERM, result.stderr)
+        self.assertEqual(next(r for r in rows if r['event'] == 'stalled')['stalled_channels'], ['O'])
+
+    def test_health_file_failure_preserves_working_daemon(self):
+        result, rows = self.run_parent('health_file_failure')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('health_publication_degraded', [r['event'] for r in rows])
+        self.assertNotIn('sigterm', [r['event'] for r in rows])
 
     def test_frozen_shutdown_gets_kill_only_for_original_parent(self):
         result, rows = self.run_parent('ignore_term')

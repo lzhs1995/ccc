@@ -6533,6 +6533,11 @@ class WatchDaemon:
                         observations=rows),
                     "claude_hook_coverage": hooks, "hook_coverage_at": metadata_at,
                     "scheduler": self._scheduler_metrics()}
+        if self._liveness_guard is not None:
+            from ccc_daemon_liveness import observations_current
+            if observations_current([] if config.get("global_paused") else targets, state, now=now,
+                                    cadence=float(config.get("poll_interval_sec", 1))):
+                self._liveness_guard.progress(b'O')
         atomic_write_json(self.observation_health_path, snapshot)
         if self._liveness_guard is not None:
             self._liveness_guard.progress(b'H')

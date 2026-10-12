@@ -2,7 +2,7 @@
 
 ## 0.2.35
 
-- Recover a stalled launchd daemon with a separate, exact-parent watchdog. A completed scheduling pass and a successful health publication each refresh their own 90-second deadline; a stopped channel requests daemon shutdown, followed by a 15-second bounded shutdown grace. Codex/Claude clients and durable delivery ledgers are preserved. Watchdog loss exits directly so blocked cleanup cannot defeat launchd recovery.
+- Recover a stalled launchd daemon with a separate, exact-parent watchdog. Scheduling-loop progress, completed observations and health publication have independent deadlines starting at 90 seconds, with bounded 15-second shutdown grace and repeated-stall backoff up to 15 minutes. A health-file write failure alone does not restart a daemon that is still scheduling and observing. Codex/Claude clients and durable delivery ledgers are preserved. Watchdog loss exits directly so blocked cleanup cannot defeat launchd recovery.
 - Recognize the exact exhausted-retry 429 banner in completed-turn queue recovery while retaining quoted-message, current-turn and specific provider-blocker precedence.
 - Ignore malformed advisory discovery hints without crashing the refresh loop or granting new lane/input ownership.
 - Keep authenticated protected rollouts in native wakeup coverage. Bound discovery to two concurrent readers, use completion-based backoff, and recheck stale foreground hints against only the named processes.
