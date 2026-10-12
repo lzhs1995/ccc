@@ -6,13 +6,28 @@ import time
 import unittest
 import sys
 import subprocess
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import cmux_codex_watch as core
-from ccc_native_lanes import AuthorizationCells, InterpreterLane, refresh_native_bindings
+from ccc_native_lanes import (AuthorizationCells, InterpreterLane, refresh_native_bindings,
+                              _binding_process_current, _binding_matches)
 
 
 class NativeLaneTests(unittest.TestCase):
+    def test_original_lane_rejects_same_second_pid_reuse_and_changed_foreground(self):
+        target = {'surface_id': 'surface', 'workspace_id': 'workspace'}
+        binding = {'session_id': 'original', 'pid': 7, 'process_start': 100, 'birth': [100, 123]}
+        with patch('ccc_codex_queue.process_placement_start', return_value=100), \
+                patch('ccc_guard_scope.birth', return_value=[100, 123]) as birth:
+            self.assertTrue(_binding_process_current(target, binding))
+            birth.return_value = [100, 124]
+            self.assertFalse(_binding_process_current(target, binding))
+            birth.return_value = None
+            self.assertFalse(_binding_process_current(target, binding))
+        self.assertTrue(_binding_matches({**binding, 'kind': 'task_started'}, binding))
+        for change in ({'birth': [100, 124]}, {'session_id': 'replacement'}, {'kind': 'unknown', 'pid': None}):
+            self.assertFalse(_binding_matches({**binding, **change}, binding))
+
     @unittest.skipUnless(sys.version_info >= (3,14), 'native lanes use Python 3.14 interpreters')
     def test_real_lane_keeps_info_receipts_on_inherited_stderr(self):
         # Stop at construction, before config, sockets or native observation.

@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import patch
 
 import ccc_guard_scope as scope
-from ccc_native_processes import NativeProcessIndex, local_processes
+from ccc_native_processes import NativeProcessIndex, local_processes, foreground_generation
 from ccc_scheduling import SnapshotCache, SnapshotClient
 import cmux_codex_watch as core
 from tests.test_watch import discovery_fixture, FakeClient, armed_daemon, grid_payload, visible_lines
@@ -30,6 +30,7 @@ class NativeDiscoveryTests(unittest.TestCase):
         index.refresh()
         target = {"surface_id": "codex-a", "workspace_id": "workspace-uuid"}
         self.assertEqual(index.lookup(target)["agent_pids"], [101])
+        self.assertEqual(index.lookup(target)["agent_birth"], (100, 200))
         self.assertIsNone(index.lookup({**target, "workspace_id": "moved"}))
         self.assertIsNone(index.lookup({**target, "surface_id": "ambiguous"}))
         now[0] = 106
@@ -67,10 +68,31 @@ class NativeDiscoveryTests(unittest.TestCase):
                 self.assertEqual(local_processes(), [])
         with patch.object(scope, "scan", return_value=[row]), \
                 patch.object(scope, "arguments", return_value=(["/native/codex", "resume", "session"], {})), \
-                patch.object(scope, "birth", return_value=row["birth"]) as birth:
-            self.assertEqual(local_processes(), [row])
+                patch.object(scope, "birth", return_value=row["birth"]) as birth, \
+                patch('ccc_native_processes.foreground_generation', return_value=('ok', 'thread', 'epoch')):
+            self.assertEqual(local_processes(), [{**row, 'foreground_generation': ('ok', 'thread', 'epoch')}])
             birth.return_value = [100, 201]
             self.assertEqual(local_processes(), [])
+
+    def test_periodic_foreground_publication_is_not_a_new_discovery_generation(self):
+        with patch('ccc_client_thread_observation.read_foreground') as read:
+            read.return_value = ('ok', 'thread', ((101, (100, 200)), 'epoch', 1000, 'old inode'))
+            before = foreground_generation(101)
+            read.return_value = ('ok', 'thread', ((101, (100, 200)), 'epoch', 2000, 'new inode'))
+            self.assertEqual(foreground_generation(101), before)
+            read.return_value = ('ok', 'other', ((101, (100, 200)), 'epoch', 2000, 'new inode'))
+            self.assertNotEqual(foreground_generation(101), before)
+            read.return_value = ('ok', 'thread', ((101, (100, 200)), 'other epoch', 2000, 'new inode'))
+            self.assertNotEqual(foreground_generation(101), before)
+
+    def test_index_copies_birth_and_foreground_generation(self):
+        row = {**self.row(), 'foreground_generation': ['ok', 'thread', 'epoch']}
+        index = self.index([row])
+        row['birth'][1] += 1
+        row['foreground_generation'][1] = 'changed'
+        hint = index.lookup({'surface_id': 'codex-a', 'workspace_id': 'workspace-uuid'})
+        self.assertEqual(hint['agent_birth'], (100, 200))
+        self.assertEqual(hint['foreground_generation'], ('ok', 'thread', 'epoch'))
 
     def test_700_surfaces_discover_while_the_single_gui_snapshot_is_blocked(self):
         tree, _ = discovery_fixture()

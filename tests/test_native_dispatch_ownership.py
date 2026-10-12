@@ -113,6 +113,50 @@ class OwnershipTests(unittest.TestCase):
         self.assertNotEqual(replacement['cell'],cell)
         self.assertEqual(replacement['binding']['pid'],2)
 
+    def test_same_second_pid_reuse_cannot_pass_native_admission(self):
+        self.source['birth'] = [1, 100]
+        self.daemon.codex_queue_recovery.current_turn = lambda _: {**self.source, 'birth': [1, 101]}
+        self.refresh()
+        self.assertFalse(self.dispatch.owns(self.sid))
+
+    def test_exact_birth_is_preserved_and_replacement_retires_original_cell(self):
+        self.source['birth'] = [1, 100]
+        self.refresh()
+        original = self.dispatch.owned[self.sid]['assignment']
+        self.assertEqual(original['binding']['birth'], [1, 100])
+        self.source['birth'][1] = 101
+        self.refresh()
+        self.assertEqual(original['binding']['birth'], [1, 100])
+        self.assertEqual(self.dispatch.cells.shared()[original['cell']], 0)
+        self.assertTrue(self.dispatch.owns(self.sid))
+
+    def test_foreground_switch_retires_old_owner_before_rediscovery(self):
+        self.source['birth'] = [1, 100]
+        self.refresh()
+        original = self.dispatch.owned[self.sid]['assignment']
+        hint = {'agent_kind': 'codex', 'agent_pids': [1], 'agent_birth': (1, 100),
+                'foreground_generation': ('ok', 'replacement', 'same-client')}
+        with patch.object(self.daemon._native_process_index, 'lookup', return_value=hint):
+            self.refresh()
+            self.assertEqual(self.dispatch.cells.shared()[original['cell']], 0)
+            self.assertTrue(self.dispatch.owns(self.sid))
+            self.assertFalse(self.dispatch._discovering)
+            lane = self.dispatch.owned[self.sid]['state']['lane']
+            lane.rows.append({'type': 'released', 'surface_id': self.sid,
+                              'cell': original['cell'], 'runtime': {}})
+            self.source['session_id'] = 'replacement'
+            self.refresh()
+        replacement = self.dispatch.owned[self.sid]['assignment']
+        self.assertNotEqual(replacement['cell'], original['cell'])
+        self.assertEqual(replacement['binding']['session_id'], 'replacement')
+
+    def test_paused_target_revokes_without_rediscovery(self):
+        self.refresh()
+        assignment = self.dispatch.owned[self.sid]['assignment']
+        self.refresh([{**self.targets[0], 'paused': True}])
+        self.assertEqual(self.dispatch.cells.shared()[assignment['cell']], 0)
+        self.assertFalse(self.dispatch._discovering)
+
     def test_failed_lane_cannot_release_parent_before_final_receipt(self):
         self.refresh();owned=self.dispatch.owned[self.sid]
         lane=owned['state']['lane'];cell=owned['assignment']['cell']

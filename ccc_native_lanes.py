@@ -14,6 +14,18 @@ import threading
 import time
 
 
+def _binding_matches(value, binding):
+    return isinstance(value, dict) and all(value.get(key) == expected
+                                          for key, expected in binding.items())
+
+
+def _binding_process_current(target, binding):
+    from ccc_codex_queue import process_placement_start
+    from ccc_guard_scope import birth
+    return (process_placement_start(binding["pid"], target) == binding["process_start"]
+            and ("birth" not in binding or birth(binding["pid"], codex=True) == binding["birth"]))
+
+
 class AuthorizationCells:
     """Never reuse an assignment cell: a revoked old callback stays revoked."""
     def __init__(self, capacity=1024 * 1024):
@@ -132,14 +144,31 @@ class NativeDispatcher:
         self._closed = False
         self._discovery_pool = None
         self._discovering = {}
-        self._discovery_due = {}
+        self._discovery_state = {}
+        self._discovery_cursor = None
+        self._discovery_limit = 2
 
     def owns(self, sid):
         return str(sid) in self.owned
 
     @staticmethod
     def binding(source):
-        return {key:source[key] for key in ("session_id", "pid", "process_start")}
+        value = {key:source[key] for key in ("session_id", "pid", "process_start")}
+        if "birth" in source:
+            value["birth"] = list(source["birth"])
+        return value
+
+    @staticmethod
+    def _hint_conflicts(binding, hint):
+        """A native hint can revoke stale ownership, never authorize new input."""
+        if not hint or hint.get("agent_kind") != "codex" or len(hint.get("agent_pids", [])) != 1:
+            return False
+        born = hint.get("agent_birth")
+        foreground = hint.get("foreground_generation")
+        return (hint["agent_pids"][0] != binding["pid"]
+                or (born and "birth" in binding and list(born) != binding["birth"])
+                or (foreground and foreground[0] == "ok"
+                    and foreground[1] != binding["session_id"]))
 
     def _merge(self, sid, cell, value):
         owned = self.owned.get(sid)
@@ -189,11 +218,15 @@ class NativeDispatcher:
         if self._closed or time.monotonic() < self._next_refresh:
             return
         self._next_refresh = time.monotonic() + .25
-        active = {str(t["surface_id"]):t for t in targets}
+        active = {str(t["surface_id"]):t for t in targets
+                  if t.get("enabled", True) and not t.get("paused", False)}
+        hints = {sid:self.daemon._native_process_index.lookup(target) for sid,target in active.items()}
         sources = self.daemon.codex_queue_recovery.wakeup_sources(targets)
         bindings = {s["surface_id"]:self.binding(s) for s in sources
                     if s.get("identity_current") and all(k in s for k in ("session_id","pid","process_start"))}
-        self._discover_unbound(active, bindings)
+        bindings = {sid:binding for sid,binding in bindings.items()
+                    if sid in active and not self._hint_conflicts(binding, hints.get(sid))}
+        self._discover_unbound(active, bindings, hints)
         changed = []
         def dirty(state):
             if not any(item is state for item in changed):
@@ -202,7 +235,8 @@ class NativeDispatcher:
             assignment, state = owned["assignment"], owned["state"]
             if (sid not in active or any(active[sid].get(key) != assignment["target"].get(key)
                     for key in ("workspace_id", "source", "source_workspace_id", "pane_id"))
-                    or (sid in bindings and bindings[sid] != assignment["binding"])):
+                    or (sid in bindings and bindings[sid] != assignment["binding"])
+                    or self._hint_conflicts(assignment["binding"], hints.get(sid))):
                 self.cells.revoke(assignment["cell"])
                 if sid in state["assignments"]:
                     del state["assignments"][sid]
@@ -222,8 +256,7 @@ class NativeDispatcher:
                 # Hook indexes are advisory. A stale Codex binding must not
                 # steal ownership from a replacement Claude/shell process.
                 native = self.daemon.codex_queue_recovery.current_turn(target)
-                if not isinstance(native, dict) or any(native.get(k) != bindings[sid][k]
-                        for k in ("session_id", "pid", "process_start")):
+                if not _binding_matches(native, bindings[sid]):
                     continue
                 state = next((s for s in self.lanes if not s.get("failed")
                     and s["workspace_id"] == target["workspace_id"] and len(s["assignments"]) < 25), None)
@@ -237,7 +270,7 @@ class NativeDispatcher:
                     state = {"lane":lane, "workspace_id":target["workspace_id"], "assignments":{}}
                     self.lanes.append(state)
                 runtime = self.daemon.runtime.get(sid)
-                assignment = {"target":dict(target), "binding":bindings[sid],
+                assignment = {"target":dict(target), "binding":self.binding(native),
                     "cell":self.cells.allocate(), "runtime":runtime.to_dict() if runtime else {}}
                 # Publish exclusion in the parent before waking the child.
                 self.owned[sid] = {"state":state, "assignment":assignment}
@@ -254,36 +287,86 @@ class NativeDispatcher:
                 # interpreter has copied its final receipts into the parent.
                 state["failed"] = "native lane stopped before assignment publication"
 
-    def _discover_unbound(self, active, bindings):
+    @staticmethod
+    def _discovery_identity(target, hint):
+        return (tuple(target.get(key) for key in
+                      ("surface_id", "workspace_id", "source", "source_workspace_id", "pane_id")),
+                hint["agent_pids"][0], tuple(hint.get("agent_birth") or ()),
+                tuple(hint.get("foreground_generation") or ()))
+
+    def _read_unbound(self, target, completion):
+        try:
+            return self.daemon.codex_queue_recovery.current_turn(target)
+        finally:
+            completion["at"] = time.monotonic()
+
+    def _discover_unbound(self, active, bindings, hints=None):
         """Bind a new working CLI before its first error, without GUI polling.
 
         Hookless native clients have no advisory source until current_turn
         verifies their original writer. Discover only OS-indexed candidates in
         background readers. Admission below still repeats the complete proof.
         """
-        for sid, future in list(self._discovering.items()):
+        hints = hints if hints is not None else {
+            sid:self.daemon._native_process_index.lookup(target) for sid,target in active.items()}
+        candidates = {}
+        for sid, target in active.items():
+            hint = hints.get(sid)
+            if (sid in bindings or sid in self.owned or not target.get("enabled", True)
+                    or target.get("paused", False) or not hint or hint.get("agent_kind") != "codex"
+                    or len(hint.get("agent_pids", [])) != 1):
+                continue
+            identity = self._discovery_identity(target, hint)
+            candidates[sid] = (target, identity)
+            state = self._discovery_state.get(sid)
+            if state is None or state["identity"] != identity:
+                self._discovery_state[sid] = {"identity":identity, "failures":0, "due":0.0}
+        completed = set()
+        for sid, attempt in list(self._discovering.items()):
+            future = attempt["future"]
             if future.done():
                 try:
-                    future.result()
-                except (OSError, ValueError, RuntimeError):
-                    pass
+                    value = future.result()
+                except Exception:
+                    value = None
                 del self._discovering[sid]
+                # A removed/replaced generation cannot delay or approve its
+                # successor. Keep at most one read per surface even across a
+                # generation change; its old result remains advisory only.
+                if sid not in candidates or candidates[sid][1] != attempt["identity"]:
+                    continue
+                state = self._discovery_state[sid]
+                success = (isinstance(value, dict) and value.get("kind") not in (None, "unknown")
+                           and all(key in value for key in ("session_id", "pid", "process_start"))
+                           and not self._hint_conflicts(self.binding(value), hints[sid]))
+                state["failures"] = 0 if success else min(state["failures"] + 1, 4)
+                delay = .25 if success else .25 * 2 ** (state["failures"] - 1)
+                state["due"] = attempt["completion"].get("at", time.monotonic()) + delay
+                # wakeup_sources was read before consuming this future. Even
+                # when its completion was earlier, allow the next refresh to
+                # see the source instead of immediately repeating a full read.
+                completed.add(sid)
         now = time.monotonic()
-        index = self.daemon._native_process_index
-        for sid, target in active.items():
-            if (sid in bindings or sid in self.owned or sid in self._discovering
-                    or self._discovery_due.get(sid, 0) > now):
-                continue
-            hint = index.lookup(target)
-            if not hint or hint.get("agent_kind") != "codex" or len(hint.get("agent_pids", [])) != 1:
+        order = list(candidates)
+        if self._discovery_cursor in order:
+            offset = order.index(self._discovery_cursor) + 1
+            order = order[offset:] + order[:offset]
+        for sid in order:
+            if len(self._discovering) >= self._discovery_limit:
+                break
+            if (sid in completed or sid in self._discovering
+                    or self._discovery_state[sid]["due"] > now):
                 continue
             if self._discovery_pool is None:
                 from concurrent.futures import ThreadPoolExecutor
-                self._discovery_pool = ThreadPoolExecutor(8, thread_name_prefix="ccc-native-bind")
-            self._discovering[sid] = self._discovery_pool.submit(
-                self.daemon.codex_queue_recovery.current_turn, dict(target))
-            self._discovery_due[sid] = now + .25
-        self._discovery_due = {sid:due for sid,due in self._discovery_due.items() if sid in active}
+                self._discovery_pool = ThreadPoolExecutor(self._discovery_limit, thread_name_prefix="ccc-native-bind")
+            target, identity = candidates[sid]
+            completion = {}
+            future = self._discovery_pool.submit(self._read_unbound, dict(target), completion)
+            self._discovering[sid] = {"future":future, "identity":identity, "completion":completion}
+            self._discovery_cursor = sid
+        self._discovery_state = {sid:state for sid,state in self._discovery_state.items()
+                                 if sid in active and sid not in bindings and sid not in self.owned}
 
     def filter(self, targets, publication):
         cached = self._filtered
@@ -293,7 +376,8 @@ class NativeDispatcher:
         return cached[2], cached[3]
 
     def metrics(self):
-        combined = {"native_interpreters":len(self.lanes), "native_owned_targets":len(self.owned)}
+        combined = {"native_interpreters":len(self.lanes), "native_owned_targets":len(self.owned),
+                    "native_discovery_inflight":len(self._discovering)}
         for state in self.lanes:
             for key, value in state.get("scheduler", {}).items():
                 if isinstance(value, int):
@@ -324,7 +408,7 @@ def run_native_lane(initial, flags, lane_cell, commands, results):
     import sys
     from concurrent.interpreters import QueueEmpty
     import cmux_codex_watch as core
-    from ccc_codex_queue import NativeCompletionWatcher, process_placement_start
+    from ccc_codex_queue import NativeCompletionWatcher
     from ccc_scheduling import SurfaceScheduler
 
     settings = json.loads(initial)
@@ -380,7 +464,7 @@ def run_native_lane(initial, flags, lane_cell, commands, results):
         if not current(target):
             return {"agent_kind":"unknown", "agent_pids":[]}
         binding = assignments[str(target["surface_id"])]["binding"]
-        if process_placement_start(binding["pid"], target) != binding["process_start"]:
+        if not _binding_process_current(target, binding):
             return {"agent_kind":"unknown", "agent_pids":[]}
         return {"agent_kind":"codex", "agent_pid":binding["pid"], "agent_pids":[binding["pid"]]}
     daemon._candidate_process_label = native_label
@@ -391,8 +475,7 @@ def run_native_lane(initial, flags, lane_cell, commands, results):
             return {"kind":"unknown"}
         bound = assignments[str(target["surface_id"])]["binding"]
         value = original_turn(target)
-        if not isinstance(value, dict) or any(value.get(k) != bound[k]
-                for k in ("session_id", "pid", "process_start")):
+        if not _binding_matches(value, bound):
             return {"kind":"unknown"}
         return value
     daemon.codex_queue_recovery.current_turn = turn

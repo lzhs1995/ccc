@@ -10,6 +10,14 @@ import threading
 import time
 
 
+def foreground_generation(pid):
+    """Small native selection hint; publication timestamps are not a generation."""
+    from ccc_client_thread_observation import read_foreground
+    from ccc_request_observation_policy import request_observation_directory_matches
+    status, thread, evidence = read_foreground(pid, request_observation_directory_matches)
+    return (status, thread, evidence[1] if status == "ok" else None)
+
+
 def local_processes():
     import ccc_guard_scope as scope
 
@@ -31,7 +39,7 @@ def local_processes():
                                    "cloud", "features", "--version", "-V", "--help", "-h"}
                 or scope.birth(row["pid"], codex=True) != row["birth"]):
             continue
-        rows.append(row)
+        rows.append({**row, "foreground_generation": foreground_generation(row["pid"])})
     return rows
 
 
@@ -53,10 +61,13 @@ class NativeProcessIndex:
             groups = {}
             for row in rows:
                 sid, wid = row["surface_id"], row["environment_workspace_id"]
-                groups.setdefault(sid, []).append((wid, row["pid"]))
+                groups.setdefault(sid, []).append((wid, row))
             snapshot = {
                 sid: {"workspace_id": group[0][0], "agent_kind": "codex",
-                      "agent_pids": [group[0][1]], "summary": "local native process hint"}
+                      "agent_pids": [group[0][1]["pid"]],
+                      "agent_birth": tuple(group[0][1].get("birth") or ()),
+                      "foreground_generation": tuple(group[0][1].get("foreground_generation") or ()),
+                      "summary": "local native process hint"}
                 for sid, group in groups.items() if len(group) == 1
             }
         except (OSError, ValueError, RuntimeError, KeyError, TypeError):

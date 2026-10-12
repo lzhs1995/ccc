@@ -1,5 +1,6 @@
 """Protected rollouts remain usable only while their original native writer holds them."""
 from contextlib import closing
+from copy import deepcopy
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,8 @@ from unittest.mock import patch
 
 import ccc_shared_codex_turn as shared
 import ccc_request_key_binding as connection
+from ccc_codex_queue import NativeCompletionWatcher, QueueRecovery
+from ccc_native_lanes import NativeDispatcher
 
 
 class ProtectedTurnTests(unittest.TestCase):
@@ -260,6 +263,172 @@ class ProtectedTurnTests(unittest.TestCase):
             return dict(self.files)
         self.inventory.side_effect = inventory
         self.assertFalse(shared.valid(self.target, proof))
+
+    def foreground_queue(self):
+        queue = QueueRecovery(self.root / 'ledger', self.root / 'hooks', self.sessions, 'continue')
+        queue.process_lookup = lambda _: {'agent_kind': 'codex', 'agent_pids': [41]}
+        self.patch(__import__('ccc_client_thread_observation'), 'read_foreground',
+                   side_effect=lambda *a: self.selection)
+        return queue
+
+    def dispatcher(self, queue):
+        from tests.test_native_dispatch_ownership import FakeLane
+        from tests.test_watch import FakeClient, armed_daemon, grid_payload
+        daemon = armed_daemon(self.root, FakeClient(grid_payload([])), [dict(self.target)])
+        daemon.codex_queue_recovery = queue
+        daemon._start_scheduler()
+        self.addCleanup(daemon._scheduler.close)
+        self.addCleanup(daemon._process_snapshots.close)
+        self.patch(__import__('ccc_native_lanes'), 'InterpreterLane', side_effect=FakeLane)
+        dispatch = NativeDispatcher(daemon, {})
+        daemon._native_dispatch = dispatch
+        self.addCleanup(dispatch.close)
+        return daemon, dispatch
+
+    def test_protected_original_reaches_failure_watcher_and_native_ownership(self):
+        queue = self.foreground_queue()
+        turn = queue.current_turn(self.target)
+        self.assertEqual((turn['kind'], turn['session_id']), ('task_complete', self.sid))
+        sources = queue.wakeup_sources([self.target])
+        self.assertEqual(len(sources), 1)
+        self.assertEqual((sources[0]['path'], sources[0]['birth']), (self.path, [100, 4]))
+        self.assertTrue(sources[0]['identity_current'])
+        self.assertFalse(self.path.is_relative_to(self.sessions))
+        woken = []
+        watcher = NativeCompletionWatcher(lambda: queue.wakeup_sources([self.target]),
+            lambda sid, wid: woken.append((sid, wid)) or True, interval=.05, retry_interval=.1)
+        watcher.scan()
+        self.assertEqual(woken, [])
+        with self.path.open('ab') as handle:
+            handle.write(json.dumps({'type': 'event_msg', 'timestamp': '2026-10-12T00:00:00Z',
+                'payload': {'type': 'task_complete', 'turn_id': 'new-original-failure',
+                            'error': {'message': 'We are currently experiencing high demand'}}}).encode() + b'\n')
+        watcher.scan()
+        watcher.scan()
+        self.assertEqual(woken, [('surface', 'workspace')])
+        self.assertIn(('surface', 'workspace'), watcher.coverage)
+        daemon, dispatch = self.dispatcher(queue)
+        dispatch.refresh([self.target])
+        self.assertTrue(dispatch.owns('surface'))
+        self.assertIsNone(daemon._active_send_target(self.target))
+        assignment = dispatch.owned['surface']['assignment']
+        self.assertEqual(assignment['binding'], {
+            'session_id': self.sid, 'pid': 41, 'process_start': 100, 'birth': [100, 4]})
+        self.assertEqual(len(dispatch.lanes[0]['lane'].assignments), 1)
+
+    def test_hook_cannot_authorize_protected_source_even_after_native_path_cache_hit(self):
+        queue = self.foreground_queue()
+        record = {'surfaceId': 'surface', 'workspaceId': 'workspace', 'pid': 41,
+                  'pidStartSeconds': 100, 'transcriptPath': str(self.path),
+                  'native_foreground': True, 'birth': [100, 4]}
+        self.patch(queue, 'records', return_value={self.sid: record})
+        self.assertEqual(queue.wakeup_sources([self.target]), [])
+        self.assertEqual(queue.current_turn(self.target)['session_id'], self.sid)
+        self.assertEqual(len(queue.wakeup_sources([self.target])), 1)
+        queue.open_file_sources.clear()
+        self.assertEqual(queue.wakeup_sources([self.target]), [])
+
+    def test_other_discovery_backoff_cannot_delay_bound_original_failure_wake(self):
+        from tests.test_native_discovery_backoff import ControlledPool
+        queue = self.foreground_queue()
+        queue.current_turn(self.target)
+        daemon, dispatch = self.dispatcher(queue)
+        pool = ControlledPool()
+        dispatch._discovery_pool = pool
+        pending = {'surface_id': 'unbound', 'workspace_id': 'workspace'}
+        targets = [self.target, pending]
+        hint = {'agent_kind': 'codex', 'agent_pids': [42], 'agent_birth': (50, 1),
+                'foreground_generation': ('ok', 'pending-session', 'epoch')}
+        self.patch(daemon._native_process_index, 'lookup',
+                   side_effect=lambda target: hint if target == pending else None)
+        now = [0.0]
+        woken = []
+        watcher = NativeCompletionWatcher(lambda: queue.wakeup_sources(targets),
+            lambda sid, wid: woken.append((sid, wid, now[0])) or True,
+            interval=.05, retry_interval=.1, clock=lambda: now[0])
+        with patch('ccc_native_lanes.time.monotonic', side_effect=lambda: now[0]):
+            dispatch.refresh(targets)
+            watcher.scan()
+            self.assertTrue(dispatch.owns('surface'))
+            self.assertEqual(len(pool.calls), 1)
+            now[0] = 37.0
+            pool.finish(0)
+            dispatch.refresh(targets)
+            self.assertAlmostEqual(dispatch._discovery_state['unbound']['due'], 37.25)
+            with self.path.open('ab') as handle:
+                handle.write(json.dumps({'type': 'event_msg',
+                    'timestamp': '2026-10-12T00:00:00Z',
+                    'payload': {'type': 'task_complete', 'turn_id': 'failure-during-backoff',
+                                'error': {'message': 'high demand'}}}).encode() + b'\n')
+            now[0] += .05
+            watcher.scan()
+            watcher.scan()
+            self.assertEqual(woken, [('surface', 'workspace', 37.05)])
+            self.assertEqual(len(pool.calls), 1)
+            self.assertLess(now[0], dispatch._discovery_state['unbound']['due'])
+            self.assertTrue(dispatch.owns('surface'))
+            self.assertIsNone(daemon._active_send_target(self.target))
+
+    def test_reader_flag_without_original_publication_cannot_authorize_protected_source(self):
+        queue = self.foreground_queue()
+        queue.current_turn(self.target)
+        queue._native_wakeup_bindings.clear()
+        self.assertEqual(queue.wakeup_sources([self.target]), [])
+
+    def test_native_source_pin_is_checked_on_every_cached_candidate(self):
+        queue = self.foreground_queue()
+        queue.current_turn(self.target)
+        self.assertEqual(len(queue.wakeup_sources([self.target])), 1)
+        original = deepcopy(queue.open_file_sources['surface'])
+        variants = [
+            ('session', {'session_id': str(uuid.uuid4())}),
+            ('workspace', {'workspace_id': 'moved'}),
+            ('surface', {'surface_id': 'moved'}),
+            ('pid', {'pid': 42}),
+            ('birth', {'birth': [100, 5]}),
+            ('process_start', {'process_start': 101}),
+            ('path', {'path': self.path.with_name('different')}),
+            ('writer_pid', {'shared_writer': {**original['shared_writer'], 'pid': 81}}),
+            ('writer_birth', {'shared_writer': {**original['shared_writer'], 'birth': [100, 5]}}),
+            ('writer_root', {'shared_writer': {**original['shared_writer'], 'sessions_root': str(self.root)}}),
+        ]
+        for name, change in variants:
+            with self.subTest(change=name):
+                source = {**deepcopy(original), **change}
+                queue.open_file_sources['surface'] = source
+                target = {**self.target, 'surface_id': source['surface_id'],
+                          'workspace_id': source['workspace_id']}
+                self.assertEqual(queue.wakeup_sources([target]), [])
+        queue.open_file_sources['surface'] = original
+        self.assertEqual(len(queue.wakeup_sources([self.target])), 1)
+
+    def test_live_exact_birth_and_target_authorization_remain_required_for_cached_source(self):
+        queue = self.foreground_queue()
+        queue.current_turn(self.target)
+        self.assertEqual(len(queue.wakeup_sources([self.target])), 1)
+        for born in ([100, 5], [101, 4], None):
+            with self.subTest(birth=born):
+                self.process['birth'] = born
+                self.assertEqual(queue.wakeup_sources([self.target]), [])
+        self.process['birth'] = [100, 4]
+        for change in ({'paused': True}, {'enabled': False}, {'workspace_id': 'moved'}):
+            with self.subTest(target=change):
+                self.assertEqual(queue.wakeup_sources([{**self.target, **change}]), [])
+        self.assertEqual(queue.wakeup_sources([]), [])
+        self.assertEqual(len(queue.wakeup_sources([self.target])), 1)
+
+    def test_advisory_source_cannot_admit_after_original_writer_loses_descriptor(self):
+        queue = self.foreground_queue()
+        queue.current_turn(self.target)
+        self.assertEqual(len(queue.wakeup_sources([self.target])), 1)
+        del self.files[self.path]
+        # A locator can survive a descriptor gap, but admission must repeat the
+        # complete live reader rather than trusting the old path or birth.
+        self.assertEqual(len(queue.wakeup_sources([self.target])), 1)
+        _, dispatch = self.dispatcher(queue)
+        dispatch.refresh([self.target])
+        self.assertFalse(dispatch.owns('surface'))
+        self.assertEqual(dispatch.lanes, [])
 
 
 if __name__ == '__main__':

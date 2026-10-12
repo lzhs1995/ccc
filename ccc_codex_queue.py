@@ -767,6 +767,7 @@ class QueueRecovery:
         self.open_file_cache = {}
         self.idle_file_cache = {}
         self.open_file_sources = {}
+        self._native_wakeup_bindings = {}
         self.wakeup_process_cache = (0.0, frozenset(), {})
         self.wakeup_root_cache = (None, None)
         self.wakeup_path_cache = {}
@@ -781,6 +782,22 @@ class QueueRecovery:
     def records(self):
         return self._binding_file.read()
 
+    @staticmethod
+    def _native_wakeup_binding(source):
+        """Immutable provenance from the full native reader, never a Hook flag."""
+        try:
+            born = tuple(source['birth'])
+            writer = source['shared_writer']
+            writer_born = tuple(writer['birth'])
+            if (not source.get('native_foreground') or len(born) != 2 or len(writer_born) != 2
+                    or any(type(n) is not int for n in (*born, *writer_born))):
+                return None
+            return (source['surface_id'], source['workspace_id'], source['session_id'],
+                    source['pid'], source['process_start'], born, str(source['path']),
+                    writer['pid'], writer_born, str(writer['sessions_root']))
+        except (KeyError, TypeError):
+            return None
+
     def wakeup_sources(self, targets):
         """Latest known original transcript for each currently enabled UUID."""
         active_targets = {str(t["surface_id"]): t for t in targets
@@ -791,11 +808,12 @@ class QueueRecovery:
         except (OSError, ValueError):
             records = {}
         with self.lock:
-            candidates = list(self.open_file_sources.values())
-        candidates.extend({"surface_id": r.get("surfaceId"), "workspace_id": r.get("workspaceId"),
+            candidates = [(dict(source), True) for source in self.open_file_sources.values()]
+            native_bindings = dict(self._native_wakeup_bindings)
+        candidates.extend(({"surface_id": r.get("surfaceId"), "workspace_id": r.get("workspaceId"),
                            "session_id": sid, "path": r.get("transcriptPath"),
                            "pid": r.get("pid"),
-                           "process_start": r.get("pidStartSeconds", 0)}
+                           "process_start": r.get("pidStartSeconds", 0)}, False)
                           for sid, r in _selected_bindings(records, set(active.items())))
         chosen = {}
         root_key = str(self.sessions_root)
@@ -803,8 +821,12 @@ class QueueRecovery:
             self.wakeup_root_cache = (root_key, self.sessions_root.resolve())
             self.wakeup_path_cache = {}
         root = self.wakeup_root_cache[1]
+        from ccc_guard_scope import birth
+        from ccc_shared_codex_turn import _protected_root
+        protected = _protected_root()
+        native_births = {}
         paths = set()
-        for source in candidates:
+        for source, from_reader in candidates:
             sid = source["surface_id"]
             if active.get(sid) != source["workspace_id"] or not source["path"]:
                 continue
@@ -814,15 +836,32 @@ class QueueRecovery:
                 path = self.wakeup_path_cache.get(path_key)
                 if path is None:
                     path = Path(path_key).resolve()
-                    if not path.is_relative_to(root):
-                        continue
                     self.wakeup_path_cache[path_key] = path
+                # Check provenance on EVERY candidate, including cache hits.
+                # A Hook naming the same protected path must not inherit a
+                # native source's cached placement or original process proof.
+                native_source = from_reader and source.get('native_foreground') is True
+                if native_source:
+                    pin = self._native_wakeup_binding(source)
+                    if pin is None or native_bindings.get(sid) != pin or path_key != str(path):
+                        continue
+                    pid = source['pid']
+                    if pid not in native_births:
+                        native_births[pid] = birth(pid, codex=True)
+                    if native_births[pid] != list(pin[5]):
+                        continue
+                if not path.is_relative_to(root) and not (
+                        native_source and path.is_relative_to(protected)):
+                    continue
                 # Keep the original canonical file as an advisory source.
                 # Re-resolving hundreds of unchanged paths every 250 ms made
                 # the event thread compete with the viewport fleet for I/O/GIL.
                 # A later symlink retarget cannot redirect this pinned hint;
                 # actual sends independently verify the current native writer.
-                if sid not in chosen or source["process_start"] > chosen[sid]["process_start"]:
+                if (sid not in chosen
+                        or (native_source and not chosen[sid].get('native_foreground'))
+                        or (bool(native_source) == bool(chosen[sid].get('native_foreground'))
+                            and source["process_start"] > chosen[sid]["process_start"])):
                     chosen[sid] = {**source, "path": path}
             except (OSError, ValueError, TypeError):
                 continue
@@ -832,14 +871,16 @@ class QueueRecovery:
         # at once, producing another full-fleet burst of viewport requests.
         # Direct OS queries check the already-bound PID/start identities.
         # This is advisory coverage only; send still performs its full guards.
-        pids = frozenset(s["pid"] for s in chosen.values() if type(s.get("pid")) is int and s["pid"] > 0)
+        pids = frozenset(s["pid"] for s in chosen.values()
+                         if not s.get('native_foreground') and type(s.get("pid")) is int and s["pid"] > 0)
         cached_at, cached_pids, starts = self.wakeup_process_cache
         now = time.monotonic()
         if pids != cached_pids or now - cached_at >= 1:
-            starts = codex_process_starts(pids)
+            starts = codex_process_starts(pids) if pids else {}
             self.wakeup_process_cache = (now, pids, starts)
-        return [{**source, "identity_current": bool(source.get("pid") in starts
-                  and abs(starts[source["pid"]] - source["process_start"]) < 1)}
+        return [{**source, "identity_current": (True if source.get('native_foreground') else
+                  bool(source.get("pid") in starts
+                       and abs(starts[source["pid"]] - source["process_start"]) < 1))}
                 for source in chosen.values()]
 
     def evidence(self, target):
@@ -941,12 +982,14 @@ class QueueRecovery:
         if not path or (hinted and path != str(known.get('path'))):
             return {'kind': 'unknown', 'reason': 'original native transcript changed during inventory refresh'}
         with self.lock:
-            self.open_file_sources[str(target['surface_id'])] = {
+            source = {
                 'surface_id': str(target['surface_id']), 'workspace_id': str(target['workspace_id']),
                 'session_id': turn['session_id'], 'path': Path(path), 'pid': pid,
                 'process_start': turn['process_start'], 'birth': turn['birth'],
                 'shared_writer': turn['shared_writer'], 'native_foreground': True,
             }
+            self.open_file_sources[str(target['surface_id'])] = source
+            self._native_wakeup_bindings[str(target['surface_id'])] = self._native_wakeup_binding(source)
         return turn
 
     def _open_process_turn(self, target):
