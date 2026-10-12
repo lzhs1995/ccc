@@ -89,6 +89,7 @@ RUNTIME_FILES += ("ccc_standby_sources.py", "ccc_standby_rollouts.py", "ccc_stan
                   "ccc_standby_environment.py", "ccc_standby_routes.py",
                   "ccc_standby_target.py", "ccc_standby_caller.py", "ccc_standby_runner.py")
 RUNTIME_FILES += ("ccc_claude_closeout.py",)
+RUNTIME_FILES += ("ccc_daemon_liveness.py",)
 DEFAULT_LOG_DIR = Path.home() / "Library" / "Logs" / APP_NAME
 DEFAULT_CONFIG_PATH = DEFAULT_APP_DIR / "config.json"
 DEFAULT_STATE_PATH = DEFAULT_APP_DIR / "state.json"
@@ -5883,6 +5884,7 @@ class WatchDaemon:
         self._registration_due = {str(t["surface_id"]): 0.0 for t in self.config.get("targets", [])}
         self._observation_rows: dict[str, dict[str, Any]] = {}
         self.observation_health_path = config_path.parent / "monitoring-health.json"
+        self._liveness_guard = None
         self._last_workspace_discovery_at = 0.0
         # Set while the on-disk config is invalid, so the rejection is logged
         # once per distinct reason instead of every second.
@@ -6532,6 +6534,8 @@ class WatchDaemon:
                     "claude_hook_coverage": hooks, "hook_coverage_at": metadata_at,
                     "scheduler": self._scheduler_metrics()}
         atomic_write_json(self.observation_health_path, snapshot)
+        if self._liveness_guard is not None:
+            self._liveness_guard.progress(b'H')
 
     def _registration_events(self) -> list[dict[str, Any]]:
         path = self.claude_event_inbox.journal_path
@@ -7643,6 +7647,12 @@ class WatchDaemon:
         self._write_daemon_runtime()
         signal.signal(signal.SIGTERM, self.request_stop)
         signal.signal(signal.SIGINT, self.request_stop)
+        # launchd KeepAlive restarts an exited process, not a live interpreter
+        # stuck in a lock/GIL/extension. A separate process observes actual work.
+        if self.client is None and os.environ.get("CCC_DAEMON_SUPERVISED") == "1":
+            from ccc_daemon_liveness import LivenessGuard
+            self._liveness_guard = LivenessGuard(self.config_path.parent / "daemon-liveness.jsonl")
+            self._liveness_guard.start()
         client = self.client or CmuxClient(str(self.config.get("cmux_path", DEFAULT_CMUX)))
         capabilities_ok = False
         last_unavailable_log = 0.0
@@ -7690,6 +7700,9 @@ class WatchDaemon:
                         self.logger.info("cmux unavailable; waiting")
                         last_unavailable_log = time.time()
                     self.claude_event_inbox.wait(float(self.config.get("cmux_unavailable_poll_sec", 2)))
+                    if self._liveness_guard is not None:
+                        self._liveness_guard.progress(b'M')
+                        self._request_health_publish()
                     continue
                 if not capabilities_ok:
                     try:
@@ -7705,6 +7718,9 @@ class WatchDaemon:
                         self._mark_global_incompatible(TargetRuntime(), str(exc))
                         self.save()
                         self.claude_event_inbox.wait(float(self.config.get("cmux_unavailable_poll_sec", 2)))
+                        if self._liveness_guard is not None:
+                            self._liveness_guard.progress(b'M')
+                            self._request_health_publish()
                         continue
                 self._reload_config_if_changed()
                 if self.client is None:
@@ -7723,6 +7739,8 @@ class WatchDaemon:
                     self._request_health_publish()
                     self.save(wait=False)
                     last_publish = now
+                if self._liveness_guard is not None:
+                    self._liveness_guard.progress(b'M')
                 scheduler.wakeup.wait(scheduler.wait_timeout())
             return 0
         finally:
@@ -7747,6 +7765,9 @@ class WatchDaemon:
             self._state_writer = None
             self._delivery_store.close()
             self.save()
+            if self._liveness_guard is not None:
+                self._liveness_guard.close()
+                self._liveness_guard = None
 
     def _observation_due(self, runtime: TargetRuntime, now: float) -> bool:
         last = float(runtime.observed_at or 0.0)
@@ -13858,6 +13879,7 @@ def write_plist(
             "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
             "LANG": "en_US.UTF-8",
             "PYTHONDONTWRITEBYTECODE": "1",
+            "CCC_DAEMON_SUPERVISED": "1",
         },
         "StandardOutPath": str(DEFAULT_LOG_DIR / "launchd.out.log"),
         "StandardErrorPath": str(DEFAULT_LOG_DIR / "launchd.err.log"),

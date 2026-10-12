@@ -57,6 +57,32 @@ class NativeHintFreshnessTests(unittest.TestCase):
         self.assertEqual(self.reader.call_count, 1)
         self.assertEqual(self.pool.calls, [])
 
+    def test_malformed_advisory_hint_does_not_crash_refresh_or_revoke_native_owner(self):
+        f = self.fixture
+        original = self.admit()
+        valid = {'agent_kind': 'codex', 'agent_pids': [1]}
+        malformed = [3, {'agent_kind': 'codex', 'agent_pids': None},
+                     {**valid, 'agent_birth': 5},
+                     {**valid, 'foreground_generation': {'bad': 1}},
+                     {**valid, 'foreground_generation': ('ok',)}]
+        for hint in malformed:
+            with self.subTest(hint=hint):
+                f.daemon._native_process_index = Mock(lookup=Mock(return_value=hint))
+                f.refresh()
+                self.assertEqual(f.dispatch.cells.shared()[original['cell']], 1)
+                self.assertIsNone(f.dispatch._discovery_identity(f.targets[0], hint))
+                self.assertEqual(self.pool.calls, [])
+
+    def test_malformed_hint_alone_never_admits_an_unbound_surface(self):
+        f = self.fixture
+        f.daemon.codex_queue_recovery.wakeup_sources = Mock(return_value=[])
+        f.daemon._native_process_index = Mock(lookup=Mock(return_value={
+            'agent_kind': 'codex', 'agent_pids': None, 'agent_birth': 5}))
+        f.refresh()
+        self.assertFalse(f.dispatch.owns(f.sid))
+        self.reader.assert_not_called()
+        self.assertEqual(self.pool.calls, [])
+
     def test_delayed_old_snapshot_cannot_revoke_already_admitted_source(self):
         original = {}
         def delayed_publication():

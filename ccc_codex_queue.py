@@ -116,7 +116,8 @@ def task_snapshot(path, session_id):
 def _retryable_completed_message(message):
     normalized = " ".join(message.lower().split())
     compact = re.sub(r'\s+', '', normalized)
-    if compact.lstrip('■⚠└').startswith(('documentation:', 'example:', 'quoted:', 'sample:')):
+    prefix = compact.lstrip('■⚠└')
+    if prefix.startswith(('documentation:', 'example:', 'quoted:', 'sample:')):
         return False
     if (structured_error_type(message) in PROVIDER_BLOCKED
             or ('"error":{' in compact and '"insufficient_quota"' in compact)
@@ -125,8 +126,16 @@ def _retryable_completed_message(message):
             or '401' in normalized and any(x in normalized for x in (
                 '额度已用尽', 'remainquota', 'insufficient_quota', 'quota exceeded'))):
         return False
-    return (any(x in normalized for x in ("currently experiencing high demand", "rate limit exceeded",
-                                          "temporarily unavailable", "stream disconnected before completion"))
+    # Codex's exhausted retry banner is a terminal transport failure even
+    # though it carries no JSON envelope. Keep this exact shape narrow: an
+    # arbitrary "last status: 429" fragment in user/quoted text must not make
+    # a completed turn eligible for input.
+    exhausted_429 = bool(re.fullmatch(
+        r'exceededretrylimit,laststatus:429toomanyrequests(?:,requestid:[a-z0-9._:-]+)?',
+        prefix))
+    return (exhausted_429
+            or any(x in normalized for x in ("currently experiencing high demand", "rate limit exceeded",
+                                              "temporarily unavailable", "stream disconnected before completion"))
             or normalized == "connection failed: error sending request")
 
 

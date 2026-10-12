@@ -2,6 +2,9 @@
 
 ## 0.2.35
 
+- Recover a stalled launchd daemon with a separate, exact-parent watchdog. A completed scheduling pass and a successful health publication each refresh their own 90-second deadline; a stopped channel requests daemon shutdown, followed by a 15-second bounded shutdown grace. Codex/Claude clients and durable delivery ledgers are preserved. Watchdog loss exits directly so blocked cleanup cannot defeat launchd recovery.
+- Recognize the exact exhausted-retry 429 banner in completed-turn queue recovery while retaining quoted-message, current-turn and specific provider-blocker precedence.
+- Ignore malformed advisory discovery hints without crashing the refresh loop or granting new lane/input ownership.
 - Keep authenticated protected rollouts in native wakeup coverage. Bound discovery to two concurrent readers, use completion-based backoff, and recheck stale foreground hints against only the named processes.
 - Preserve exact process birth through open, idle, Hook and guard paths. Revalidate precise lane readers before and after reading, reject malformed identities, and keep an upgraded native binding when a legacy Hook omits birth.
 - Revoke a lost native process's lane using fresh checks of its original PID, then wait for the lane's final release before returning ownership to the parent. Inventory gaps and inspection errors do not alone release ownership.

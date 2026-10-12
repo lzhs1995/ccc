@@ -231,9 +231,25 @@ class NativeDispatcher:
         return True
 
     @staticmethod
+    def _usable_hint(hint):
+        if not isinstance(hint, dict) or hint.get("agent_kind") != "codex":
+            return False
+        pids = hint.get("agent_pids")
+        if (not isinstance(pids, (list, tuple)) or len(pids) != 1
+                or type(pids[0]) is not int or pids[0] <= 0):
+            return False
+        born = hint.get("agent_birth")
+        if born and (not isinstance(born, (list, tuple)) or not _valid_birth(list(born))):
+            return False
+        foreground = hint.get("foreground_generation")
+        return (not foreground or (isinstance(foreground, (list, tuple))
+                and len(foreground) >= 2 and isinstance(foreground[0], str)
+                and (foreground[1] is None or isinstance(foreground[1], str))))
+
+    @staticmethod
     def _hint_conflicts(binding, hint):
         """A cached disagreement requests a fresh check, never a verdict."""
-        if not hint or hint.get("agent_kind") != "codex" or len(hint.get("agent_pids", [])) != 1:
+        if not NativeDispatcher._usable_hint(hint):
             return False
         born = hint.get("agent_birth")
         foreground = hint.get("foreground_generation")
@@ -412,6 +428,8 @@ class NativeDispatcher:
 
     @staticmethod
     def _discovery_identity(target, hint):
+        if not NativeDispatcher._usable_hint(hint):
+            return None
         return (tuple(target.get(key) for key in
                       ("surface_id", "workspace_id", "source", "source_workspace_id", "pane_id")),
                 hint["agent_pids"][0], tuple(hint.get("agent_birth") or ()),
@@ -436,8 +454,7 @@ class NativeDispatcher:
         for sid, target in active.items():
             hint = hints.get(sid)
             if (sid in bindings or sid in self.owned or not target.get("enabled", True)
-                    or target.get("paused", False) or not hint or hint.get("agent_kind") != "codex"
-                    or len(hint.get("agent_pids", [])) != 1):
+                    or target.get("paused", False) or not self._usable_hint(hint)):
                 continue
             identity = self._discovery_identity(target, hint)
             candidates[sid] = (target, identity)
