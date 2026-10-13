@@ -188,9 +188,14 @@ class SubmitNotSentTests(unittest.TestCase):
             d,t,r,e,c=self.setup_case(root)
             live=control.ControlSocketTests().client(transport)
             frame=c.replay(t['workspace_id'],t['surface_id'])
-            with mock.patch.object(live,'replay',return_value=frame):
+            identity_check = mock.Mock(side_effect=[True,True,True,True,False])
+            with mock.patch.object(live,'tree',side_effect=c.tree), \
+                    mock.patch.object(live,'replay',return_value=frame) as replay:
                 self.assertFalse(d._send_claude_enter(t,r,live,reason='connected',
-                    input_check=mock.Mock(side_effect=[True,True,False])))
+                    input_check=identity_check))
+                # Two full preflights passed before connected admission failed.
+                self.assertEqual(identity_check.call_count, 5)
+                self.assertEqual(replay.call_count, 2)
                 self.assertFalse(r.claude_submit_write_unknown)
                 self.assertEqual(requests,[])
                 self.assertTrue(d._send_claude_enter(t,r,live,reason='recovered',input_check=lambda:True))

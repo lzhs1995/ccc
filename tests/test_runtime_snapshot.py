@@ -199,6 +199,42 @@ class HealthSnapshotScopeTests(unittest.TestCase):
         self.assertIn("surface:100", result["claude_hook_coverage"]["unregistered"])
         self.assertEqual(result["claude_hook_coverage"]["excluded_live"], ["surface:101"])
 
+    def test_diagnostic_refresh_skips_history_and_keeps_same_health(self):
+        daemon = self.daemon
+        original = daemon._observation_metadata
+        full_state = daemon._runtime_snapshot()
+        client = mock.Mock()
+        client.top_all.return_value = {}
+        client.terminal_diagnostics.return_value = {
+            "terminals": [dict(row, surface_id=sid)
+                          for sid, row in original["terminals"].items()]}
+        daemon._native_process_index = mock.Mock()
+        daemon._native_process_index.snapshot.return_value = {}
+        daemon._health_writer = None
+
+        with mock.patch.object(daemon, "_check_claude_hook_settings"), \
+             mock.patch.object(core, "main_surface_records", return_value=list(original["records"].values())), \
+             mock.patch.object(core, "classify_surface_processes", side_effect=lambda _: dict(original["labels"])), \
+             mock.patch.object(daemon, "_inspect_process_cached", side_effect=original["hook_inspections"].get), \
+             mock.patch.object(daemon, "_observation_owner_alive", side_effect=lambda row: bool(row.get("claude_process_pid"))), \
+             mock.patch.object(daemon, "_request_health_publish"), \
+             mock.patch.object(core.time, "time", return_value=100):
+            with ExitStack() as stack:
+                copies = {sid: stack.enter_context(mock.patch.object(value, "to_dict", wraps=value.to_dict))
+                          for sid, value in daemon.runtime.items()}
+                daemon._refresh_observation_health(client)
+            scoped_metadata = daemon._observation_metadata
+            self.assertEqual({sid: copied.call_count for sid, copied in copies.items()},
+                             {sid: int(sid in self.target_ids) for sid in daemon.runtime})
+            scoped_report = self.publish()
+            with mock.patch.object(daemon, "_runtime_snapshot", return_value=full_state):
+                daemon._refresh_observation_health(client)
+            self.assertEqual(daemon._observation_metadata, scoped_metadata)
+            self.assertEqual(self.publish(), scoped_report)
+        self.assertEqual(set(scoped_metadata["owners"]), self.target_ids)
+        self.assertIn("paused", scoped_metadata["owners"])
+        self.assertIn("disabled", scoped_metadata["owners"])
+
 
 if __name__ == "__main__":
     unittest.main()

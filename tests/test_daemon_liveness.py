@@ -1,14 +1,115 @@
 import json
+import contextlib
 import os
 from pathlib import Path
 import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import Mock, patch
 
 import ccc_daemon_liveness as live
+import cmux_codex_watch as watch
+from tests.test_watch import FakeClient, armed_daemon, claude_grid_payload
+
+
+class DaemonAvailabilityLivenessTests(unittest.TestCase):
+    """Exercise run() and its real health publisher with an enabled guard.
+
+    Only external workers and the scheduler's time source are controlled; the
+    availability branches and observation-completion decision are production
+    code. Twelve failed checks span four normal watchdog deadlines.
+    """
+
+    def run_availability(self, mode, *, recover):
+        with tempfile.TemporaryDirectory() as folder, contextlib.ExitStack() as stack:
+            client = FakeClient(claude_grid_payload())
+            daemon = armed_daemon(folder, client)
+            target = daemon.config['targets'][0]
+            runtime = daemon.runtime.setdefault(target['surface_id'], watch.TargetRuntime())
+            runtime.state = runtime.observed_state = 'working'
+            clock, waits, ticks, phase = [time.time()], [0], [0], ['unavailable']
+            tokens, snapshots = [], []
+            guard = Mock()
+            guard.progress.side_effect = lambda channel: tokens.append((phase[0], clock[0], channel))
+            daemon._liveness_guard = guard
+
+            def wait_unavailable(_):
+                waits[0] += 1
+                clock[0] += 30
+                if waits[0] == 12 and not recover:
+                    daemon.stop_requested = True
+
+            def capabilities():
+                if mode == 'capabilities' and waits[0] < 12:
+                    raise watch.IncompatibleError('cmux capability discovery unavailable')
+                return {}
+
+            def tick(*args, **kwargs):
+                ticks[0] += 1
+                clock[0] += 60
+                # Recent viewport/publication timestamps do not prove that the
+                # observation worker completed. Only the final tick does.
+                runtime.observed_at = clock[0]
+                runtime.observation_timings = {'completed_at': clock[0] - 300}
+                phase[0] = 'scheduled_without_completion'
+                if ticks[0] == 4:
+                    runtime.observation_timings['completed_at'] = clock[0]
+                    phase[0] = 'completed'
+                    daemon.stop_requested = True
+                daemon._publish_observation_health()
+                snapshots.append(json.loads(daemon.observation_health_path.read_text()))
+
+            client.ping = lambda: mode == 'capabilities' or waits[0] >= 12
+            client.capabilities = capabilities
+            scheduler = Mock()
+            scheduler.tick.side_effect = tick
+            for name in ('ClaudeEventWorkerPool', 'CoalescingWriter', 'NativeCompletionWatcher'):
+                stack.enter_context(patch.object(watch, name))
+            stack.enter_context(patch('ccc_workspace_batch.BatchReconciler'))
+            stack.enter_context(patch.object(watch, 'DEFAULT_LOG_DIR', Path(folder) / 'logs'))
+            stack.enter_context(patch.object(watch.logging, 'basicConfig'))
+            stack.enter_context(patch.object(watch.signal, 'signal'))
+            stack.enter_context(patch.object(watch.time, 'time', side_effect=lambda: clock[0]))
+            stack.enter_context(patch.object(daemon, '_start_scheduler', return_value=scheduler))
+            stack.enter_context(patch.object(daemon, '_schedule_diagnostics'))
+            stack.enter_context(patch.object(daemon, '_scheduler_metrics', return_value={}))
+            stack.enter_context(patch.object(daemon, '_scheduling_targets', return_value=([target], {})))
+            stack.enter_context(patch.object(daemon, '_request_health_publish',
+                                            side_effect=daemon._publish_observation_health))
+            for component in (daemon.claude_event_inbox, daemon._native_process_index):
+                for method in ('start', 'close'):
+                    stack.enter_context(patch.object(component, method))
+            stack.enter_context(patch.object(daemon.claude_event_inbox, 'wait', side_effect=wait_unavailable))
+            self.assertEqual(daemon.run(), 0)
+            guard.close.assert_called_once()
+            return tokens, snapshots, waits[0], ticks[0]
+
+    def test_unavailable_cmux_does_not_look_like_a_stalled_observer(self):
+        for mode in ('ping', 'capabilities'):
+            with self.subTest(mode=mode):
+                tokens, _, waits, ticks = self.run_availability(mode, recover=False)
+                self.assertEqual((waits, ticks), (12, 0))
+                observations = [at for _, at, channel in tokens if channel == b'O']
+                self.assertEqual(len(observations), 12)
+                self.assertGreater(observations[-1] - observations[0], 3 * 90)
+                self.assertLess(max(b - a for a, b in zip(observations, observations[1:])), 90)
+
+    def test_after_recovery_only_completed_observations_advance_observer_channel(self):
+        for mode in ('ping', 'capabilities'):
+            with self.subTest(mode=mode):
+                tokens, snapshots, waits, ticks = self.run_availability(mode, recover=True)
+                self.assertEqual((waits, ticks), (12, 4))
+                stalled = [channel for phase, _, channel in tokens if phase == 'scheduled_without_completion']
+                self.assertIn(b'M', stalled)
+                self.assertIn(b'H', stalled)
+                self.assertNotIn(b'O', stalled)
+                self.assertIn(b'O', [channel for phase, _, channel in tokens if phase == 'completed'])
+                for snapshot in snapshots[:3]:
+                    self.assertTrue(snapshot['rows'])
+                    self.assertTrue(all(row['status'] != 'healthy' for row in snapshot['rows']))
 
 
 class LivenessIdentityTests(unittest.TestCase):

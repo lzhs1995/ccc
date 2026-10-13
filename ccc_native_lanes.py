@@ -542,6 +542,39 @@ def refresh_native_bindings(recovery, targets):
             recovery.current_turn(target)
 
 
+def _create_lane_daemon(settings):
+    import cmux_codex_watch as core
+
+    class LaneDaemon(core.WatchDaemon):
+        def _load_config_at_startup(self):
+            # The parent performs migration and global service maintenance.
+            return self._load_config()
+
+        def _load_runtime(self):
+            # Parent snapshots retain all history. An empty lane must not
+            # copy/serialize it, or seven lanes retain seven full fleet copies.
+            # Durable send state is loaded before each new assignment below.
+            return {}
+
+    return LaneDaemon(Path(settings["config_path"]), Path(settings["state_path"]))
+
+
+def _restore_assignment_runtime(daemon, assignment):
+    import cmux_codex_watch as core
+
+    sid = assignment["target"]["surface_id"]
+    previous = daemon.runtime.get(sid)
+    supplied = core.TargetRuntime.from_dict(assignment["runtime"])
+    chosen = (supplied if previous is None or previous.delivery_revision <= supplied.delivery_revision
+              else previous)
+    rows = {sid: chosen}
+    # The parent can publish a same-revision mutation before its durable write.
+    # Re-read this identity's original durable fields, including UNKNOWN and
+    # absent-field defaults. Newer durable revisions always win, as at startup.
+    daemon._delivery_store.restore(rows, core.TargetRuntime, surface_ids=(sid,))
+    daemon.runtime[sid] = rows[sid]
+
+
 def run_native_lane(initial, flags, lane_cell, commands, results):
     """Run only parent-assigned, freshly verified original native identities."""
     import time
@@ -562,12 +595,7 @@ def run_native_lane(initial, flags, lane_cell, commands, results):
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
     sys.setswitchinterval(min(sys.getswitchinterval(), .001))
-    class LaneDaemon(core.WatchDaemon):
-        def _load_config_at_startup(self):
-            # The parent performs migration and global service maintenance.
-            return self._load_config()
-
-    daemon = LaneDaemon(Path(settings["config_path"]), Path(settings["state_path"]))
+    daemon = _create_lane_daemon(settings)
     if settings.get("native_sessions_root"):
         from ccc_private_check import PrivateChecks
         daemon.codex_queue_recovery.sessions_root = Path(settings["native_sessions_root"])
@@ -663,10 +691,7 @@ def run_native_lane(initial, flags, lane_cell, commands, results):
                     if sid in retiring:
                         raise ValueError("original native input has not quiesced")
                     if sid not in assignments:
-                        previous = daemon.runtime.get(sid)
-                        supplied = core.TargetRuntime.from_dict(assignment["runtime"])
-                        if previous is None or previous.delivery_revision <= supplied.delivery_revision:
-                            daemon.runtime[sid] = supplied
+                        _restore_assignment_runtime(daemon, assignment)
                 retiring.update({sid:a for sid,a in assignments.items() if sid not in replacement})
                 new_targets = [a["target"] for sid,a in replacement.items() if sid not in assignments]
                 assignments = replacement

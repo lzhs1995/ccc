@@ -27,6 +27,7 @@ import ccc_claude_closeout as adapter
 import claude_dispatch_recovery as recovery
 import cmux_codex_watch as watch
 import tests.test_claude_dispatch_recovery as legacy_recovery
+from tests.test_watch import claude_grid_payload, claude_wrapped_composer_payload
 
 assert Path(adapter.__file__).resolve() == CCC_BASE / "ccc_claude_closeout.py"
 assert Path(watch.__file__).resolve() == CCC_BASE / "cmux_codex_watch.py"
@@ -47,10 +48,18 @@ def iso(epoch):
 
 class RefuseInput:
     """没有外部命令或 cmux socket；guard 在每次虚拟输入前重新执行。"""
-    def __init__(self):
+    def __init__(self, workspace, surface, pane):
         self.inputs = []
         self.check = None
         self.before_input = None
+        self.tree_data = {"windows": [{"workspaces": [{
+            "id": workspace, "ref": "workspace:7", "panes": [{
+                "id": pane, "ref": "pane:7", "surfaces": [{
+                    "id": surface, "ref": "surface:77", "type": "terminal",
+                }],
+            }],
+        }]}]}
+        self.payload = claude_grid_payload()
 
     @contextlib.contextmanager
     def input_guard(self, check):
@@ -75,13 +84,13 @@ class RefuseInput:
         return self._input("key", args)
 
     def tree(self):
-        return {}
+        return self.tree_data
 
     def top(self, *args):
         return {}
 
     def replay(self, *args):
-        return {}
+        return self.payload
 
 
 class Fixture(unittest.TestCase):
@@ -366,7 +375,10 @@ class EvidenceTests(Fixture):
 class WatcherTests(Fixture):
     def setUp(self):
         super().setUp()
-        self.client = RefuseInput()
+        self.client = RefuseInput(self.workspace, self.surface, str(uuid.uuid4()))
+        delivery_root = mock.patch.object(watch, "DELIVERY_LOCK_ROOT", self.root / "deliveries")
+        delivery_root.start()
+        self.addCleanup(delivery_root.stop)
         self.config_path, self.state_path = self.root / "config.json", self.root / "state.json"
         config = watch.default_config()
         config.update(mode="armed", claude_enabled=True, targets=[self.target])
@@ -947,11 +959,12 @@ class WatcherTests(Fixture):
         self.attempt_path.unlink()
         self.runtime.claude_submit_phase = "text_written"
         self.runtime.claude_submit_event_id = "original-text"
-        self.client.before_input = lambda: self.attempt_path.write_bytes(saved)
-        with mock.patch.object(watch.Grid, "from_rpc", return_value=object()), \
-             mock.patch.object(watch, "classify_claude_grid", return_value=self.composer):
-            self.assertFalse(self.daemon._send_claude_enter(
-                self.target, self.runtime, self.client, reason="race", input_check=lambda: True))
+        self.client.payload = claude_wrapped_composer_payload()
+        self.client.before_input = mock.Mock(side_effect=lambda: self.attempt_path.write_bytes(saved))
+        self.assertFalse(self.daemon._send_claude_enter(
+            self.target, self.runtime, self.client, reason="race", input_check=lambda: True))
+        self.client.before_input.assert_called_once()
+        self.assertEqual(self.attempt_path.read_bytes(), saved)
         self.assertEqual(self.runtime.claude_supervisor_wait["status"], adapter.WAITING)
         self.assertEqual(self.runtime.claude_submit_phase, "text_written")
         self.assertEqual(self.client.inputs, [])
@@ -959,7 +972,7 @@ class WatcherTests(Fixture):
     def test_final_text_guard_discovers_return_after_preflight_and_sends_nothing(self):
         saved = self.attempt_path.read_bytes()
         self.attempt_path.unlink()
-        self.client.before_input = lambda: self.attempt_path.write_bytes(saved)
+        self.client.before_input = mock.Mock(side_effect=lambda: self.attempt_path.write_bytes(saved))
         process = dict(agent_kind="claude", agent_pid=self.identity["agent_pid"])
         identity = dict(generation=self.identity["process_generation"], started_epoch=self.now - 500)
         with contextlib.ExitStack() as stack:
@@ -969,10 +982,8 @@ class WatcherTests(Fixture):
                 (self.daemon, "_active_send_target", self.target),
                 (self.daemon, "_claude_event_snapshot", ({}, False, self.stopped, "frame")),
                 (self.daemon, "_apply_claude_context_guard", self.stopped),
-                (watch, "find_main_surface", self.target),
                 (watch, "classify_surface_processes", {}),
                 (watch, "surface_process_label", process),
-                (watch.Grid, "from_rpc", object()),
                 (watch, "classify_claude_grid", self.stopped),
             ):
                 stack.enter_context(mock.patch.object(obj, name, return_value=value))
@@ -980,6 +991,8 @@ class WatcherTests(Fixture):
             sent, _ = self.daemon._send_claude_event(
                 self.event(), self.target, self.runtime, self.client)
         self.assertFalse(sent)
+        self.client.before_input.assert_called_once()
+        self.assertEqual(self.attempt_path.read_bytes(), saved)
         self.assertEqual(self.runtime.claude_supervisor_wait["status"], adapter.WAITING)
         self.assertEqual(self.client.inputs, [])
 

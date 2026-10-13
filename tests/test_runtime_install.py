@@ -250,7 +250,10 @@ print('staged daemon constructed without running watch loop')
             return subprocess.CompletedProcess(args, 0, "", "")
 
         self.launch.side_effect = launch
-        with mock.patch.object(core.time, "sleep") as sleep:
+        with mock.patch.object(core, "time", wraps=core.time) as clock:
+            # Do not replace time.sleep process-wide: unrelated background
+            # workers otherwise spin and contaminate this installer's count.
+            sleep = clock.sleep = mock.Mock()
             core.launchctl("install")
         self.assertEqual(len(attempts), 3)
         self.assertEqual(sleep.call_count, 2)
@@ -270,7 +273,8 @@ print('staged daemon constructed without running watch loop')
             return subprocess.CompletedProcess(args, 0, "", "")
 
         self.launch.side_effect = launch
-        with mock.patch.object(core.time, "sleep") as sleep:
+        with mock.patch.object(core, "time", wraps=core.time) as clock:
+            sleep = clock.sleep = mock.Mock()
             with self.assertRaisesRegex(RuntimeError, "previous runtime pointer and plist restored"):
                 core.launchctl("install")
             sleep.assert_not_called()
@@ -280,7 +284,8 @@ print('staged daemon constructed without running watch loop')
 
     def test_bootstrap_busy_retry_has_a_deadline(self):
         self.launch.return_value = subprocess.CompletedProcess([], 5, "", "Bootstrap failed: 5: Input/output error")
-        with mock.patch.object(core.time, "sleep") as sleep:
+        with mock.patch.object(core, "time", wraps=core.time) as clock:
+            sleep = clock.sleep = mock.Mock()
             with self.assertRaisesRegex(RuntimeError, "Input/output error"):
                 core._bootstrap_runtime_service("gui/test", self.plist, timeout_sec=0)
             sleep.assert_not_called()

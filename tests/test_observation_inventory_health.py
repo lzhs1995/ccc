@@ -259,6 +259,43 @@ class ContinuationWaitReasonTests(unittest.TestCase):
             now=101, observation=observation)
         self.assertEqual((row['status'], row['reason_code']), ('unknown', 'process_inventory_incomplete'))
 
+    def test_new_read_of_same_failed_turn_preserves_retry_reason(self):
+        verdict = self.verdict('failure_reserved', checked_at=90,
+                               observed_turn_key='session:failed:89')
+        for phase in ('awaiting_transition', 'queued_followup', 'error', 'recoverable_error',
+                      'provider_blocked', 'token_exhausted'):
+            with self.subTest(phase=phase):
+                row = self.row(state=phase, provider_retry_status=verdict,
+                               codex_observed_turn_key=verdict['observed_turn_key'])
+                self.assertEqual(row['provider_retry_status'], verdict)
+                if phase not in ('provider_blocked', 'token_exhausted'):
+                    self.assertEqual((row['status'], row['reason_code']),
+                                     ('waiting', 'provider_retry_failure_reserved'))
+
+    def test_old_turn_verdict_is_discarded_after_progress_or_turn_change(self):
+        verdict = self.verdict('failure_reserved', checked_at=90,
+                               observed_turn_key='session:failed:89')
+        for phase in ('working', 'idle', 'completed', 'error_superseded'):
+            with self.subTest(phase=phase):
+                row = self.row(state=phase, provider_retry_status=verdict,
+                               codex_observed_turn_key=verdict['observed_turn_key'])
+                self.assertEqual(row['provider_retry_status'], {})
+                self.assertNotEqual(row['reason_code'], verdict['reason_code'])
+        row = self.row(provider_retry_status=verdict, codex_observed_turn_key='session:new:100')
+        self.assertEqual(row['provider_retry_status'], {})
+
+    def test_matching_failed_turn_cannot_retain_invalid_clock_or_unbound_verdict(self):
+        for stamp in (102, 0, -1, True, float('nan'), float('inf'), 'bad'):
+            with self.subTest(stamp=stamp):
+                verdict = self.verdict('failure_reserved', checked_at=stamp, observed_turn_key='failed')
+                row = self.row(provider_retry_status=verdict, codex_observed_turn_key='failed')
+                self.assertEqual(row['provider_retry_status'], {})
+        for turn in (None, ''):
+            verdict = self.verdict('failure_reserved', checked_at=90)
+            if turn is not None:
+                verdict['observed_turn_key'] = turn
+            self.assertEqual(self.row(provider_retry_status=verdict)['provider_retry_status'], {})
+
     def test_observation_timings_are_projected_as_an_independent_snapshot(self):
         self.assertEqual(self.row()['observation_timings'], {})
         timings = {'source': 'native', 'generation': 3, 'stages_ms': {'viewport': 12.5}}

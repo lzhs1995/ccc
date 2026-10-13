@@ -49,11 +49,14 @@ def state(payload):
 
 
 def queued_frame(*, faint=True):
-    payload = activity_frame(ACTIVE[1] + '\n' + TIP, metadata=False)
+    # Queued transcript rows sit above the complete composer top border.
+    # Drawing them at prompt - 1 overwrites that border and creates a cropped
+    # box, which correctly cannot prove an empty live composer.
+    payload = activity_frame(ACTIVE[1] + '\n' + TIP + '\n❯ ' + w.CLAUDE_MESSAGE,
+                             metadata=False)
     grid = payload['render_grid']
     prompt = grid['cursor']['row']
     grid['row_spans'].extend([
-        span(prompt - 1, 0, '❯ ' + w.CLAUDE_MESSAGE, 0),
         span(prompt, 2, QUEUE_HINT, 1 if faint else 0),
     ])
     return payload
@@ -215,8 +218,12 @@ class NativeActivityTests(unittest.TestCase):
                 d,t,r,e,c = submit_tests.SubmitNotSentTests().setup_case(root)
                 live = socket_tests.ControlSocketTests().client(transport)
                 before = c.replay(t['workspace_id'],t['surface_id'])
-                with mock.patch.object(live,'replay',side_effect=[before,after]):
+                with mock.patch.object(live,'tree',side_effect=c.tree), \
+                        mock.patch.object(live,'replay',side_effect=[before,before,after]) as replay:
                     self.assertFalse(d._send_claude_enter(t,r,live,reason='connected',input_check=lambda:True))
+                # Both preflight observations pass; the connected write guard
+                # must see the new native activity and withhold the actual key.
+                self.assertEqual(replay.call_count, 3)
                 self.assertEqual(requests, [])
                 self.assertFalse(r.claude_submit_write_unknown)
                 self.assertTrue(r.claude_submit_not_sent)

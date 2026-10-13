@@ -16,6 +16,7 @@ from typing import Any
 HEALTH_PUBLISH_INTERVAL_SEC = 1.0
 PROVIDER_RETRY_HEALTH = {
     'provider_retry_failure_reserved': 'waiting',
+    'provider_retry_superseded': 'waiting',
     'provider_retry_server_floor': 'waiting',
     'provider_retry_local_cooldown': 'waiting',
     'provider_retry_shared_slot': 'waiting',
@@ -325,11 +326,21 @@ def continuation_row(target, runtime, *, now, poll_interval=1.0, observation=Non
     observed_at = runtime.get('observed_at', 0)
     if type(observed_at) not in (int, float) or not math.isfinite(observed_at):
         observed_at = 0
+    # Repeated reads of the same failed native turn do not supersede its retry
+    # decision. Only retain an older verdict when it is explicitly bound to
+    # that turn and the watcher is still waiting on it. Active/successful work,
+    # another turn and legacy unbound verdicts keep the freshness requirement.
+    same_failed_turn = (isinstance(provider_retry, Mapping)
+        and bool(provider_retry.get('observed_turn_key'))
+        and provider_retry['observed_turn_key'] == runtime.get('codex_observed_turn_key')
+        and phase in {'awaiting_transition', 'queued_followup', 'error', 'recoverable_error',
+                      'provider_blocked', 'token_exhausted'})
     if (not isinstance(provider_retry, Mapping)
             or not isinstance(provider_retry.get('reason_code'), str)
             or provider_retry.get('reason_code') not in PROVIDER_RETRY_HEALTH
             or type(provider_checked) not in (int, float) or not math.isfinite(provider_checked)
-            or not max(checked, observed_at) <= provider_checked <= now
+            or not 0 < provider_checked <= now
+            or (provider_checked < max(checked, observed_at) and not same_failed_turn)
             or ('observed_turn_key' in provider_retry
                 and provider_retry['observed_turn_key'] != runtime.get('codex_observed_turn_key', ''))):
         provider_retry = {}

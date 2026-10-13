@@ -27,6 +27,9 @@ RATE = '{"error":{"message":"Request limit reached"}}'
 SERVER = '{"error":{"type":"server_error","message":"Internal server error"}}'
 PROMPT_CACHE = ('{"error":{"type":"invalid_request_error","param":"prompt_cache_retention",'
                 '"code":null,"message":"bad response status code 400"}}')
+DEPLOYMENT = ('Could not find an existing deployment to match the model in the request. '
+              'Please verify the model matches an existing deployment in the account.')
+BALANCE = 'unexpected status 403 Forbidden: 用户额度不足, 剩余额度: ¥-0.067956 (request id: fixture)'
 
 
 def screen(message, *, wrapped=False, composer="placeholder"):
@@ -57,6 +60,34 @@ class StructuredProviderEnvelopeTests(unittest.TestCase):
             with self.subTest(prefix=prefix):
                 self.assert_envelope(prefix + RESOURCE, "resource_mismatch", "provider_blocked")
                 self.assertFalse(_retryable_completed_message(prefix + RESOURCE))
+
+    def test_plaintext_deployment_and_balance_block_every_recovery_layer(self):
+        for body, expected in ((DEPLOYMENT, 'deployment_not_found'), (BALANCE, 'billing_exhausted')):
+            for prefix in ('', STREAM, HIGH_DEMAND):
+                with self.subTest(cause=expected, prefix=prefix):
+                    message = prefix + body
+                    self.assert_envelope(message, expected, 'provider_blocked')
+                    self.assertFalse(_retryable_completed_message(message))
+                    self.assertFalse(_retryable_completed_message('\n'.join(
+                        message[i:i + 31] for i in range(0, len(message), 31))))
+
+    def test_structured_balance_and_deployment_codes_keep_the_concrete_blocker(self):
+        for code, expected in (('DeploymentNotFound', 'deployment_not_found'),
+                               ('model_not_found', 'deployment_not_found'),
+                               ('insufficient_balance', 'billing_exhausted')):
+            body = json.dumps({'error': {'code': code, 'type': 'invalid_request_error', 'message': 'Rejected'}})
+            self.assert_envelope(STREAM + body, expected, 'provider_blocked')
+
+    def test_specific_plaintext_failures_in_docs_history_or_drafts_do_not_grant_input(self):
+        for body in (DEPLOYMENT, BALANCE):
+            self.assertIsNone(structured_error_type('Documentation: ' + body))
+            self.assertIsNone(structured_error_type('■ Example: ' + STREAM + body))
+            self.assertFalse(_retryable_completed_message('Example: ' + STREAM + body))
+            self.assertEqual(screen(body, composer='busy').kind, 'composer_busy')
+            history = grid_payload([])
+            history['render_grid']['scrollback_spans'] = [span(0, 0, '■ ' + body, 3)]
+            self.assertNotEqual(core.classify_grid(core.Grid.from_rpc(history, 'surface-uuid')).kind,
+                                'provider_blocked')
 
     def test_http_status_with_reason_phrase_survives_wrapping(self):
         for status, body, expected in (("429 Too Many Requests", RATE, "rate_limit"),
@@ -141,7 +172,7 @@ class NativeQueueEnvelopeTests(unittest.TestCase):
                 "at": 1250, "error": {"message": high_demand}}
         evidence = {"session_id": "s", "pid": 123, "process_start": 1,
                     "turn_id": "latest", "completed_at": 1250}
-        for message in (RESOURCE, invalid_request):
+        for message in (RESOURCE, invalid_request, STREAM + DEPLOYMENT, BALANCE):
             for columns in (600, 74):
                 for replacement in ("none", "user", "high_demand", "continue_echo"):
                     with self.subTest(message=message, columns=columns, replacement=replacement):
@@ -246,6 +277,7 @@ class NativeQueueEnvelopeTests(unittest.TestCase):
             path = root / "session.jsonl"
             recovery = QueueRecovery(root / "queue.json", root / "bindings", root, "任务请继续")
             cases = ((STREAM + RESOURCE, False), (HIGH_DEMAND + RESOURCE, False),
+                     (STREAM + DEPLOYMENT, False), (STREAM + BALANCE, False),
                      (STREAM + "unexpected status 429 Too Many Requests: " + RATE, True),
                      (STREAM + "unexpected status 500 Internal Server Error: " + SERVER, True),
                      (STREAM + PROMPT_CACHE, True))
@@ -309,7 +341,7 @@ class NativeProviderBlockGateTests(unittest.TestCase):
         self.daemon.codex_queue_recovery.recover.assert_not_called()
         self.assertEqual(self.client.mock_calls, [])
 
-    def assert_blocked_health(self):
+    def assert_blocked_health(self, expected='resource_mismatch'):
         snapshot = self.runtime.to_dict()
         unknown = health.continuation_row(self.target, snapshot, now=1301)
         self.assertEqual(unknown["status"], "delivery_unknown")
@@ -317,7 +349,7 @@ class NativeProviderBlockGateTests(unittest.TestCase):
         # receipt the same provider cause must become visible, not green/waiting.
         snapshot["delivery_status"] = "confirmed"
         row = health.continuation_row(self.target, snapshot, now=1301)
-        self.assertEqual((row["status"], row["reason_code"]), ("blocked", "resource_mismatch"))
+        self.assertEqual((row["status"], row["reason_code"]), ("blocked", expected))
         report = health.continuation_report([self.target], {"surface": snapshot}, now=1301)
         self.assertEqual(report["status"], "degraded")
         self.assertEqual(report["counts"]["blocked"], 1)
@@ -329,6 +361,18 @@ class NativeProviderBlockGateTests(unittest.TestCase):
                          ("provider_blocked", "resource_mismatch"))
         self.assert_preserved()
         self.assert_blocked_health()
+
+    def test_plaintext_native_blockers_survive_queued_state_and_keep_unknown_delivery(self):
+        for message, expected in ((STREAM + DEPLOYMENT, 'deployment_not_found'),
+                                   (BALANCE, 'billing_exhausted')):
+            with self.subTest(expected=expected):
+                self.turn['error'] = {'message': message}
+                result = self.daemon._recover_stranded_codex_queue(
+                    self.target, self.runtime, self.queued, self.client, lambda **kwargs: True)
+                self.assert_preserved()
+                self.assertEqual((result.kind, result.error_type), ('provider_blocked', expected))
+                self.daemon._record_state('surface', self.runtime, result)
+                self.assert_blocked_health(expected)
 
     def test_unknown_native_turn_uses_blocked_goal_without_consuming_unknown_attempt(self):
         self.daemon.codex_queue_recovery.current_turn.return_value = {"kind": "unknown"}

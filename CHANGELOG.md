@@ -2,6 +2,11 @@
 
 ## 0.2.35
 
+- Recover a newly completed failed Codex turn even when the Goal still names an older turn. Require the complete native completion at a stable physical EOF and recheck it before input; later user activity, torn records and uncertain deliveries retain their existing protections.
+- Use Claude's complete bordered composer for draft detection and final Enter checks. Hold the shared pane and target delivery leases through submission, recheck their exact inodes, and preserve original attempts and retry budgets when a lease is busy or replaced.
+- Bound background state snapshots to one write per five seconds and copy only effective targets for diagnostics. Native workers restore only their assigned surfaces while the parent retains complete history. Synchronous persistence, original UNKNOWN deliveries and the one-second health publisher keep their existing guarantees.
+- Continue newly proved transient provider failures after the old four-retry ceiling, with capped backoff and bounded durable history. Preserve explicit server deadlines, prevent replay of old failures after history pruning or restart, and distinguish missing deployments and insufficient balance from retryable outages.
+- Keep the provider decision attached to its original failed turn as observations refresh; invalidate it when newer activity or a different turn supersedes that failure. A temporarily missing render snapshot no longer permanently excludes a target from observation.
 - Recover a stalled launchd daemon with a separate, exact-parent watchdog. Scheduling-loop progress, completed observations and health publication have independent deadlines starting at 90 seconds, with bounded 15-second shutdown grace and repeated-stall backoff up to 15 minutes. A health-file write failure alone does not restart a daemon that is still scheduling and observing. Codex/Claude clients and durable delivery ledgers are preserved. Watchdog loss exits directly so blocked cleanup cannot defeat launchd recovery.
 - Recognize the exact exhausted-retry 429 banner in completed-turn queue recovery while retaining quoted-message, current-turn and specific provider-blocker precedence.
 - Ignore malformed advisory discovery hints without crashing the refresh loop or granting new lane/input ownership.

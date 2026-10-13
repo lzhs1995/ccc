@@ -15,6 +15,7 @@ import dataclasses
 import datetime as dt
 import errno
 import fcntl
+import functools
 import hashlib
 import json
 import logging
@@ -93,6 +94,10 @@ RUNTIME_FILES += ("ccc_daemon_liveness.py",)
 DEFAULT_LOG_DIR = Path.home() / "Library" / "Logs" / APP_NAME
 DEFAULT_CONFIG_PATH = DEFAULT_APP_DIR / "config.json"
 DEFAULT_STATE_PATH = DEFAULT_APP_DIR / "state.json"
+# Full history remains compatible with existing raw JSON readers. Publish
+# background snapshots at most once per five seconds; synchronous Claude
+# barriers bypass this interval and live monitoring health still updates at 1s.
+STATE_BACKGROUND_INTERVAL_SEC = 5.0
 DEFAULT_LOCK_PATH = DEFAULT_APP_DIR / "daemon.lock"
 DEFAULT_CONFIG_LOCK_PATH = DEFAULT_APP_DIR / "config.lock"
 DEFAULT_CLAUDE_EVENT_LEDGER_PATH = DEFAULT_APP_DIR / "claude-event-ledger.json"
@@ -100,6 +105,7 @@ DEFAULT_CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
 DEFAULT_CLAUDE_SETTINGS_LOCK_PATH = Path.home() / ".claude" / "settings.json.ccc.lock"
 DEFAULT_CLAUDE_SETTINGS_BACKUP_DIR = DEFAULT_APP_DIR / "settings-backups"
 DEFAULT_CLAUDE_HOOK_REPAIR_STATE_PATH = DEFAULT_APP_DIR / "claude-hook-repair-state.json"
+DELIVERY_LOCK_ROOT = Path.home() / ".local" / "state" / "multi-agent-collaboration" / "deliveries-v1"
 # Log-channel incidents live in the app dir, never in the log dir: the whole
 # point is to survive the log directory being deleted.
 DEFAULT_LOG_CHANNEL_INCIDENT_PATH = DEFAULT_APP_DIR / "log-channel-incidents.jsonl"
@@ -417,12 +423,56 @@ class InputNotSentError(CmuxError):
     """A connected guard refused before any input request bytes were written."""
 
 
+class DeliveryLeaseError(InputNotSentError):
+    """The shared pane→target lease is busy, replaced or not ours.
+
+    No composer or identity was judged, so a lease fault never consumes a
+    Claude attempt, an orphan Enter or the recorded not_sent/reason evidence.
+    """
+
+
+class DeliveryBusyError(DeliveryLeaseError):
+    """The shared MAC/CCC delivery lock is held; no input was attempted."""
+
+
+def _claude_delivery_scope(method):
+    """Release a lazily acquired shared delivery lock at the outer call.
+
+    The lock is acquired before the last fresh composer preflight. Nested
+    ``_send_claude_enter`` calls therefore keep the same
+    pane→target lease through paste, readback and Enter.
+    """
+    @functools.wraps(method)
+    def wrapped(self, *args, **kwargs):
+        local = self._claude_delivery_local
+        depth = int(getattr(local, "depth", 0))
+        outer = depth == 0
+        local.depth = depth + 1
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            local.depth -= 1
+            if outer:
+                stack = getattr(local, "stack", None)
+                local.stack = None
+                local.binding = None
+                local.pins = ()
+                local.lease_fault = None
+                if stack is not None:
+                    stack.close()
+    return wrapped
+
+
 class IncompatibleError(CmuxError):
     """The connected cmux does not expose the required protocol shape."""
 
 
 class UnanchoredFrameError(IncompatibleError):
     """This frame cannot authorize input; a later read may recover."""
+
+
+class ViewportUnavailableError(IncompatibleError):
+    """cmux has no render snapshot yet; keep observing without changing scope."""
 
 
 class GlobalIncompatibleError(IncompatibleError):
@@ -461,12 +511,12 @@ class Grid:
         if isinstance(response.get("result"), Mapping):
             response = response["result"]
         if "render_grid" not in response and "format" not in response:
-            raise IncompatibleError("terminal.replay missing render_grid")
+            raise ViewportUnavailableError("terminal.replay missing render_grid")
         render_grid = response.get("render_grid", response)
         if isinstance(render_grid, Mapping) and isinstance(render_grid.get("result"), Mapping):
             render_grid = render_grid["result"]
         if not isinstance(render_grid, Mapping):
-            raise IncompatibleError("terminal.replay missing render_grid")
+            raise ViewportUnavailableError("terminal.replay missing render_grid")
         if render_grid.get("format") != GRID_FORMAT:
             raise GlobalIncompatibleError(f"unsupported render grid format: {render_grid.get('format')!r}")
         rows = render_grid.get("rows")
@@ -1748,6 +1798,34 @@ def _claude_faint(grid: Grid, span: Span) -> bool:
     return bool(grid.style(span.style_id).get("faint", False))
 
 
+CLAUDE_COMPOSER_BORDER_RE = re.compile(r"─{8,}")
+
+
+def _claude_composer_box(lines: Sequence[str]) -> tuple[int, int] | None:
+    """(top, bottom) border rows of the live Claude composer, or None.
+
+    The structural start is a column-0 ``────`` border directly above a
+    column-0 ``❯``; the end is the first later row identical to that border
+    (the same rule as MAC's exact-composer check). Only the live box draws
+    borders, and draft rows carry a two-column gutter, so a pasted ``❯``, rule
+    or footer text can never move either boundary. Every row between the
+    borders is draft. A missing closing border (cropped viewport) or a
+    column-0 ``❯`` below it means no live box is proven.
+    """
+
+    for top in range(len(lines) - 2, -1, -1):
+        border = lines[top]
+        if not (CLAUDE_COMPOSER_BORDER_RE.fullmatch(border)
+                and lines[top + 1].startswith("❯")):
+            continue
+        bottom = next((row for row in range(top + 2, len(lines))
+                       if lines[row] == border), None)
+        if bottom is None or any(line.startswith("❯") for line in lines[bottom + 1:]):
+            return None
+        return top, bottom
+    return None
+
+
 def _claude_cursor_inside_composer(grid: Grid, prompt_row: int) -> bool:
     """Whether the cursor sits on a continuation row of ``prompt_row``'s prompt.
 
@@ -1781,22 +1859,32 @@ def _claude_cursor_inside_composer(grid: Grid, prompt_row: int) -> bool:
 
 
 def _claude_composer_state(grid: Grid) -> tuple[str, int | None]:
-    """empty / busy / unverified using the nearest ❯ row.
+    """empty / busy / unverified for the live bordered composer.
+
+    The ❯ row comes from ``_claude_composer_box``; without a complete box only
+    visible text near the cursor can still report busy, never empty.
 
     Claude's cmux render reports cursor.visible=false even while the input row
     is present, so Codex's › + visible-cursor gate cannot be reused here.
     """
 
+    # A complete bordered box fixes the only prompt row; a ``❯`` drawn inside
+    # a draft (pasted transcript, quoted screen) must never become the anchor
+    # and hide the rows above it. Without that box nothing can prove "empty".
+    box = _claude_composer_box(grid.lines)
     candidates: list[tuple[int, int]] = []
     anchor_row = grid.cursor.row
     for row in range(max(0, anchor_row - 6), min(grid.rows, anchor_row + 2)):
         text = grid.lines[row]
         prompt_column = text.find("❯")
-        if prompt_column >= 0 and not text[:prompt_column].strip():
+        if (prompt_column >= 0 and not text[:prompt_column].strip()
+                and (box is None or row == box[0] + 1)):
             candidates.append((abs(row - grid.cursor.row), row))
     if not candidates:
         return "unverified", None
     distance, prompt_row = min(candidates)
+    if box is not None and grid.cursor.visible and not box[0] < grid.cursor.row < box[1]:
+        return "unverified", distance
     # A multi-line prompt puts the cursor at the END of the wrapped text, several
     # rows below its own ``❯``.  The old gate read any distance > 1 as "the
     # cursor is somewhere else entirely" and returned unverified, which made a
@@ -1809,9 +1897,10 @@ def _claude_composer_state(grid: Grid) -> tuple[str, int | None]:
     # under the composer box, so if no rule/footer row separates the prompt from
     # the cursor, every row between them belongs to this one prompt.  A cursor
     # that really is elsewhere always has a rule between it and the ``❯``.
-    if distance > 1 and grid.cursor.visible and not _claude_cursor_inside_composer(
-        grid, prompt_row,
-    ):
+    # Inside a complete box the borders already decided this; draft rows that
+    # look like a rule, footer or ``❯`` are text, not a boundary.
+    if (box is None and distance > 1 and grid.cursor.visible
+            and not _claude_cursor_inside_composer(grid, prompt_row)):
         return "unverified", distance
 
     prompt_end = None
@@ -1838,24 +1927,26 @@ def _claude_composer_state(grid: Grid) -> tuple[str, int | None]:
     # 多行文本、行首换行）时，用户文字只渲染在续行上；只扫 prompt 行会把这种
     # composer 误判成 ``empty``——而 ``empty`` 是唯一能打开发送路径的状态，
     # 误判的后果是守卫器覆盖用户输入。沿用 ``_claude_cursor_inside_composer``
-    # 的结构边界向下走到光标行：rule / footer / 第二个 ``❯`` 终止块，空行是
-    # 盒内填充不是边界，淡色 span 是占位提示不是输入。光标行以下不扫，
-    # composer 为空时光标就停在 ``❯`` 行、区间为空，历史布局零影响。
-    cursor_row = min(grid.cursor.row, grid.rows - 1)
-    for row in range(prompt_row + 1, cursor_row + 1):
+    # 的结构边界向下扫描：rule / footer / 第二个 ``❯`` 终止块，空行是
+    # 盒内填充不是边界，淡色 span 是占位提示不是输入。
+    # The cursor can sit before a second sender's text. Scan the entire composer
+    # to its border/footer; empty-before-cursor does not mean empty input.
+    # With a complete box that is exactly every row up to the bottom border.
+    for row in range(prompt_row + 1, box[1] if box is not None else grid.rows):
         stripped = grid.lines[row].strip()
         if not stripped:
             continue
-        if CLAUDE_RULE_RE.match(stripped) or CLAUDE_FOOTER_RE.search(stripped):
-            break
-        if CLAUDE_PROMPT_RE.match(stripped):
+        if box is None and (CLAUDE_RULE_RE.match(stripped) or CLAUDE_FOOTER_RE.search(stripped)
+                            or CLAUDE_PROMPT_RE.match(stripped)):
             break
         for span in _claude_spans_on_row(grid, row):
             if not span.text.strip():
                 continue
             if not _claude_faint(grid, span):
                 return "busy", distance
-    return "empty", distance
+    # Unbordered visible text still protects the user, but only a complete
+    # box can prove that nothing else is in the composer.
+    return ("empty" if box is not None else "unverified"), distance
 
 
 def _claude_error_type(text: str) -> str | None:
@@ -2030,27 +2121,19 @@ def _claude_active_prompt_is_watchdog(
     normalisation used for historical watchdog prompts.
     """
 
-    if prompt_row < 0 or prompt_row >= len(lines):
-        return False
     target = _normalise_claude_prompt(claude_message)
     if not target:
         return False
-    pieces: list[str] = []
-    for row in range(prompt_row, min(len(lines), prompt_row + 16)):
-        stripped = lines[row].strip()
-        if row == prompt_row:
-            if not CLAUDE_PROMPT_RE.match(stripped):
-                return False
-            stripped = CLAUDE_PROMPT_RE.sub("", stripped, count=1).strip()
-        elif not stripped or CLAUDE_RULE_RE.match(stripped) or CLAUDE_FOOTER_RE.search(stripped):
-            break
-        pieces.append(stripped)
-        rendered = _normalise_claude_prompt("".join(pieces))
-        if rendered == target:
-            return True
-        if not target.startswith(rendered):
-            return False
-    return False
+    # Ownership is of the whole bordered composer. Footer-like text, a blank
+    # row followed by another sender's notice, or a pasted ``❯`` line inside
+    # the borders are all draft. A cropped or unbordered composer has no
+    # provable end and cannot authorize Enter, whatever its visible prefix.
+    box = _claude_composer_box(lines)
+    if box is None or prompt_row != box[0] + 1:
+        return False
+    first = CLAUDE_PROMPT_RE.sub("", lines[prompt_row].strip(), count=1)
+    pieces = [first] + [line.strip() for line in lines[prompt_row + 1:box[1]]]
+    return _normalise_claude_prompt("".join(pieces)) == target
 
 
 def _claude_last_content_lines(
@@ -2264,7 +2347,11 @@ def classify_claude_grid(grid: Grid, *, claude_message: str = CLAUDE_MESSAGE) ->
         for row, text in enumerate(grid.lines)
         if "❯" in text and not text[: text.find("❯")].strip()
     ]
-    if prompt_rows:
+    box = _claude_composer_box(grid.lines)
+    if box is not None:
+        # A later ``❯``-looking row inside the borders is draft text.
+        prompt_row = box[0] + 1
+    elif prompt_rows:
         prompt_row = max(prompt_rows)
     elif prompt_distance is not None:
         prompt_row = grid.cursor.row
@@ -5841,6 +5928,7 @@ class WatchDaemon:
         self.stop_requested = False
         self.logger = logging.getLogger(APP_NAME)
         self._runtime_lock = threading.RLock()
+        self._claude_delivery_local = threading.local()
         self._state_save_lock = threading.Lock()
         self._state_writer: CoalescingWriter | None = None
         self._health_writer: CoalescingWriter | None = None
@@ -6304,6 +6392,7 @@ class WatchDaemon:
                     surface_id, item.get("workspace_id"),
                     "paused" if paused else "resumed", not paused,
                 )
+        self._write_daemon_runtime()
 
     def _mutate_config(self, mutator: Any) -> Any:
         with self._config_reload_lock:
@@ -6449,7 +6538,7 @@ class WatchDaemon:
                        for info in labels.values() if info.get("agent_kind") == "claude"}
         # Capture runtime after I/O. In the old implementation this copy could
         # already be minutes old when a supposedly fresh snapshot was published.
-        state = self._runtime_snapshot()
+        state = self._runtime_snapshot(str(t["surface_id"]) for t in targets)
         owners = {}
         for target in targets:
             sid = str(target["surface_id"])
@@ -7235,7 +7324,8 @@ class WatchDaemon:
                 # record into a failed transaction or authorize another input.
                 self.logger.warning("surface=%s delivery committed; observer snapshot failed: %s",
                                     surface_id[:8], exc)
-        # The production loop publishes the full snapshot once per second.
+        # The production loop requests snapshots once per second; the writer
+        # bounds background I/O separately from synchronous input barriers.
         # Re-requesting it on every input spends O(fleet) CPU at O(inputs)
         # frequency even with an asynchronous coalescing writer.
 
@@ -7673,7 +7763,8 @@ class WatchDaemon:
         self._diagnostics_pool = ThreadPoolExecutor(max_workers=MAINTENANCE_WORKERS, thread_name_prefix="ccc-maintenance")
         self._discovery_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ccc-discovery")
         self._state_writer = CoalescingWriter(
-            self._save_now, on_error=lambda exc: self.logger.error("state persistence failed: %s", exc))
+            self._save_now, background_interval=STATE_BACKGROUND_INTERVAL_SEC,
+            on_error=lambda exc: self.logger.error("state persistence failed: %s", exc))
         self._health_writer = CoalescingWriter(
             self._publish_runtime_health, name="ccc-health", delay=0,
             on_error=lambda exc: self.logger.error("health publication failed: %s", exc))
@@ -7707,6 +7798,10 @@ class WatchDaemon:
                     self.claude_event_inbox.wait(float(self.config.get("cmux_unavailable_poll_sec", 2)))
                     if self._liveness_guard is not None:
                         self._liveness_guard.progress(b'M')
+                        # No observations are scheduled until cmux is ready.
+                        # A completed availability check is progress in this
+                        # state; restarting CCC cannot restore the external app.
+                        self._liveness_guard.progress(b'O')
                         self._request_health_publish()
                     continue
                 if not capabilities_ok:
@@ -7725,6 +7820,10 @@ class WatchDaemon:
                         self.claude_event_inbox.wait(float(self.config.get("cmux_unavailable_poll_sec", 2)))
                         if self._liveness_guard is not None:
                             self._liveness_guard.progress(b'M')
+                            # This branch is reachable only before the first
+                            # successful capability check. Once scheduling starts,
+                            # only completed observations may advance O again.
+                            self._liveness_guard.progress(b'O')
                             self._request_health_publish()
                         continue
                 self._reload_config_if_changed()
@@ -8027,6 +8126,10 @@ class WatchDaemon:
             with surface_locked():
                 if not current(fresh=True):
                     return None
+                if isinstance(exc, ViewportUnavailableError):
+                    self._record_state(surface_id, runtime, ScreenState(
+                        "cmux_unavailable", reason=f"{exc}; still monitoring"))
+                    return None
                 if isinstance(exc, UnanchoredFrameError):
                     self._record_state(surface_id, runtime, ScreenState(
                         "viewport_unanchored", reason=str(exc)))
@@ -8130,6 +8233,10 @@ class WatchDaemon:
                 except IncompatibleError as retry_exc:
                     with surface_locked():
                         if not current(fresh=True):
+                            return None
+                        if isinstance(retry_exc, ViewportUnavailableError):
+                            self._record_state(surface_id, runtime, ScreenState(
+                                "cmux_unavailable", reason=f"{retry_exc}; still monitoring"))
                             return None
                         if isinstance(retry_exc, UnanchoredFrameError):
                             self._record_state(surface_id, runtime, ScreenState(
@@ -9889,6 +9996,100 @@ class WatchDaemon:
             raise
         return True, "verified native human prompt superseded the original callback wait"
 
+    def _verify_claude_delivery_lease(self) -> None:
+        """Prove this scope still owns the exact MAC lock inodes it locked.
+
+        Each named path must still be the same regular, single-link inode
+        owned by this user as the descriptor this scope holds open and locked.
+        Called at first acquisition, at every nested check and immediately
+        before the final Enter write.
+        """
+        local = self._claude_delivery_local
+        pins = getattr(local, "pins", ())
+        if getattr(local, "stack", None) is None or not pins:
+            raise DeliveryLeaseError("shared delivery lease not held")
+        uid = os.geteuid()
+        try:
+            for path, handle, expected in pins:
+                named, held = path.lstat(), os.fstat(handle.fileno())
+                for current in (named, held):
+                    if (not stat.S_ISREG(current.st_mode) or current.st_nlink != 1
+                            or current.st_uid != uid
+                            or (current.st_dev, current.st_ino) != expected):
+                        raise DeliveryLeaseError("shared delivery lock replaced or not ours")
+        except (OSError, ValueError) as exc:
+            raise DeliveryLeaseError(f"shared delivery lock unverifiable: {exc}") from exc
+
+    def _acquire_claude_delivery(self, target, runtime, client) -> bool:
+        """Join MAC's deliveries-v1 pane→target lease, without waiting.
+
+        Identity comes from a fresh tree, never a cached pane ref. These exact
+        SHA256 inputs also belong to MAC's message/task/callback controllers.
+        Keep existing transaction evidence intact on contention or read failure.
+        """
+        local = self._claude_delivery_local
+        local.lease_fault = None
+        stack = None
+        try:
+            base = client.client if isinstance(client, SnapshotClient) else client
+            record = find_main_surface(base.tree(), str(target["surface_id"]))
+            if (record.get("workspace_id") != target["workspace_id"]
+                    or not record.get("pane_id")):
+                raise InputNotSentError("shared delivery identity unavailable")
+            binding = tuple(str(value).upper() for value in (
+                record["workspace_id"], record["pane_id"], target["surface_id"],
+            ))
+            if getattr(local, "stack", None) is not None:
+                if binding != local.binding:
+                    raise InputNotSentError("shared delivery identity changed")
+                self._verify_claude_delivery_lease()
+                return True
+            if not getattr(local, "depth", 0):
+                raise InputNotSentError("shared delivery scope missing")
+            DELIVERY_LOCK_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
+            workspace, pane, surface = binding
+            names = ("pane-" + hashlib.sha256((workspace + ":" + pane).encode()).hexdigest(),
+                     "target-" + hashlib.sha256(surface.encode()).hexdigest())
+            stack = contextlib.ExitStack()
+            pins = []
+            for name in names:
+                path = DELIVERY_LOCK_ROOT / (name + ".lock")
+                try:
+                    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+                except OSError as exc:
+                    raise DeliveryLeaseError(f"shared delivery lock unavailable: {exc}") from exc
+                handle = stack.enter_context(os.fdopen(fd, "a+"))
+                held = os.fstat(handle.fileno())
+                if not stat.S_ISREG(held.st_mode):
+                    raise DeliveryLeaseError("shared delivery lock not regular")
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as exc:
+                    raise DeliveryBusyError("shared delivery in progress") from exc
+                pins.append((path, handle, (held.st_dev, held.st_ino)))
+            # Opening an inode and locking it does not prove it is still the
+            # named lease. Recheck both after acquiring the pair, including the
+            # first acquisition (not just nested calls at the input boundary).
+            local.stack, local.binding, local.pins = stack, binding, tuple(pins)
+            try:
+                self._verify_claude_delivery_lease()
+            except DeliveryLeaseError:
+                local.stack, local.binding, local.pins = None, None, ()
+                raise
+            stack = None
+            return True
+        except (OSError, CmuxError, ValueError, TypeError, KeyError) as exc:
+            if isinstance(exc, DeliveryLeaseError):
+                local.lease_fault = exc
+            runtime.state = "claude_delivery_wait"
+            self.logger.info("surface=%s Claude delivery deferred, zero input: %s",
+                             str(target["surface_id"])[:8], exc)
+            return False
+        finally:
+            if stack is not None:
+                stack.close()
+
+    @_claude_delivery_scope
     def _send_claude_enter(
         self,
         target: Mapping[str, Any],
@@ -9900,6 +10101,8 @@ class WatchDaemon:
     ) -> bool:
         """Submit only the already verified watchdog text with an explicit key."""
 
+        if not self._acquire_claude_delivery(target, runtime, client):
+            return False
         if self._claude_supervisor_wait_guard(target, runtime):
             return False
         if self._claude_provider_guard_reason(target, runtime):
@@ -9914,6 +10117,7 @@ class WatchDaemon:
             "claude_submit_write_unknown", "claude_submit_not_sent",
             "claude_submit_last_attempt_at", "claude_submit_last_reason")}
         submit: dict[str, Any] = {}
+        composer_pin = None
         try:
             if runtime.claude_submit_write_unknown or runtime.claude_handshake_wait:
                 return False
@@ -9941,8 +10145,9 @@ class WatchDaemon:
             identity_check = input_check
 
             def submit_check():
-                nonlocal submit
-                if (self._claude_supervisor_wait_guard(target, runtime)
+                nonlocal submit, composer_pin
+                if (not self._acquire_claude_delivery(target, runtime, client)
+                        or self._claude_supervisor_wait_guard(target, runtime)
                         or self._claude_provider_guard_reason(target, runtime)
                         or runtime.claude_handshake_wait or not identity_check()):
                     return False
@@ -9960,6 +10165,16 @@ class WatchDaemon:
                 state = classify_claude_grid(frame, claude_message=message)
                 if self._claude_provider_guard_reason(target, runtime, state, event=submit):
                     return False
+                # Pin the complete bordered composer, never "from the last ❯":
+                # a draft row drawn as ``❯``/rule/footer cannot cut it short.
+                box = _claude_composer_box(frame.lines)
+                if box is None:
+                    return False
+                start, end = box
+                observed = (frame.columns, start, tuple(frame.lines[start:end + 1]))
+                if composer_pin is not None and observed != composer_pin:
+                    return False
+                composer_pin = observed
                 return (state.kind == "composer_busy" and state.watchdog_echo
                         and not state.claude_native_activity and identity_check()
                         and not runtime.claude_handshake_wait
@@ -9968,7 +10183,9 @@ class WatchDaemon:
                         and not self._claude_provider_guard_reason(target, runtime, event=submit)
                         and str(self.config.get("claude_message") or CLAUDE_MESSAGE) == message)
 
-            if not submit_check():
+            # Two complete fresh observations under the same pane+target lease;
+            # connected input_guard rechecks the same pin immediately at write.
+            if not submit_check() or not submit_check():
                 raise InputNotSentError("Claude live identity or exact composer check rejected Enter")
             guard = (base.input_guard(submit_check) if hasattr(base, "input_guard") else contextlib.nullcontext())
             with guard:
@@ -9982,16 +10199,28 @@ class WatchDaemon:
                 runtime.claude_submit_not_sent = False
                 runtime.claude_submit_write_unknown = True
                 self.save()
+                # Last local step before the key bytes: the same lock inodes
+                # must still be ours. The connected input_guard repeats it.
+                self._verify_claude_delivery_lease()
                 client.send_key(str(target["workspace_id"]), surface_id, "enter")
         except InputNotSentError as exc:
             # Typed transport evidence proves the input request never left this
             # process. Preserve the original text/event; retry only Enter after
             # fresh authorization, process and exact-composer checks.
+            local = self._claude_delivery_local
+            if isinstance(exc, DeliveryLeaseError):
+                local.lease_fault = exc
             if self._claude_provider_guard_reason(target, runtime, event=submit):
                 # The provider gate consumed no key budget. Keep the original
                 # attempt and any earlier uncertainty exactly as recorded.
                 for key, value in previous_attempt.items():
                     setattr(runtime, key, value)
+            elif getattr(local, "lease_fault", None) is not None:
+                # Lock contention/replacement judged nothing: no attempt,
+                # not_sent or reason change. Only the lease wait is visible.
+                for key, value in previous_attempt.items():
+                    setattr(runtime, key, value)
+                runtime.state = "claude_delivery_wait"
             else:
                 runtime.claude_submit_write_unknown = False
                 runtime.claude_submit_not_sent = True
@@ -10025,6 +10254,7 @@ class WatchDaemon:
         self._record_claude_submission(runtime)
         return True
 
+    @_claude_delivery_scope
     def _recover_orphan_watchdog_submit(
         self,
         target: Mapping[str, Any],
@@ -10077,6 +10307,11 @@ class WatchDaemon:
         if state.claude_native_activity:
             runtime.state = "working"
             return True
+        # Ordinary observation (including Codex polls) owns no Claude input.
+        # Acquire only after identifying an actual stranded Claude composer,
+        # before changing its attempt budget or entering the input path.
+        if not self._acquire_claude_delivery(target, runtime, client):
+            return True
         surface_id = str(target["surface_id"])
         # F2（2026-09-01）：总量上限。间隔限制只保证"每 5 秒最多一次"，不保证
         # 总次数有限；预算耗尽即 degraded，把决定权交还给人而不是永远按键。
@@ -10115,9 +10350,18 @@ class WatchDaemon:
             runtime.claude_orphan_enter_count = previous_orphan_count
             self.save()
             return True
+        if not entered and getattr(self._claude_delivery_local, "lease_fault", None) is not None:
+            # A lease fault (replaced/busy lock inside the Enter path) pressed
+            # nothing; it must not spend the bounded orphan Enter budget.
+            runtime.claude_orphan_enter_at = previous_orphan_at
+            runtime.claude_orphan_enter_count = previous_orphan_count
+            runtime.state = "claude_delivery_wait"
+            self.save()
+            return True
         runtime.state = "claude_orphan_enter"
         return True
 
+    @_claude_delivery_scope
     def _reconcile_claude_submit(
         self,
         target: Mapping[str, Any],
@@ -10174,6 +10418,10 @@ class WatchDaemon:
             # and context guards, busy/error states -- is decided upstream of this
             # call, so no safety gate is bypassed by acting here.
             return self._recover_orphan_watchdog_submit(target, runtime, state, client)
+        # This reconciler also runs for Codex and idle Claude targets. Only a
+        # real Claude transaction participates in the shared delivery lease.
+        if not self._acquire_claude_delivery(target, runtime, client):
+            return True
         surface_id = str(target["surface_id"])
         now = time.time()
         if runtime.claude_submit_write_unknown:
@@ -10250,6 +10498,7 @@ class WatchDaemon:
     def _claude_send_process_identity(self, pid):
         return inspect_claude_process(pid)
 
+    @_claude_delivery_scope
     def _send_claude_event(
         self,
         event: Mapping[str, Any],
@@ -10346,6 +10595,8 @@ class WatchDaemon:
                 record = find_main_surface(base.tree(), surface_id)
                 if record.get("workspace_id") != target["workspace_id"]:
                     return False
+                if not self._acquire_claude_delivery(target, runtime, client):
+                    return False
                 labels = classify_surface_processes(base.top(str(target["workspace_id"])))
                 live = surface_process_label(labels, target)
                 if live.get("agent_kind") != "claude" or int(live.get("agent_pid") or 0) != pinned_pid:
@@ -10375,7 +10626,11 @@ class WatchDaemon:
             _stage("frame1_ms")
             time.sleep(CLAUDE_EVENT_PREFLIGHT_SETTLE_SEC)
             _stage("settle_ms")
-            _, focused_after, final, final_signature = self._claude_event_snapshot(target, client)
+            # Acquire after the settle wait, before the final complete composer
+            # observation, and retain it through paste/readback/one Enter.
+            if not self._acquire_claude_delivery(target, runtime, client):
+                return False, "Claude input not sent: shared delivery lock unavailable"
+            _, focused_after, final, final_signature = self._claude_event_snapshot(target, base)
             _stage("frame2_ms")
         except (CmuxError, IncompatibleError) as exc:
             return False, str(exc)
@@ -10505,12 +10760,8 @@ class WatchDaemon:
         # text is visible in this surface's own viewport; otherwise leave the
         # transaction pending for the next poll and never press a user's key.
         try:
-            rendered = client.read_screen(str(target["workspace_id"]), surface_id)
-            if _normalise_claude_prompt(message) not in _normalise_claude_prompt(rendered):
-                runtime.claude_submit_last_reason = "watchdog text not visible after send"
-                return False, "Claude submit text not visible; waiting for confirmation"
             verification_grid = Grid.from_rpc(
-                client.replay(str(target["workspace_id"]), surface_id), surface_id,
+                base.replay(str(target["workspace_id"]), surface_id), surface_id,
             )
             verification_state = classify_claude_grid(
                 verification_grid, claude_message=message,
@@ -13223,9 +13474,12 @@ class WatchDaemon:
                 return None
             identity = self._codex_input_identity(target, goal, goal=True)
         else:
-            if state.requires_goal_proof and not runtime.codex_goal_resume:
+            turn = self.codex_queue_recovery.current_turn(target)
+            if (state.requires_goal_proof and not runtime.codex_goal_resume
+                    and not self._codex_terminal_tail_proven(turn)):
                 return None
-            identity = self._current_codex_input_identity(target, runtime)
+            identity = (self._current_codex_input_identity(target, runtime) if runtime.codex_goal_resume
+                        else self._codex_input_identity(target, turn))
         proof = runtime.codex_input_not_sent
         if (identity and proof.get('identity') == identity
                 and proof.get('attempt_id') == runtime.send_attempt_id
@@ -13660,6 +13914,28 @@ class WatchDaemon:
     def _goal_turn_key(goal):
         return f"goal:{goal['session_id']}:{goal['goal_id']}:{goal['turn_id']}:{goal['at']}"
 
+    @staticmethod
+    def _codex_terminal_tail_proven(turn):
+        """A freshly bound final native record outranks stale viewport ordering.
+
+        A lifecycle hint alone cannot show whether later user input arrived.
+        task_snapshot supplies this fence only for a complete task_complete at
+        the stable journal EOF; current_turn reauthenticates its original writer.
+        Every reserved/pre-input check reads it again, so a later append vetoes
+        the send rather than falling back to the old failed turn.
+        """
+        if not isinstance(turn, Mapping) or turn.get('kind') != 'task_complete':
+            return False
+        proof, signature = turn.get('terminal_tail'), turn.get('signature')
+        return bool(isinstance(proof, Mapping)
+                    and isinstance(signature, (tuple, list)) and len(signature) == 3
+                    and all(type(value) is int and value > 0 for value in signature)
+                    and type(proof.get('offset')) is int and proof['offset'] >= 0
+                    and type(proof.get('end')) is int
+                    and proof['offset'] < proof['end'] == signature[1]
+                    and isinstance(proof.get('sha256'), str)
+                    and re.fullmatch(r'[0-9a-f]{64}', proof['sha256']))
+
     def _current_blocked_goal(self, target):
         from ccc_codex_goal import blocked_goal
         label = self.codex_queue_recovery.process_lookup(target) if self.codex_queue_recovery.process_lookup else {}
@@ -13723,11 +13999,12 @@ class WatchDaemon:
             # not freeze a still-visible high-demand failure; continue below.
             runtime.codex_goal_resume = False
         runtime.codex_goal_resume = False
-        if state.requires_goal_proof:
-            self._record_state(str(target['surface_id']), runtime, dataclasses.replace(
-                state, kind='error_superseded', reason='in-flight transcript needs the original blocked goal'))
-            return False
         turn = self.codex_queue_recovery.current_turn(target)
+        if state.requires_goal_proof and not self._codex_terminal_tail_proven(turn):
+            self._record_state(str(target['surface_id']), runtime, dataclasses.replace(
+                state, kind='error_superseded',
+                reason='in-flight transcript needs the original blocked goal or a later native completion'))
+            return False
         if turn is None and state.native_goal_stalled:
             turn = {"kind": "unknown"}
         if turn is None:

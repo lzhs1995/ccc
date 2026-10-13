@@ -82,6 +82,48 @@ class SharedTurnTests(unittest.TestCase):
                 self.write_turn(kind)
                 self.assertEqual(self.read()['kind'], kind)
 
+    def test_response_item_input_supersedes_failure_then_new_completion_restores_it(self):
+        first = self.read()
+        self.assertEqual(first['terminal_tail']['end'], self.path.stat().st_size)
+        with self.path.open('a') as stream:
+            stream.write(json.dumps({'type': 'response_item', 'timestamp': '2026-10-03T00:00:01Z',
+                'payload': {'type': 'message', 'role': 'user', 'content': [
+                    {'type': 'input_text', 'text': 'rate limit exceeded is quoted here'}]}}) + '\n')
+        incoming = self.read()
+        self.assertEqual(incoming['kind'], 'user_message')
+        self.assertNotIn('terminal_tail', incoming)
+        self.assertIsNone(shared.binding_for_turn(self.target, first))
+        with self.path.open('a') as stream:
+            stream.write(json.dumps({'type': 'event_msg', 'timestamp': '2026-10-03T00:00:02Z',
+                'payload': {'type': 'task_complete', 'turn_id': 'new-failed-turn',
+                            'error': {'message': 'rate limit exceeded'}}}) + '\n')
+        ended = self.read()
+        self.assertEqual(ended['kind'], 'task_complete')
+        self.assertEqual(ended['turn_id'], 'new-failed-turn')
+        self.assertEqual(ended['terminal_tail']['end'], self.path.stat().st_size)
+        self.assertIsNotNone(shared.binding_for_turn(self.target, ended))
+
+    def test_response_item_tool_or_assistant_output_does_not_resurrect_prior_failure(self):
+        for payload in ({'type': 'message', 'role': 'assistant', 'content': []},
+                        {'type': 'function_call', 'name': 'exec_command'},
+                        {'type': 'function_call_output', 'output': 'new work'},
+                        {'type': 'reasoning', 'summary': []}):
+            with self.subTest(payload=payload):
+                self.write_turn('task_complete')
+                with self.path.open('a') as stream:
+                    stream.write(json.dumps({'type': 'response_item',
+                        'timestamp': '2026-10-03T00:00:01Z', 'payload': payload}) + '\n')
+                self.assertEqual(self.read()['kind'], 'native_activity')
+
+    def test_torn_or_invalid_trailing_record_is_not_a_completed_turn(self):
+        for suffix in ('{"type": "response_item"', 'not-json\n', '[]\n',
+                       '{"type":"response_item","payload":null}\n'):
+            with self.subTest(suffix=suffix):
+                self.write_turn('task_complete')
+                with self.path.open('a') as stream:
+                    stream.write(suffix)
+                self.assertEqual(self.read()['kind'], 'unknown')
+
     def test_missing_foreground_never_uses_resume_argv(self):
         self.selection = ('absent', None, None)
         result = self.read()

@@ -366,7 +366,10 @@ class NativeJournalTests(NativeFixture):
 class NativeWatcherTests(NativeFixture):
     def setUp(self):
         super().setUp()
-        self.client = fixtures.RefuseInput()
+        self.client = fixtures.RefuseInput(self.workspace, self.surface, str(uuid.uuid4()))
+        delivery_root = mock.patch.object(watch, "DELIVERY_LOCK_ROOT", self.root / "deliveries")
+        delivery_root.start()
+        self.addCleanup(delivery_root.stop)
         self.config_path, self.state_path = self.root / "config.json", self.root / "state.json"
         config = watch.default_config()
         config.update(mode="armed", claude_enabled=True, targets=[self.target])

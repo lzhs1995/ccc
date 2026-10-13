@@ -250,7 +250,13 @@ class DeliveryStore:
         # its exact UTF-8 bytes, never a normalized JSON representation.
         return data.encode('utf-8') if isinstance(data, str) else data
 
-    def restore(self, runtimes, factory):
+    def restore(self, runtimes, factory, *, surface_ids=None):
+        # The parent restores all history. Native lanes need only the exact
+        # assignments they own; never materialize every fleet row per lane.
+        selected = None if surface_ids is None else tuple(dict.fromkeys(surface_ids))
+        if selected == ():
+            return
+
         def apply(value, expected=None):
             sid, saved = self.validate(value)
             if expected is not None and expected != self.key(sid):
@@ -265,9 +271,16 @@ class DeliveryStore:
                     setattr(runtime, key, saved.get(key, getattr(defaults, key)))
 
         file_heads = {}
-        for path in self.root.glob("*.json"):
+        paths = (self.root.glob("*.json") if selected is None else
+                 (self.root / (self.key(sid) + ".json") for sid in selected))
+        for path in paths:
             try:
-                data = path.read_bytes()
+                try:
+                    data = path.read_bytes()
+                except FileNotFoundError:
+                    if selected is not None:
+                        continue
+                    raise
                 value = json.loads(data)
                 apply(value, path.stem)
                 file_heads[value['surface_id']] = (value['runtime']['delivery_revision'], data)
@@ -279,7 +292,14 @@ class DeliveryStore:
         if database.exists():
             try:
                 with closing(sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True)) as connection:
-                    for sid, revision, data in connection.execute("SELECT surface_id, revision, record FROM delivery"):
+                    if selected is None:
+                        rows = connection.execute("SELECT surface_id, revision, record FROM delivery")
+                    else:
+                        # Indexed per-surface reads avoid full scans and the
+                        # SQLite variable limit for a large explicit selection.
+                        rows = (row for sid in selected for row in connection.execute(
+                            "SELECT surface_id, revision, record FROM delivery WHERE surface_id=?", (sid,)))
+                    for sid, revision, data in rows:
                         try:
                             value = json.loads(data)
                             actual_sid, saved = self.validate(value)

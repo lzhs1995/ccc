@@ -7,13 +7,74 @@ import unittest
 import sys
 import subprocess
 from unittest.mock import Mock, patch
+from types import SimpleNamespace
 
 import cmux_codex_watch as core
 from ccc_native_lanes import (AuthorizationCells, InterpreterLane, refresh_native_bindings,
-                              _binding_process_current, _binding_matches)
+                              _binding_process_current, _binding_matches,
+                              _create_lane_daemon, _restore_assignment_runtime)
+from ccc_delivery import DeliveryStore
 
 
 class NativeLaneTests(unittest.TestCase):
+    def test_empty_lane_does_not_read_or_serialize_fleet_history_parent_retains_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config, state = root / 'config.json', root / 'state.json'
+            core.atomic_write_json(config, core.default_config())
+            history = {str(i): core.TargetRuntime(last_send_error='original-' + str(i)).to_dict()
+                       for i in range(150)}
+            core.atomic_write_json(state, history)
+            original = state.read_bytes()
+            load = core.load_json
+            def no_fleet_read(path, *args, **kwargs):
+                self.assertNotEqual(Path(path), state, 'lane read the complete fleet state')
+                return load(path, *args, **kwargs)
+            with patch.object(core, 'load_json', side_effect=no_fleet_read):
+                lane = _create_lane_daemon({'config_path': str(config), 'state_path': str(state)})
+            self.addCleanup(lane._process_snapshots.close)
+            self.assertEqual(lane.runtime, {})
+            self.assertEqual(lane._last_state_serialized, '{}')
+            parent = core.WatchDaemon(config, state)
+            self.addCleanup(parent._process_snapshots.close)
+            self.assertEqual(json.loads(parent._serialize_state()), history)
+            self.assertEqual(state.read_bytes(), original)
+
+    def test_new_assignment_restores_newer_and_equal_durable_unknown_before_observation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = DeliveryStore(directory)
+            store.start()
+            self.addCleanup(store.close)
+            original = core.TargetRuntime(send_attempt_id='original', delivery_status='unknown',
+                codex_sent_turn_key='session:original-turn', send_io_started_at=20)
+            store.persist('selected', original)
+            store.persist('selected', original)
+            for supplied_revision in (1, 2):
+                with self.subTest(supplied_revision=supplied_revision):
+                    daemon = SimpleNamespace(runtime={}, _delivery_store=DeliveryStore(directory))
+                    supplied = core.TargetRuntime(delivery_revision=supplied_revision,
+                        send_attempt_id='uncommitted', delivery_status='retryable', send_count=99)
+                    _restore_assignment_runtime(daemon, {'target': {'surface_id': 'selected'},
+                                                        'runtime': supplied.to_dict()})
+                    restored = daemon.runtime['selected']
+                    self.assertEqual(restored.delivery_revision, 2)
+                    self.assertEqual(restored.delivery_status, 'unknown')
+                    self.assertEqual(restored.send_attempt_id, 'original')
+                    self.assertEqual(restored.codex_sent_turn_key, 'session:original-turn')
+                    self.assertEqual(restored.send_io_started_at, 20)
+                    self.assertEqual(restored.send_count, 0)
+                    self.assertEqual(set(daemon.runtime), {'selected'})
+
+    def test_reassignment_never_regresses_newer_local_revision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            newer = core.TargetRuntime(delivery_revision=4, send_attempt_id='newer', delivery_status='unknown')
+            daemon = SimpleNamespace(runtime={'selected': newer}, _delivery_store=DeliveryStore(directory))
+            supplied = core.TargetRuntime(delivery_revision=2, send_attempt_id='stale')
+            _restore_assignment_runtime(daemon, {'target': {'surface_id': 'selected'},
+                                                'runtime': supplied.to_dict()})
+            self.assertIs(daemon.runtime['selected'], newer)
+            self.assertEqual(daemon.runtime['selected'].delivery_status, 'unknown')
+
     def test_original_lane_rejects_same_second_pid_reuse_and_changed_foreground(self):
         target = {'surface_id': 'surface', 'workspace_id': 'workspace'}
         binding = {'session_id': 'original', 'pid': 7, 'process_start': 100, 'birth': [100, 123]}

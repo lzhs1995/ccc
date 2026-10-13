@@ -10,6 +10,7 @@ import uuid
 from unittest.mock import patch
 
 import ccc_codex_goal as goal
+from ccc_codex_queue import task_snapshot
 import cmux_codex_watch as core
 from ccc_provider_retry import ProviderRetryStore
 from tests.test_codex_status_chrome import status_payload, visible_text, ERRORS
@@ -509,6 +510,72 @@ class GoalResumeDeliveryTests(unittest.TestCase):
         self.payload['render_grid']['row_spans'].append(span(49, 0, '• 后续消息已到达', 0))
         self.client.text = visible_text(self.payload)
         self.daemon.codex_queue_recovery.current_turn = lambda _: {**self.proof, 'kind': 'task_complete'}
+        with patch.object(goal, 'blocked_goal', return_value=None):
+            self.daemon.process_once(self.client)
+        self.assertEqual(self.client.sent, [])
+
+    def native_notice_turn(self):
+        """Real journal ordering from the stalled surface28 incident."""
+        path = Path(self.temp.name) / 'original.jsonl'
+        completed = {'type': 'event_msg', 'timestamp': '1970-01-01T00:03:20Z',
+                     'payload': {'type': 'task_complete', 'turn_id': 'failed',
+                                 'error': self.proof['error']}}
+        notice = {'type': 'response_item', 'timestamp': '1970-01-01T00:03:19Z',
+                  'payload': {'type': 'message', 'role': 'user',
+                              'content': [{'type': 'input_text', 'text': '后续消息已到达'}]}}
+        path.write_text('\n'.join(json.dumps(row) for row in (
+            {'type': 'session_meta', 'payload': {'id': 'original',
+                                                'model_provider': 'synthetic-provider'}},
+            {**completed, 'timestamp': '1970-01-01T00:02:00Z',
+             'payload': {**completed['payload'], 'turn_id': 'old-goal-turn'}},
+            notice, completed)) + '\n')
+        self.payload['render_grid']['row_spans'].append(span(49, 0, '› 后续消息已到达', 0))
+        self.client.text = visible_text(self.payload)
+        self.daemon.codex_queue_recovery.current_turn = lambda _: {
+            'session_id': 'original', 'pid': 12345, 'process_start': 1,
+            **(task_snapshot(path, 'original') or {'kind': 'unknown'})}
+        return path, notice
+
+    def test_new_native_completion_after_notices_recovers_despite_stale_goal(self):
+        self.native_notice_turn()
+        with patch.object(goal, 'blocked_goal', return_value=None):
+            self.daemon.process_once(self.client)
+            runtime = self.daemon.runtime['surface-uuid']
+            runtime.awaiting, runtime.last_send_at = False, 0
+            self.daemon.process_once(self.client)
+        self.assertEqual([r[-1] for r in self.client.sent], ['任务请继续'])
+        self.assertFalse(runtime.codex_goal_resume)
+
+    def test_native_notice_after_failed_completion_cannot_reuse_old_error(self):
+        path, notice = self.native_notice_turn()
+        with path.open('a') as stream:
+            stream.write(json.dumps(notice) + '\n')
+        # Even a backwards/equal timestamp cannot override physical append order.
+        with patch.object(goal, 'blocked_goal', return_value=None):
+            self.daemon.process_once(self.client)
+        self.assertEqual(self.client.sent, [])
+
+    def test_native_notice_arriving_during_reservation_cancels_continuation(self):
+        path, notice = self.native_notice_turn()
+        original = self.daemon._save_delivery
+        injected = []
+        def persist(*args, **kwargs):
+            result = original(*args, **kwargs)
+            if not injected:
+                with path.open('a') as stream:
+                    stream.write(json.dumps(notice) + '\n')
+                injected.append(True)
+            return result
+        with patch.object(goal, 'blocked_goal', return_value=None), \
+                patch.object(self.daemon, '_save_delivery', side_effect=persist):
+            self.daemon.process_once(self.client)
+        self.assertEqual(injected, [True])
+        self.assertEqual(self.client.sent, [])
+
+    def test_torn_native_input_after_completion_cannot_recover_stale_goal(self):
+        path, _ = self.native_notice_turn()
+        with path.open('a') as stream:
+            stream.write('{"type":"response_item","payload":')
         with patch.object(goal, 'blocked_goal', return_value=None):
             self.daemon.process_once(self.client)
         self.assertEqual(self.client.sent, [])

@@ -5,6 +5,7 @@ Only FakeClient sees Text/Enter. These tests do not start or read live agents.
 import copy
 import dataclasses
 import datetime as dt
+import inspect
 import json
 import unittest
 from pathlib import Path
@@ -378,19 +379,43 @@ class DispatchRecoveryTests(unittest.TestCase):
         self.assertEqual(len(self.client.sent_text), 1)
         self.assertEqual(self.client.sent_keys, [])
 
-    def test_native_append_during_enter_composer_read_blocks_second_write(self):
+    def _append_at_enter_composer_read(self, read):
+        """Append a native user prompt inside the n-th Enter composer read.
+
+        After Text only ``replay`` is read: the readback, then the two complete
+        composer observations in ``_send_claude_enter.submit_check``.
+        ``read_screen`` is never called after Text, so a hook on it never
+        fired. Hook the real boundary and prove the append happened.
+        """
         self.history()
         self.recover()
-        original = self.client.read_screen
+        original = self.client.replay
+        seen = []
+
         def changed(*args):
             result = original(*args)
-            if self.client.sent_text:
-                self.append('user', 'New user task at Enter boundary')
+            callers = {frame.function for frame in inspect.stack(0)[1:12]}
+            if self.client.sent_text and 'submit_check' in callers:
+                seen.append(len(seen) + 1)
+                if len(seen) == read:
+                    self.append('user', 'New user task at Enter boundary')
             return result
-        with mock.patch.object(self.client, 'read_screen', side_effect=changed):
+
+        with mock.patch.object(self.client, 'replay', side_effect=changed):
             self.deferred()
+        self.assertGreaterEqual(len(seen), read, 'Enter composer read was never exercised')
         self.assertEqual(len(self.client.sent_text), 1)
         self.assertEqual(self.client.sent_keys, [])
+        self.deferred()
+        self.gap()
+        self.assertEqual(len(self.client.sent_text), 1)
+        self.assertEqual(self.client.sent_keys, [])
+
+    def test_native_append_during_enter_composer_read_blocks_second_write(self):
+        self._append_at_enter_composer_read(1)
+
+    def test_native_append_during_second_enter_composer_read_blocks_enter(self):
+        self._append_at_enter_composer_read(2)
 
 
 if __name__ == '__main__':

@@ -281,6 +281,19 @@ never an empty agent inventory. Input uses one connection and one attempt. A
 lost, malformed or mismatched acknowledgement remains uncertain in the ledger;
 CCC never retries that write through a second transport.
 
+For a transient provider failure, recovery follows the latest authenticated native
+turn. A complete failed-turn ending at a stable log boundary can establish that
+an older Goal no longer describes the current failure. Later user input or an
+incomplete trailing record withholds that authority. New proved failures retain
+capped backoff without a permanent retry-count ceiling; old failure keys remain
+protected against replay. Missing deployments, exhausted balance and invalid
+credentials remain explicit provider blockers.
+
+Claude submission uses the complete bordered composer and the shared pane and
+target delivery locks. A draft that contains prompt symbols, rules or footer text
+still counts as input. Lock contention or replacement defers submission while
+preserving the original attempt and Enter budget.
+
 ## Registration recovery and observation coverage (v0.2.0)
 
 Explicit registration triggers background readiness checks. If the latest genuine

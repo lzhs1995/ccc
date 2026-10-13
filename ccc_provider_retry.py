@@ -24,16 +24,19 @@ BLOCKED_REASONS = {
     'http_401': 'provider authentication rejected (401); verify credentials/quota; session preserved',
     'http_403': 'provider permission rejected (403); verify access policy; session preserved',
     'resource_mismatch': 'provider rejected an item from a different OpenAI resource; restore original resource affinity; session preserved',
+    'deployment_not_found': 'provider has no deployment matching the requested model; restore the deployment; session and model preserved',
+    'billing_exhausted': 'provider explicitly reported insufficient balance; top up the original account; session preserved',
     'invalid_request': 'provider rejected the request; inspect parameters/protocol; session preserved',
     'provider_error_unknown': 'unrecognized structured provider error; inspect original failure before retrying; session preserved',
 }
 BLOCKED = frozenset(BLOCKED_REASONS)
 RATE_LIMIT_RECOVERY_INTERVAL = 0.25
 RATE_LIMIT_PROVIDER_SPACING = 0.05
+TRANSIENT_RECOVERY_DELAYS = (15, 30, 60, 120)
 
 
 def structured_error_type(message):
-    """Classify a complete provider error object, including hard-wrapped JSON.
+    """Classify specific provider failures, including hard-wrapped JSON/text.
 
     Callers must first establish a live error card or a native failed turn.
     This is not a detector for arbitrary transcript, documentation or drafts.
@@ -41,6 +44,18 @@ def structured_error_type(message):
     stream-disconnected wrapper; a missing HTTP status must not imply health.
     """
     compact = re.sub(r'\s+', '', str(message)).lower()
+    if compact.lstrip('■⚠└').startswith(('documentation:', 'example:', 'quoted:', 'sample:')):
+        return None
+    # These measured failures have no JSON envelope. Preserve their concrete
+    # cause before callers consider an outer stream/high-demand/HTTP wrapper.
+    deployment = ('couldnotfindanexistingdeploymenttomatchthemodelintherequest.'
+                  'pleaseverifythemodelmatchesanexistingdeploymentintheaccount.')
+    if deployment in compact:
+        return 'deployment_not_found'
+    if any(token in compact for token in (
+            '用户额度不足', '余额不足', 'insufficientbalance', 'insufficient_balance',
+            'creditbalancetoolow', 'insufficientcredits', 'insufficient_credits')):
+        return 'billing_exhausted'
     start = compact.find('{')
     if start < 0:
         return None
@@ -56,6 +71,8 @@ def structured_error_type(message):
         return None
     codes = {error[key] for key in ('code', 'type') if isinstance(error.get(key), str)}
     detail = error.get('message') if isinstance(error.get('message'), str) else ''
+    if codes & {'deployment_not_found', 'deploymentnotfound', 'model_not_found'}:
+        return 'deployment_not_found'
     if (codes & {'resource_mismatch', 'resource_mismatch_error'} or (
             'therequesteditemwascreatedunderadifferent' in detail
             and 'openairesource' in detail and 'usethesameresource' in detail)):
@@ -166,6 +183,15 @@ class ProviderRetryStore:
             record['legacy_recovery_anchor'] = record['due'] - 120
             self._save(connection, key, record)
 
+    def _pin_latest_failure(self, connection, key, record):
+        # JSON preserves the original insertion order. Older ledgers retained
+        # observations in that order, but only remembered the last reservation.
+        # Pin their latest observation once; an old caller must not promote an
+        # earlier unreserved (or previously reserved) failure after a restart.
+        if 'latest_stamp' not in record:
+            record['latest_stamp'] = next(reversed(record['seen']), None)
+            self._save(connection, key, record)
+
     def observe(self, session, provider, turn, error_type, message, at):
         """Observe one original failure; repeated polls never move its deadline."""
         if error_type not in RETRYABLE:
@@ -177,25 +203,36 @@ class ProviderRetryStore:
             row = connection.execute('SELECT record FROM episodes WHERE identity=?', (key,)).fetchone()
             record = json.loads(row[0]) if row else dict(count=0, failure_at=0, success_at=0, seen={})
             self._pin_legacy_anchor(connection, key, record)
+            self._pin_latest_failure(connection, key, record)
             if at <= record['success_at'] or at < record['failure_at']:
                 return None
             stamp = hashlib.sha256(json.dumps([turn, float(at), error_type, message]).encode()).hexdigest()
             if stamp not in record['seen']:
-                if len(record['seen']) >= 256 and error_type != 'rate_limit':
-                    raise ValueError('provider failure history limit reached; success proof required')
+                # Once a time bucket has been pruned, an unknown stamp in it
+                # cannot be distinguished from replay. Keep a durable time
+                # floor instead of forgetting that ambiguity on restart.
+                if at <= record.get('history_floor_at', 0):
+                    return None
                 now = self.clock()
                 delay = (RATE_LIMIT_RECOVERY_INTERVAL if error_type == 'rate_limit'
-                         else (15, 30, 60, 120)[min(record['count'], 3)])
+                         else TRANSIENT_RECOVERY_DELAYS[min(record['count'], 3)])
                 noise = float(self.jitter())
                 if not math.isfinite(noise) or not 0 <= noise <= .1:
                     raise ValueError('invalid retry jitter')
                 server = retry_after(message, at)
                 deadline = max((at + delay if error_type == 'rate_limit' else now + delay * (1 + noise)), server)
                 record['seen'][stamp] = deadline
+                observed_at = record.setdefault('seen_at', {})
+                observed_at[stamp] = at
                 # Keep bounded history without turning sustained transient load
-                # into a permanent stop. Older failures are rejected above.
+                # into a permanent stop. Legacy observations have no individual
+                # timestamp, so retire their last known time conservatively.
                 while len(record['seen']) > 256:
-                    del record['seen'][next(iter(record['seen']))]
+                    retired = next(iter(record['seen']))
+                    del record['seen'][retired]
+                    record['history_floor_at'] = max(record.get('history_floor_at', 0),
+                        observed_at.pop(retired, record['failure_at']))
+                record['latest_stamp'] = stamp
                 record['due'] = max(record.get('due', 0), deadline)
                 record['failure_at'] = max(record['failure_at'], at)
                 if server:
@@ -245,6 +282,7 @@ class ProviderRetryStore:
                 return ProviderRetryDecision(False, 'provider_retry_evidence_missing')
             record = json.loads(row[0])
             self._pin_legacy_anchor(connection, evidence['identity'], record)
+            self._pin_latest_failure(connection, evidence['identity'], record)
             now = self.clock()
             floor = connection.execute('SELECT until FROM server_floors WHERE provider=?', (evidence['provider'],)).fetchone()
             # Idempotency is only for the same in-flight operation (paste/Enter).
@@ -269,8 +307,12 @@ class ProviderRetryStore:
                 return ProviderRetryDecision(False, 'provider_retry_evidence_missing')
             if record.get('reserved_stamp') == evidence['stamp']:
                 return ProviderRetryDecision(False, 'provider_retry_failure_reserved')
-            if record['count'] >= 4 and not sustained_rate_limit:
-                return ProviderRetryDecision(False, 'provider_retry_budget_exhausted')
+            if record['latest_stamp'] != evidence['stamp']:
+                return ProviderRetryDecision(False, 'provider_retry_superseded')
+            # A transient outage can outlast four remedies. Keep the durable
+            # count and reservation, but continue at the capped delay for each
+            # newly proved failed turn. This never refunds an uncertain input
+            # or permits replay of a previously reserved failure.
             # Eligible live callers keep their place across provider cooldowns.
             # A fast polling session must not repeatedly win every shared slot.
             # Leases prevent a paused/exited caller from blocking other sessions.
@@ -297,7 +339,7 @@ class ProviderRetryStore:
             record['reserved_stamp'] = evidence['stamp']
             record['last_reserved_at'] = now
             record['due'] = now + (RATE_LIMIT_RECOVERY_INTERVAL if sustained_rate_limit
-                                   else (15, 30, 60, 120)[min(record['count'], 3)])
+                                   else TRANSIENT_RECOVERY_DELAYS[min(record['count'], 3)])
             self._save(connection, evidence['identity'], record)
             connection.execute('DELETE FROM waiters WHERE identity=?', (evidence['identity'],))
             if sustained_rate_limit:

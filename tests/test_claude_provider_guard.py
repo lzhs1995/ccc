@@ -168,7 +168,7 @@ class ProviderGuardTests(unittest.TestCase):
         grid = w.Grid.from_rpc(claude_grid_payload(lines=lines), "surface-uuid")
         grid = dataclasses.replace(grid, lines=tuple(
             "\x1b[31m" + s + "\x1b[0m" if s.strip() else s for s in grid.lines))
-        self.assertEqual(w._claude_current_error(grid, grid.rows - 4)["error_kind"], "claude_billing")
+        self.assertEqual(w._claude_current_error(grid, grid.cursor.row)["error_kind"], "claude_billing")
         for body in (["> " + AUTH], ["```text", AUTH, "```"], ["    " + AUTH],
                      [AUTH, "Previous problem has been resolved."], [AUTH, "⏺ All work is complete."],
                      [AUTH, "❯ 新任务", "新的正常结果"]):

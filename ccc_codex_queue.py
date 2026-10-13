@@ -54,7 +54,13 @@ def _task_stamp(info):
 
 
 def task_snapshot(path, session_id):
-    """Read the original thread's latest lifecycle event, with a stable file."""
+    """Read the original thread's lifecycle and subsequent native input/output.
+
+    Some Codex versions persist accepted user input only as response_item, not
+    event_msg/user_message. Ignoring it could reuse a failure from before that
+    input. A complete terminal record at EOF also proves that all earlier
+    transcript messages preceded completion, independently of an older Goal DB.
+    """
     path = Path(path)
     before = path.stat()
     key, signature = (str(path), session_id), _task_stamp(before)
@@ -70,23 +76,44 @@ def task_snapshot(path, session_id):
             return None
         if _task_stamp(os.fstat(handle.fileno())) != signature:
             return None
-        latest, limit = None, min(before.st_size, 16384)
+        latest, terminal_tail, limit = None, None, min(before.st_size, 16384)
         while latest is None:
             offset = max(0, before.st_size - limit)
             handle.seek(offset)
-            lines = handle.read(limit).splitlines()
+            lines = handle.read(limit).splitlines(keepends=True)
             if offset:
                 lines = lines[1:]
+            end = before.st_size
             for line in reversed(lines):
+                start, record_end = end - len(line), end
+                end = start
+                # A torn trailing record may be new input. Never skip it to
+                # resurrect an older completion, even while the writer is idle.
+                if not line.endswith(b'\n'):
+                    return None
                 try:
                     event = json.loads(line)
                 except (ValueError, UnicodeError):
-                    continue
+                    return None
+                if not isinstance(event, dict):
+                    return None
                 payload = event.get("payload", {})
+                if not isinstance(payload, dict):
+                    return None
                 if event.get("type") == "event_msg" and payload.get("type") in {
                     "task_started", "task_complete", "turn_aborted", "user_message",
+                    "agent_message", "agent_reasoning",
                 }:
                     latest = event
+                    latest_kind = payload['type']
+                    if latest_kind == 'task_complete' and record_end == before.st_size:
+                        terminal_tail = {'offset': start, 'end': record_end,
+                                         'sha256': hashlib.sha256(line).hexdigest()}
+                    break
+                if event.get('type') == 'response_item':
+                    latest = event
+                    latest_kind = ('user_message' if payload.get('type') == 'message'
+                                   and payload.get('role') == 'user' else 'native_activity')
                     break
             if limit >= min(before.st_size, 1024 * 1024):
                 break
@@ -101,10 +128,12 @@ def task_snapshot(path, session_id):
     except (TypeError, ValueError):
         return None
     snapshot = {**({"model_provider": first["payload"]["model_provider"]} if first["payload"].get("model_provider") else {}),
-            "kind": latest["payload"]["type"], "at": at,
+            "kind": latest_kind, "at": at,
             "turn_id": latest["payload"].get("turn_id"), "error": latest["payload"].get("error"),
             "last_agent_message": latest["payload"].get("last_agent_message"),
             "signature": [after.st_ino, after.st_size, after.st_mtime_ns]}
+    if terminal_tail is not None:
+        snapshot['terminal_tail'] = terminal_tail
     with _task_snapshot_lock:
         _task_snapshots[key] = (signature, snapshot)
         _task_snapshots.move_to_end(key)

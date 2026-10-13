@@ -53,6 +53,60 @@ class DeliveryJournalTests(unittest.TestCase):
         self.store.start()
         self.addCleanup(self.store.close)
 
+    def test_selected_restore_never_loads_unassigned_history_or_its_corrupt_rows(self):
+        self.store.persist('assigned', core.TargetRuntime(send_attempt_id='original', delivery_status='unknown'))
+        self.store.persist('other', core.TargetRuntime(send_attempt_id='other'))
+        database = Path(self.directory.name) / 'delivery.sqlite3'
+        with closing(sqlite3.connect(database)) as connection, connection:
+            connection.execute("UPDATE delivery SET record=? WHERE surface_id='other'", (b'broken-json',))
+        foreign = Path(self.directory.name) / (self.store.key('foreign') + '.json')
+        foreign.write_bytes(b'broken-original-file')
+        reader, recovered = DeliveryStore(self.directory.name), {}
+        reader.restore(recovered, core.TargetRuntime, surface_ids=('assigned',))
+        self.assertEqual(set(recovered), {'assigned'})
+        self.assertEqual(recovered['assigned'].delivery_status, 'unknown')
+        self.assertEqual(recovered['assigned'].send_attempt_id, 'original')
+        self.assertEqual(reader.faults, set())
+        self.assertIsNone(reader.database_error)
+        # Full parent recovery still sees and preserves the unrelated faults.
+        parent, history = DeliveryStore(self.directory.name), {}
+        parent.restore(history, core.TargetRuntime)
+        self.assertTrue(parent.blocked('other'))
+        self.assertTrue(parent.blocked('foreign'))
+        self.assertEqual(foreign.read_bytes(), b'broken-original-file')
+
+    def test_selected_restore_preserves_legacy_head_and_same_revision_conflict(self):
+        legacy = DeliveryStore(self.directory.name)
+        runtime = core.TargetRuntime(send_attempt_id='legacy', delivery_status='unknown')
+        legacy.persist('selected', runtime)
+        reader, recovered = DeliveryStore(self.directory.name), {}
+        reader.restore(recovered, core.TargetRuntime, surface_ids=('selected',))
+        self.assertEqual(recovered['selected'].send_attempt_id, 'legacy')
+        self.assertEqual(recovered['selected'].delivery_status, 'unknown')
+        path = legacy.root / (legacy.key('selected') + '.json')
+        original = path.read_bytes()
+        value = json.loads(original)
+        value['runtime']['send_attempt_id'] = 'conflicting-same-revision'
+        with closing(sqlite3.connect(legacy.root / 'delivery.sqlite3')) as connection, connection:
+            connection.execute('INSERT INTO delivery VALUES (?, ?, ?)',
+                               ('selected', runtime.delivery_revision, json.dumps(value).encode()))
+        conflicted, rows = DeliveryStore(self.directory.name), {}
+        conflicted.restore(rows, core.TargetRuntime, surface_ids=('selected',))
+        self.assertTrue(conflicted.blocked('selected'))
+        self.assertFalse(conflicted.blocked('unrelated'))
+        self.assertEqual(rows['selected'].send_attempt_id, 'legacy')
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_selected_corrupt_record_blocks_only_the_assigned_surface(self):
+        self.store.persist('assigned', core.TargetRuntime(send_attempt_id='original'))
+        with closing(sqlite3.connect(self.store.root / 'delivery.sqlite3')) as connection, connection:
+            connection.execute("UPDATE delivery SET record=? WHERE surface_id='assigned'", (b'broken',))
+        reader, recovered = DeliveryStore(self.directory.name), {}
+        reader.restore(recovered, core.TargetRuntime, surface_ids=('assigned',))
+        self.assertEqual(recovered, {})
+        self.assertTrue(reader.blocked('assigned'))
+        self.assertFalse(reader.blocked('unassigned'))
+
     def test_committed_intent_and_unknown_ack_survive_a_new_reader(self):
         runtime = core.TargetRuntime(send_attempt_id='original', delivery_status='sending',
                                     codex_sent_turn_key='session:turn:10', send_started_at=11)
