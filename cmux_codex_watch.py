@@ -53,6 +53,7 @@ from ccc_codex_queue import NativeCompletionWatcher, QueueRecovery
 from ccc_native_processes import NativeProcessIndex
 from ccc_scheduling import CoalescingWriter, SnapshotCache, SnapshotClient, SurfaceScheduler, TreeSnapshot
 from ccc_delivery import DeliveryStore
+from ccc_state_snapshot import AtomicJSONSnapshot
 from ccc_provider_retry import (
     ProviderRetryStore, RETRYABLE as PROVIDER_RETRYABLE,
     BLOCKED as PROVIDER_BLOCKED, BLOCKED_REASONS as PROVIDER_BLOCKED_REASONS,
@@ -91,6 +92,7 @@ RUNTIME_FILES += ("ccc_standby_sources.py", "ccc_standby_rollouts.py", "ccc_stan
                   "ccc_standby_target.py", "ccc_standby_caller.py", "ccc_standby_runner.py")
 RUNTIME_FILES += ("ccc_claude_closeout.py",)
 RUNTIME_FILES += ("ccc_daemon_liveness.py",)
+RUNTIME_FILES += ("ccc_state_snapshot.py",)
 DEFAULT_LOG_DIR = Path.home() / "Library" / "Logs" / APP_NAME
 DEFAULT_CONFIG_PATH = DEFAULT_APP_DIR / "config.json"
 DEFAULT_STATE_PATH = DEFAULT_APP_DIR / "state.json"
@@ -6004,7 +6006,7 @@ class WatchDaemon:
             if config_path == DEFAULT_CONFIG_PATH
             else config_path.parent / "daemon-runtime.json"
         )
-        self._last_state_serialized = self._serialize_state()
+        self._state_snapshot = AtomicJSONSnapshot(self.state_path)
 
     def _clear_stale_runtime_pause_reasons(self) -> None:
         """Drop isolation text left by a pause that is no longer active."""
@@ -7331,12 +7333,7 @@ class WatchDaemon:
 
     def _save_now(self) -> None:
         with self._state_save_lock:
-            state_serialized = self._serialize_state()
-            if state_serialized != self._last_state_serialized or not self.state_path.exists():
-                # The canonical snapshot is already JSON. Re-parsing it and
-                # streaming another encoding holds the GIL for every send.
-                atomic_write_text(self.state_path, state_serialized)
-                self._last_state_serialized = state_serialized
+            self._state_snapshot.write(self._runtime_snapshot())
 
     def request_stop(self, *_: Any) -> None:
         self.stop_requested = True
@@ -8382,12 +8379,13 @@ class WatchDaemon:
 
     def _provider_retry_gate(self, target, runtime, state, *, attempt=None, dry_run=False):
         """One persistent budget for plain, goal and queue error remedies."""
+        from ccc_provider_retry import ProviderRetryDecision, ProviderRetryEvidenceError
         runtime.provider_retry_status = {}
         if runtime.paused_reason and runtime.paused_reason.startswith('provider retry '):
             runtime.paused_reason = ''
         turn = self.codex_queue_recovery.current_turn(target) or {}
         original = turn
-        if turn.get('kind') == 'unknown':
+        if not turn or turn.get('kind') == 'unknown':
             original = self._current_blocked_goal(target) or turn
         error = original.get('error')
         message = str(error.get('message') or '') if isinstance(error, dict) else ''
@@ -8410,8 +8408,9 @@ class WatchDaemon:
                 original.get('turn_id'), error_type, message, original.get('at'))
             decision = self._provider_retry.evaluate(evidence, attempt,
                 reserve=bool(attempt and not dry_run))
+        except ProviderRetryEvidenceError:
+            decision = ProviderRetryDecision(False, 'provider_retry_evidence_missing')
         except (OSError, ValueError, TypeError, RuntimeError, sqlite3.Error):
-            from ccc_provider_retry import ProviderRetryDecision
             decision = ProviderRetryDecision(False, 'provider_retry_ledger_unavailable')
         if not decision.allowed:
             key = (self._goal_turn_key(original) if original.get('goal_id') else
@@ -13710,6 +13709,13 @@ class WatchDaemon:
         input_identity = (self._current_codex_input_identity(target, runtime)
                           if state.message_kind == 'codex' and not private_check
                           and self._connected_native_input(client) else {})
+        if (state.message_kind == 'codex' and not private_check
+                and self._connected_native_input(client) and not input_identity):
+            # Missing evidence is an observation gap, not an attempted send.
+            # Never create an unbound pending row that cannot later prove a
+            # zero-write refusal. Existing attempts remain untouched.
+            runtime.paused_reason = 'native input identity unavailable; awaiting fresh observation; session preserved'
+            return
         if (checked_attempt != retry_attempt
                 or (retry_attempt and input_identity != retry_identity)):
             runtime.paused_reason = 'zero-write recovery changed before persistence; session preserved'

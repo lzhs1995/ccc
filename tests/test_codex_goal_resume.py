@@ -40,6 +40,7 @@ class NativeGoalEvidenceTests(unittest.TestCase):
                 "codex_core::session::turn", f"turn{{turn.id={self.tid} model=model}}:session_task.run:run_turn: Turn error: " + ERRORS["rate_limit"],
                 "pid:12345:process-generation"))
         self.files = {p: {"device": p.stat().st_dev, "inode": p.stat().st_ino} for p in (lock, self.goals, self.logs)}
+        self.provider_state()
         self.scope = patch.object(goal.scope, "process", return_value=self.process)
         self.inventory = patch.object(goal.native, "process_writable_files", return_value=self.files)
         self.scope.start()
@@ -52,6 +53,7 @@ class NativeGoalEvidenceTests(unittest.TestCase):
         self.assertEqual(result["kind"], "goal_blocked")
         self.assertEqual(result["session_id"], self.sid)
         self.assertEqual(result["turn_id"], self.tid)
+        self.assertEqual(result['model_provider'], 'original-provider')
 
     def test_goal_and_provider_retry_complete_inventory_churn_at_each_boundary(self):
         self.provider_state()
@@ -144,8 +146,10 @@ class NativeGoalEvidenceTests(unittest.TestCase):
         calls = 0
         def connect(*args, **kwargs):
             nonlocal calls
-            calls += 1
-            if calls == 3:
+            if str(args[0]).startswith(self.goals.as_uri() + '?'):
+                calls += 1
+            if calls == 2:
+                calls += 1
                 replacement = self.goals.with_name('replacement.sqlite')
                 replacement.write_bytes(self.goals.read_bytes())
                 replacement.replace(self.goals)
@@ -174,11 +178,7 @@ class NativeGoalEvidenceTests(unittest.TestCase):
         self.assertIsNone(method(daemon, self.target))
 
     def test_provider_comes_from_original_open_database_and_writer(self):
-        state = self.goals.parent / 'state_5.sqlite'
-        with closing(sqlite3.connect(state)) as db, db:
-            db.execute('CREATE TABLE threads(id PRIMARY KEY, model_provider)')
-            db.execute('INSERT INTO threads VALUES(?, ?)', (self.sid, 'original-provider'))
-        self.files[state] = {'device': state.stat().st_dev, 'inode': state.stat().st_ino}
+        state = self.provider_state()
         turn = {'pid': 12345, 'session_id': self.sid, 'process_start': self.process['birth'][0]}
         self.assertEqual(goal.provider_for_turn(self.target, turn), 'original-provider')
         self.assertIsNone(goal.provider_for_turn(self.target, {**turn, 'session_id': str(uuid.uuid4())}))
@@ -191,8 +191,8 @@ class NativeGoalEvidenceTests(unittest.TestCase):
     def provider_state(self):
         state = self.goals.parent / 'state_5.sqlite'
         with closing(sqlite3.connect(state)) as db, db:
-            db.execute('CREATE TABLE threads(id PRIMARY KEY, model_provider)')
-            db.execute('INSERT INTO threads VALUES(?,?)', (self.sid, 'original-provider'))
+            db.execute('CREATE TABLE IF NOT EXISTS threads(id PRIMARY KEY, model_provider)')
+            db.execute('INSERT OR REPLACE INTO threads VALUES(?,?)', (self.sid, 'original-provider'))
         self.files[state] = {'device': state.stat().st_dev, 'inode': state.stat().st_ino}
         return state
 
@@ -249,7 +249,100 @@ class NativeGoalEvidenceTests(unittest.TestCase):
 
     def test_provider_missing_database_never_guesses_global_config(self):
         turn = {'pid': 12345, 'session_id': self.sid, 'process_start': self.process['birth'][0]}
+        del self.files[self.goals.parent / 'state_5.sqlite']
         self.assertIsNone(goal.provider_for_turn(self.target, turn))
+        self.assertIsNone(goal.blocked_goal(self.target, 12345, current_turn=self.primary_turn()))
+
+    def test_shared_goal_keeps_provider_without_impersonating_native_turn(self):
+        native_turn = {**self.primary_turn(), 'shared_writer': {'pid': 54321}}
+        binding = {'writer_pid': 54321, 'writer_birth': [int(self.now) - 101, 0]}
+        with closing(sqlite3.connect(self.logs)) as db, db:
+            db.execute("UPDATE logs SET process_uuid='pid:54321:writer-generation'")
+        def inventory(pid, *, identities):
+            self.assertEqual(pid, 54321, 'must not scan the frontend for the shared provider')
+            self.assertTrue(identities)
+            return self.files
+        with patch('ccc_shared_codex_turn.binding_for_turn', return_value=binding) as verify, \
+             patch.object(goal.native, 'process_writable_files', side_effect=inventory):
+            proof = goal.blocked_goal(self.target, 12345, current_turn=native_turn)
+        self.assertIsNotNone(proof)
+        self.assertEqual(proof['model_provider'], 'original-provider')
+        self.assertNotIn('shared_writer', proof)
+        self.assertEqual(verify.call_count, 2)
+        self.assertTrue(all(call.args == (self.target, native_turn) for call in verify.call_args_list))
+        with patch.object(goal, 'provider_for_turn', side_effect=AssertionError('lost provider identity')):
+            identity = core.WatchDaemon._codex_input_identity(self.target, proof, goal=True)
+        self.assertEqual(identity['model_provider'], 'original-provider')
+        with patch('ccc_shared_codex_turn.binding_for_turn', side_effect=[binding, None]):
+            self.assertIsNone(goal.blocked_goal(self.target, 12345, current_turn=native_turn))
+
+    def test_goal_provider_replacement_or_update_during_read_is_rejected(self):
+        state = self.provider_state()
+        read = goal._read_provider
+        for change in ('replace', 'update'):
+            with self.subTest(change=change):
+                self.provider_state()
+                calls = 0
+                def changed(database, sid):
+                    nonlocal calls
+                    calls += 1
+                    if calls == 2:
+                        if change == 'replace':
+                            replacement = state.with_name('replacement.sqlite')
+                            replacement.write_bytes(state.read_bytes())
+                            replacement.replace(state)
+                        else:
+                            with closing(sqlite3.connect(state)) as db, db:
+                                db.execute("UPDATE threads SET model_provider='replacement'")
+                    return read(database, sid)
+                with patch.object(goal, '_read_provider', side_effect=changed):
+                    self.assertIsNone(goal.blocked_goal(self.target, 12345, current_turn=self.primary_turn()))
+
+    def retry_daemon(self, turn, store):
+        from types import SimpleNamespace
+        return SimpleNamespace(codex_queue_recovery=SimpleNamespace(current_turn=lambda _: turn),
+            _current_blocked_goal=lambda target: goal.blocked_goal(target, 12345),
+            _provider_retry=store, _codex_turn_key_identity=core.WatchDaemon._codex_turn_key_identity)
+
+    def test_none_and_unknown_rollout_use_bound_goal_retry_evidence(self):
+        from types import SimpleNamespace
+        for index, turn in enumerate((None, {}, {'kind': 'unknown'})):
+            with self.subTest(turn=turn):
+                store = ProviderRetryStore(self.goals.parent / f'goal-retry-{index}.sqlite',
+                    clock=lambda: self.now + 1, jitter=lambda: 0)
+                runtime = core.TargetRuntime()
+                self.assertTrue(core.WatchDaemon._provider_retry_gate(
+                    self.retry_daemon(turn, store), self.target, runtime,
+                    SimpleNamespace(error_type='rate_limit'), dry_run=True))
+                with store.transaction() as db:
+                    self.assertEqual(db.execute('SELECT identity FROM episodes').fetchall(),
+                        [(store.identity(self.sid, 'original-provider'),)])
+
+    def test_missing_retry_evidence_is_not_a_broken_ledger(self):
+        from types import SimpleNamespace
+        turn = {**self.primary_turn(), 'model_provider': 'original-provider'}
+        for change in ({'session_id': None}, {'turn_id': None}, {'model_provider': None},
+                       {'at': None}, {'at': 'yesterday'}, {'at': True}, {'at': float('nan')}):
+            with self.subTest(change=change):
+                store = ProviderRetryStore(self.goals.parent / 'missing-evidence.sqlite')
+                runtime = core.TargetRuntime()
+                with patch.object(goal, 'provider_for_turn', return_value=None):
+                    self.assertFalse(core.WatchDaemon._provider_retry_gate(
+                        self.retry_daemon({**turn, **change}, store), self.target, runtime,
+                        SimpleNamespace(error_type='rate_limit')))
+                self.assertEqual(runtime.provider_retry_status['reason_code'], 'provider_retry_evidence_missing')
+                self.assertFalse(store.path.exists())
+
+    def test_corrupt_ledger_json_keeps_ledger_failure_classification(self):
+        from types import SimpleNamespace
+        turn = {**self.primary_turn(), 'model_provider': 'original-provider'}
+        store = ProviderRetryStore(self.goals.parent / 'corrupt-ledger.sqlite')
+        with store.transaction() as db:
+            db.execute('INSERT INTO episodes VALUES (?, ?)', (store.identity(self.sid, 'original-provider'), '{'))
+        runtime = core.TargetRuntime()
+        self.assertFalse(core.WatchDaemon._provider_retry_gate(
+            self.retry_daemon(turn, store), self.target, runtime, SimpleNamespace(error_type='rate_limit')))
+        self.assertEqual(runtime.provider_retry_status['reason_code'], 'provider_retry_ledger_unavailable')
 
     def test_later_submission_active_goal_and_replaced_database_each_veto(self):
         with closing(sqlite3.connect(self.logs)) as db, db:
@@ -357,8 +450,10 @@ class NativeGoalEvidenceTests(unittest.TestCase):
         calls = 0
         def connect(*args, **kwargs):
             nonlocal calls
-            calls += 1
-            if calls == 3:
+            if str(args[0]).startswith(self.goals.as_uri() + '?'):
+                calls += 1
+            if calls == 2:
+                calls += 1
                 with closing(original(self.logs)) as db, db:
                     db.execute('INSERT INTO logs VALUES(?,?,?,?,?,?,?)', (
                         2, int(self.now) + 1, 0, self.sid, 'codex_core::session::handlers',

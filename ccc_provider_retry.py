@@ -35,6 +35,10 @@ RATE_LIMIT_PROVIDER_SPACING = 0.05
 TRANSIENT_RECOVERY_DELAYS = (15, 30, 60, 120)
 
 
+class ProviderRetryEvidenceError(ValueError):
+    """The caller lacks a dated, bound failure; the ledger was not accessed."""
+
+
 def structured_error_type(message):
     """Classify specific provider failures, including hard-wrapped JSON/text.
 
@@ -166,8 +170,9 @@ class ProviderRetryStore:
 
     @staticmethod
     def identity(session, provider):
-        if not isinstance(session, str) or not session or not isinstance(provider, str) or not provider:
-            raise ValueError('provider retry requires original session and provider identity')
+        if (not isinstance(session, str) or not session.strip()
+                or not isinstance(provider, str) or not provider.strip()):
+            raise ProviderRetryEvidenceError('provider retry requires original session and provider identity')
         return hashlib.sha256(json.dumps([session, provider]).encode()).hexdigest()
 
     @staticmethod
@@ -196,8 +201,9 @@ class ProviderRetryStore:
         """Observe one original failure; repeated polls never move its deadline."""
         if error_type not in RETRYABLE:
             return None
-        if not turn or not math.isfinite(at) or at <= 0:
-            raise ValueError('provider retry requires dated original failed turn')
+        if (not isinstance(turn, str) or not turn.strip() or type(at) not in (int, float)
+                or not math.isfinite(at) or at <= 0):
+            raise ProviderRetryEvidenceError('provider retry requires dated original failed turn')
         key = self.identity(session, provider)
         with self.transaction() as connection:
             row = connection.execute('SELECT record FROM episodes WHERE identity=?', (key,)).fetchone()

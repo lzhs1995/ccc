@@ -65,6 +65,22 @@ class GoalInputNotSentTests(unittest.TestCase):
         self.restart()
         self.assert_recovered_once(attempt)
 
+    def test_missing_goal_input_identity_does_not_persist_a_send_and_can_reobserve(self):
+        c = self.case
+        c.deny = False
+        with patch.object(c.f.daemon, '_current_codex_input_identity', return_value={}), \
+             patch.object(c.f.daemon, '_save_delivery', wraps=c.f.daemon._save_delivery) as persist:
+            c.send()
+        self.assertFalse(c.pending)
+        persist.assert_not_called()
+        self.assertFalse(c.f.runtime.send_attempt_id)
+        self.assertFalse(c.f.runtime.codex_sent_turn_key)
+        self.assertEqual(c.episode()['count'], 0)
+        c.send()
+        self.assertEqual(c.f.runtime.delivery_status, 'accepted')
+        self.assertEqual([r[0] for r in c.pending], ['surface.send_text', 'surface.send_key'])
+        self.assertEqual(c.episode()['count'], 1)
+
     def test_real_goal_workspace_lock_timeout_recovers_same_attempt_after_restart(self):
         c = self.case
         c.deny = False

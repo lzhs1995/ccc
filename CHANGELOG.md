@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.36
+
+- Reduce background state write amplification on clone-capable macOS filesystems by updating block-aligned records in a private clone, then atomically publishing ordinary JSON. Preserve every historical record; use a complete atomic snapshot when cloning is unavailable or the layout changes.
+- Acknowledge snapshot persistence only after syncing both the file and its parent directory. Invalidate the optimization cache after failed writes or external replacement, including failures after rename, so retries still cross the durable barrier. Cover short writes, disk exhaustion, replacement and real process interruption.
+- Resolve blocked Codex Goals against the authenticated writer's own provider database and recheck that identity before recovery. Keep missing failure evidence distinct from an unavailable retry ledger, and observe blocked Goals when the current turn is absent or unknown.
+- Wait for fresh native input identity before creating a continuation attempt. Preserve existing uncertain attempts and delivery budgets while observation catches up.
+
 ## 0.2.35
 
 - Recover a newly completed failed Codex turn even when the Goal still names an older turn. Require the complete native completion at a stable physical EOF and recheck it before input; later user activity, torn records and uncertain deliveries retain their existing protections.

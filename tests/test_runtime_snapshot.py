@@ -42,7 +42,7 @@ class RuntimeSnapshotTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             daemon.state_path = Path(directory) / "state.json"
             daemon._state_save_lock = threading.Lock()
-            daemon._last_state_serialized = ""
+            daemon._state_snapshot = core.AtomicJSONSnapshot(daemon.state_path)
             daemon._save_now()
             saved = json.loads(daemon.state_path.read_text())
         self.assertEqual(saved, expected)

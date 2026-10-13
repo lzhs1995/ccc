@@ -34,7 +34,7 @@ class NativeLaneTests(unittest.TestCase):
                 lane = _create_lane_daemon({'config_path': str(config), 'state_path': str(state)})
             self.addCleanup(lane._process_snapshots.close)
             self.assertEqual(lane.runtime, {})
-            self.assertEqual(lane._last_state_serialized, '{}')
+            self.assertEqual(lane._state_snapshot._entries, {})
             parent = core.WatchDaemon(config, state)
             self.addCleanup(parent._process_snapshots.close)
             self.assertEqual(json.loads(parent._serialize_state()), history)
