@@ -106,6 +106,48 @@ class NativeGoalEvidenceTests(unittest.TestCase):
                 'at': self.now + .054,
                 'error': {'message': ERRORS['rate_limit'], 'codex_error_info': 'rate_limit_exceeded'}}
 
+    def test_day_old_blocked_goal_requires_matching_live_completed_turn(self):
+        updated = (int(self.now * 1000) + 5) / 1000
+        for age in (86399, 86400, 86401, 7 * 86400):
+            with self.subTest(age=age), patch.object(goal.time, 'time', return_value=updated + age):
+                legacy = goal.blocked_goal(self.target, 12345)
+                self.assertEqual(legacy is not None, age < 86400)
+                proof = goal.blocked_goal(self.target, 12345, current_turn=self.primary_turn())
+                self.assertIsNotNone(proof)
+                self.assertEqual(proof['turn_id'], self.tid)
+                self.assertEqual(proof['at'], updated)
+
+    def test_day_old_goal_cannot_borrow_wrong_turn_error_or_process(self):
+        with patch.object(goal.time, 'time', return_value=self.now + 2 * 86400):
+            for change in ({'session_id': str(uuid.uuid4())}, {'pid': 999},
+                           {'process_start': 1}, {'turn_id': str(uuid.uuid4())},
+                           {'kind': 'task_started'}, {'error': {'message': 'other'}}):
+                with self.subTest(change=change):
+                    self.assertIsNone(goal.blocked_goal(self.target, 12345,
+                        current_turn={**self.primary_turn(), **change}))
+
+    def test_future_or_nonfinite_goal_age_never_authorizes(self):
+        for now in (self.now - 1, float('nan'), float('inf'), float('-inf')):
+            for turn in (None, self.primary_turn()):
+                with self.subTest(now=now, turn=turn), patch.object(goal.time, 'time', return_value=now):
+                    self.assertIsNone(goal.blocked_goal(self.target, 12345, current_turn=turn))
+
+    def test_day_old_goal_still_rejects_later_unmatched_submission(self):
+        with patch.object(goal.time, 'time', return_value=self.now + 2 * 86400):
+            self.assertIsNotNone(goal.blocked_goal(self.target, 12345, current_turn=self.primary_turn()))
+            self.append_submission(self.submission(mode='StartOrSteer'))
+            self.assertIsNone(goal.blocked_goal(self.target, 12345, current_turn=self.primary_turn()))
+
+    def test_day_old_goal_still_rechecks_native_lifecycle(self):
+        from types import SimpleNamespace
+        turn = self.primary_turn()
+        turns = iter([turn, {**turn, 'kind': 'task_started'}])
+        queue = SimpleNamespace(process_lookup=lambda _: {'agent_kind': 'codex', 'agent_pids': [12345]},
+                                current_turn=lambda _: next(turns))
+        with patch.object(goal.time, 'time', return_value=self.now + 2 * 86400):
+            self.assertIsNone(core.WatchDaemon._current_blocked_goal(
+                SimpleNamespace(codex_queue_recovery=queue), self.target))
+
     def add_child_lock(self):
         lock = self.goals.parent / 'thread-writer-locks' / (str(uuid.uuid4()) + '.lock')
         lock.touch()

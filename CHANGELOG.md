@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.37
+
+- Recover a blocked Codex Goal older than one day when an independently authenticated, current completed turn still proves the original failure. Keep the one-day fallback without that proof, and reject future or non-finite timestamps.
+- Retry a private Codex short check only when its delivery journal and private ledger both prove zero input for the same original attempt, task, process and failed turn. Persist the private intent before invalidating the delivery proof, then commit the delivery proof before the private no-input receipt. Partial writes, changed identities and uncertain deliveries remain closed to replay.
+- Preserve a deferred Claude Stop after a proven refusal before text input. Durably commit the retry state and zero-input proof together before clearing the transaction, and restore the provisional orphan-submit budget. A persistence failure or lost text acknowledgement retains the original reservation.
+- Set the Claude profile example template's `autoCompactWindow` to 50000 so new profiles inherit the configured window. Existing profile migration is a separate local operation.
+
 ## 0.2.36
 
 - Reduce background state write amplification on clone-capable macOS filesystems by updating block-aligned records in a private clone, then atomically publishing ordinary JSON. Preserve every historical record; use a complete atomic snapshot when cloning is unavailable or the layout changes.

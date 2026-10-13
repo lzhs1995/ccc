@@ -10719,33 +10719,44 @@ class WatchDaemon:
             self.save()
         except InputNotSentError as exc:
             provider_reason = self._claude_provider_guard_reason(target, runtime, event=event)
+            status = "reserved" if provider_reason else "deferred_input_not_sent"
+            if not provider_reason:
+                if event.get("dispatch_migration_source_event_id"):
+                    status = "deferred_dispatch_migration"
+                elif event.get("report_migration_source_event_id"):
+                    status = "deferred_report_migration"
+            # InputNotSentError is the transport's proof that no text I/O
+            # started. Commit that proof and the retry status together before
+            # clearing the transaction. In particular, an ordinary deferred
+            # Stop must not remain reserved and lose its slot on the next poll.
+            # Unknown writes and crash-left reservations never enter this path.
+            with self.claude_event_ledger._lock:
+                event_id = str(event["event_id"])
+                row = self.claude_event_ledger.events.get(event_id, {})
+                if (row.get("status") != "reserved"
+                        or self.claude_event_ledger._row_identity(row)
+                        != self.claude_event_ledger._identity(event)):
+                    raise CmuxError("Claude zero-input reservation changed; transaction retained")
+                proof = {"phase": "text", "at": time.time(), "reason": str(exc)}
+                if provider_reason:
+                    proof["provider_guard"] = provider_reason
+                events = {**self.claude_event_ledger.events, event_id: {
+                    **row, "status": status, "input_not_sent": proof}}
+                # Do not publish retry permission in memory if persistence
+                # fails. The original reservation/unknown state stays closed.
+                self.claude_event_ledger._write(events)
+                self.claude_event_ledger.events = events
+            self._clear_claude_submit(runtime, reason=f"text not sent: {exc}")
+            runtime.claude_orphan_enter_count, runtime.claude_orphan_enter_at = previous_orphan
+            runtime.claude_last_event_status = status
+            runtime.claude_hook_status = status
             if provider_reason:
-                # This original transport attempt proved no text was written.
-                # Persist that fact before clearing its provisional transaction;
-                # a failed write leaves the reservation/unknown state closed.
-                with self.claude_event_ledger._lock:
-                    event_id = str(event["event_id"])
-                    row = self.claude_event_ledger.events[event_id]
-                    events = {**self.claude_event_ledger.events, event_id: {
-                        **row, "input_not_sent": {"phase": "text", "at": time.time(),
-                                                   "reason": str(exc), "provider_guard": provider_reason}}}
-                    self.claude_event_ledger._write(events)
-                    self.claude_event_ledger.events = events
-                self._clear_claude_submit(runtime, reason=f"text not sent: {exc}")
-                runtime.claude_orphan_enter_count, runtime.claude_orphan_enter_at = previous_orphan
                 if provider_reason == "claude_provider_retry_wait":
                     self._defer_claude_event(surface_id, runtime, event, "provider_retry_wait")
                 else:
                     self.claude_event_ledger.mark(event, "provider_blocked", detail=provider_reason)
                 self.save()
                 return False, provider_reason
-            if event.get("report_migration_source_event_id") or event.get("dispatch_migration_source_event_id"):
-                # Only a proven zero-input refusal may reopen this reservation.
-                # Unknown writes and crash-left reserved rows remain consumed.
-                status = ("deferred_dispatch_migration" if event.get("dispatch_migration_source_event_id")
-                          else "deferred_report_migration")
-                self.claude_event_ledger.mark(event, status, detail=str(exc))
-            self._clear_claude_submit(runtime, reason=f"text not sent: {exc}")
             self.save()
             return False, f"Claude input not sent: {exc}"
         except (CmuxError, RuntimeError) as exc:
@@ -13007,7 +13018,8 @@ class WatchDaemon:
                     and fresh.message_kind == "codex" and fresh.error_type == state.error_type
                     and not fresh.native_goal_stalled)
 
-        if not self.private_checks.valid(proof, target, read_turn, snapshot=snapshot):
+        if (not self.private_checks.valid(proof, target, read_turn, snapshot=snapshot)
+                or not self.private_checks.receipt_matches(proof, runtime.send_attempt_id, 'intent')):
             return False
         # Source reads and the write-ahead send record can wait for disk. Read
         # placement and the empty composer after them, then recheck native and
@@ -13462,7 +13474,6 @@ class WatchDaemon:
         # belongs to the current native Goal. A superseded Goal can leave that
         # footer visible across newer failed turns; it is not an input veto.
         if (state.message_kind != 'codex'
-                or runtime.codex_private_check
                 or runtime.codex_input_phase != 'input_not_sent'
                 or runtime.delivery_status != 'retryable'
                 or not runtime.codex_sent_turn_key
@@ -13480,11 +13491,36 @@ class WatchDaemon:
             identity = (self._current_codex_input_identity(target, runtime) if runtime.codex_goal_resume
                         else self._codex_input_identity(target, turn))
         proof = runtime.codex_input_not_sent
+        private = runtime.codex_private_check
+        if proof.get('private_check', {}) != private:
+            return None
+        if private:
+            snapshot = {}
+            if (not self.private_checks.valid(private, target,
+                    lambda: self.codex_queue_recovery.current_turn(target), snapshot=snapshot)
+                    or not self.private_checks.receipt_matches(private, runtime.send_attempt_id, 'not_sent')
+                    or not self.private_checks.snapshot_current(snapshot)):
+                return None
         if (identity and proof.get('identity') == identity
                 and proof.get('attempt_id') == runtime.send_attempt_id
                 and proof.get('turn_key') == runtime.codex_sent_turn_key):
             return runtime.send_attempt_id
         return None
+
+    @staticmethod
+    def _codex_zero_input_proof(runtime, input_identity):
+        proof = dict(identity=copy.deepcopy(input_identity), attempt_id=runtime.send_attempt_id,
+                     turn_key=runtime.codex_sent_turn_key)
+        if runtime.codex_private_check:
+            proof['private_check'] = copy.deepcopy(runtime.codex_private_check)
+        return proof
+
+    def _finish_private_zero_input(self, runtime):
+        if runtime.codex_private_check:
+            # Publish this second. Until both records agree, the private intent
+            # prevents recovery even if the delivery proof already committed.
+            self.private_checks.finish(runtime.codex_private_check, runtime.send_attempt_id,
+                                       'not_sent', io_started_at=0)
 
 
     def _cancel_before_input(self, surface_id, runtime, state, input_identity, reason):
@@ -13498,12 +13534,13 @@ class WatchDaemon:
             # has changed. Reuse still requires the same authenticated process,
             # turn, transport and all current authorizations. This branch is
             # never used to infer non-delivery from a historical cancelled row.
-            runtime.codex_input_not_sent = dict(identity=input_identity,
-                attempt_id=runtime.send_attempt_id, turn_key=runtime.codex_sent_turn_key)
+            runtime.codex_input_not_sent = self._codex_zero_input_proof(runtime, input_identity)
             runtime.codex_input_phase = 'input_not_sent'
             runtime.delivery_status = 'retryable'
         try:
             self._save_delivery(surface_id, runtime, state.message_kind == 'codex')
+            if runtime.codex_input_not_sent:
+                self._finish_private_zero_input(runtime)
         except (OSError, RuntimeError):
             runtime.codex_input_not_sent = {}
             runtime.codex_input_phase = initial_phase
@@ -13703,13 +13740,16 @@ class WatchDaemon:
         private_check = (self.private_checks.select(target, lambda: self.codex_queue_recovery.current_turn(target))
                          if state.message_kind == "codex" and not state.native_goal_stalled
                          and not runtime.codex_goal_resume else None)
+        if retry_attempt and (private_check or {}) != runtime.codex_private_check:
+            runtime.paused_reason = 'zero-write private source changed; session preserved'
+            return
         outgoing_message = private_check["message"] if private_check else None
         runtime.codex_private_check = private_check or {}
         checked_attempt = self._unwritten_codex_attempt(target, runtime, state)
         input_identity = (self._current_codex_input_identity(target, runtime)
-                          if state.message_kind == 'codex' and not private_check
+                          if state.message_kind == 'codex'
                           and self._connected_native_input(client) else {})
-        if (state.message_kind == 'codex' and not private_check
+        if (state.message_kind == 'codex'
                 and self._connected_native_input(client) and not input_identity):
             # Missing evidence is an observation gap, not an attempted send.
             # Never create an unbound pending row that cannot later prove a
@@ -13745,19 +13785,25 @@ class WatchDaemon:
         initial_input_phase = runtime.codex_input_phase
         runtime.last_send_error = ""
         persisted_at = time.monotonic()
+        private_reserved = False
         try:
             if input_identity and self._codex_input_matches_key(input_identity, runtime.codex_sent_turn_key):
                 # This live capability ends before any terminal operation.
                 # It can recover only this first pending write, with an exact
                 # durable head comparison; no historical failure can mint it.
                 with self._delivery_store.pre_input(surface_id, runtime, identity=input_identity) as pending:
+                    if private_check:
+                        # Invalidate the private receipt before the delivery
+                        # proof. A crash between these writes cannot retry.
+                        self.private_checks.reserve(private_check, runtime.send_attempt_id, reuse=bool(retry_attempt))
+                        private_reserved = True
                     try:
                         self._save_delivery(surface_id, runtime, True, pre_input=pending)
                     except (OSError, RuntimeError) as exc:
                         error = f"attempt persistence failed; input not sent: {exc}"
-                        pending.recover_input_not_sent(dict(identity=input_identity,
-                            attempt_id=runtime.send_attempt_id, turn_key=runtime.codex_sent_turn_key),
-                            error=error)
+                        pending.recover_input_not_sent(self._codex_zero_input_proof(runtime, input_identity),
+                                                      error=error)
+                        self._finish_private_zero_input(runtime)
                         self._publish_delivery_snapshot(surface_id)
                         self.logger.warning("surface=%s %s; original attempt retained",
                                             surface_id[:8], error)
@@ -13785,7 +13831,7 @@ class WatchDaemon:
                                       'native turn changed after persistence')
             return
         send_started = time.monotonic()
-        private_reserved = input_attempted = False
+        input_attempted = False
         try:
             with contextlib.ExitStack() as input_scope:
                 try:
@@ -13814,8 +13860,9 @@ class WatchDaemon:
                                               'provider retry is not ready')
                     return
                 if private_check:
-                    self.private_checks.reserve(private_check, runtime.send_attempt_id)
-                    private_reserved = True
+                    if not private_reserved:
+                        self.private_checks.reserve(private_check, runtime.send_attempt_id)
+                        private_reserved = True
                     if (not self._connected_native_input(client)
                             and not self._private_check_ready(private_check, target, runtime, state, client, is_current)):
                         raise CmuxError("原 b 检查来源、任务或输入授权已变化；本次未发送")
@@ -13839,26 +13886,27 @@ class WatchDaemon:
             runtime.send_duration_ms = round((time.monotonic() - send_started) * 1000, 3)
             runtime.last_send_error = str(exc)[-500:]
             uncertain = isinstance(exc, UncertainDeliveryError) or isinstance(exc.__cause__, subprocess.TimeoutExpired)
-            if private_reserved:
+            zero_input = (isinstance(exc, InputNotSentError) and not uncertain and input_identity
+                    and runtime.codex_input_phase in {'text_pending', 'paste_submit_pending'}
+                    and self._codex_input_matches_key(input_identity, runtime.codex_sent_turn_key))
+            if private_reserved and not zero_input:
                 with contextlib.suppress(OSError, RuntimeError):
                     self.private_checks.finish(private_check, runtime.send_attempt_id,
                         "not_sent" if not input_attempted else "unknown" if uncertain else "failed",
                         io_started_at=runtime.send_io_started_at if input_attempted else 0)
             runtime.delivery_status = "unknown" if uncertain else "failed"
             runtime.state = "delivery_unknown" if uncertain else "send_failed"
-            if (isinstance(exc, InputNotSentError) and not uncertain and input_identity
-                    and not private_reserved
-                    and runtime.codex_input_phase in {'text_pending', 'paste_submit_pending'}
-                    and self._codex_input_matches_key(input_identity, runtime.codex_sent_turn_key)):
+            if zero_input:
                 # _control_rpc proves no input sendall was attempted. The
                 # split Enter path wraps every post-text failure as uncertain.
-                runtime.codex_input_not_sent = dict(identity=input_identity,
-                    attempt_id=runtime.send_attempt_id, turn_key=runtime.codex_sent_turn_key)
+                runtime.codex_input_not_sent = self._codex_zero_input_proof(runtime, input_identity)
                 runtime.codex_input_phase = 'input_not_sent'
                 runtime.delivery_status = 'retryable'
             self.logger.error("surface=%s attempt=%s send failed: %s", surface_id[:8], runtime.send_attempt_id, exc)
             try:
                 self._save_delivery(surface_id, runtime, state.message_kind == "codex")
+                if zero_input:
+                    self._finish_private_zero_input(runtime)
             except (OSError, RuntimeError):
                 # An in-memory claim cannot authorize recovery after a failed
                 # durable write. Leave the old pending record authoritative.

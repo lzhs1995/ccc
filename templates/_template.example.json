@@ -1,4 +1,5 @@
 {
+  "autoCompactWindow": 50000,
   "env": {
     "ANTHROPIC_API_KEY": "",
     "ANTHROPIC_AUTH_TOKEN": "",

@@ -10,6 +10,7 @@ from contextlib import closing
 import re
 import hashlib
 import json
+import math
 import sqlite3
 import time
 import uuid
@@ -211,7 +212,15 @@ def blocked_goal(target, pid, *, current_turn=None):
         provider = _read_provider(provider_database, sid)
         with closing(sqlite3.connect(goals[0].as_uri() + "?mode=ro", uri=True, timeout=.05)) as db:
             goal = db.execute("SELECT goal_id,status,updated_at_ms FROM thread_goals WHERE thread_id=?", (sid,)).fetchone()
-        if not goal or goal[1] != "blocked" or not 0 <= time.time() - goal[2] / 1000 < 86400:
+        if not goal or goal[1] != "blocked":
+            return None
+        age = time.time() - goal[2] / 1000
+        # A completed primary turn is reauthenticated by the caller and matched
+        # to the original writer/error below. Its blocked goal does not expire
+        # merely because a provider outage lasts more than a day. Without that
+        # independent turn, keep the bounded fallback for missing rollout data.
+        if (not math.isfinite(age) or age < 0
+                or (current_turn is None and age >= 86400)):
             return None
         query = ("SELECT id,ts,ts_nanos,substr(feedback_log_body,1,65537),process_uuid,target FROM logs "
                 "WHERE thread_id=? AND ts>=? AND ((target='codex_core::session::turn' "

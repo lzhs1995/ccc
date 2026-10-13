@@ -45,7 +45,7 @@ class _PreInputAttempt:
         if (self.saved['delivery_status'] != 'sending'
                 or self.saved['codex_input_phase'] not in {'text_pending', 'paste_submit_pending'}
                 or self.saved['send_io_started_at'] != 0 or self.saved['send_completed_at'] != 0
-                or self.saved['codex_input_not_sent'] or self.saved['codex_private_check']
+                or self.saved['codex_input_not_sent']
                 or not self.saved['codex_sent_turn_key']
                 or self.saved['codex_sent_turn_key'] != self.saved['codex_observed_turn_key']):
             raise PreInputRecoveryError('pre-input context requires a fresh pending reservation')
@@ -92,6 +92,16 @@ class _PreInputAttempt:
                 or proof.get('attempt_id') != self.saved['send_attempt_id']
                 or proof.get('turn_key') != self.saved['codex_sent_turn_key']):
             raise PreInputRecoveryError('zero-input proof does not match the original pending identity')
+        private = self.saved['codex_private_check']
+        if proof.get('private_check', {}) != private:
+            raise PreInputRecoveryError('zero-input proof does not match the original private check')
+        if private and (not isinstance(private.get('origin'), dict)
+                or self.saved['codex_goal_resume']
+                or private.get('failed_turn_id') != identity.get('turn_id')
+                or private.get('failed_at') != identity.get('at')
+                or any(private['origin'].get(field) != identity.get(field)
+                       for field in ('workspace_id', 'surface_id', 'session_id', 'pid', 'process_start'))):
+            raise PreInputRecoveryError('zero-input private check lacks its original native binding')
         for key in ('workspace_id', 'session_id', 'turn_id', 'model_provider'):
             if not isinstance(identity.get(key), str) or not identity[key].strip():
                 raise PreInputRecoveryError('zero-input proof lacks its original native identity')
@@ -230,6 +240,7 @@ class DeliveryStore:
                     or proof.get("attempt_id") != saved["send_attempt_id"]
                     or not saved.get("codex_sent_turn_key")
                     or proof.get("turn_key") != saved["codex_sent_turn_key"]
+                    or proof.get("private_check", {}) != saved.get("codex_private_check", {})
                     or not isinstance(proof.get("identity"), dict)
                     or proof["identity"].get("surface_id") != sid):
                 raise ValueError("invalid durable zero-write binding")

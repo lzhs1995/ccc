@@ -943,6 +943,40 @@ class DeliveryJournalTests(unittest.TestCase):
         self.assertEqual(self.store._phase, 'running')
         self.assertIsNone(self.store.database_error)
 
+    def test_malformed_private_origin_does_not_stop_unrelated_surface_writer(self):
+        for case, origin in (('missing', None), ('null', None), ('list', []),
+                             ('text', 'origin'), ('number', 1), ('incomplete', {})):
+            with self.subTest(case=case):
+                self._database_statement("DELETE FROM delivery WHERE surface_id='surface'")
+                runtime, proof = self._pending_input()
+                private = dict(failed_turn_id='turn', failed_at=10.0)
+                if case != 'missing':
+                    private['origin'] = origin
+                runtime.codex_private_check = private
+                proof['private_check'] = private
+                prior = core.TargetRuntime.from_dict(runtime.to_dict())
+                prior.delivery_status, prior.codex_input_phase = 'retryable', 'input_not_sent'
+                prior.codex_input_not_sent = proof
+                self.store.persist('surface', prior)
+                original = self._head()
+                runtime.delivery_revision = prior.delivery_revision
+                with self.store.pre_input('surface', runtime, identity=proof['identity']) as pending:
+                    with self.assertRaisesRegex(PreInputRecoveryError, 'original native binding'):
+                        pending.persist()
+                    with self.assertRaisesRegex(PreInputRecoveryError, 'original native binding'):
+                        pending.recover_input_not_sent(proof)
+                self.assertEqual(self._head(), original)
+                self.assertEqual(runtime.codex_input_not_sent, {})
+                other_id = 'unrelated-' + case
+                other = core.TargetRuntime(send_attempt_id=other_id, delivery_status='sending')
+                self.store.persist(other_id, other)
+                self.assertEqual(other.delivery_revision, 1)
+                with closing(sqlite3.connect(self.store.root / 'delivery.sqlite3')) as db:
+                    self.assertEqual(db.execute('SELECT revision FROM delivery WHERE surface_id=?',
+                                                (other_id,)).fetchone(), (1,))
+                self.assertEqual(self.store._phase, 'running')
+                self.assertIsNone(self.store.database_error)
+
     def test_recovery_rejects_changed_complete_head_or_identity(self):
         for damage in ('changed_io', 'unknown', 'other_attempt', 'unreadable', 'process_identity'):
             with self.subTest(damage=damage):
