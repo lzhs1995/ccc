@@ -24,6 +24,8 @@ import time
 import uuid
 import weakref
 
+from ccc_provider_retry import BLOCKED as PROVIDER_BLOCKED, structured_error_type
+
 
 def epoch(value):
     return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
@@ -52,7 +54,13 @@ def _task_stamp(info):
 
 
 def task_snapshot(path, session_id):
-    """Read the original thread's latest lifecycle event, with a stable file."""
+    """Read the original thread's lifecycle and subsequent native input/output.
+
+    Some Codex versions persist accepted user input only as response_item, not
+    event_msg/user_message. Ignoring it could reuse a failure from before that
+    input. A complete terminal record at EOF also proves that all earlier
+    transcript messages preceded completion, independently of an older Goal DB.
+    """
     path = Path(path)
     before = path.stat()
     key, signature = (str(path), session_id), _task_stamp(before)
@@ -68,23 +76,44 @@ def task_snapshot(path, session_id):
             return None
         if _task_stamp(os.fstat(handle.fileno())) != signature:
             return None
-        latest, limit = None, min(before.st_size, 16384)
+        latest, terminal_tail, limit = None, None, min(before.st_size, 16384)
         while latest is None:
             offset = max(0, before.st_size - limit)
             handle.seek(offset)
-            lines = handle.read(limit).splitlines()
+            lines = handle.read(limit).splitlines(keepends=True)
             if offset:
                 lines = lines[1:]
+            end = before.st_size
             for line in reversed(lines):
+                start, record_end = end - len(line), end
+                end = start
+                # A torn trailing record may be new input. Never skip it to
+                # resurrect an older completion, even while the writer is idle.
+                if not line.endswith(b'\n'):
+                    return None
                 try:
                     event = json.loads(line)
                 except (ValueError, UnicodeError):
-                    continue
+                    return None
+                if not isinstance(event, dict):
+                    return None
                 payload = event.get("payload", {})
+                if not isinstance(payload, dict):
+                    return None
                 if event.get("type") == "event_msg" and payload.get("type") in {
                     "task_started", "task_complete", "turn_aborted", "user_message",
+                    "agent_message", "agent_reasoning",
                 }:
                     latest = event
+                    latest_kind = payload['type']
+                    if latest_kind == 'task_complete' and record_end == before.st_size:
+                        terminal_tail = {'offset': start, 'end': record_end,
+                                         'sha256': hashlib.sha256(line).hexdigest()}
+                    break
+                if event.get('type') == 'response_item':
+                    latest = event
+                    latest_kind = ('user_message' if payload.get('type') == 'message'
+                                   and payload.get('role') == 'user' else 'native_activity')
                     break
             if limit >= min(before.st_size, 1024 * 1024):
                 break
@@ -99,10 +128,12 @@ def task_snapshot(path, session_id):
     except (TypeError, ValueError):
         return None
     snapshot = {**({"model_provider": first["payload"]["model_provider"]} if first["payload"].get("model_provider") else {}),
-            "kind": latest["payload"]["type"], "at": at,
+            "kind": latest_kind, "at": at,
             "turn_id": latest["payload"].get("turn_id"), "error": latest["payload"].get("error"),
             "last_agent_message": latest["payload"].get("last_agent_message"),
             "signature": [after.st_ino, after.st_size, after.st_mtime_ns]}
+    if terminal_tail is not None:
+        snapshot['terminal_tail'] = terminal_tail
     with _task_snapshot_lock:
         _task_snapshots[key] = (signature, snapshot)
         _task_snapshots.move_to_end(key)
@@ -114,14 +145,26 @@ def task_snapshot(path, session_id):
 def _retryable_completed_message(message):
     normalized = " ".join(message.lower().split())
     compact = re.sub(r'\s+', '', normalized)
-    if (('"error":{' in compact and '"insufficient_quota"' in compact)
+    prefix = compact.lstrip('■⚠└')
+    if prefix.startswith(('documentation:', 'example:', 'quoted:', 'sample:')):
+        return False
+    if (structured_error_type(message) in PROVIDER_BLOCKED
+            or ('"error":{' in compact and '"insufficient_quota"' in compact)
             or 'invalid_encrypted_content' in normalized
             or re.search(r'(?:unexpected\s+status(?:\s+code)?|unknown\s+status\s+code|http(?:/\d(?:\.\d)?)?|last\s+status)\s*[:=]?\s*(?:400|401|403)\b', normalized)
             or '401' in normalized and any(x in normalized for x in (
                 '额度已用尽', 'remainquota', 'insufficient_quota', 'quota exceeded'))):
         return False
-    return (any(x in normalized for x in ("currently experiencing high demand", "rate limit exceeded",
-                                          "temporarily unavailable", "stream disconnected before completion"))
+    # Codex's exhausted retry banner is a terminal transport failure even
+    # though it carries no JSON envelope. Keep this exact shape narrow: an
+    # arbitrary "last status: 429" fragment in user/quoted text must not make
+    # a completed turn eligible for input.
+    exhausted_429 = bool(re.fullmatch(
+        r'exceededretrylimit,laststatus:429toomanyrequests(?:,requestid:[a-z0-9._:-]+)?',
+        prefix))
+    return (exhausted_429
+            or any(x in normalized for x in ("currently experiencing high demand", "rate limit exceeded",
+                                              "temporarily unavailable", "stream disconnected before completion"))
             or normalized == "connection failed: error sending request")
 
 
@@ -762,6 +805,7 @@ class QueueRecovery:
         self.open_file_cache = {}
         self.idle_file_cache = {}
         self.open_file_sources = {}
+        self._native_wakeup_bindings = {}
         self.wakeup_process_cache = (0.0, frozenset(), {})
         self.wakeup_root_cache = (None, None)
         self.wakeup_path_cache = {}
@@ -776,6 +820,22 @@ class QueueRecovery:
     def records(self):
         return self._binding_file.read()
 
+    @staticmethod
+    def _native_wakeup_binding(source):
+        """Immutable provenance from the full native reader, never a Hook flag."""
+        try:
+            born = tuple(source['birth'])
+            writer = source['shared_writer']
+            writer_born = tuple(writer['birth'])
+            if (not source.get('native_foreground') or len(born) != 2 or len(writer_born) != 2
+                    or any(type(n) is not int for n in (*born, *writer_born))):
+                return None
+            return (source['surface_id'], source['workspace_id'], source['session_id'],
+                    source['pid'], source['process_start'], born, str(source['path']),
+                    writer['pid'], writer_born, str(writer['sessions_root']))
+        except (KeyError, TypeError):
+            return None
+
     def wakeup_sources(self, targets):
         """Latest known original transcript for each currently enabled UUID."""
         active_targets = {str(t["surface_id"]): t for t in targets
@@ -786,11 +846,12 @@ class QueueRecovery:
         except (OSError, ValueError):
             records = {}
         with self.lock:
-            candidates = list(self.open_file_sources.values())
-        candidates.extend({"surface_id": r.get("surfaceId"), "workspace_id": r.get("workspaceId"),
+            candidates = [(dict(source), True) for source in self.open_file_sources.values()]
+            native_bindings = dict(self._native_wakeup_bindings)
+        candidates.extend(({"surface_id": r.get("surfaceId"), "workspace_id": r.get("workspaceId"),
                            "session_id": sid, "path": r.get("transcriptPath"),
                            "pid": r.get("pid"),
-                           "process_start": r.get("pidStartSeconds", 0)}
+                           "process_start": r.get("pidStartSeconds", 0)}, False)
                           for sid, r in _selected_bindings(records, set(active.items())))
         chosen = {}
         root_key = str(self.sessions_root)
@@ -798,8 +859,12 @@ class QueueRecovery:
             self.wakeup_root_cache = (root_key, self.sessions_root.resolve())
             self.wakeup_path_cache = {}
         root = self.wakeup_root_cache[1]
+        from ccc_guard_scope import birth
+        from ccc_shared_codex_turn import _protected_root
+        protected = _protected_root()
+        native_births = {}
         paths = set()
-        for source in candidates:
+        for source, from_reader in candidates:
             sid = source["surface_id"]
             if active.get(sid) != source["workspace_id"] or not source["path"]:
                 continue
@@ -809,15 +874,32 @@ class QueueRecovery:
                 path = self.wakeup_path_cache.get(path_key)
                 if path is None:
                     path = Path(path_key).resolve()
-                    if not path.is_relative_to(root):
-                        continue
                     self.wakeup_path_cache[path_key] = path
+                # Check provenance on EVERY candidate, including cache hits.
+                # A Hook naming the same protected path must not inherit a
+                # native source's cached placement or original process proof.
+                native_source = from_reader and source.get('native_foreground') is True
+                if native_source:
+                    pin = self._native_wakeup_binding(source)
+                    if pin is None or native_bindings.get(sid) != pin or path_key != str(path):
+                        continue
+                    pid = source['pid']
+                    if pid not in native_births:
+                        native_births[pid] = birth(pid, codex=True)
+                    if native_births[pid] != list(pin[5]):
+                        continue
+                if not path.is_relative_to(root) and not (
+                        native_source and path.is_relative_to(protected)):
+                    continue
                 # Keep the original canonical file as an advisory source.
                 # Re-resolving hundreds of unchanged paths every 250 ms made
                 # the event thread compete with the viewport fleet for I/O/GIL.
                 # A later symlink retarget cannot redirect this pinned hint;
                 # actual sends independently verify the current native writer.
-                if sid not in chosen or source["process_start"] > chosen[sid]["process_start"]:
+                if (sid not in chosen
+                        or (native_source and not chosen[sid].get('native_foreground'))
+                        or (bool(native_source) == bool(chosen[sid].get('native_foreground'))
+                            and source["process_start"] > chosen[sid]["process_start"])):
                     chosen[sid] = {**source, "path": path}
             except (OSError, ValueError, TypeError):
                 continue
@@ -827,14 +909,16 @@ class QueueRecovery:
         # at once, producing another full-fleet burst of viewport requests.
         # Direct OS queries check the already-bound PID/start identities.
         # This is advisory coverage only; send still performs its full guards.
-        pids = frozenset(s["pid"] for s in chosen.values() if type(s.get("pid")) is int and s["pid"] > 0)
+        pids = frozenset(s["pid"] for s in chosen.values()
+                         if not s.get('native_foreground') and type(s.get("pid")) is int and s["pid"] > 0)
         cached_at, cached_pids, starts = self.wakeup_process_cache
         now = time.monotonic()
         if pids != cached_pids or now - cached_at >= 1:
-            starts = codex_process_starts(pids)
+            starts = codex_process_starts(pids) if pids else {}
             self.wakeup_process_cache = (now, pids, starts)
-        return [{**source, "identity_current": bool(source.get("pid") in starts
-                  and abs(starts[source["pid"]] - source["process_start"]) < 1)}
+        return [{**source, "identity_current": (True if source.get('native_foreground') else
+                  bool(source.get("pid") in starts
+                       and abs(starts[source["pid"]] - source["process_start"]) < 1))}
                 for source in chosen.values()]
 
     def evidence(self, target):
@@ -862,21 +946,14 @@ class QueueRecovery:
             if guarded and guarded.get("session_id"):
                 return {"session_id": guarded["session_id"], "pid": guarded["pid"],
                         "process_start": guarded["process_start"], "kind": guarded["kind"],
+                        **({"birth": guarded["birth"]} if "birth" in guarded else {}),
                         "turn_id": guarded.get("turn_id"), "at": guarded.get("at", 0),
                         "error": guarded.get("turn_error"),
                         "signature": [guarded.get("start_id"), guarded.get("turn_id"), guarded.get("at")]}
-        # A native foreground observation outranks historical Hook bindings:
-        # /resume can change selection without changing the client's PID.
         if self.process_lookup is not None:
-            from ccc_client_thread_observation import read_foreground
-            from ccc_request_observation_policy import request_observation_directory_matches
-            label = self.process_lookup(target)
-            pids = label.get('agent_pids', [])
-            if label.get('agent_kind') == 'codex' and len(pids) == 1:
-                status, _, _ = read_foreground(pids[0], request_observation_directory_matches)
-                if status != 'absent':
-                    from ccc_shared_codex_turn import current_turn
-                    return current_turn(target, pids[0], self.sessions_root)
+            turn = self._foreground_process_turn(target, self.process_lookup(target))
+            if turn is not None:
+                return turn
         try:
             records = self.records()
         except FileNotFoundError:
@@ -904,6 +981,56 @@ class QueueRecovery:
             return self._open_process_turn(target)
         return matches[0] if len(matches) == 1 else {"kind": "unknown"}
 
+    def _foreground_process_turn(self, target, label):
+        """Keep a locator through inventory gaps, never a cached native verdict.
+
+        Shared app-server clients do not hold their own rollout open. Their
+        authenticated foreground path must also feed the native wakeup scanner
+        and outrank historical Hooks while the GUI process inventory refreshes.
+        Every use still verifies the foreground, client, connected writer, lock,
+        file identity and current lifecycle through the shared native reader.
+        """
+        from ccc_client_thread_observation import read_foreground
+        from ccc_request_observation_policy import request_observation_directory_matches
+        from ccc_shared_codex_turn import current_turn
+
+        with self.lock:
+            known = dict(self.open_file_sources.get(str(target['surface_id']), {}))
+        if (not known.get('native_foreground')
+                or known.get('workspace_id') != str(target['workspace_id'])):
+            known = {}
+        pids = label.get('agent_pids', [])
+        hinted = label.get('agent_kind') != 'codex' or len(pids) != 1
+        if hinted:
+            if not known:
+                return None
+            if label.get('summary') not in {'process refresh pending', 'process lookup unavailable'}:
+                return {'kind': 'unknown', 'reason': 'current process inventory conflicts with native client'}
+            pids = [known['pid']]
+        pid = pids[0]
+        status, _, _ = read_foreground(pid, request_observation_directory_matches)
+        if status == 'absent' and not (hinted or known.get('pid') == pid):
+            return None  # A client without native foreground support uses the legacy reader.
+        turn = current_turn(target, pid, self.sessions_root)
+        if turn.get('kind') == 'unknown':
+            return turn
+        if hinted and any(turn.get(key) != known.get(key) for key in
+                          ('pid', 'process_start', 'birth', 'session_id', 'shared_writer')):
+            return {'kind': 'unknown', 'reason': 'original native client or selection changed during inventory refresh'}
+        path = turn.get('transcript_path')
+        if not path or (hinted and path != str(known.get('path'))):
+            return {'kind': 'unknown', 'reason': 'original native transcript changed during inventory refresh'}
+        with self.lock:
+            source = {
+                'surface_id': str(target['surface_id']), 'workspace_id': str(target['workspace_id']),
+                'session_id': turn['session_id'], 'path': Path(path), 'pid': pid,
+                'process_start': turn['process_start'], 'birth': turn['birth'],
+                'shared_writer': turn['shared_writer'], 'native_foreground': True,
+            }
+            self.open_file_sources[str(target['surface_id'])] = source
+            self._native_wakeup_bindings[str(target['surface_id'])] = self._native_wakeup_binding(source)
+        return turn
+
     def _open_process_turn(self, target):
         """Recover read-only identity when a real SessionStart Hook was lost.
 
@@ -912,6 +1039,7 @@ class QueueRecovery:
         """
         if self.process_lookup is None:
             return None
+        from ccc_guard_scope import birth
         # A configured native reader losing its sessions directory is not a
         # legacy client. None permits viewport-only dispatch downstream and
         # could submit while the original turn is still reconnecting.
@@ -948,9 +1076,14 @@ class QueueRecovery:
 
         try:
             started = identity()
-            if started is None or (hint_started is not None and started != hint_started):
+            exact_birth = birth(pid, codex=True)
+            if (started is None or (hint_started is not None and started != hint_started)
+                    or (exact_birth is None and (sys.platform == "darwin" or _proc_pidinfo is not None))
+                    or (exact_birth is not None and exact_birth[0] != started)
+                    or (hint_source is not None and 'birth' in hint_source
+                        and hint_source['birth'] != exact_birth)):
                 return {"kind": "unknown"}
-            cache_key = (pid, started)
+            cache_key = (pid, started, tuple(exact_birth or ()))
             with self.lock:
                 cached = self.open_file_cache.get(cache_key)
             if cached and time.monotonic() - cached[0] < 1:
@@ -975,16 +1108,20 @@ class QueueRecovery:
                     or path != Path(str(hint_source.get("path") or "")).resolve()):
                 return {"kind": "unknown"}
             snapshot = task_snapshot(path, sid)
-            if identity() != started:
+            if identity() != started or birth(pid, codex=True) != exact_birth:
                 return {"kind": "unknown"}
+            # Legacy platforms can lack microsecond birth inspection. When
+            # available, carry this freshly checked identity through every
+            # open/idle transition; never fill it from the source cache.
+            generation = {'birth': list(exact_birth)} if exact_birth is not None else {}
             with self.lock:
                 self.open_file_sources[str(target["surface_id"])] = {
                     "surface_id": str(target["surface_id"]), "workspace_id": str(target["workspace_id"]),
                     "session_id": sid, "path": path, "process_start": started,
-                    "pid": pid,
+                    "pid": pid, **generation,
                 }
             return {"session_id": sid, "pid": pid, "process_start": started,
-                    **(snapshot or {"kind": "unknown"})}
+                    **generation, **(snapshot or {"kind": "unknown"})}
         except (OSError, ValueError, subprocess.SubprocessError):
             return {"kind": "unknown"}
 
@@ -1064,6 +1201,7 @@ class QueueRecovery:
                 self.open_file_sources[str(target["surface_id"])] = {
                     "surface_id": str(target["surface_id"]), "workspace_id": str(target["workspace_id"]),
                     "session_id": sid, "path": path, "process_start": process["process_start"], "pid": pid,
+                    "birth": list(process["birth"]),
                 }
             return {"session_id": sid, "pid": pid, "process_start": process["process_start"],
                     "birth": process["birth"], **snapshot}

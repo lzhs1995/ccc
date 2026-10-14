@@ -5,7 +5,11 @@ Discovery caches PID hints only; every use rechecks identities and connection.
 """
 import ctypes
 from contextlib import closing
+import hashlib
+import json
+import os
 from pathlib import Path
+import re
 import sqlite3
 import stat
 import threading
@@ -54,6 +58,68 @@ def _linked(path, identity):
             and info.st_ino == identity['inode'])
 
 
+def _protected_root():
+    return Path.home() / 'Library/Application Support/CodexSessionBackup/protected/sessions'
+
+
+def _held_rollout(path, sid, root):
+    return ((path.suffix == '.jsonl' and path.name.endswith('-' + sid + '.jsonl')
+             and path.is_relative_to(root))
+            or (path.is_relative_to(_protected_root())
+                and ('-' + sid + '.jsonl') in path.name))
+
+
+def _protected_metadata(path, sid, identity):
+    """Authenticate only a native-held protected rollout, never a backup search.
+
+    Pin the bounded metadata prefix and ancestor identities, not journal size or
+    mtime: the native writer may legitimately append while the binding is live.
+    """
+    root = _protected_root()
+    relative = path.relative_to(root).as_posix()
+    pattern = (r'([0-9]{4})/([0-9]{2})/([0-9]{2})/rollout-\1-\2-\3T'
+               r'[0-9]{2}-[0-9]{2}-[0-9]{2}-' + re.escape(sid)
+               + r'\.jsonl\.' + str(identity['device']) + '-' + str(identity['inode']))
+    if not re.fullmatch(pattern, relative):
+        raise ValueError('invalid protected rollout name or vnode')
+
+    def placement():
+        if path.resolve(strict=True) != path or not _linked(path, identity):
+            raise ValueError('protected rollout moved or linked')
+        parents = []
+        for parent in path.parents:
+            info = parent.lstat()
+            if not stat.S_ISDIR(info.st_mode):
+                raise ValueError('protected rollout ancestor is not a directory')
+            parents.append((str(parent), info.st_dev, info.st_ino))
+        return parents
+
+    parents = placement()
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, 'rb', buffering=0) as stream:
+        info = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_dev != identity['device']
+                or info.st_ino != identity['inode']):
+            raise ValueError('protected rollout descriptor changed')
+        prefix = os.pread(stream.fileno(), 65536, 0)
+        newline = prefix.find(b'\n')
+        if newline < 0:
+            raise ValueError('protected rollout metadata missing or oversized')
+        raw = prefix[:newline + 1]
+        meta = json.loads(raw)
+        if (not isinstance(meta, dict) or meta.get('type') != 'session_meta'
+                or not isinstance(meta.get('payload'), dict)
+                or meta['payload'].get('id') != sid):
+            raise ValueError('protected rollout session metadata mismatch')
+        # Bypass buffered reads: a same-inode rewrite must not be hidden by a
+        # seek into the first read's cache. Appending after this prefix is fine.
+        if os.pread(stream.fileno(), len(raw), 0) != raw:
+            raise ValueError('protected rollout metadata changed during read')
+    if placement() != parents:
+        raise ValueError('protected rollout ancestors changed')
+    return {'sha256': hashlib.sha256(raw).hexdigest(), 'bytes': len(raw), 'parents': parents}
+
+
 def _rollout_row(database, sid, root):
     # A closed rollout is located only through the selected writer's own DB.
     # Bound the value as well as the row count; never search all session files.
@@ -68,6 +134,22 @@ def _rollout_row(database, sid, root):
             or not path.name.endswith('-' + sid + '.jsonl')):
         raise ValueError('invalid rollout mapping')
     return path
+
+
+def writer_files(pid):
+    """Retry a changing complete inventory, never combine partial evidence.
+
+    A shared app-server opens and moves other sessions' files concurrently.
+    A rejected snapshot conveys no ownership; each retry starts both native
+    passes again. Short reads and persistent drift still fail closed, and
+    callers retain all process, connection, selected lock and rollout checks.
+    """
+    for attempt in range(3):
+        try:
+            return native.process_writable_files(pid, identities=True)
+        except native.VnodeInventoryChanged:
+            if attempt == 2:
+                raise
 
 
 def binding(target, pid, sessions_root):
@@ -89,16 +171,16 @@ def binding(target, pid, sessions_root):
             born = scope.birth(writer, codex=True)
             if not born or not connected_writer(pid, writer, process['birth'], born):
                 continue
-            files = native.process_writable_files(writer, identities=True)
+            files = writer_files(writer)
             locks = [p for p in files if p.parent.name == 'thread-writer-locks'
                      and p.name == sid + '.lock'
                      and (p.parent.parent / 'sessions').resolve() == root]
             if len(locks) != 1 or not _linked(locks[0], files[locks[0]]):
                 continue
-            paths = [p for p in files if p.suffix == '.jsonl'
-                     and p.name.endswith('-' + sid + '.jsonl') and p.is_relative_to(root)]
+            paths = [p for p in files if _held_rollout(p, sid, root)]
             held = {locks[0]: files[locks[0]]}
             database = None
+            protected = None
             if not paths:
                 databases = [p for p in files if p.name == 'state_5.sqlite'
                              and p.parent == locks[0].parent.parent]
@@ -114,10 +196,13 @@ def binding(target, pid, sessions_root):
                 held[paths[0]] = identity
             if len(paths) != 1 or not _linked(paths[0], identity):
                 continue
+            if paths[0].is_relative_to(_protected_root()):
+                protected = _protected_metadata(paths[0], sid, identity)
             matches.append({'pid': pid, 'process': process, 'writer_pid': writer,
                             'writer_birth': born, 'selection': selection, 'session_id': sid,
                             'sessions_root': str(root), 'paths': held,
                             'rollout_identity': identity, 'rollout_database': database,
+                            'protected_metadata': protected,
                             'path': paths[0]})
         if len(matches) != 1 or not valid(target, matches[0]):
             return None, 'native foreground writer missing, ambiguous or changed'
@@ -136,12 +221,24 @@ def valid(target, proof):
                 or read_foreground(pid, request_observation_directory_matches) != proof['selection']
                 or not connected_writer(pid, writer, process['birth'], proof['writer_birth'])):
             return False
-        files = native.process_writable_files(writer, identities=True)
+        files = writer_files(writer)
         if any(files.get(p) != identity or not _linked(p, identity)
                for p, identity in proof['paths'].items()):
             return False
         if not _linked(proof['path'], proof['rollout_identity']):
             return False
+        if proof.get('protected_metadata') is not None:
+            if ({p for p in files if _held_rollout(p, proof['session_id'],
+                                                Path(proof['sessions_root']))} != {proof['path']}
+                    or _protected_metadata(proof['path'], proof['session_id'],
+                                           proof['rollout_identity']) != proof['protected_metadata']):
+                return False
+            after = writer_files(writer)
+            if ({p for p in after if _held_rollout(p, proof['session_id'],
+                                                 Path(proof['sessions_root']))} != {proof['path']}
+                    or any(after.get(p) != identity or not _linked(p, identity)
+                           for p, identity in proof['paths'].items())):
+                return False
         if (proof['rollout_database'] is not None
                 and _rollout_row(proof['rollout_database'], proof['session_id'],
                                  Path(proof['sessions_root'])) != proof['path']):
@@ -166,6 +263,7 @@ def current_turn(target, pid, sessions_root):
             return {'kind': 'unknown', 'reason': 'native foreground lifecycle missing or changed'}
         return {**snapshot, 'pid': pid, 'process_start': process['process_start'],
                 'birth': process['birth'], 'session_id': proof['session_id'],
+                'transcript_path': str(proof['path']),
                 'shared_writer': {'pid': proof['writer_pid'], 'birth': proof['writer_birth'],
                                   'sessions_root': proof['sessions_root']}}
     except (OSError, ValueError, KeyError, TypeError):

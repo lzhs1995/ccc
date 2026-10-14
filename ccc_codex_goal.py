@@ -10,6 +10,7 @@ from contextlib import closing
 import re
 import hashlib
 import json
+import math
 import sqlite3
 import time
 import uuid
@@ -17,11 +18,29 @@ import stat
 
 import ccc_codex_queue as native
 import ccc_guard_scope as scope
+from ccc_shared_codex_turn import writer_files
 
 
 def linked(path, identity):
     info = Path(path).stat()
     return info.st_dev == identity["device"] and info.st_ino == identity["inode"]
+
+
+def _provider_database(files, lock):
+    databases = [p for p in files if p.name == 'state_5.sqlite'
+                 and p.parent == lock.parent.parent]
+    if len(databases) != 1:
+        raise ValueError('missing original writer provider database')
+    return databases[0]
+
+
+def _read_provider(database, sid):
+    with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True, timeout=.05)) as db:
+        rows = db.execute('SELECT substr(model_provider,1,1025) FROM threads WHERE id=? LIMIT 2', (sid,)).fetchall()
+    if (len(rows) != 1 or not isinstance(rows[0][0], str)
+            or not rows[0][0].strip() or len(rows[0][0]) > 1024):
+        raise ValueError('missing original session provider')
+    return rows[0][0]
 
 
 def provider_for_turn(target, turn):
@@ -42,7 +61,7 @@ def provider_for_turn(target, turn):
             if shared is None:
                 return None
             writer_pid = shared['writer_pid']
-        files = native.process_writable_files(writer_pid, identities=True)
+        files = writer_files(writer_pid)
         # Child threads retain their own writer locks in the same process.
         # Select only the independently bound primary session; never choose
         # whichever lock happens to be returned first by the OS.
@@ -51,24 +70,18 @@ def provider_for_turn(target, turn):
                  and p.suffix == '.lock' and p.stem == sid]
         if len(locks) != 1:
             return None
-        databases = [p for p in files if p.name == 'state_5.sqlite' and p.parent == locks[0].parent.parent]
-        if len(databases) != 1:
-            return None
-        paths = [locks[0], databases[0]]
+        database = _provider_database(files, locks[0])
+        paths = [locks[0], database]
         if not all(not p.is_symlink() and linked(p, files[p]) for p in paths):
             return None
-        def read():
-            with closing(sqlite3.connect(databases[0].as_uri() + '?mode=ro', uri=True, timeout=.05)) as db:
-                return db.execute('SELECT substr(model_provider,1,1025) FROM threads WHERE id=? LIMIT 2', (sid,)).fetchall()
-        rows = read()
-        if (len(rows) != 1 or not isinstance(rows[0][0], str)
-                or not rows[0][0].strip() or len(rows[0][0]) > 1024 or read() != rows):
+        provider = _read_provider(database, sid)
+        if _read_provider(database, sid) != provider:
             return None
-        current = native.process_writable_files(writer_pid, identities=True)
+        current = writer_files(writer_pid)
         if ((shared is not None and binding_for_turn(target, turn) is None)
                 or scope.process(pid) != process or any(current.get(p) != files[p] or p.is_symlink() or not linked(p, files[p]) for p in paths)):
             return None
-        return rows[0][0]
+        return provider
     except (OSError, ValueError, KeyError, TypeError, sqlite3.Error):
         return None
 
@@ -157,7 +170,7 @@ def blocked_goal(target, pid, *, current_turn=None):
             if shared is None:
                 return None
             writer_pid, writer_birth = shared['writer_pid'], shared['writer_birth']
-        files = native.process_writable_files(writer_pid, identities=True)
+        files = writer_files(writer_pid)
         locks = [p for p in files if p.parent.name == "thread-writer-locks" and p.suffix == ".lock"]
         if current_turn is not None:
             if (current_turn.get('pid') != pid
@@ -174,7 +187,11 @@ def blocked_goal(target, pid, *, current_turn=None):
         root = locks[0].parent.parent
         if logs[0].parent != root:
             return None
-        held_paths = [locks[0], logs[0]]
+        # Resolve the provider while the real native turn still authenticates
+        # the writer. A Goal proof has different kind/at fields and must not
+        # impersonate that turn by copying its shared_writer hint later.
+        provider_database = _provider_database(files, locks[0])
+        held_paths = [locks[0], logs[0], provider_database]
         # Idle native clients may close their goal DB connection while retaining
         # the original writer lock and logs DB. Only an independently bound
         # completed primary turn may use that exact root's closed goal database.
@@ -189,12 +206,21 @@ def blocked_goal(target, pid, *, current_turn=None):
             held_paths += goals
         if len(goals) != 1 or goals[0].parent != root or goals[0].is_symlink():
             return None
-        paths = [locks[0], goals[0], logs[0]]
-        if not all(linked(p, files[p]) for p in paths):
+        paths = [locks[0], goals[0], logs[0], provider_database]
+        if not all(not p.is_symlink() and linked(p, files[p]) for p in paths):
             return None
+        provider = _read_provider(provider_database, sid)
         with closing(sqlite3.connect(goals[0].as_uri() + "?mode=ro", uri=True, timeout=.05)) as db:
             goal = db.execute("SELECT goal_id,status,updated_at_ms FROM thread_goals WHERE thread_id=?", (sid,)).fetchone()
-        if not goal or goal[1] != "blocked" or not 0 <= time.time() - goal[2] / 1000 < 86400:
+        if not goal or goal[1] != "blocked":
+            return None
+        age = time.time() - goal[2] / 1000
+        # A completed primary turn is reauthenticated by the caller and matched
+        # to the original writer/error below. Its blocked goal does not expire
+        # merely because a provider outage lasts more than a day. Without that
+        # independent turn, keep the bounded fallback for missing rollout data.
+        if (not math.isfinite(age) or age < 0
+                or (current_turn is None and age >= 86400)):
             return None
         query = ("SELECT id,ts,ts_nanos,substr(feedback_log_body,1,65537),process_uuid,target FROM logs "
                 "WHERE thread_id=? AND ts>=? AND ((target='codex_core::session::turn' "
@@ -229,7 +255,9 @@ def blocked_goal(target, pid, *, current_turn=None):
         with closing(sqlite3.connect(logs[0].as_uri() + "?mode=ro", uri=True, timeout=.05)) as db:
             if db.execute(query, params).fetchall() != rows:
                 return None
-        current_files = native.process_writable_files(writer_pid, identities=True)
+        if _read_provider(provider_database, sid) != provider:
+            return None
+        current_files = writer_files(writer_pid)
         if (scope.process(pid) != process
                 or (shared is not None and binding_for_turn(target, current_turn) is None)
                 or any(current_files.get(p) != files[p] for p in held_paths)
@@ -238,6 +266,7 @@ def blocked_goal(target, pid, *, current_turn=None):
         return {"kind": "goal_blocked", "session_id": sid, "turn_id": turn[1], "pid": pid,
                 "process_start": process["birth"][0], "birth": process["birth"], "at": goal[2] / 1000,
                 "goal_id": goal[0], "error": {"message": error[1]}, "log_id": row[0],
+                "model_provider": provider,
                 "submission_digest": hashlib.sha256(json.dumps(following).encode()).hexdigest()}
     except (OSError, ValueError, KeyError, TypeError, sqlite3.Error):
         return None

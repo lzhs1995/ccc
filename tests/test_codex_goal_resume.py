@@ -10,6 +10,7 @@ import uuid
 from unittest.mock import patch
 
 import ccc_codex_goal as goal
+from ccc_codex_queue import task_snapshot
 import cmux_codex_watch as core
 from ccc_provider_retry import ProviderRetryStore
 from tests.test_codex_status_chrome import status_payload, visible_text, ERRORS
@@ -39,6 +40,7 @@ class NativeGoalEvidenceTests(unittest.TestCase):
                 "codex_core::session::turn", f"turn{{turn.id={self.tid} model=model}}:session_task.run:run_turn: Turn error: " + ERRORS["rate_limit"],
                 "pid:12345:process-generation"))
         self.files = {p: {"device": p.stat().st_dev, "inode": p.stat().st_ino} for p in (lock, self.goals, self.logs)}
+        self.provider_state()
         self.scope = patch.object(goal.scope, "process", return_value=self.process)
         self.inventory = patch.object(goal.native, "process_writable_files", return_value=self.files)
         self.scope.start()
@@ -51,12 +53,100 @@ class NativeGoalEvidenceTests(unittest.TestCase):
         self.assertEqual(result["kind"], "goal_blocked")
         self.assertEqual(result["session_id"], self.sid)
         self.assertEqual(result["turn_id"], self.tid)
+        self.assertEqual(result['model_provider'], 'original-provider')
+
+    def test_goal_and_provider_retry_complete_inventory_churn_at_each_boundary(self):
+        self.provider_state()
+        readers = (lambda: goal.blocked_goal(self.target, 12345, current_turn=self.primary_turn()),
+                   lambda: goal.provider_for_turn(self.target, self.primary_turn()))
+        for reader in readers:
+            for boundary in (0, 1):
+                with self.subTest(reader=readers.index(reader), boundary=boundary):
+                    drift = goal.native.VnodeInventoryChanged('concurrent writer inventory changed')
+                    values = ([self.files] if boundary else []) + [drift, drift, self.files]
+                    if not boundary:
+                        values.append(self.files)
+                    with patch.object(goal.native, 'process_writable_files', side_effect=values) as read:
+                        self.assertIsNotNone(reader())
+                        self.assertEqual(read.call_count, 4)
+
+    def test_goal_and_provider_persistent_inventory_drift_stops_after_three_reads(self):
+        self.provider_state()
+        for reader in (lambda: goal.blocked_goal(self.target, 12345, current_turn=self.primary_turn()),
+                       lambda: goal.provider_for_turn(self.target, self.primary_turn())):
+            with patch.object(goal.native, 'process_writable_files',
+                              side_effect=goal.native.VnodeInventoryChanged('drift')) as read:
+                self.assertIsNone(reader())
+                self.assertEqual(read.call_count, 3)
+
+    def test_incomplete_inventory_never_borrows_a_retry_or_prior_snapshot(self):
+        self.provider_state()
+        for reader in (lambda: goal.blocked_goal(self.target, 12345, current_turn=self.primary_turn()),
+                       lambda: goal.provider_for_turn(self.target, self.primary_turn())):
+            for boundary in (0, 1):
+                values = ([self.files] if boundary else []) + [goal.native.IncompleteVnodeRead('short read')]
+                with patch.object(goal.native, 'process_writable_files', side_effect=values) as read:
+                    self.assertIsNone(reader())
+                    self.assertEqual(read.call_count, boundary + 1)
+
+    def test_inventory_retry_does_not_accept_replaced_selected_lock(self):
+        self.provider_state()
+        replacement = {p: dict(identity) for p, identity in self.files.items()}
+        lock = next(p for p in replacement if p.suffix == '.lock')
+        replacement[lock]['inode'] += 1
+        for reader in (lambda: goal.blocked_goal(self.target, 12345, current_turn=self.primary_turn()),
+                       lambda: goal.provider_for_turn(self.target, self.primary_turn())):
+            with patch.object(goal.native, 'process_writable_files', side_effect=[
+                    self.files, goal.native.VnodeInventoryChanged('drift'), replacement]):
+                self.assertIsNone(reader())
 
     def primary_turn(self):
         return {'pid': 12345, 'process_start': self.process['birth'][0],
                 'session_id': self.sid, 'turn_id': self.tid, 'kind': 'task_complete',
                 'at': self.now + .054,
                 'error': {'message': ERRORS['rate_limit'], 'codex_error_info': 'rate_limit_exceeded'}}
+
+    def test_day_old_blocked_goal_requires_matching_live_completed_turn(self):
+        updated = (int(self.now * 1000) + 5) / 1000
+        for age in (86399, 86400, 86401, 7 * 86400):
+            with self.subTest(age=age), patch.object(goal.time, 'time', return_value=updated + age):
+                legacy = goal.blocked_goal(self.target, 12345)
+                self.assertEqual(legacy is not None, age < 86400)
+                proof = goal.blocked_goal(self.target, 12345, current_turn=self.primary_turn())
+                self.assertIsNotNone(proof)
+                self.assertEqual(proof['turn_id'], self.tid)
+                self.assertEqual(proof['at'], updated)
+
+    def test_day_old_goal_cannot_borrow_wrong_turn_error_or_process(self):
+        with patch.object(goal.time, 'time', return_value=self.now + 2 * 86400):
+            for change in ({'session_id': str(uuid.uuid4())}, {'pid': 999},
+                           {'process_start': 1}, {'turn_id': str(uuid.uuid4())},
+                           {'kind': 'task_started'}, {'error': {'message': 'other'}}):
+                with self.subTest(change=change):
+                    self.assertIsNone(goal.blocked_goal(self.target, 12345,
+                        current_turn={**self.primary_turn(), **change}))
+
+    def test_future_or_nonfinite_goal_age_never_authorizes(self):
+        for now in (self.now - 1, float('nan'), float('inf'), float('-inf')):
+            for turn in (None, self.primary_turn()):
+                with self.subTest(now=now, turn=turn), patch.object(goal.time, 'time', return_value=now):
+                    self.assertIsNone(goal.blocked_goal(self.target, 12345, current_turn=turn))
+
+    def test_day_old_goal_still_rejects_later_unmatched_submission(self):
+        with patch.object(goal.time, 'time', return_value=self.now + 2 * 86400):
+            self.assertIsNotNone(goal.blocked_goal(self.target, 12345, current_turn=self.primary_turn()))
+            self.append_submission(self.submission(mode='StartOrSteer'))
+            self.assertIsNone(goal.blocked_goal(self.target, 12345, current_turn=self.primary_turn()))
+
+    def test_day_old_goal_still_rechecks_native_lifecycle(self):
+        from types import SimpleNamespace
+        turn = self.primary_turn()
+        turns = iter([turn, {**turn, 'kind': 'task_started'}])
+        queue = SimpleNamespace(process_lookup=lambda _: {'agent_kind': 'codex', 'agent_pids': [12345]},
+                                current_turn=lambda _: next(turns))
+        with patch.object(goal.time, 'time', return_value=self.now + 2 * 86400):
+            self.assertIsNone(core.WatchDaemon._current_blocked_goal(
+                SimpleNamespace(codex_queue_recovery=queue), self.target))
 
     def add_child_lock(self):
         lock = self.goals.parent / 'thread-writer-locks' / (str(uuid.uuid4()) + '.lock')
@@ -98,8 +188,10 @@ class NativeGoalEvidenceTests(unittest.TestCase):
         calls = 0
         def connect(*args, **kwargs):
             nonlocal calls
-            calls += 1
-            if calls == 3:
+            if str(args[0]).startswith(self.goals.as_uri() + '?'):
+                calls += 1
+            if calls == 2:
+                calls += 1
                 replacement = self.goals.with_name('replacement.sqlite')
                 replacement.write_bytes(self.goals.read_bytes())
                 replacement.replace(self.goals)
@@ -128,11 +220,7 @@ class NativeGoalEvidenceTests(unittest.TestCase):
         self.assertIsNone(method(daemon, self.target))
 
     def test_provider_comes_from_original_open_database_and_writer(self):
-        state = self.goals.parent / 'state_5.sqlite'
-        with closing(sqlite3.connect(state)) as db, db:
-            db.execute('CREATE TABLE threads(id PRIMARY KEY, model_provider)')
-            db.execute('INSERT INTO threads VALUES(?, ?)', (self.sid, 'original-provider'))
-        self.files[state] = {'device': state.stat().st_dev, 'inode': state.stat().st_ino}
+        state = self.provider_state()
         turn = {'pid': 12345, 'session_id': self.sid, 'process_start': self.process['birth'][0]}
         self.assertEqual(goal.provider_for_turn(self.target, turn), 'original-provider')
         self.assertIsNone(goal.provider_for_turn(self.target, {**turn, 'session_id': str(uuid.uuid4())}))
@@ -145,8 +233,8 @@ class NativeGoalEvidenceTests(unittest.TestCase):
     def provider_state(self):
         state = self.goals.parent / 'state_5.sqlite'
         with closing(sqlite3.connect(state)) as db, db:
-            db.execute('CREATE TABLE threads(id PRIMARY KEY, model_provider)')
-            db.execute('INSERT INTO threads VALUES(?,?)', (self.sid, 'original-provider'))
+            db.execute('CREATE TABLE IF NOT EXISTS threads(id PRIMARY KEY, model_provider)')
+            db.execute('INSERT OR REPLACE INTO threads VALUES(?,?)', (self.sid, 'original-provider'))
         self.files[state] = {'device': state.stat().st_dev, 'inode': state.stat().st_ino}
         return state
 
@@ -159,8 +247,9 @@ class NativeGoalEvidenceTests(unittest.TestCase):
         self.assertEqual(goal.provider_for_turn(self.target, turn), 'original-provider')
         clock = [turn["at"] + .1]
         store = ProviderRetryStore(self.goals.parent / 'retry.sqlite', clock=lambda: clock[0], jitter=lambda: 0)
-        daemon = SimpleNamespace(codex_queue_recovery=SimpleNamespace(current_turn=lambda _: turn), _provider_retry=store)
-        runtime = SimpleNamespace(paused_reason='')
+        daemon = SimpleNamespace(codex_queue_recovery=SimpleNamespace(current_turn=lambda _: turn),
+            _provider_retry=store, _codex_turn_key_identity=core.WatchDaemon._codex_turn_key_identity)
+        runtime = core.TargetRuntime(paused_reason='')
         method = core.WatchDaemon._provider_retry_gate
         state = SimpleNamespace(error_type='rate_limit')
         self.assertFalse(method(daemon, self.target, runtime, state))
@@ -202,7 +291,100 @@ class NativeGoalEvidenceTests(unittest.TestCase):
 
     def test_provider_missing_database_never_guesses_global_config(self):
         turn = {'pid': 12345, 'session_id': self.sid, 'process_start': self.process['birth'][0]}
+        del self.files[self.goals.parent / 'state_5.sqlite']
         self.assertIsNone(goal.provider_for_turn(self.target, turn))
+        self.assertIsNone(goal.blocked_goal(self.target, 12345, current_turn=self.primary_turn()))
+
+    def test_shared_goal_keeps_provider_without_impersonating_native_turn(self):
+        native_turn = {**self.primary_turn(), 'shared_writer': {'pid': 54321}}
+        binding = {'writer_pid': 54321, 'writer_birth': [int(self.now) - 101, 0]}
+        with closing(sqlite3.connect(self.logs)) as db, db:
+            db.execute("UPDATE logs SET process_uuid='pid:54321:writer-generation'")
+        def inventory(pid, *, identities):
+            self.assertEqual(pid, 54321, 'must not scan the frontend for the shared provider')
+            self.assertTrue(identities)
+            return self.files
+        with patch('ccc_shared_codex_turn.binding_for_turn', return_value=binding) as verify, \
+             patch.object(goal.native, 'process_writable_files', side_effect=inventory):
+            proof = goal.blocked_goal(self.target, 12345, current_turn=native_turn)
+        self.assertIsNotNone(proof)
+        self.assertEqual(proof['model_provider'], 'original-provider')
+        self.assertNotIn('shared_writer', proof)
+        self.assertEqual(verify.call_count, 2)
+        self.assertTrue(all(call.args == (self.target, native_turn) for call in verify.call_args_list))
+        with patch.object(goal, 'provider_for_turn', side_effect=AssertionError('lost provider identity')):
+            identity = core.WatchDaemon._codex_input_identity(self.target, proof, goal=True)
+        self.assertEqual(identity['model_provider'], 'original-provider')
+        with patch('ccc_shared_codex_turn.binding_for_turn', side_effect=[binding, None]):
+            self.assertIsNone(goal.blocked_goal(self.target, 12345, current_turn=native_turn))
+
+    def test_goal_provider_replacement_or_update_during_read_is_rejected(self):
+        state = self.provider_state()
+        read = goal._read_provider
+        for change in ('replace', 'update'):
+            with self.subTest(change=change):
+                self.provider_state()
+                calls = 0
+                def changed(database, sid):
+                    nonlocal calls
+                    calls += 1
+                    if calls == 2:
+                        if change == 'replace':
+                            replacement = state.with_name('replacement.sqlite')
+                            replacement.write_bytes(state.read_bytes())
+                            replacement.replace(state)
+                        else:
+                            with closing(sqlite3.connect(state)) as db, db:
+                                db.execute("UPDATE threads SET model_provider='replacement'")
+                    return read(database, sid)
+                with patch.object(goal, '_read_provider', side_effect=changed):
+                    self.assertIsNone(goal.blocked_goal(self.target, 12345, current_turn=self.primary_turn()))
+
+    def retry_daemon(self, turn, store):
+        from types import SimpleNamespace
+        return SimpleNamespace(codex_queue_recovery=SimpleNamespace(current_turn=lambda _: turn),
+            _current_blocked_goal=lambda target: goal.blocked_goal(target, 12345),
+            _provider_retry=store, _codex_turn_key_identity=core.WatchDaemon._codex_turn_key_identity)
+
+    def test_none_and_unknown_rollout_use_bound_goal_retry_evidence(self):
+        from types import SimpleNamespace
+        for index, turn in enumerate((None, {}, {'kind': 'unknown'})):
+            with self.subTest(turn=turn):
+                store = ProviderRetryStore(self.goals.parent / f'goal-retry-{index}.sqlite',
+                    clock=lambda: self.now + 1, jitter=lambda: 0)
+                runtime = core.TargetRuntime()
+                self.assertTrue(core.WatchDaemon._provider_retry_gate(
+                    self.retry_daemon(turn, store), self.target, runtime,
+                    SimpleNamespace(error_type='rate_limit'), dry_run=True))
+                with store.transaction() as db:
+                    self.assertEqual(db.execute('SELECT identity FROM episodes').fetchall(),
+                        [(store.identity(self.sid, 'original-provider'),)])
+
+    def test_missing_retry_evidence_is_not_a_broken_ledger(self):
+        from types import SimpleNamespace
+        turn = {**self.primary_turn(), 'model_provider': 'original-provider'}
+        for change in ({'session_id': None}, {'turn_id': None}, {'model_provider': None},
+                       {'at': None}, {'at': 'yesterday'}, {'at': True}, {'at': float('nan')}):
+            with self.subTest(change=change):
+                store = ProviderRetryStore(self.goals.parent / 'missing-evidence.sqlite')
+                runtime = core.TargetRuntime()
+                with patch.object(goal, 'provider_for_turn', return_value=None):
+                    self.assertFalse(core.WatchDaemon._provider_retry_gate(
+                        self.retry_daemon({**turn, **change}, store), self.target, runtime,
+                        SimpleNamespace(error_type='rate_limit')))
+                self.assertEqual(runtime.provider_retry_status['reason_code'], 'provider_retry_evidence_missing')
+                self.assertFalse(store.path.exists())
+
+    def test_corrupt_ledger_json_keeps_ledger_failure_classification(self):
+        from types import SimpleNamespace
+        turn = {**self.primary_turn(), 'model_provider': 'original-provider'}
+        store = ProviderRetryStore(self.goals.parent / 'corrupt-ledger.sqlite')
+        with store.transaction() as db:
+            db.execute('INSERT INTO episodes VALUES (?, ?)', (store.identity(self.sid, 'original-provider'), '{'))
+        runtime = core.TargetRuntime()
+        self.assertFalse(core.WatchDaemon._provider_retry_gate(
+            self.retry_daemon(turn, store), self.target, runtime, SimpleNamespace(error_type='rate_limit')))
+        self.assertEqual(runtime.provider_retry_status['reason_code'], 'provider_retry_ledger_unavailable')
 
     def test_later_submission_active_goal_and_replaced_database_each_veto(self):
         with closing(sqlite3.connect(self.logs)) as db, db:
@@ -310,8 +492,10 @@ class NativeGoalEvidenceTests(unittest.TestCase):
         calls = 0
         def connect(*args, **kwargs):
             nonlocal calls
-            calls += 1
-            if calls == 3:
+            if str(args[0]).startswith(self.goals.as_uri() + '?'):
+                calls += 1
+            if calls == 2:
+                calls += 1
                 with closing(original(self.logs)) as db, db:
                     db.execute('INSERT INTO logs VALUES(?,?,?,?,?,?,?)', (
                         2, int(self.now) + 1, 0, self.sid, 'codex_core::session::handlers',
@@ -361,6 +545,38 @@ class GoalResumeDeliveryTests(unittest.TestCase):
             self.daemon.process_once(self.client)
         self.assertEqual(len(self.client.sent), 1)
         self.assertEqual(self.client.sent[0][-1], "/goal resume")
+
+    def test_goal_resume_measures_latency_from_matching_native_completion(self):
+        self.daemon._native_failed('surface-uuid', 'workspace-uuid', 'original', 'failed', 199.75)
+        with patch.object(goal, 'blocked_goal', return_value=self.proof):
+            self.daemon.process_once(self.client)
+        runtime = self.daemon.runtime['surface-uuid']
+        self.assertEqual([row[-1] for row in self.client.sent], ['/goal resume'])
+        self.assertTrue(runtime.native_send_latency_measured)
+        self.assertTrue(runtime.native_send_deadline_missed)
+        self.assertAlmostEqual(runtime.native_complete_to_send_ms,
+                               (runtime.send_io_started_at - 199.75) * 1000, places=2)
+
+    def test_goal_resume_cannot_reuse_another_turns_latency(self):
+        self.daemon._native_failed('surface-uuid', 'workspace-uuid', 'original', 'other-turn', 199.75)
+        runtime = self.daemon.runtime['surface-uuid']
+        runtime.native_complete_to_send_ms = 5000
+        runtime.native_send_deadline_missed = True
+        with patch.object(goal, 'blocked_goal', return_value=self.proof):
+            self.daemon.process_once(self.client)
+        self.assertEqual([row[-1] for row in self.client.sent], ['/goal resume'])
+        self.assertFalse(runtime.native_send_latency_measured)
+        self.assertEqual(runtime.native_complete_to_send_ms, 0)
+        self.assertFalse(runtime.native_send_deadline_missed)
+
+    def test_immediate_observation_does_not_use_an_old_queued_candidate_clock(self):
+        runtime = self.daemon.runtime.setdefault('surface-uuid', core.TargetRuntime())
+        runtime.candidate_observed_at = 1.0
+        with patch.object(goal, 'blocked_goal', return_value=self.proof):
+            self.daemon.process_once(self.client)
+        self.assertEqual([row[-1] for row in self.client.sent], ['/goal resume'])
+        self.assertGreater(runtime.candidate_observed_at, 1.0)
+        self.assertLess(runtime.detection_to_send_ms, 5000)
 
     def test_goal_resumed_during_persistence_cancels_io(self):
         with patch.object(goal, "blocked_goal", side_effect=[self.proof, None]):
@@ -431,6 +647,72 @@ class GoalResumeDeliveryTests(unittest.TestCase):
         self.payload['render_grid']['row_spans'].append(span(49, 0, '• 后续消息已到达', 0))
         self.client.text = visible_text(self.payload)
         self.daemon.codex_queue_recovery.current_turn = lambda _: {**self.proof, 'kind': 'task_complete'}
+        with patch.object(goal, 'blocked_goal', return_value=None):
+            self.daemon.process_once(self.client)
+        self.assertEqual(self.client.sent, [])
+
+    def native_notice_turn(self):
+        """Real journal ordering from the stalled surface28 incident."""
+        path = Path(self.temp.name) / 'original.jsonl'
+        completed = {'type': 'event_msg', 'timestamp': '1970-01-01T00:03:20Z',
+                     'payload': {'type': 'task_complete', 'turn_id': 'failed',
+                                 'error': self.proof['error']}}
+        notice = {'type': 'response_item', 'timestamp': '1970-01-01T00:03:19Z',
+                  'payload': {'type': 'message', 'role': 'user',
+                              'content': [{'type': 'input_text', 'text': '后续消息已到达'}]}}
+        path.write_text('\n'.join(json.dumps(row) for row in (
+            {'type': 'session_meta', 'payload': {'id': 'original',
+                                                'model_provider': 'synthetic-provider'}},
+            {**completed, 'timestamp': '1970-01-01T00:02:00Z',
+             'payload': {**completed['payload'], 'turn_id': 'old-goal-turn'}},
+            notice, completed)) + '\n')
+        self.payload['render_grid']['row_spans'].append(span(49, 0, '› 后续消息已到达', 0))
+        self.client.text = visible_text(self.payload)
+        self.daemon.codex_queue_recovery.current_turn = lambda _: {
+            'session_id': 'original', 'pid': 12345, 'process_start': 1,
+            **(task_snapshot(path, 'original') or {'kind': 'unknown'})}
+        return path, notice
+
+    def test_new_native_completion_after_notices_recovers_despite_stale_goal(self):
+        self.native_notice_turn()
+        with patch.object(goal, 'blocked_goal', return_value=None):
+            self.daemon.process_once(self.client)
+            runtime = self.daemon.runtime['surface-uuid']
+            runtime.awaiting, runtime.last_send_at = False, 0
+            self.daemon.process_once(self.client)
+        self.assertEqual([r[-1] for r in self.client.sent], ['任务请继续'])
+        self.assertFalse(runtime.codex_goal_resume)
+
+    def test_native_notice_after_failed_completion_cannot_reuse_old_error(self):
+        path, notice = self.native_notice_turn()
+        with path.open('a') as stream:
+            stream.write(json.dumps(notice) + '\n')
+        # Even a backwards/equal timestamp cannot override physical append order.
+        with patch.object(goal, 'blocked_goal', return_value=None):
+            self.daemon.process_once(self.client)
+        self.assertEqual(self.client.sent, [])
+
+    def test_native_notice_arriving_during_reservation_cancels_continuation(self):
+        path, notice = self.native_notice_turn()
+        original = self.daemon._save_delivery
+        injected = []
+        def persist(*args, **kwargs):
+            result = original(*args, **kwargs)
+            if not injected:
+                with path.open('a') as stream:
+                    stream.write(json.dumps(notice) + '\n')
+                injected.append(True)
+            return result
+        with patch.object(goal, 'blocked_goal', return_value=None), \
+                patch.object(self.daemon, '_save_delivery', side_effect=persist):
+            self.daemon.process_once(self.client)
+        self.assertEqual(injected, [True])
+        self.assertEqual(self.client.sent, [])
+
+    def test_torn_native_input_after_completion_cannot_recover_stale_goal(self):
+        path, _ = self.native_notice_turn()
+        with path.open('a') as stream:
+            stream.write('{"type":"response_item","payload":')
         with patch.object(goal, 'blocked_goal', return_value=None):
             self.daemon.process_once(self.client)
         self.assertEqual(self.client.sent, [])

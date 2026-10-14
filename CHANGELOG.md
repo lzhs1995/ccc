@@ -1,5 +1,63 @@
 # Changelog
 
+## 0.2.37
+
+- Recover a blocked Codex Goal older than one day when an independently authenticated, current completed turn still proves the original failure. Keep the one-day fallback without that proof, and reject future or non-finite timestamps.
+- Retry a private Codex short check only when its delivery journal and private ledger both prove zero input for the same original attempt, task, process and failed turn. Persist the private intent before invalidating the delivery proof, then commit the delivery proof before the private no-input receipt. Partial writes, changed identities and uncertain deliveries remain closed to replay.
+- Preserve a deferred Claude Stop after a proven refusal before text input. Durably commit the retry state and zero-input proof together before clearing the transaction, and restore the provisional orphan-submit budget. A persistence failure or lost text acknowledgement retains the original reservation.
+- Set the Claude profile example template's `autoCompactWindow` to 50000 so new profiles inherit the configured window. Existing profile migration is a separate local operation.
+
+## 0.2.36
+
+- Reduce background state write amplification on clone-capable macOS filesystems by updating block-aligned records in a private clone, then atomically publishing ordinary JSON. Preserve every historical record; use a complete atomic snapshot when cloning is unavailable or the layout changes.
+- Acknowledge snapshot persistence only after syncing both the file and its parent directory. Invalidate the optimization cache after failed writes or external replacement, including failures after rename, so retries still cross the durable barrier. Cover short writes, disk exhaustion, replacement and real process interruption.
+- Resolve blocked Codex Goals against the authenticated writer's own provider database and recheck that identity before recovery. Keep missing failure evidence distinct from an unavailable retry ledger, and observe blocked Goals when the current turn is absent or unknown.
+- Wait for fresh native input identity before creating a continuation attempt. Preserve existing uncertain attempts and delivery budgets while observation catches up.
+
+## 0.2.35
+
+- Recover a newly completed failed Codex turn even when the Goal still names an older turn. Require the complete native completion at a stable physical EOF and recheck it before input; later user activity, torn records and uncertain deliveries retain their existing protections.
+- Use Claude's complete bordered composer for draft detection and final Enter checks. Hold the shared pane and target delivery leases through submission, recheck their exact inodes, and preserve original attempts and retry budgets when a lease is busy or replaced.
+- Bound background state snapshots to one write per five seconds and copy only effective targets for diagnostics. Native workers restore only their assigned surfaces while the parent retains complete history. Synchronous persistence, original UNKNOWN deliveries and the one-second health publisher keep their existing guarantees.
+- Continue newly proved transient provider failures after the old four-retry ceiling, with capped backoff and bounded durable history. Preserve explicit server deadlines, prevent replay of old failures after history pruning or restart, and distinguish missing deployments and insufficient balance from retryable outages.
+- Keep the provider decision attached to its original failed turn as observations refresh; invalidate it when newer activity or a different turn supersedes that failure. A temporarily missing render snapshot no longer permanently excludes a target from observation.
+- Recover a stalled launchd daemon with a separate, exact-parent watchdog. Scheduling-loop progress, completed observations and health publication have independent deadlines starting at 90 seconds, with bounded 15-second shutdown grace and repeated-stall backoff up to 15 minutes. A health-file write failure alone does not restart a daemon that is still scheduling and observing. Codex/Claude clients and durable delivery ledgers are preserved. Watchdog loss exits directly so blocked cleanup cannot defeat launchd recovery.
+- Recognize the exact exhausted-retry 429 banner in completed-turn queue recovery while retaining quoted-message, current-turn and specific provider-blocker precedence.
+- Ignore malformed advisory discovery hints without crashing the refresh loop or granting new lane/input ownership.
+- Keep authenticated protected rollouts in native wakeup coverage. Bound discovery to two concurrent readers, use completion-based backoff, and recheck stale foreground hints against only the named processes.
+- Preserve exact process birth through open, idle, Hook and guard paths. Revalidate precise lane readers before and after reading, reject malformed identities, and keep an upgraded native binding when a legacy Hook omits birth.
+- Revoke a lost native process's lane using fresh checks of its original PID, then wait for the lane's final release before returning ownership to the parent. Inventory gaps and inspection errors do not alone release ownership.
+- Cover process replacement, same-second PID reuse, source disappearance and legacy-to-precise transitions. Separate standby cache semantics from the real service deadline tests.
+
+## 0.2.34
+
+- Classify Codex's structured provider errors even without a literal HTTP status. Preserve specific rate-limit and prompt-cache remedies, and report resource ownership, encrypted-content, authentication and unknown request failures as blockers across ordinary, Goal and queued recovery without spending retry budgets.
+- Classify Claude's structured StopFailure details and current wrapped API error block together. Recognize request-limit 429 errors, and give explicit billing rejection priority over generic authentication hints without treating quoted historical errors as current failures.
+- Persist provider holds and 60–900 second rate-limit backoff across daemon restarts. Recheck both text and Enter paths, preserve pending/unknown deliveries and original retry budgets, and release holds only against authenticated new task or process evidence. Keep handshake recovery independent of deferred retry ownership.
+- Report disabled targets and effective surface/workspace pauses with their source and timestamp. Publish current effective target snapshots and twelve reconcile-stage timings so observation delays can be investigated without claiming the underlying delay is fixed.
+- Restore Python 3.10 compatibility and isolate regression desktop notifications. Preserve existing native clients, sessions and continuation ledgers during immutable runtime upgrades.
+
+## 0.2.33
+
+- Preserve an attempt's proven zero-input cancellation across process checks, provider admission, workspace-lock contention and daemon restarts. Commit that proof before retrying the same attempt; uncertain input and failures after lock entry never acquire a zero-input exemption.
+- Reconcile Goal and ordinary continuation keys against the same authenticated session and turn. Wake a new failed turn from current native evidence without replaying an old unknown delivery or duplicating input already accepted for that turn.
+- Serialize file-backed delivery journals across processes, retain prior-attempt archives and fsync their directory chain. Migrate legacy JSON heads into SQLite before accepting writes, preserve newer SQL evidence and isolate corrupt or conflicting records to their own surfaces.
+- Use bounded complete native file-inventory retries for Goal lookups. Expose generation-bound observation stages and provider retry reasons so a queued, budget-limited or unconfirmed continuation cannot be reported as healthy progress.
+- Add regressions for pre-input persistence failures, real file-lock contention, journal migration and rollback, native retry wakeups, stale timings and provider decisions. The integrated macOS Python 3.14 suite passes 4153 tests; provider service availability and compact completion remain separate live checks.
+
+## 0.2.32 (unreleased)
+
+- Keep authenticated shared app-server foreground sessions in native wakeup coverage while the process inventory refreshes. Reuse only the original locator; recheck the process, selected session, reciprocal connection, writer lock, transcript and current turn before acting.
+- Re-establish a current blocked Goal from that verified foreground binding during inventory gaps. Conflicting inventory, changed selection and uncertain delivery continue to withhold input.
+- Retry at most three complete native file inventories when concurrent descriptor changes invalidate a snapshot. Never merge partial snapshots or accept short reads, persistent drift or a changed selected lock.
+- Fetch immutable collaboration test fixtures with blob and SHA-256 checks in CI so the complete closeout and native-wait suites run on clean runners.
+
+## 0.2.31 (unreleased)
+
+- Reuse a proven zero-input Codex continuation attempt after a newer failed turn supersedes an old stalled Goal. Keep native turn, process, provider, admission and duplicate-input checks; a current blocked Goal still takes its own recovery path.
+- Recognize a Claude executor's original native `WAITING_SUPERVISOR` Stop even when the older daemon did not retain a task binding. Validate the frozen report and original callback against the marker at the time of that Stop; never recreate a receipt or refresh the wait deadline.
+- Read bounded, fingerprinted native transcript tails so long-running sessions over 128 MiB can retain wait and human-takeover evidence. Preserve original hook provenance and verify the live process when native events omit its generation.
+
 ## 0.2.30 (unreleased)
 
 - Reduce repeated parsing under the shared batch startup lock with a bounded cache of unchanged jobs that cannot contribute startup capacity. Invalidate on file replacement or modification; retain four initialization permits, the 0.5-second interval, the 30-second lease and a fresh authorization check before reservation.

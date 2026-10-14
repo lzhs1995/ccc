@@ -2,7 +2,7 @@ import json
 import unittest
 import ccc_standby_identity as identity
 import ccc_workspace_batch as batch
-from test_standby_identity import StandbyIdentityTests
+from tests.test_standby_identity import StandbyIdentityTests
 
 
 class PartialRecordTests(StandbyIdentityTests):

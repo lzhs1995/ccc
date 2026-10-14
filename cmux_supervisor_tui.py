@@ -51,6 +51,7 @@ WATCH_LABELS = {
     "idling": "空转",
     "pool_idling": "整池空转",
     "paused": "已暂停",
+    "disabled": "已停用",
     "pool": "整池",
     "starting": "整池／启动中",
     "excluded": "已排除",
@@ -130,7 +131,7 @@ STATE_LABELS = {
     "claude_model_unavailable": "模型错误",
     "claude_input_guard": "输入保护",
     "claude_completed": "已完成",
-    "claude_report_ready": "报告待核",
+    "claude_report_ready": "旧报告待恢复",
     "claude_pending_input": "已续跑",
     "claude_hook_waiting": "Hook等待",
     "claude_event_pending": "待续跑",
@@ -174,7 +175,7 @@ DETAIL_FALLBACKS = {
     "claude_model_unavailable": "Claude 报告模型不存在或无访问权限；重复续跑不能修复，需核对 /model",
     "claude_input_guard": "等待输入保护期结束；用户输入优先",
     "claude_completed": "Claude 已完成；仍持续监控，下个任务自动恢复",
-    "claude_report_ready": "报告已就绪，回调未确认；停止催促，等待监督侧核收",
+    "claude_report_ready": "旧报告误判记录待恢复；需核实当前停止事件及在途发送，尚不代表任务完成",
     "claude_pending_input": "本次停止已续跑，不会重复排队",
     "claude_hook_waiting": "等待 Claude Stop/StopFailure 事件；画面本身不会触发发送",
     "claude_event_pending": "已收到 Claude 停止事件，正在进行输入保护校验",
@@ -213,7 +214,7 @@ DETAIL_SHORT = {
     "claude_model_unavailable": "模型错误",
     "claude_input_guard": "保护中",
     "claude_completed": "已完成",
-    "claude_report_ready": "报告待核",
+    "claude_report_ready": "旧报告待恢复",
     "claude_pending_input": "已续跑",
     "claude_hook_waiting": "等Hook",
     "claude_event_pending": "待续跑",
@@ -385,6 +386,12 @@ class Candidate:
     # Transport admission is independent of the native viewport. Keeping its
     # projection separate avoids relabeling old sends or mutating runtime state.
     access: dict[str, Any] = field(default_factory=dict)
+    enabled: bool = True
+    pause_origin: Any = ""
+    paused_reason: Any = ""
+    paused_at: Any = None
+    pause_age_sec: float | None = None
+    pause_time_status: str = "missing"
 
     @property
     def session_text(self) -> str:
@@ -437,7 +444,7 @@ def is_idling(candidate: Candidate) -> bool:
     A target whose surface has vanished is *not* idling — it is paused with a
     diagnostic, which is a different and more specific story.
     """
-    if candidate.source in {"untracked", "workspace_starting"}:
+    if candidate.source in {"untracked", "workspace_starting"} or not candidate.enabled:
         return False
     if candidate.state == "claude_observed":
         # The adapter is disabled, so this registered target is observation-only.
@@ -490,16 +497,18 @@ def program_label(candidate: Candidate) -> str:
 
 
 def watch_kind(candidate: Candidate) -> str:
-    if candidate.source == "workspace_starting":
-        return "paused" if candidate.paused else "starting"
     if candidate.source == "untracked":
         return "untracked"
     if candidate.source == "workspace_excluded":
         return "excluded"
+    if not candidate.enabled:
+        return "disabled"
+    if candidate.source == "workspace_starting":
+        return "paused" if candidate.paused else "starting"
+    if candidate.paused and candidate.source != "workspace_non_codex":
+        return "paused"
     if candidate.source in {"workspace_rule", "workspace_non_codex"}:
         return "pool_idling" if is_idling(candidate) else "pool"
-    if candidate.source in SINGLE_SOURCES and candidate.paused:
-        return "paused"
     if candidate.source in SINGLE_SOURCES:
         return "idling" if is_idling(candidate) else "watching"
     return "untracked"
@@ -508,13 +517,13 @@ def watch_kind(candidate: Candidate) -> str:
 def watch_label(candidate: Candidate) -> str:
     if candidate.source == "workspace_starting":
         return WATCH_LABELS[watch_kind(candidate)]
-    if candidate.access and not candidate.paused:
+    if candidate.access and candidate.enabled and not candidate.paused:
         phase = candidate.access.get('phase')
         if candidate.access.get('alarming') and phase != 'retryable':
             return 'N异常'
         return ('N续跑' if phase == 'retryable' else
                 'N完成' if phase in {'complete', 'stopped'} else 'N检查')
-    if candidate.source not in {"untracked", "workspace_excluded", "workspace_non_codex"} and not candidate.paused:
+    if candidate.source not in {"untracked", "workspace_excluded", "workspace_non_codex"} and candidate.enabled and not candidate.paused:
         health_labels = {"unknown": "待检测", "delivery_unknown": "投递待验",
                          "send_failed": "发送失败", "unavailable": "读取异常", "blocked": "服务阻塞"}
         if candidate.continuation_status in health_labels:
@@ -525,7 +534,9 @@ def watch_label(candidate: Candidate) -> str:
 def continuation_fields(target, runtime, poll_interval=1.0):
     row = core.observation_health.continuation_row(target, runtime, now=time.time(), poll_interval=poll_interval)
     return {"continuation_status": row["status"], "observation_age_sec": row["observation_age_sec"],
-            "continuation_reason": row["last_send_error"] or row["reason_code"]}
+            "continuation_reason": row["last_send_error"] or row["reason_code"],
+            **{key: row[key] for key in ("enabled", "pause_origin", "paused_reason", "paused_at",
+                                        "pause_age_sec", "pause_time_status")}}
 
 
 def state_label(state: str) -> str:
@@ -2306,6 +2317,22 @@ def filter_candidates(candidates: list[Candidate], view: str, query: str = "") -
     )).lower()]
 
 
+def pause_description(candidate: Candidate) -> str:
+    if candidate.enabled and not candidate.paused:
+        return ""
+    if not candidate.paused:
+        return "enabled=false，自动续跑已停用"
+    if candidate.pause_age_sec is not None:
+        span = compact_duration(candidate.pause_age_sec) if candidate.pause_age_sec >= 60 else f"{candidate.pause_age_sec:g}s"
+        age = f"已暂停 {span}"
+    else:
+        detail = {"missing": "未记录", "invalid": "无效", "future": "晚于当前时间"}.get(candidate.pause_time_status, "未核实")
+        age = f"暂停时长未知（时间{detail}）"
+    return (f"{age}；原因 {candidate.paused_reason or '未记录'}；"
+            f"来源 {candidate.pause_origin or '未记录'}（操作者未记录）；"
+            f"paused_at={candidate.paused_at!r}")
+
+
 def focus_summary(candidate: Candidate | None, workspace_ref: str = "") -> str:
     """What the cursor is on: position, management state, screen, error, count."""
     if candidate is None:
@@ -2315,9 +2342,11 @@ def focus_summary(candidate: Candidate | None, workspace_ref: str = "") -> str:
     if title:
         facts.append(clip_to_width(title, 30))
     facts.append(watch_label(candidate))
+    if detail := pause_description(candidate):
+        facts.append(detail)
     if candidate.source != "untracked" and candidate.observation_age_sec is not None:
         facts.append(f"上次检测 {max(0, candidate.observation_age_sec):.1f} 秒前")
-    if not candidate.access and candidate.continuation_status not in {"", "ok", "paused"}:
+    if not candidate.access and candidate.continuation_status not in {"", "ok", "paused", "disabled"}:
         facts.append(candidate.continuation_reason)
     if candidate.agent_kind == "claude" or candidate.state.startswith("claude"):
         facts.append(f"Hook {hook_label(candidate)}")
@@ -2412,12 +2441,14 @@ def group_counts(candidates: list[Candidate]) -> dict[str, int]:
     idling = sum(1 for item in candidates if is_idling(item))
     return {
         "watching": sum(1 for item in candidates
-                        if item.source in SINGLE_SOURCES and not item.paused and not is_idling(item)),
+                        if item.source in SINGLE_SOURCES and item.enabled and not item.paused and not is_idling(item)),
         "idling": idling,
         "paused": sum(1 for item in candidates
-                      if not is_idling(item)
+                      if item.enabled and not is_idling(item)
                       and (item.paused or item.source == "workspace_excluded")),
-        "pool": sum(1 for item in candidates if item.source in POOL_SOURCES),
+        "disabled": sum(1 for item in candidates if item.source != "untracked" and not item.enabled),
+        "pool": sum(1 for item in candidates if item.source in POOL_SOURCES and item.enabled
+                    and (not item.paused or item.source == "workspace_non_codex")),
         "pool_authorized": int(any(item.record.get("workspace_authorized") or item.source in POOL_SOURCES
                                    for item in candidates)),
         "untracked": sum(1 for item in candidates if item.source == "untracked"),
@@ -2616,6 +2647,8 @@ def group_row_text(row: ViewRow, width: int) -> str:
         bits.append(f"{row.counts['idling']} 空转")
     if row.counts.get("paused"):
         bits.append(f"{row.counts['paused']} 已暂停")
+    if row.counts.get("disabled"):
+        bits.append(f"{row.counts['disabled']} 已停用")
     if row.counts.get("untracked"):
         bits.append(f"{row.counts['untracked']} 未登记")
     if row.counts.get("warnings"):
@@ -2681,7 +2714,7 @@ def selected_action_hint(candidate: Candidate | None) -> str:
                 "额度或授权恢复后在原会话重试，无需重新登记"
             )
         if candidate.state == "claude_report_ready":
-            return "报告已就绪、回调未确认；等待监督侧核收，新任务仍可正常继续"
+            return "旧报告误判记录尚未安全恢复：正在核实原会话停止事件与在途发送；报告就绪不等于任务完成"
         if candidate.state == "claude_completed":
             return "已完成但仍持续监控；下个任务自动恢复判断，无需按 r   ·   p 暂停   x 删除"
         if candidate.hook_health == "legacy_override":
@@ -3091,8 +3124,7 @@ class SupervisorModel:
                     target = {"paused": False}
                 elif target is not None:
                     source = target.get("source") if target.get("source") in SINGLE_SOURCES else "explicit"
-                    if not target.get("enabled", True) or (source in {"claude_auto", "pane_follow"}
-                            and not core.dynamic_target_authorized(self.config, target)):
+                    if target.get("enabled", True) and source in {"claude_auto", "pane_follow"} and not core.dynamic_target_authorized(self.config, target):
                         target = {**target, "paused": True, "paused_reason": "发现授权未启用"}
                 elif rule is not None and surface_id in excluded:
                     source = "workspace_excluded"
@@ -3108,8 +3140,10 @@ class SupervisorModel:
                     target = {"paused": True}
                 else:
                     source = "untracked"
-                if rule is not None and rule.get("paused"):
-                    target = {**(target or {}), "paused": True, "paused_reason": "整池已暂停"}
+                if rule is not None and rule.get("paused") and not (target or {}).get("paused"):
+                    target = {**(target or {}), "paused": True,
+                              "paused_reason": rule.get("paused_reason") or "整池已暂停",
+                              "pause_origin": rule.get("pause_origin", ""), "paused_at": rule.get("paused_at")}
                 runtime = self.runtime.get(surface_id, {}) if isinstance(self.runtime, Mapping) else {}
                 observed_error, observed_reason = runtime_observation(runtime)
                 exclusion = (rule or {}).get("excluded_surface_reasons", {}).get(surface_id, {})
@@ -3139,9 +3173,8 @@ class SupervisorModel:
                     agent_kind=agent_kind,
                     process_summary=process_summary,
                     **continuation_fields(
-                        {"surface_id": surface_id, "workspace_id": str(record.get("workspace_id") or ""),
-                         "paused": bool(target and target.get("paused")),
-                         "enabled": bool((target or {}).get("enabled", True))},
+                        {**(target or {}), "surface_id": surface_id,
+                         "workspace_id": str(record.get("workspace_id") or "")},
                         runtime, float(self.config.get("poll_interval_sec", 1))),
                     hook_health=str(runtime.get("claude_hook_health") or ""),
                     consecutive_resumes=int(runtime.get("claude_consecutive_resumes") or 0),
@@ -3320,16 +3353,18 @@ class SupervisorModel:
     def counts(self) -> dict[str, int]:
         idling = sum(1 for item in self.candidates if is_idling(item))
         paused = sum(1 for item in self.candidates
-                     if item.source != "untracked" and not is_idling(item)
+                     if item.source != "untracked" and item.enabled and not is_idling(item)
                      and (item.paused or item.source == "workspace_excluded"))
+        disabled = sum(1 for item in self.candidates if item.source != "untracked" and not item.enabled)
         registered = sum(1 for item in self.candidates if item.source != "untracked")
         return {
             "watched": registered,
             # 监控中 now means "registered, not paused, Codex actually running";
             # 空转 is the rest of the registered set that cannot be sent to.
-            "watching": registered - idling - paused,
+            "watching": registered - idling - paused - disabled,
             "idling": idling,
             "paused": paused,
+            "disabled": disabled,
             "untracked": sum(1 for item in self.candidates if item.source == "untracked"),
             "all": len(self.candidates),
         }
@@ -3944,8 +3979,9 @@ def _stack_component(raw: Any, name: str) -> dict[str, Any]:
             projected["observation_coverage"] = {
                 "status": coverage.get("status") if isinstance(coverage.get("status"), str) else "unknown",
                 "counts": {key: _finite_int(counts.get(key)) for key in (
-                    "readable", "live_unreadable", "dormant", "paused", "missing", "unknown")}
+                    "readable", "live_unreadable", "dormant", "paused", "disabled", "missing", "unknown")}
                 if isinstance(counts, Mapping) else {},
+                "attention_reasons": [reason for reason in (coverage.get("attention_reasons") or []) if isinstance(reason, str)],
             }
     elif name == "janitor":
         # Summary only.  Janitor DETAIL has exactly one source in this panel --
@@ -4145,6 +4181,7 @@ STACK_WARNING_TEXT = {
     "guard_observation_stale": "守卫观测已过期",
     "terminal_observation_gap": "存活会话画面不可读",
     "terminal_observation_unknown": "画面观测待核验",
+    "targets_paused_or_disabled": "目标有暂停或停用",
     "claude_hook_coverage_gap": "Claude Hook 覆盖缺口",
     "claude_hook_coverage_unknown": "Claude Hook 覆盖待核验",
 }
@@ -4177,6 +4214,8 @@ def stack_line(snapshot: Mapping[str, Any]) -> str:
     if counts.get("readable") is not None:
         parts.append(f"可读 {counts.get('readable', 0)} / 未初始化 {counts.get('dormant', 0)} / "
                      f"缺口 {counts.get('live_unreadable', 0)} / 未知 {counts.get('unknown', 0)}")
+    if counts.get("paused") or counts.get("disabled"):
+        parts.append(f"暂停 {counts.get('paused', 0)} / 停用 {counts.get('disabled', 0)}")
     probed = snapshot.get("probed_count")
     requested = snapshot.get("requested_count")
     if isinstance(probed, int) and isinstance(requested, int) and probed < requested:
@@ -4435,6 +4474,7 @@ def row_attr(candidate: Candidate) -> int:
         "watching": attr("watching"),
         "pool": attr("pool"),
         "paused": attr("paused"),
+        "disabled": attr("paused"),
         "excluded": attr("paused"),
         "untracked": attr("untracked"),
     }.get(watch_kind(candidate), 0)
@@ -4791,9 +4831,12 @@ def _draw(
         f"{counts['untracked']} 未登记",
         f"筛选 {FILTER_LABELS[view]}",
     ]
+    if counts.get("disabled"):
+        facts.insert(4, f"{counts['disabled']} 已停用")
     if query:
         facts.append(f"查找 {query}")
-    _safe_addnstr(stdscr, at["counts"], 0, " | ".join(facts), clip, attr("dim"))
+    _safe_addnstr(stdscr, at["counts"], 0, " | ".join(facts), clip,
+                  attr("error") if counts.get("paused") or counts.get("disabled") else attr("dim"))
     claude_rows = [item for item in model.candidates if item.agent_kind == "claude"]
     hook_config = getattr(model, "hook_config", {})
     hook_ok = bool(hook_config.get("healthy"))

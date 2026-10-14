@@ -593,10 +593,16 @@ class CoalescingWriter:
     Requests arriving during I/O require a subsequent write. Failures reach
     every affected waiter, so failed persistence can never authorize input.
     Nonblocking requests let periodic publishing stay off the scheduler thread.
+    An optional background interval bounds snapshot write amplification. A
+    waiting caller or close always bypasses that interval; durable input
+    barriers must never be throttled with observer-only snapshots.
     """
 
-    def __init__(self, write, *, delay=0.003, name="ccc-state", on_error=None):
+    def __init__(self, write, *, delay=0.003, name="ccc-state", on_error=None,
+                 background_interval=0.0):
         self.write, self.delay, self.on_error = write, delay, on_error
+        self.background_interval = max(0.0, float(background_interval))
+        self._last_started: float | None = None
         self._condition = threading.Condition()
         self._pending = False
         self._waiters: list[Future] = []
@@ -622,11 +628,20 @@ class CoalescingWriter:
                 self._condition.wait_for(lambda: self._pending or self._closed)
                 if not self._pending:
                     return
+                # Keep the pending request while waiting. New background
+                # requests coalesce without extending its deadline, and a
+                # synchronous request wakes us immediately for a fresh write.
+                while not self._closed and not self._waiters and self._last_started is not None:
+                    remaining = self._last_started + self.background_interval - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    self._condition.wait(remaining)
                 end = time.monotonic() + self.delay
                 while not self._closed and time.monotonic() < end:
                     self._condition.wait(max(0, end - time.monotonic()))
                 waiters, self._waiters = self._waiters, []
                 self._pending = False
+                self._last_started = time.monotonic()
             try:
                 self.write()
             except Exception as exc:

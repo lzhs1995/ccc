@@ -181,5 +181,131 @@ class IncompleteInventoryHealthTests(unittest.TestCase):
                 self.assertEqual(row['status'], 'delayed')
 
 
+class ContinuationWaitReasonTests(unittest.TestCase):
+    def setUp(self):
+        self.target = {'surface_id': 's', 'workspace_id': 'w', 'enabled': True}
+        self.runtime = {'state': 'awaiting_transition', 'viewport_checked_at': 100,
+                        'observed_at': 100, 'delivery_status': 'confirmed'}
+
+    def row(self, **changes):
+        return health.continuation_row(self.target, {**self.runtime, **changes}, now=101)
+
+    def verdict(self, reason, **changes):
+        return {'reason_code': 'provider_retry_' + reason, 'retry_at': 115,
+                'checked_at': 100.5, **changes}
+
+    def test_awaiting_native_transition_is_waiting_instead_of_green_observation(self):
+        row = self.row()
+        self.assertEqual((row['status'], row['reason_code']),
+                         ('waiting', 'awaiting_native_turn_transition'))
+
+    def test_current_provider_decision_has_specific_wait_or_failure_reason(self):
+        for reason, expected in (('failure_reserved', 'waiting'), ('server_floor', 'waiting'),
+                                 ('local_cooldown', 'waiting'), ('shared_slot', 'waiting'),
+                                 ('fair_queue', 'waiting'), ('budget_exhausted', 'blocked'),
+                                 ('evidence_missing', 'unknown'), ('ledger_unavailable', 'unavailable'),
+                                 ('attempt_mismatch', 'blocked')):
+            with self.subTest(reason=reason):
+                verdict = self.verdict(reason)
+                row = self.row(provider_retry_status=verdict)
+                self.assertEqual((row['status'], row['reason_code']),
+                                 (expected, verdict['reason_code']))
+                self.assertEqual(row['provider_retry_status'], verdict)
+
+    def test_independent_delivery_faults_take_precedence_but_keep_provider_detail(self):
+        verdict = self.verdict('failure_reserved')
+        for changes, expected in (({'delivery_status': 'unknown'}, 'delivery_unknown'),
+                                  ({'delivery_status': 'failed'}, 'send_failed'),
+                                  ({'delivery_status': 'sending', 'send_started_at': 90}, 'delivery_unknown')):
+            with self.subTest(changes=changes):
+                row = self.row(provider_retry_status=verdict, **changes)
+                self.assertEqual(row['status'], expected)
+                self.assertEqual(row['provider_retry_status'], verdict)
+
+    def test_old_or_malformed_provider_detail_never_overrides_a_new_observation(self):
+        for verdict in (self.verdict('server_floor', checked_at=99),
+                        self.verdict('server_floor', checked_at=102),
+                        self.verdict('server_floor', checked_at=float('nan')),
+                        self.verdict('server_floor', checked_at='bad'),
+                        self.verdict('unknown_reason'),
+                        self.verdict('server_floor', reason_code=[]), None):
+            with self.subTest(verdict=verdict):
+                row = self.row(state='working', provider_retry_status=verdict)
+                self.assertEqual((row['status'], row['reason_code']), ('ok', 'current_observation'))
+                self.assertEqual(row['provider_retry_status'], {})
+        row = self.row(state='working', observed_at=100.75,
+                       provider_retry_status=self.verdict('server_floor'))
+        self.assertEqual(row['status'], 'ok')
+        self.assertEqual(row['provider_retry_status'], {})
+
+    def test_provider_decision_cannot_follow_a_different_native_turn(self):
+        verdict = self.verdict('server_floor', observed_turn_key='session:old-turn:100')
+        row = self.row(state='working', codex_observed_turn_key='session:new-turn:101',
+                       provider_retry_status=verdict)
+        self.assertEqual(row['status'], 'ok')
+        self.assertEqual(row['provider_retry_status'], {})
+        row = self.row(codex_observed_turn_key=verdict['observed_turn_key'],
+                       provider_retry_status=verdict)
+        self.assertEqual((row['status'], row['reason_code']), ('waiting', 'provider_retry_server_floor'))
+
+    def test_provider_detail_does_not_hide_explicit_pause_or_inventory_uncertainty(self):
+        self.target.update(paused=True, pause_origin='user')
+        self.assertEqual(self.row(provider_retry_status=self.verdict('server_floor'))['status'], 'paused')
+        self.target.pop('paused')
+        observation = {'surface_id': 's', 'workspace_id': 'w', 'observed_at': 100,
+                       'status': 'unknown', 'reason_code': 'process_inventory_incomplete'}
+        row = health.continuation_row(self.target,
+            {**self.runtime, 'provider_retry_status': self.verdict('server_floor')},
+            now=101, observation=observation)
+        self.assertEqual((row['status'], row['reason_code']), ('unknown', 'process_inventory_incomplete'))
+
+    def test_new_read_of_same_failed_turn_preserves_retry_reason(self):
+        verdict = self.verdict('failure_reserved', checked_at=90,
+                               observed_turn_key='session:failed:89')
+        for phase in ('awaiting_transition', 'queued_followup', 'error', 'recoverable_error',
+                      'provider_blocked', 'token_exhausted'):
+            with self.subTest(phase=phase):
+                row = self.row(state=phase, provider_retry_status=verdict,
+                               codex_observed_turn_key=verdict['observed_turn_key'])
+                self.assertEqual(row['provider_retry_status'], verdict)
+                if phase not in ('provider_blocked', 'token_exhausted'):
+                    self.assertEqual((row['status'], row['reason_code']),
+                                     ('waiting', 'provider_retry_failure_reserved'))
+
+    def test_old_turn_verdict_is_discarded_after_progress_or_turn_change(self):
+        verdict = self.verdict('failure_reserved', checked_at=90,
+                               observed_turn_key='session:failed:89')
+        for phase in ('working', 'idle', 'completed', 'error_superseded'):
+            with self.subTest(phase=phase):
+                row = self.row(state=phase, provider_retry_status=verdict,
+                               codex_observed_turn_key=verdict['observed_turn_key'])
+                self.assertEqual(row['provider_retry_status'], {})
+                self.assertNotEqual(row['reason_code'], verdict['reason_code'])
+        row = self.row(provider_retry_status=verdict, codex_observed_turn_key='session:new:100')
+        self.assertEqual(row['provider_retry_status'], {})
+
+    def test_matching_failed_turn_cannot_retain_invalid_clock_or_unbound_verdict(self):
+        for stamp in (102, 0, -1, True, float('nan'), float('inf'), 'bad'):
+            with self.subTest(stamp=stamp):
+                verdict = self.verdict('failure_reserved', checked_at=stamp, observed_turn_key='failed')
+                row = self.row(provider_retry_status=verdict, codex_observed_turn_key='failed')
+                self.assertEqual(row['provider_retry_status'], {})
+        for turn in (None, ''):
+            verdict = self.verdict('failure_reserved', checked_at=90)
+            if turn is not None:
+                verdict['observed_turn_key'] = turn
+            self.assertEqual(self.row(provider_retry_status=verdict)['provider_retry_status'], {})
+
+    def test_observation_timings_are_projected_as_an_independent_snapshot(self):
+        self.assertEqual(self.row()['observation_timings'], {})
+        timings = {'source': 'native', 'generation': 3, 'stages_ms': {'viewport': 12.5}}
+        row = self.row(observation_timings=timings)
+        self.assertEqual(row['observation_timings'], timings)
+        timings['stages_ms']['viewport'] = 20
+        self.assertEqual(row['observation_timings']['stages_ms']['viewport'], 12.5)
+        row['observation_timings']['stages_ms']['viewport'] = 30
+        self.assertEqual(timings['stages_ms']['viewport'], 20)
+
+
 if __name__ == '__main__':
     unittest.main()

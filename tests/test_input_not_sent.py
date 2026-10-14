@@ -1,6 +1,6 @@
 """Zero-write recovery through the daemon, real SQLite and a private Unix socket."""
 import json
-from contextlib import closing
+from contextlib import closing, contextmanager
 from pathlib import Path
 import socketserver
 import sqlite3
@@ -13,10 +13,69 @@ import cmux_codex_watch as core
 from ccc_delivery import DeliveryStore
 from ccc_provider_retry import ProviderRetryStore
 from tests import test_native_enter as native
-from tests.test_watch import HIGH_DEMAND_TEXT, grid_payload
+from tests.test_watch import HIGH_DEMAND_TEXT, grid_payload, span
 
 
 ERROR = 'rate limit exceeded: Your requests to gpt-6-astra for gpt-6-astra in eastus2 have exceeded token rate limit.'
+
+
+@contextmanager
+def held_workspace_input_lock(case):
+    """Real exclusive flock contention, with only the wait budget shortened."""
+    original = core.workspace_input_lock
+    f = case.f
+    with original(f.daemon.config_path, f.target['workspace_id']):
+        def bounded(*args, **kwargs):
+            lock = original(*args, **kwargs)
+            lock.timeout_sec = .01
+            return lock
+        with patch.object(core, 'workspace_input_lock', side_effect=bounded):
+            yield
+
+
+@contextmanager
+def workspace_lock_exit_failure():
+    original = core.workspace_input_lock
+    @contextmanager
+    def fail_after_exit(*args, **kwargs):
+        with original(*args, **kwargs):
+            yield
+        raise RuntimeError('workspace lock release failed')
+    with patch.object(core, 'workspace_input_lock', side_effect=fail_after_exit):
+        yield
+
+
+@contextmanager
+def pending_commit_fault(case, mode):
+    """Fail actual SQLite work while retaining the daemon's real socket path."""
+    store = case.f.daemon._delivery_store
+    commit, seen = store._commit_batch, []
+
+    def fail(connection, batch):
+        operation = batch[0][3][1] if len(batch[0]) == 5 else None
+        if operation == 'pending' and not seen:
+            seen.append(operation)
+            if mode == 'rollback':
+                connection.execute("CREATE TEMP TRIGGER reject_pending BEFORE INSERT ON delivery "
+                                   "BEGIN SELECT RAISE(ABORT, 'real pending rollback'); END")
+                try:
+                    return commit(connection, batch)
+                finally:
+                    connection.execute('DROP TRIGGER reject_pending')
+            commit(connection, batch)
+            raise sqlite3.OperationalError('pending committed; result lost')
+        if operation == 'proof' and mode == 'proof_failure':
+            seen.append(operation)
+            connection.execute("CREATE TEMP TRIGGER reject_proof BEFORE INSERT ON delivery "
+                               "BEGIN SELECT RAISE(ABORT, 'real proof rollback'); END")
+            try:
+                return commit(connection, batch)
+            finally:
+                connection.execute('DROP TRIGGER reject_proof')
+        return commit(connection, batch)
+
+    with patch.object(store, '_commit_batch', side_effect=fail):
+        yield seen
 
 
 class InputNotSentTests(unittest.TestCase):
@@ -64,7 +123,7 @@ class InputNotSentTests(unittest.TestCase):
                         restored = case.restored()
                         case.pending.append((method, restored.delivery_status, restored.codex_input_phase))
                         if method == 'surface.send_text':
-                            f.client.payload = native.draft_frame(f.sid, core.MESSAGE)
+                            f.client.payload = native.draft_frame(f.sid, req['params']['text'])
                             if case.fault == 'exit_after_text': case.deny = True
                         if case.fault == 'eof': return
                         if method == 'terminal.paste':
@@ -143,6 +202,198 @@ class InputNotSentTests(unittest.TestCase):
     def test_same_process_reuses_only_proven_unwritten_attempt(self): self.exercise_recovery()
     def test_restored_delivery_and_provider_reuse_same_attempt(self): self.exercise_recovery(True)
 
+    def test_real_workspace_lock_timeout_recovers_same_attempt_after_restart(self):
+        self.deny = False
+        with held_workspace_input_lock(self):
+            self.send()
+        self.assertFalse(self.pending)
+        attempt = self.f.runtime.send_attempt_id
+        self.assertEqual(self.restored().codex_input_phase, 'input_not_sent')
+        self.assertEqual(self.restored().delivery_status, 'retryable')
+        self.assertEqual(self.episode()['count'], 0)
+        self.restart_records()
+        self.send()
+        self.assertEqual(self.f.runtime.send_attempt_id, attempt)
+        self.assertEqual(self.f.runtime.delivery_status, 'accepted')
+        self.assertEqual(self.pending, [('terminal.paste', 'sending', 'paste_submit_pending')])
+        self.assertEqual(self.episode()['count'], 1)
+        self.send()
+        self.assertEqual(len(self.pending), 1)
+
+    def test_workspace_lock_exit_failure_cannot_authorize_another_paste(self):
+        self.deny = False
+        with workspace_lock_exit_failure():
+            self.send()
+        self.assertEqual(len(self.pending), 1)
+        self.assertFalse(self.restored().codex_input_not_sent)
+        self.restart_records()
+        self.send()
+        self.assertEqual(len(self.pending), 1)
+
+    def test_pre_input_cancellation_preserves_original_retry_after_restart(self):
+        """Every post-commit refusal is still zero I/O, even after reservation."""
+        for boundary in ('placement', 'native', 'locked_placement', 'locked_native', 'provider'):
+            with self.subTest(boundary=boundary):
+                if boundary != 'placement':
+                    # A distinct original failure gives each boundary its own
+                    # reservation; never reset the durable retry ledger.
+                    self.f.append_turn(boundary, time.time() - 2, message='Next work')
+                    self.f.path.write_text(self.f.path.read_text().replace(HIGH_DEMAND_TEXT, ERROR))
+                    self.now[0] += 2
+                    self.deny = True
+                    self.pending.clear()
+                self.send()
+                self.assertFalse(self.pending)
+                self.assertEqual(self.f.runtime.codex_input_phase, 'input_not_sent')
+                attempt = self.f.runtime.send_attempt_id
+                f = self.f
+                proof = dict(f.runtime.codex_input_not_sent)
+                count = self.episode()['count']
+                self.deny = False
+                entered = {'persisted': False, 'locked': False}
+                save, active, ready, provider = (f.daemon._save_delivery, f.daemon._active_send_target,
+                    f.daemon._codex_turn_ready, f.daemon._provider_retry_gate)
+                lock = core.workspace_input_lock
+
+                def persist(*args, **kwargs):
+                    result = save(*args, **kwargs)
+                    if f.runtime.delivery_status == 'sending':
+                        entered['persisted'] = True
+                    return result
+
+                @contextmanager
+                def locked(*args, **kwargs):
+                    with lock(*args, **kwargs):
+                        entered['locked'] = True
+                        yield
+
+                def denied(kind):
+                    return entered['persisted'] and (boundary == kind or
+                        boundary == 'locked_' + kind and entered['locked'])
+
+                with patch.object(f.daemon, '_save_delivery', side_effect=persist), \
+                     patch.object(f.daemon, '_active_send_target', side_effect=lambda *a, **k:
+                                  None if denied('placement') else active(*a, **k)), \
+                     patch.object(f.daemon, '_codex_turn_ready', side_effect=lambda *a, **k:
+                                  False if denied('native') else ready(*a, **k)), \
+                     patch.object(f.daemon, '_provider_retry_gate', side_effect=lambda *a, **k:
+                                  False if denied('provider') else provider(*a, **k)), \
+                     patch.object(core, 'workspace_input_lock', side_effect=locked):
+                    self.send()
+                self.assertTrue(entered['persisted'])
+                self.assertFalse(self.pending)
+                self.assertEqual(f.runtime.codex_input_not_sent, proof)
+                self.assertEqual(self.restored().codex_input_phase, 'input_not_sent')
+                self.restart_records()
+                self.send()
+                self.assertEqual(self.f.runtime.delivery_status, 'accepted')
+                self.assertEqual(self.f.runtime.send_attempt_id, attempt)
+                self.assertEqual(self.episode()['count'], count)
+                self.assertEqual(self.pending, [('terminal.paste', 'sending', 'paste_submit_pending')])
+
+    def stale_goal_footer(self):
+        f = self.f
+        grid = f.client.payload['render_grid']
+        grid['row_spans'].append(span(grid['cursor']['row'] + 1, 0, 'Goal stalled (/goal resume)'))
+        f.state = core.classify_grid(core.Grid.from_rpc(f.client.payload, f.sid))
+        self.assertTrue(f.state.native_goal_stalled)
+        self.assertFalse(f.state.requires_goal_proof)
+        turn = f.daemon.codex_queue_recovery.current_turn(f.target)
+        self.goal = [{**turn, 'kind': 'goal_blocked', 'goal_id': 'old-goal',
+                      'turn_id': 'first', 'at': f.first_start + 1}]
+        process_patch = patch.object(f.daemon.codex_queue_recovery, 'process_lookup',
+            return_value={'agent_kind': 'codex', 'agent_pids': [turn['pid']]})
+        process_patch.start()
+        self.addCleanup(process_patch.stop)
+        goal_patch = patch('ccc_codex_goal.blocked_goal', side_effect=lambda *a, **kw: self.goal[0])
+        goal_patch.start()
+        self.addCleanup(goal_patch.stop)
+        # Exercise the real stale-goal filter, not a mocked readiness verdict.
+        self.assertLess(self.goal[0]['at'], turn['at'])
+        self.assertNotEqual(self.goal[0]['turn_id'], turn['turn_id'])
+        self.assertIsNone(f.daemon._current_blocked_goal(f.target))
+
+    def test_stale_goal_footer_reuses_original_unwritten_attempt(self):
+        self.stale_goal_footer()
+        self.exercise_recovery()
+        self.assertFalse(self.f.runtime.codex_goal_resume)
+
+    def test_effective_goal_during_unwritten_retry_withholds_plain_input(self):
+        self.stale_goal_footer()
+        attempt = self.initial_refusal()
+        self.deny = False
+        f = self.f
+        save = f.daemon._save_delivery
+        changed = []
+        def goal_became_current(sid, runtime, *args, **kwargs):
+            result = save(sid, runtime, *args, **kwargs)
+            if runtime.delivery_status == 'sending' and not changed:
+                turn = f.daemon.codex_queue_recovery.current_turn(f.target)
+                self.goal[0] = {**turn, 'kind': 'goal_blocked', 'goal_id': 'current-goal'}
+                changed.append(True)
+            return result
+        with patch.object(f.daemon, '_save_delivery', side_effect=goal_became_current):
+            self.send()
+        self.assertTrue(changed)
+        self.assertIsNotNone(f.daemon._current_blocked_goal(f.target))
+        self.assertFalse(self.pending)
+        self.assertEqual(f.runtime.send_attempt_id, attempt)
+        self.assertEqual(f.runtime.delivery_status, 'retryable')
+        self.assertEqual(f.runtime.codex_input_phase, 'input_not_sent')
+        self.send()
+        self.assertFalse(self.pending)
+        self.assertEqual(self.episode()['count'], 1)
+
+    def assert_stale_goal_footer_refuses_turn_change(self, change):
+        self.stale_goal_footer()
+        attempt = self.initial_refusal()
+        self.deny = False
+        f = self.f
+        read = f.daemon.codex_queue_recovery.current_turn
+        with patch.object(f.daemon.codex_queue_recovery, 'current_turn',
+                          side_effect=lambda target: {**read(target), **change}):
+            self.assertIsNone(f.daemon._current_blocked_goal(f.target))
+            self.send()
+        self.assertFalse(self.pending)
+        self.assertEqual(f.runtime.send_attempt_id, attempt)
+        self.assertEqual(self.episode()['count'], 1)
+        if change.get('kind') in {'task_started', 'user_message'}:
+            self.assertEqual(f.runtime.state, 'working')
+
+    def test_stale_goal_footer_cannot_authorize_changed_pid(self):
+        self.assert_stale_goal_footer_refuses_turn_change({'pid': 999})
+
+    def test_stale_goal_footer_cannot_authorize_changed_process_start(self):
+        self.assert_stale_goal_footer_refuses_turn_change({'process_start': 1})
+
+    def test_stale_goal_footer_cannot_authorize_changed_provider(self):
+        self.assert_stale_goal_footer_refuses_turn_change({'model_provider': 'another-provider'})
+
+    def test_stale_goal_footer_cannot_authorize_working_turn(self):
+        self.assert_stale_goal_footer_refuses_turn_change({'kind': 'task_started'})
+
+    def test_stale_goal_footer_cannot_authorize_new_user_message(self):
+        self.assert_stale_goal_footer_refuses_turn_change({'kind': 'user_message'})
+
+    def test_new_turn_before_socket_admission_cannot_use_stale_goal_retry(self):
+        self.stale_goal_footer()
+        attempt = self.initial_refusal()
+        self.deny = False
+        control = self.client._control_rpc
+        changed = []
+        def start_turn_before_admission(method, params, **kwargs):
+            self.f.append([{'type': 'event_msg', 'timestamp': self.f.iso(time.time()),
+                            'payload': {'type': 'task_started', 'turn_id': 'new-live-turn'}}])
+            changed.append(True)
+            return control(method, params, **kwargs)
+        with patch.object(self.client, '_control_rpc', side_effect=start_turn_before_admission):
+            self.send()
+        self.assertTrue(changed)
+        self.assertFalse(self.pending)
+        self.assertEqual(self.f.runtime.send_attempt_id, attempt)
+        self.assertEqual(self.f.runtime.codex_input_phase, 'input_not_sent')
+        self.assertEqual(self.episode()['count'], 1)
+
     def test_server_floor_still_blocks_original_attempt(self):
         self.initial_refusal()
         self.deny = False
@@ -219,6 +470,131 @@ class InputNotSentTests(unittest.TestCase):
             self.send()
         self.assertFalse(self.pending)
 
+    def assert_pending_write_recovers(self, mode):
+        self.deny = False
+        with pending_commit_fault(self, mode) as failures:
+            self.send()
+        self.assertEqual(failures, ['pending'])
+        self.assertFalse(self.pending)
+        attempt = self.f.runtime.send_attempt_id
+        self.assertEqual(self.f.runtime.delivery_status, 'retryable')
+        self.assertEqual(self.f.runtime.codex_input_phase, 'input_not_sent')
+        self.assertEqual(self.restored().codex_input_not_sent, self.f.runtime.codex_input_not_sent)
+        self.assertEqual(self.episode()['count'], 0)
+        self.restart_records()
+        self.send()
+        self.assertEqual(self.f.runtime.send_attempt_id, attempt)
+        self.assertEqual(self.f.runtime.delivery_status, 'accepted')
+        self.assertEqual(self.episode()['count'], 1)
+        self.assertEqual(self.pending, [('terminal.paste', 'sending', 'paste_submit_pending')])
+        self.send()
+        self.assertEqual(len(self.pending), 1)
+
+    def test_real_first_pending_rollback_recovers_after_restart(self):
+        self.assert_pending_write_recovers('rollback')
+
+    def test_committed_pending_with_lost_result_recovers_after_restart(self):
+        self.assert_pending_write_recovers('lost_result')
+
+    def test_proven_attempt_keeps_provider_reservation_after_pending_rollback(self):
+        attempt = self.initial_refusal()
+        self.deny = False
+        with pending_commit_fault(self, 'rollback'):
+            self.send()
+        self.assertFalse(self.pending)
+        self.assertEqual(self.restored().delivery_status, 'retryable')
+        self.restart_records()
+        self.send()
+        self.assertEqual(self.f.runtime.send_attempt_id, attempt)
+        self.assertEqual(self.episode()['count'], 1)
+        self.assertEqual(len(self.pending), 1)
+
+    def test_pending_recovery_proof_failure_retains_unknown_input_barrier(self):
+        self.deny = False
+        with pending_commit_fault(self, 'proof_failure') as failures:
+            self.send()
+        self.assertEqual(failures, ['pending', 'proof'])
+        self.assertFalse(self.pending)
+        self.assertFalse(self.f.runtime.codex_input_not_sent)
+        self.assertEqual(self.restored().codex_input_phase, 'paste_submit_pending')
+        self.send()
+        self.restart_records()
+        self.send()
+        self.assertFalse(self.pending)
+
+    def test_observer_snapshot_failure_does_not_reclassify_committed_input(self):
+        self.deny = False
+        with patch.object(self.f.daemon, 'save', side_effect=OSError('observer snapshot unavailable')):
+            self.send()
+        self.assertEqual(self.f.runtime.delivery_status, 'accepted')
+        self.assertEqual(self.restored().delivery_status, 'accepted')
+        self.assertFalse(self.f.runtime.codex_input_not_sent)
+        self.assertEqual(len(self.pending), 1)
+        self.restart_records()
+        self.send()
+        self.assertEqual(len(self.pending), 1)
+
+    def test_crash_after_first_pending_cannot_recreate_live_recovery_token(self):
+        self.deny = False
+        with patch.object(self.f.daemon, '_publish_delivery_snapshot', side_effect=SystemExit('process crash')):
+            with self.assertRaises(SystemExit):
+                self.send()
+        self.assertFalse(self.pending)
+        self.assertEqual(self.restored().codex_input_phase, 'paste_submit_pending')
+        self.restart_records()
+        self.send()
+        self.assertFalse(self.pending)
+
+    def test_cancelled_proof_commit_failure_cannot_authorize_replay(self):
+        self.initial_refusal()
+        self.deny = False
+        f = self.f
+        persist, active = f.daemon._save_delivery, f.daemon._active_send_target
+        pending = []
+        def fail_proof(sid, runtime, *args, **kwargs):
+            if runtime.codex_input_phase == 'input_not_sent':
+                raise RuntimeError('cancellation proof commit failed')
+            result = persist(sid, runtime, *args, **kwargs)
+            if runtime.delivery_status == 'sending':
+                pending.append(True)
+            return result
+        with patch.object(f.daemon, '_save_delivery', side_effect=fail_proof), \
+             patch.object(f.daemon, '_active_send_target', side_effect=lambda *a, **k:
+                          None if pending else active(*a, **k)):
+            with self.assertRaisesRegex(RuntimeError, 'cancellation proof commit failed'):
+                self.send()
+        self.assertFalse(f.runtime.codex_input_not_sent)
+        self.assertEqual(self.restored().codex_input_phase, 'paste_submit_pending')
+        self.send()
+        self.restart_records()
+        self.send()
+        self.assertFalse(self.pending)
+
+    def test_cancellation_keeps_original_identity_when_owner_changes(self):
+        attempt = self.initial_refusal()
+        proof = dict(self.f.runtime.codex_input_not_sent)
+        self.deny = False
+        f = self.f
+        persist, ready = f.daemon._save_delivery, f.daemon._codex_turn_ready
+        changed = []
+        def change_after_commit(sid, runtime, *args, **kwargs):
+            result = persist(sid, runtime, *args, **kwargs)
+            if runtime.delivery_status == 'sending' and not changed:
+                changed.append(True)
+                self.change_provider()
+            return result
+        with patch.object(f.daemon, '_save_delivery', side_effect=change_after_commit), \
+             patch.object(f.daemon, '_codex_turn_ready', side_effect=lambda *a, **k:
+                          False if changed else ready(*a, **k)):
+            self.send()
+        self.assertTrue(changed)
+        self.assertEqual(self.restored().codex_input_not_sent, proof)
+        self.restart_records()
+        self.send()
+        self.assertFalse(self.pending)
+        self.assertEqual(self.f.runtime.send_attempt_id, attempt)
+        self.assertEqual(self.episode()['count'], 1)
+
     def test_old_failed_pending_record_is_not_zero_write_proof(self):
         self.initial_refusal()
         self.f.runtime.codex_input_phase = 'paste_submit_pending'
@@ -275,12 +651,12 @@ class InputNotSentTests(unittest.TestCase):
     def test_identity_drift_after_pending_commit_blocks_actual_paste(self):
         self.initial_refusal()
         self.deny = False
-        persist = self.f.daemon._delivery_store.persist
-        def drift(sid, runtime):
-            persist(sid, runtime)
+        persist = self.f.daemon._save_delivery
+        def drift(sid, runtime, *args, **kwargs):
+            persist(sid, runtime, *args, **kwargs)
             if runtime.delivery_status == 'sending':
                 self.change_provider()
-        with patch.object(self.f.daemon._delivery_store, 'persist', side_effect=drift):
+        with patch.object(self.f.daemon, '_save_delivery', side_effect=drift):
             self.send()
         self.assertFalse(self.pending)
         self.assertEqual(self.episode()['count'], 1)
@@ -358,11 +734,32 @@ class InputNotSentTests(unittest.TestCase):
     def test_provider_observation_is_readiness_not_a_second_reservation(self):
         attempt = self.initial_refusal()
         self.f.daemon.config_store.mutate(lambda c: c.update(global_paused=True))
-        with patch.object(self.f.daemon._provider_retry, 'reserve', wraps=self.f.daemon._provider_retry.reserve) as reserve:
+        with patch.object(self.f.daemon._provider_retry, 'evaluate', wraps=self.f.daemon._provider_retry.evaluate) as evaluate:
             self.send()
-        reserve.assert_not_called()
+        self.assertTrue(evaluate.called)
+        self.assertTrue(all(not call.kwargs.get('reserve') for call in evaluate.call_args_list))
         self.assertEqual(self.f.runtime.send_attempt_id, attempt)
         self.assertEqual(self.episode()['count'], 1)
+
+    def test_provider_block_reason_is_current_without_an_extra_reservation(self):
+        attempt = self.initial_refusal()
+        with self.f.daemon._provider_retry.transaction() as connection:
+            connection.execute('INSERT INTO server_floors VALUES (?, ?)', ('test-provider', self.now[0] + 30))
+        with patch.object(self.f.daemon._provider_retry, 'evaluate', wraps=self.f.daemon._provider_retry.evaluate) as evaluate:
+            self.send()
+        self.assertEqual(evaluate.call_count, 1)
+        self.assertFalse(evaluate.call_args.kwargs['reserve'])
+        verdict = self.f.runtime.provider_retry_status
+        self.assertEqual(verdict['reason_code'], 'provider_retry_server_floor')
+        self.assertEqual(verdict['retry_at'], self.now[0] + 30)
+        self.assertEqual(verdict['observed_turn_key'], self.f.runtime.codex_observed_turn_key)
+        self.assertEqual(self.episode()['count'], 1)
+        self.assertEqual(self.f.runtime.send_attempt_id, attempt)
+        self.now[0] += 31
+        self.deny = False
+        self.send()
+        self.assertEqual(self.f.runtime.provider_retry_status, {})
+        self.assertEqual(len(self.pending), 1)
 
 
 if __name__ == '__main__':

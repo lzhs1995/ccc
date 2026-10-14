@@ -246,7 +246,7 @@ class CodexReconnectRecoveryTests(unittest.TestCase):
             payload = grid_payload([], error=f'unexpected status {status} Unknown error')
             self.check_without_send(payload, 'provider_blocked')
 
-    def test_provider_budget_waits_and_stops_after_four_remedies_across_turns(self):
+    def test_provider_transient_retries_continue_after_four_remedies_across_turns(self):
         for error in ('HTTP 500 Internal Server Error',
                       'HTTP 524 A timeout occurred'):
             with self.subTest(error=error), tempfile.TemporaryDirectory() as directory:
@@ -257,7 +257,7 @@ class CodexReconnectRecoveryTests(unittest.TestCase):
                 daemon.process_once(client)
                 self.assertEqual(len(client.sent), 0)
                 runtime = daemon.runtime['surface-uuid']
-                for i in range(4):
+                for i in range(8):
                     now[0] += 200
                     daemon.process_once(client)
                     self.assertEqual(len(client.sent), i + 1)
@@ -267,8 +267,13 @@ class CodexReconnectRecoveryTests(unittest.TestCase):
                     self.assertEqual(len(client.sent), i + 1)
                 now[0] += 200
                 daemon.process_once(client)
-                self.assertEqual(len(client.sent), 4)
-                self.assertIn('shared retry slot' if '429' in error else 'four-remedy budget', runtime.paused_reason)
+                self.assertEqual(len(client.sent), 9)
+                # A fresh failed turn permits one remedy; observing that same
+                # failure again cannot issue another input even much later.
+                runtime.awaiting, runtime.last_send_at = False, 0
+                now[0] += 1000
+                daemon.process_once(client)
+                self.assertEqual(len(client.sent), 9)
 
     def test_typographic_apostrophe_recovers_but_preserves_input_guards(self):
         error = HIGH_DEMAND_TEXT.replace("'", "’")

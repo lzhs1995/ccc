@@ -284,7 +284,11 @@ The runner's intent is consumed once. Reusing its evidence directory cannot
 start another cohort. Submission settlement and subsequent cohort admission
 are implemented: admission validates the preceding live owner's immutable
 settlement while that owner retains its worker lock and routes. This is not
-a whole-run terminal; that separate record remains pending implementation.
+a whole-run terminal. `tools/standby_run_terminal.py` separately collects,
+captures and verifies the original terminal records for every declared batch.
+Its `run_terminal` receipt proves outcome coverage; simultaneous liveness and
+latency still need their own native acceptance evidence. Native acceptance of
+the complete standby flow remains unfinished.
 Configuration and skills
 sources are pinned for the admitted generation; shared global config must not
 be rewritten for this optimization. No production warm pool has been started
