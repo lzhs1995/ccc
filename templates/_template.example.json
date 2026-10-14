@@ -1,5 +1,5 @@
 {
-  "autoCompactWindow": 50000,
+  "autoCompactWindow": 500000,
   "env": {
     "ANTHROPIC_API_KEY": "",
     "ANTHROPIC_AUTH_TOKEN": "",
@@ -7,7 +7,8 @@
     "ANTHROPIC_MODEL": "claude-sonnet-4-5",
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "",
     "CLAUDE_CODE_EFFORT_LEVEL": "",
-    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "75",
+    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "",
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "500000",
     "HTTP_PROXY": "",
     "HTTPS_PROXY": "",
     "NO_PROXY": "127.0.0.1,localhost"
