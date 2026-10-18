@@ -1,0 +1,103 @@
+name: Native compact candidate v2
+
+on:
+  push:
+    paths:
+      - .github/workflows/native-compact-candidate.yml
+      - ci/native-compact-v2/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_TARGET_DIR: ${{ runner.temp }}/native-compact-target
+      RUST_MIN_STACK: "8388608"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - name: Reconstruct the pinned upstream, baseline and candidate
+        id: source
+        run: |
+          python3 -I -B ci/native-compact-v2/prepare.py \
+            --output "$RUNNER_TEMP/native-compact/source" \
+            --report "$GITHUB_WORKSPACE/compact-evidence/reconstruction.json"
+
+      - name: Require disk space before building on the GitHub runner
+        run: |
+          python3 -I -B -c 'import os, shutil; free = shutil.disk_usage(os.environ["RUNNER_TEMP"]).free; print(f"Free disk: {free / 2**30:.1f} GiB"); assert free >= 25 * 2**30, "At least 25 GiB of free disk is required"'
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config libcap-dev libasound2-dev bubblewrap
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582
+        with:
+          toolchain: 1.95.0
+          components: rustfmt
+
+      - uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532
+        with:
+          tool: just@1.51.0,nextest@0.9.103
+
+      - name: Rust formatting check
+        id: fmt
+        continue-on-error: true
+        working-directory: ${{ runner.temp }}/native-compact/source/codex-rs
+        run: |
+          set -o pipefail
+          cargo fmt --all -- --config imports_granularity=Item --check 2>&1 | tee "$GITHUB_WORKSPACE/compact-evidence/rustfmt.log"
+
+      - name: Check the affected Rust libraries
+        id: check
+        continue-on-error: true
+        working-directory: ${{ runner.temp }}/native-compact/source/codex-rs
+        run: |
+          set -o pipefail
+          cargo check --locked -p codex-api -p codex-core --lib 2>&1 | tee "$GITHUB_WORKSPACE/compact-evidence/cargo-check.log"
+
+      - name: Run deadline, cancellation, collector and websocket pump tests
+        id: tests
+        if: steps.check.outcome == 'success'
+        continue-on-error: true
+        working-directory: ${{ runner.temp }}/native-compact/source/codex-rs
+        run: |
+          set -o pipefail
+          just test --locked -p codex-core -p codex-api --lib \
+            -E 'test(compact_deadline) | test(compact_cancel_wait) | test(collect_compaction_output) | test(close_and_wait_joins_the_websocket_pump)' \
+            --retries 0 2>&1 | tee "$GITHUB_WORKSPACE/compact-evidence/targeted-tests.log"
+
+      - name: Upload validation evidence
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: native-compact-v2-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            compact-evidence/
+            ${{ runner.temp }}/native-compact-target/nextest/local/junit.xml
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Require all validation steps to pass
+        if: always()
+        env:
+          SOURCE_RESULT: ${{ steps.source.outcome }}
+          FORMAT_RESULT: ${{ steps.fmt.outcome }}
+          CHECK_RESULT: ${{ steps.check.outcome }}
+          TEST_RESULT: ${{ steps.tests.outcome }}
+        run: |
+          python3 -I -B -c 'import os; results = {name: os.environ[name] for name in ("SOURCE_RESULT", "FORMAT_RESULT", "CHECK_RESULT", "TEST_RESULT")}; print(results); assert all(result == "success" for result in results.values()), "Candidate validation failed or was incomplete"'

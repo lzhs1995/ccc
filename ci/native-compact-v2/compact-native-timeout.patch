@@ -1,0 +1,826 @@
+diff --git a/codex-api/src/common.rs b/codex-api/src/common.rs
+--- a/codex-api/src/common.rs
++++ b/codex-api/src/common.rs
+@@ -411,6 +411,7 @@
+ }
+ 
+ pub struct ResponseStream {
++    pub request_task: Option<tokio::task::JoinHandle<()>>,
+     pub rx_event: mpsc::Receiver<Result<ResponseEvent, ApiError>>,
+     /// Server-assigned `x-request-id` response header, when present.
+     pub upstream_request_id: Option<String>,
+diff --git a/codex-api/src/endpoint/responses_websocket.rs b/codex-api/src/endpoint/responses_websocket.rs
+--- a/codex-api/src/endpoint/responses_websocket.rs
++++ b/codex-api/src/endpoint/responses_websocket.rs
+@@ -242,6 +242,16 @@
+             .is_none_or(|stream| stream.pump_task.is_finished())
+     }
+ 
++    /// Stop the socket pump and wait until it drops the transport.
++    /// Cancel and join the active response request before calling this method.
++    pub async fn close_and_wait(self) {
++        let stream = self.stream.lock().await.take();
++        if let Some(mut stream) = stream {
++            stream.pump_task.abort();
++            let _ = (&mut stream.pump_task).await;
++        }
++    }
++
+     #[instrument(
+         name = "responses_websocket.stream_request",
+         level = "info",
+@@ -290,7 +300,7 @@
+         let request_text = serialize_websocket_request(&request)?;
+ 
+         let current_span = Span::current();
+-        tokio::spawn(
++        let request_task = tokio::spawn(
+             #[expect(
+                 clippy::await_holding_invalid_type,
+                 reason = "the guard serializes exclusive use of the websocket stream for the lifetime of the response stream"
+@@ -341,18 +351,22 @@
+                 };
+ 
+                 if let Err(err) = result {
+-                    // A terminal stream error should reach the caller immediately. Waiting for a
+-                    // graceful close handshake here can stall indefinitely and mask the error.
+-                    let failed_stream = guard.take();
+-                    drop(guard);
+-                    drop(failed_stream);
++                    // Deliver errors without a graceful close handshake. Keep the pump handle in
++                    // the shared slot until joined: timeout cancellation may abort this request
++                    // during cleanup, and close_and_wait must still be able to join the pump.
+                     let _ = tx_event.send(Err(err)).await;
++                    if let Some(ws_stream) = guard.as_mut() {
++                        ws_stream.pump_task.abort();
++                        let _ = (&mut ws_stream.pump_task).await;
++                    }
++                    drop(guard.take());
+                 }
+             }
+             .instrument(current_span),
+         );
+ 
+         Ok(ResponseStream {
++            request_task: Some(request_task),
+             rx_event,
+             upstream_request_id: None,
+             interrupt: Some(tx_interrupt),
+@@ -952,6 +966,47 @@
+     use serde_json::value::to_raw_value;
+     use std::collections::HashMap;
+     use std::sync::Arc;
++
++    #[tokio::test]
++    async fn close_and_wait_joins_the_websocket_pump() {
++        use std::sync::atomic::AtomicBool;
++        use std::sync::atomic::Ordering;
++
++        struct Dropped(Arc<AtomicBool>);
++        impl Drop for Dropped {
++            fn drop(&mut self) {
++                self.0.store(true, Ordering::SeqCst);
++            }
++        }
++
++        let dropped = Arc::new(AtomicBool::new(false));
++        let drop_guard = Dropped(Arc::clone(&dropped));
++        let (started_tx, started_rx) = oneshot::channel();
++        let pump_task = tokio::spawn(async move {
++            let _drop_guard = drop_guard;
++            let _ = started_tx.send(());
++            std::future::pending::<()>().await;
++        });
++        started_rx.await.expect("pump started");
++        let (tx_command, _rx_command) = mpsc::channel(/*buffer*/ 1);
++        let (_tx_message, rx_message) = mpsc::unbounded_channel();
++        let connection = ResponsesWebsocketConnection::new(
++            WsStream {
++                credential_observation: None,
++                tx_command,
++                rx_message,
++                pump_task,
++            },
++            Duration::from_secs(300),
++            /*server_reasoning_included*/ false,
++            /*server_model*/ None,
++            /*telemetry*/ None,
++        );
++
++        connection.close_and_wait().await;
++
++        assert!(dropped.load(Ordering::SeqCst));
++    }
+ 
+     #[test]
+     fn direct_serialization_preserves_websocket_request_payload() {
+diff --git a/codex-api/src/sse/responses.rs b/codex-api/src/sse/responses.rs
+--- a/codex-api/src/sse/responses.rs
++++ b/codex-api/src/sse/responses.rs
+@@ -71,7 +71,7 @@
+         let _ = turn_state.set(header_value.to_string());
+     }
+     let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent, ApiError>>(1600);
+-    tokio::spawn(async move {
++    let request_task = tokio::spawn(async move {
+         if let Some(model) = server_model {
+             let _ = tx_event.send(Ok(ResponseEvent::ServerModel(model))).await;
+         }
+@@ -97,6 +97,7 @@
+     });
+ 
+     ResponseStream {
++        request_task: Some(request_task),
+         rx_event,
+         upstream_request_id,
+         interrupt: None,
+diff --git a/core/src/client.rs b/core/src/client.rs
+--- a/core/src/client.rs
++++ b/core/src/client.rs
+@@ -2268,6 +2268,14 @@
+         }
+     }
+ 
++    /// An interrupted response cannot be reused as an incremental request baseline.
++    pub(crate) async fn reset_after_compaction_timeout(&mut self) {
++        if let Some(connection) = self.websocket_session.connection.take() {
++            connection.close_and_wait().await;
++        }
++        self.websocket_session = WebsocketSession::default();
++    }
++
+     /// Permanently disables WebSockets for this Codex session and resets WebSocket state.
+     ///
+     /// This is used after exhausting the provider retry budget, to force subsequent requests onto
+@@ -2355,6 +2363,7 @@
+ ) -> (ResponseStream, oneshot::Receiver<LastResponse>) {
+     let upstream_request_id = api_stream.upstream_request_id.take();
+     let interrupt = api_stream.interrupt.take();
++    let request_task = api_stream.request_task.take();
+     let (mut stream, last_response) = map_response_events(
+         upstream_request_id,
+         crate::model_request::intercept_stream(Box::pin(api_stream), interceptors),
+@@ -2363,6 +2372,7 @@
+         provider,
+     );
+     stream.interrupt = interrupt;
++    stream.request_task = request_task;
+     (stream, last_response)
+ }
+ 
+@@ -2385,7 +2395,7 @@
+     let consumer_dropped = CancellationToken::new();
+     let consumer_dropped_for_stream = consumer_dropped.clone();
+ 
+-    tokio::spawn(async move {
++    let mapper_task = tokio::spawn(async move {
+         let mut logged_error = false;
+         let mut tx_last_response = Some(tx_last_response);
+         let mut items_added: Vec<ResponseItem> = Vec::new();
+@@ -2509,6 +2519,8 @@
+ 
+     (
+         ResponseStream {
++            mapper_task: Some(mapper_task),
++            request_task: None,
+             rx_event,
+             interrupt: None,
+             consumer_dropped: consumer_dropped_for_stream,
+diff --git a/core/src/client_common.rs b/core/src/client_common.rs
+--- a/core/src/client_common.rs
++++ b/core/src/client_common.rs
+@@ -117,11 +117,28 @@
+ }
+ 
+ pub struct ResponseStream {
++    pub(crate) mapper_task: Option<tokio::task::JoinHandle<()>>,
++    pub(crate) request_task: Option<tokio::task::JoinHandle<()>>,
+     pub(crate) rx_event: mpsc::Receiver<Result<ResponseEvent>>,
+     pub(crate) interrupt: Option<oneshot::Sender<()>>,
+     /// Signals the mapper task that the consumer stopped polling before the
+     /// provider stream reached its own terminal event.
+     pub(crate) consumer_dropped: CancellationToken,
++}
++
++impl ResponseStream {
++    /// Stop local request producers and wait for their destructors before a compact retry.
++    pub(crate) async fn cancel_and_wait(mut self) {
++        self.consumer_dropped.cancel();
++        self.rx_event.close();
++        let tasks = [self.mapper_task.take(), self.request_task.take()];
++        for task in tasks.iter().flatten() {
++            task.abort();
++        }
++        for task in tasks.into_iter().flatten() {
++            let _ = task.await;
++        }
++    }
+ }
+ 
+ impl Stream for ResponseStream {
+diff --git a/core/src/client_common_tests.rs b/core/src/client_common_tests.rs
+--- a/core/src/client_common_tests.rs
++++ b/core/src/client_common_tests.rs
+@@ -270,3 +270,35 @@
+         Some("flex")
+     );
+ }
++
++
++#[tokio::test]
++async fn compact_cancel_wait_joins_request_and_mapper_before_retry() {
++    use std::sync::Arc;
++    use std::sync::atomic::{AtomicUsize, Ordering};
++    struct MarkDropped(Arc<AtomicUsize>);
++    impl Drop for MarkDropped {
++        fn drop(&mut self) { self.0.fetch_add(1, Ordering::SeqCst); }
++    }
++    let stopped = Arc::new(AtomicUsize::new(0));
++    let mapper_guard = MarkDropped(Arc::clone(&stopped));
++    let request_guard = MarkDropped(Arc::clone(&stopped));
++    let mapper_task = tokio::spawn(async move {
++        let _guard = mapper_guard;
++        std::future::pending::<()>().await;
++    });
++    let request_task = tokio::spawn(async move {
++        let _guard = request_guard;
++        std::future::pending::<()>().await;
++    });
++    let (_tx, rx_event) = tokio::sync::mpsc::channel(1);
++    let stream = super::ResponseStream {
++        rx_event,
++        interrupt: None,
++        consumer_dropped: tokio_util::sync::CancellationToken::new(),
++        mapper_task: Some(mapper_task),
++        request_task: Some(request_task),
++    };
++    stream.cancel_and_wait().await;
++    assert_eq!(stopped.load(Ordering::SeqCst), 2);
++}
+diff --git a/core/src/client_tests.rs b/core/src/client_tests.rs
+--- a/core/src/client_tests.rs
++++ b/core/src/client_tests.rs
+@@ -2095,6 +2095,7 @@
+     drop(tx_event);
+     let (mut stream, last_response) = super::map_response_stream(
+         codex_api::ResponseStream {
++            request_task: None,
+             rx_event,
+             upstream_request_id: None,
+             interrupt: None,
+diff --git a/core/src/compact.rs b/core/src/compact.rs
+--- a/core/src/compact.rs
++++ b/core/src/compact.rs
+@@ -4,6 +4,9 @@
+ use crate::Prompt;
+ use crate::client::ModelClientSession;
+ use crate::client_common::ResponseEvent;
++use crate::client_common::ResponseStream;
++use crate::compact_deadline::CompactionDeadline;
++use crate::compact_deadline::COMPACTION_TIMEOUT_MESSAGE;
+ use crate::context::CompactionSummary;
+ use crate::context::ContextualUserFragment;
+ use crate::context::world_state::WorldState;
+@@ -166,6 +169,7 @@
+     reason: CompactionReason,
+     phase: CompactionPhase,
+ ) -> CodexResult<()> {
++    let mut deadline = CompactionDeadline::new();
+     let compaction_metadata =
+         CompactionTurnMetadata::new(trigger, reason, CompactionImplementation::Responses, phase);
+     let attempt = CompactionAnalyticsAttempt::begin(
+@@ -199,6 +203,7 @@
+         input,
+         initial_context_injection,
+         compaction_metadata,
++        &mut deadline,
+     )
+     .await;
+     let status = compaction_status_from_result(&result);
+@@ -248,6 +253,7 @@
+     input: Vec<UserInput>,
+     initial_context_injection: InitialContextInjection,
+     compaction_metadata: CompactionTurnMetadata,
++    deadline: &mut CompactionDeadline,
+ ) -> CodexResult<String> {
+     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
+     sess.emit_turn_item_started(&turn_context, &compaction_item)
+@@ -283,15 +289,29 @@
+         let responses_metadata = sess
+             .compaction_responses_metadata(turn_context.as_ref(), compaction_metadata)
+             .await;
+-        let attempt_result = drain_to_completed(
++        let mut stream = None;
++        let request = drain_to_completed(
+             &sess,
+             turn_context.as_ref(),
+             &mut client_session,
+             &responses_metadata,
+             &prompt,
+-            compaction_metadata.phase(),
+-        )
+-        .await;
++            &mut stream,
++        );
++        let result = deadline.run(request).await;
++        let attempt_result = match result {
++            Ok(result) => result,
++            Err(_) => {
++                if let Some(stream) = stream.take() {
++                    stream.cancel_and_wait().await;
++                }
++                client_session.reset_after_compaction_timeout().await;
++                if deadline.retry_after_timeout() {
++                    continue;
++                }
++                return Err(CodexErr::Fatal(COMPACTION_TIMEOUT_MESSAGE.to_string()));
++            }
++        };
+ 
+         match attempt_result {
+             Ok(response) => {
+@@ -339,6 +359,39 @@
+             }
+         }
+     };
++
++    for event in compaction_response.deferred_events {
++        match event {
++            ResponseEvent::ServerReasoningIncluded(included) => {
++                sess.set_server_reasoning_included(included).await;
++            }
++            ResponseEvent::RateLimits(snapshot) => {
++                sess.update_rate_limits(&turn_context, snapshot).await;
++            }
++            ResponseEvent::Completed { response_id, token_usage, usage_metadata, .. } => {
++                sess.record_observed_response_completed(
++                    &turn_context, &response_id, token_usage.as_ref(), usage_metadata.as_ref(),
++                ).await;
++                sess.update_token_usage_info(&turn_context, token_usage.as_ref()).await?;
++            }
++            _ => {}
++        }
++    }
++    if !matches!(compaction_metadata.phase(), CompactionPhase::PostTurn) {
++        for item in &compaction_response.output {
++            sess.record_annotated_conversation_items(
++                &turn_context,
++                turn_context.model_info(),
++                vec![ResponseItemEnvelope {
++                    item: item.clone(),
++                    metadata: Some(CodexHarnessMetadata {
++                        compaction_output: true,
++                        ..Default::default()
++                    }),
++                }],
++            ).await;
++        }
++    }
+ 
+     let history_snapshot = sess.clone_history().await;
+     let history_items = history_snapshot.annotated_items();
+@@ -740,6 +793,7 @@
+ }
+ 
+ struct CompactionResponse {
++    deferred_events: Vec<ResponseEvent>,
+     response_id: String,
+     output: Vec<ResponseItem>,
+ }
+@@ -750,9 +804,9 @@
+     client_session: &mut ModelClientSession,
+     responses_metadata: &CodexResponsesMetadata,
+     prompt: &Prompt,
+-    phase: CompactionPhase,
++    stream_slot: &mut Option<ResponseStream>,
+ ) -> CodexResult<CompactionResponse> {
+-    let mut stream = client_session
++    let stream = client_session
+         .stream(
+             prompt,
+             turn_context.model_info(),
+@@ -770,7 +824,9 @@
+             &InferenceTraceContext::disabled(),
+         )
+         .await?;
++    let stream = stream_slot.insert(stream);
+     let mut output = Vec::new();
++    let mut deferred_events = Vec::new();
+     loop {
+         let maybe_event = stream.next().await;
+         let Some(event) = maybe_event else {
+@@ -779,51 +835,17 @@
+             ));
+         };
+         match event {
+-            Ok(ResponseEvent::OutputItemDone(item)) => {
+-                if matches!(phase, CompactionPhase::PostTurn) {
+-                    // Commit post-turn summaries only after success; failures must leave both
+-                    // the live history and persisted rollout intact.
+-                    output.push(item);
+-                } else {
+-                    sess.record_annotated_conversation_items(
+-                        turn_context,
+-                        turn_context.model_info(),
+-                        vec![ResponseItemEnvelope {
+-                            item,
+-                            metadata: Some(CodexHarnessMetadata {
+-                                compaction_output: true,
+-                                ..Default::default()
+-                            }),
+-                        }],
+-                    )
+-                    .await;
+-                }
+-            }
+-            Ok(ResponseEvent::ServerReasoningIncluded(included)) => {
+-                sess.set_server_reasoning_included(included).await;
+-            }
+-            Ok(ResponseEvent::RateLimits(snapshot)) => {
+-                sess.update_rate_limits(turn_context, snapshot).await;
+-            }
+-            Ok(ResponseEvent::Completed {
+-                response_id,
+-                token_usage,
+-                usage_metadata,
+-                ..
+-            }) => {
+-                sess.record_observed_response_completed(
+-                    turn_context,
+-                    &response_id,
+-                    token_usage.as_ref(),
+-                    usage_metadata.as_ref(),
+-                )
+-                .await;
+-                sess.update_token_usage_info(turn_context, token_usage.as_ref())
+-                    .await?;
+-                return Ok(CompactionResponse {
+-                    response_id,
+-                    output,
+-                });
++            Ok(ResponseEvent::OutputItemDone(item)) => output.push(item),
++            Ok(event @ (ResponseEvent::ServerReasoningIncluded(_) | ResponseEvent::RateLimits(_))) => {
++                deferred_events.push(event);
++            }
++            Ok(event @ ResponseEvent::Completed { .. }) => {
++                let ResponseEvent::Completed { ref response_id, .. } = event else {
++                    unreachable!();
++                };
++                let response_id = response_id.clone();
++                deferred_events.push(event);
++                return Ok(CompactionResponse { response_id, output, deferred_events });
+             }
+             Ok(_) => continue,
+             Err(e) => return Err(e),
+diff --git a/core/src/compact_deadline.rs b/core/src/compact_deadline.rs
+new file mode 100644
+--- /dev/null
++++ b/core/src/compact_deadline.rs
+@@ -0,0 +1,45 @@
++use std::future::Future;
++use std::time::Duration;
++use tokio::time::Instant;
++
++pub(crate) const COMPACTION_TIMEOUT_MESSAGE: &str =
++    "Compaction timed out after 300 seconds; the single timeout retry is exhausted";
++
++/// One timeout recovery budget for a native compact lifecycle, shared by all request paths.
++pub(crate) struct CompactionDeadline {
++    deadline: Instant,
++    retry_used: bool,
++}
++
++impl CompactionDeadline {
++    pub(crate) fn new() -> Self {
++        Self {
++            deadline: Instant::now() + Duration::from_secs(300),
++            retry_used: false,
++        }
++    }
++
++    pub(crate) async fn run<T>(&self, request: impl Future<Output = T>) -> Result<T, ()> {
++        // Do not poll a new request when hooks/backoff already consumed its deadline.
++        if self.deadline <= Instant::now() {
++            return Err(());
++        }
++        tokio::time::timeout_at(self.deadline, request)
++            .await
++            .map_err(|_| ())
++    }
++
++    /// Call only after the expired request and its stream tasks have terminated.
++    pub(crate) fn retry_after_timeout(&mut self) -> bool {
++        if self.retry_used {
++            return false;
++        }
++        self.retry_used = true;
++        self.deadline = Instant::now() + Duration::from_secs(300);
++        true
++    }
++}
++
++#[cfg(test)]
++#[path = "compact_deadline_tests.rs"]
++mod tests;
+diff --git a/core/src/compact_deadline_tests.rs b/core/src/compact_deadline_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/core/src/compact_deadline_tests.rs
+@@ -0,0 +1,39 @@
++use super::CompactionDeadline;
++use pretty_assertions::assert_eq;
++use std::time::Duration;
++use tokio::time::Instant;
++
++#[tokio::test(start_paused = true)]
++async fn timeout_budget_is_not_extended_by_observations_and_allows_one_retry() {
++    let mut budget = CompactionDeadline::new();
++    let first = budget.deadline;
++    tokio::time::advance(Duration::from_secs(299)).await;
++    assert_eq!(budget.deadline, first);
++    tokio::time::advance(Duration::from_secs(1)).await;
++    assert_eq!(budget.deadline, Instant::now());
++    assert!(budget.retry_after_timeout());
++    let second = budget.deadline;
++    assert_eq!(second.duration_since(first), Duration::from_secs(300));
++    tokio::time::advance(Duration::from_secs(300)).await;
++    assert!(!budget.retry_after_timeout());
++    assert_eq!(budget.deadline, second);
++}
++
++#[tokio::test(start_paused = true)]
++async fn expired_deadline_does_not_poll_or_submit_a_new_request() {
++    use std::cell::Cell;
++    let budget = CompactionDeadline::new();
++    tokio::time::advance(Duration::from_secs(300)).await;
++    let submitted = Cell::new(false);
++    let result = budget.run(async { submitted.set(true) }).await;
++    assert_eq!(result, Err(()));
++    assert!(!submitted.get());
++}
++
++#[tokio::test(start_paused = true)]
++async fn pending_request_is_dropped_at_the_native_deadline() {
++    let budget = CompactionDeadline::new();
++    let result = budget.run(std::future::pending::<()>()).await;
++    assert_eq!(result, Err(()));
++    assert_eq!(Instant::now(), budget.deadline);
++}
+diff --git a/core/src/compact_remote_v2.rs b/core/src/compact_remote_v2.rs
+--- a/core/src/compact_remote_v2.rs
++++ b/core/src/compact_remote_v2.rs
+@@ -11,6 +11,8 @@
+ use crate::compact::build_compaction_initial_context;
+ use crate::compact::compaction_status_from_result;
+ use crate::compact::insert_initial_context_before_last_real_user_or_summary;
++use crate::compact_deadline::CompactionDeadline;
++use crate::compact_deadline::COMPACTION_TIMEOUT_MESSAGE;
+ use crate::compact_model_fallback::record_model_fallback;
+ use crate::compact_model_fallback::should_retry_with_current_model;
+ use crate::compact_remote_history::HistoryItemGroup;
+@@ -139,6 +141,7 @@
+     initial_context_injection: InitialContextInjection,
+     compaction_metadata: CompactionTurnMetadata,
+ ) -> CodexResult<()> {
++    let mut deadline = CompactionDeadline::new();
+     let turn_context = &step_context.turn;
+     let trigger = compaction_metadata.trigger();
+     let reason = compaction_metadata.reason();
+@@ -181,6 +184,7 @@
+         initial_context_injection,
+         compaction_metadata,
+         &mut analytics_details,
++        &mut deadline,
+     )
+     .await;
+     let status = compaction_status_from_result(&result);
+@@ -227,6 +231,7 @@
+     initial_context_injection: InitialContextInjection,
+     compaction_metadata: CompactionTurnMetadata,
+     analytics_details: &mut CompactionAnalyticsDetails,
++    deadline: &mut CompactionDeadline,
+ ) -> CodexResult<()> {
+     let turn_context = &step_context.turn;
+     let context_compaction_item = ContextCompactionItem::new();
+@@ -248,6 +253,7 @@
+         &compaction_trace,
+         compaction_metadata,
+         analytics_details,
++        deadline,
+     )
+     .await;
+     let (attempt, compaction_turn_context) = match attempt {
+@@ -276,6 +282,7 @@
+                 &fallback_compaction_trace,
+                 compaction_metadata,
+                 analytics_details,
++                deadline,
+             )
+             .await;
+             record_model_fallback(
+@@ -381,6 +388,7 @@
+     compaction_output: ResponseItem,
+     response_id: String,
+     token_usage: Option<TokenUsage>,
++    usage_metadata: Option<codex_protocol::ResponseUsageMetadata>,
+ }
+ 
+ async fn run_remote_compaction_request_v2(
+@@ -389,6 +397,7 @@
+     client_session: &mut ModelClientSession,
+     prompt: &Prompt,
+     responses_metadata: &CodexResponsesMetadata,
++    deadline: &mut CompactionDeadline,
+ ) -> CodexResult<RemoteCompactionV2Output> {
+     let turn_context = &step_context.turn;
+     let max_retries = turn_context
+@@ -398,7 +407,9 @@
+         .min(MAX_REMOTE_COMPACTION_V2_STREAM_RETRIES);
+     let mut retry_state = ResponsesStreamRetryState::default();
+     loop {
+-        let result = match client_session
++        let mut stream_slot = None;
++        let request = async {
++        match client_session
+             .stream(
+                 prompt,
+                 turn_context.model_info(),
+@@ -415,12 +426,35 @@
+             )
+             .await
+         {
+-            Ok(stream) => collect_compaction_output(sess, turn_context, stream).await,
++            Ok(stream) => {
++                let stream = stream_slot.insert(stream);
++                collect_compaction_output(stream).await
++            },
+             Err(err) => Err(err),
++        }
++        };
++        let result = match deadline.run(request).await {
++            Ok(result) => result,
++            Err(_) => {
++                if let Some(stream) = stream_slot.take() {
++                    stream.cancel_and_wait().await;
++                }
++                client_session.reset_after_compaction_timeout().await;
++                if deadline.retry_after_timeout() {
++                    continue;
++                }
++                return Err(CodexErr::Fatal(COMPACTION_TIMEOUT_MESSAGE.to_string()));
++            }
+         };
+ 
+         match result {
+-            Ok(compaction_output) => return Ok(compaction_output),
++            Ok(compaction_output) => {
++                sess.record_observed_response_completed(
++                    turn_context, &compaction_output.response_id,
++                    compaction_output.token_usage.as_ref(), compaction_output.usage_metadata.as_ref(),
++                ).await;
++                return Ok(compaction_output);
++            },
+             Err(err) => {
+                 handle_response_stream_error(
+                     &mut retry_state,
+@@ -438,15 +472,14 @@
+ }
+ 
+ async fn collect_compaction_output(
+-    sess: &Session,
+-    turn_context: &TurnContext,
+-    mut stream: ResponseStream,
++    stream: &mut ResponseStream,
+ ) -> CodexResult<RemoteCompactionV2Output> {
+     let mut output_item_count = 0usize;
+     let mut compaction_count = 0usize;
+     let mut compaction_output = None;
+     let mut completed_response_id = None;
+     let mut completed_token_usage = None;
++    let mut completed_usage_metadata = None;
+     while let Some(event) = stream.next().await {
+         match event? {
+             ResponseEvent::OutputItemDone(item) => {
+@@ -464,13 +497,7 @@
+                 usage_metadata,
+                 ..
+             } => {
+-                sess.record_observed_response_completed(
+-                    turn_context,
+-                    &response_id,
+-                    token_usage.as_ref(),
+-                    usage_metadata.as_ref(),
+-                )
+-                .await;
++                completed_usage_metadata = usage_metadata;
+                 completed_response_id = Some(response_id);
+                 completed_token_usage = token_usage;
+                 break;
+@@ -498,6 +525,7 @@
+         compaction_output,
+         response_id,
+         token_usage: completed_token_usage,
++        usage_metadata: completed_usage_metadata,
+     })
+ }
+ 
+@@ -844,6 +872,8 @@
+         }
+         drop(tx_event);
+         ResponseStream {
++            mapper_task: None,
++            request_task: None,
+             rx_event,
+             interrupt: None,
+             consumer_dropped: CancellationToken::new(),
+@@ -1234,7 +1264,7 @@
+             encrypted_content: "encrypted".to_string(),
+             internal_chat_message_metadata_passthrough: None,
+         };
+-        let stream = response_stream(vec![
++        let mut stream = response_stream(vec![
+             Ok(ResponseEvent::OutputItemDone(message(
+                 "assistant",
+                 "IGNORED_COMPACT_REPLY",
+@@ -1260,21 +1290,14 @@
+             }),
+         ]);
+ 
+-        let (sess, turn_context, rx) =
+-            crate::session::tests::make_session_and_context_with_rx().await;
+-        let output = collect_compaction_output(&sess, &turn_context, stream)
++        let output = collect_compaction_output(&mut stream)
+             .await
+             .expect("compaction should be collected");
+ 
+         assert_eq!(output.compaction_output, compaction);
+         assert_eq!(output.response_id, "resp-compact");
+-        let event = rx.recv().await.expect("raw response completion");
+-        let EventMsg::RawResponseCompleted(completed) = event.msg else {
+-            panic!("expected raw response completion, got {:?}", event.msg);
+-        };
+-        assert_eq!(completed.response_id, "resp-compact");
+         assert_eq!(
+-            completed.usage_metadata,
++            output.usage_metadata,
+             Some(codex_protocol::ResponseUsageMetadata {
+                 amount: Some("0.125".to_string()),
+                 metadata: Some(serde_json::json!({ "extra": { "label": "example" } })),
+diff --git a/core/src/compact_remote_v2_attempt.rs b/core/src/compact_remote_v2_attempt.rs
+--- a/core/src/compact_remote_v2_attempt.rs
++++ b/core/src/compact_remote_v2_attempt.rs
+@@ -5,6 +5,7 @@
+ use crate::Prompt;
+ use crate::client::ModelClientSession;
+ use crate::compact::CompactionAnalyticsDetails;
++use crate::compact_deadline::CompactionDeadline;
+ use crate::compact_remote_history::trim_function_call_history_to_fit_context_window;
+ use crate::responses_metadata::CompactionTurnMetadata;
+ use crate::session::session::Session;
+@@ -34,6 +35,7 @@
+     compaction_trace: &CompactionTraceContext,
+     compaction_metadata: CompactionTurnMetadata,
+     analytics_details: &mut CompactionAnalyticsDetails,
++    deadline: &mut CompactionDeadline,
+ ) -> CodexResult<RemoteCompactV2Attempt> {
+     let turn_context = &step_context.turn;
+     let mut history = sess.clone_history().await;
+@@ -107,6 +109,7 @@
+         client_session,
+         &prompt,
+         &responses_metadata,
++        deadline,
+     )
+     .await;
+     trace_attempt.record_result(
+@@ -118,6 +121,7 @@
+         compaction_output,
+         response_id,
+         token_usage,
++        usage_metadata: _,
+     } = compaction_output_result?;
+     let mut prompt_input = prompt.input;
+     prompt_input.pop();
+diff --git a/core/src/lib.rs b/core/src/lib.rs
+--- a/core/src/lib.rs
++++ b/core/src/lib.rs
+@@ -34,6 +34,7 @@
+ mod compact_model_fallback;
+ mod compact_remote_history;
+ mod compact_remote_v2;
++mod compact_deadline;
+ mod compact_token_budget;
+ mod thread_startup_metadata;
+ pub use codex_network_proxy::EnvironmentNetworkPolicy;
+diff --git a/core/src/model_request_tests.rs b/core/src/model_request_tests.rs
+--- a/core/src/model_request_tests.rs
++++ b/core/src/model_request_tests.rs
+@@ -30,6 +30,8 @@
+     let mut stream = intercept_stream(
+         Box::pin(
+             ResponseStream {
++                request_task: None,
++                mapper_task: None,
+                 rx_event,
+                 interrupt: None,
+                 consumer_dropped,
