@@ -18,8 +18,8 @@ UPSTREAM_ARCHIVE_SHA256 = "a04042fa9ecce4b06445d769e68496c56c371d7472bb2cdfbe9d1
 PINNED_FILES = {
     "baseline-overlay.tar.gz": "654b5c8774f631b5c9dce0a9f924d9c91b0853c6a2b9f58a0405dca7cd71383a",
     "baseline-overlay-manifest.json": "72afea8f26d6438f80303c7e7a7ceddb909e2b33ff9e16ab5549de20d7229792",
-    "compact-native-timeout.patch": "c028bac2df2b86c548f10ed9c8c0d6fbcd058d6310ad29f573b80bc2e7f7b6f1",
-    "source-manifest.json": "3362bde0f953e1c899849ba56112e1bcd9637f804f3bdffc8cf6e25110ea2bd5",
+    "compact-native-timeout.patch": "adc40c21d4326cd8ff0067e609cfcfa7f1f342c6d514b92719a4095eca80f03a",
+    "source-manifest.json": "f0af78fffc949fa168c7100f4c1adae72046b1ca68917fe62be6e2635474fadc",
 }
 
 

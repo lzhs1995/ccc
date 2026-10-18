@@ -7,8 +7,8 @@
   "rust_toolchain": "1.95.0",
   "patch_path": "compact-native-timeout.patch",
   "patch_cwd": "codex-rs",
-  "patch_sha256": "c028bac2df2b86c548f10ed9c8c0d6fbcd058d6310ad29f573b80bc2e7f7b6f1",
-  "patch_bytes": 30696,
+  "patch_sha256": "adc40c21d4326cd8ff0067e609cfcfa7f1f342c6d514b92719a4095eca80f03a",
+  "patch_bytes": 32149,
   "files": [
     {
       "path": "codex-api/src/common.rs",
@@ -43,8 +43,8 @@
     {
       "path": "core/src/client_common_tests.rs",
       "baseline_sha256": "9e6f531e3de107248300b783c057af130cda0bf876e905943121e366cac168d3",
-      "candidate_sha256": "bd26f039d5d32f604110227c86c8917fb04d262548f26027276e1aae7bdd95f7",
-      "candidate_bytes": 9922
+      "candidate_sha256": "25393d051581caf20aa74c7c9928692ef5369dad6d9332afa1ae6c996a6dd5d7",
+      "candidate_bytes": 9966
     },
     {
       "path": "core/src/client_tests.rs",
@@ -55,8 +55,8 @@
     {
       "path": "core/src/compact.rs",
       "baseline_sha256": "715756709185c29499c328617a7907a7fc8ede9e89fe55b4dbddfe9c15e22080",
-      "candidate_sha256": "06eebd00dca6f47a90d897a90238e2bb69dc0ee50213166199dfd879217d7921",
-      "candidate_bytes": 31462
+      "candidate_sha256": "5d88889dd7c18a4f403a130a5509c047a061b9c3fb534a480c5280340323f6ca",
+      "candidate_bytes": 31809
     },
     {
       "path": "core/src/compact_deadline.rs",
@@ -73,8 +73,8 @@
     {
       "path": "core/src/compact_remote_v2.rs",
       "baseline_sha256": "7cbbfa20947076c2d32c475e0cf1acf1540eef4a0d611e197c78659c0465aca2",
-      "candidate_sha256": "7bf08efcdc2c41c3363649e71862c1e91b969977c66db096504b357ffe1a2d78",
-      "candidate_bytes": 49176
+      "candidate_sha256": "7eb9519122200741de3077f27ddb7ec79a28ec1ee736c6240b6aa4235452961d",
+      "candidate_bytes": 49323
     },
     {
       "path": "core/src/compact_remote_v2_attempt.rs",
@@ -85,7 +85,7 @@
     {
       "path": "core/src/lib.rs",
       "baseline_sha256": "77123e59406093fcaa2f10e549458c228e55d53c84fef06728a73933cc9f096b",
-      "candidate_sha256": "21b7609c621ecaba70c89ba71d6bc1039742f74f739b6279e00ac4bec9c6d664",
+      "candidate_sha256": "935b32ac6928eac40d3ed177d91a40607d34fe8da796ab239a304a6495c69eaf",
       "candidate_bytes": 8726
     },
     {

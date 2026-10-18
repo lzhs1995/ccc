@@ -221,19 +221,21 @@ diff --git a/core/src/client_common.rs b/core/src/client_common.rs
 diff --git a/core/src/client_common_tests.rs b/core/src/client_common_tests.rs
 --- a/core/src/client_common_tests.rs
 +++ b/core/src/client_common_tests.rs
-@@ -270,3 +270,35 @@
+@@ -270,3 +270,37 @@
          Some("flex")
      );
  }
 +
-+
 +#[tokio::test]
 +async fn compact_cancel_wait_joins_request_and_mapper_before_retry() {
 +    use std::sync::Arc;
-+    use std::sync::atomic::{AtomicUsize, Ordering};
++    use std::sync::atomic::AtomicUsize;
++    use std::sync::atomic::Ordering;
 +    struct MarkDropped(Arc<AtomicUsize>);
 +    impl Drop for MarkDropped {
-+        fn drop(&mut self) { self.0.fetch_add(1, Ordering::SeqCst); }
++        fn drop(&mut self) {
++            self.0.fetch_add(1, Ordering::SeqCst);
++        }
 +    }
 +    let stopped = Arc::new(AtomicUsize::new(0));
 +    let mapper_guard = MarkDropped(Arc::clone(&stopped));
@@ -276,8 +278,8 @@ diff --git a/core/src/compact.rs b/core/src/compact.rs
  use crate::client::ModelClientSession;
  use crate::client_common::ResponseEvent;
 +use crate::client_common::ResponseStream;
-+use crate::compact_deadline::CompactionDeadline;
 +use crate::compact_deadline::COMPACTION_TIMEOUT_MESSAGE;
++use crate::compact_deadline::CompactionDeadline;
  use crate::context::CompactionSummary;
  use crate::context::ContextualUserFragment;
  use crate::context::world_state::WorldState;
@@ -339,7 +341,7 @@ diff --git a/core/src/compact.rs b/core/src/compact.rs
  
          match attempt_result {
              Ok(response) => {
-@@ -339,6 +359,39 @@
+@@ -339,6 +359,50 @@
              }
          }
      };
@@ -352,11 +354,21 @@ diff --git a/core/src/compact.rs b/core/src/compact.rs
 +            ResponseEvent::RateLimits(snapshot) => {
 +                sess.update_rate_limits(&turn_context, snapshot).await;
 +            }
-+            ResponseEvent::Completed { response_id, token_usage, usage_metadata, .. } => {
++            ResponseEvent::Completed {
++                response_id,
++                token_usage,
++                usage_metadata,
++                ..
++            } => {
 +                sess.record_observed_response_completed(
-+                    &turn_context, &response_id, token_usage.as_ref(), usage_metadata.as_ref(),
-+                ).await;
-+                sess.update_token_usage_info(&turn_context, token_usage.as_ref()).await?;
++                    &turn_context,
++                    &response_id,
++                    token_usage.as_ref(),
++                    usage_metadata.as_ref(),
++                )
++                .await;
++                sess.update_token_usage_info(&turn_context, token_usage.as_ref())
++                    .await?;
 +            }
 +            _ => {}
 +        }
@@ -373,13 +385,14 @@ diff --git a/core/src/compact.rs b/core/src/compact.rs
 +                        ..Default::default()
 +                    }),
 +                }],
-+            ).await;
++            )
++            .await;
 +        }
 +    }
  
      let history_snapshot = sess.clone_history().await;
      let history_items = history_snapshot.annotated_items();
-@@ -740,6 +793,7 @@
+@@ -740,6 +804,7 @@
  }
  
  struct CompactionResponse {
@@ -387,7 +400,7 @@ diff --git a/core/src/compact.rs b/core/src/compact.rs
      response_id: String,
      output: Vec<ResponseItem>,
  }
-@@ -750,9 +804,9 @@
+@@ -750,9 +815,9 @@
      client_session: &mut ModelClientSession,
      responses_metadata: &CodexResponsesMetadata,
      prompt: &Prompt,
@@ -399,7 +412,7 @@ diff --git a/core/src/compact.rs b/core/src/compact.rs
          .stream(
              prompt,
              turn_context.model_info(),
-@@ -770,7 +824,9 @@
+@@ -770,7 +835,9 @@
              &InferenceTraceContext::disabled(),
          )
          .await?;
@@ -409,7 +422,7 @@ diff --git a/core/src/compact.rs b/core/src/compact.rs
      loop {
          let maybe_event = stream.next().await;
          let Some(event) = maybe_event else {
-@@ -779,51 +835,17 @@
+@@ -779,50 +846,25 @@
              ));
          };
          match event {
@@ -454,24 +467,28 @@ diff --git a/core/src/compact.rs b/core/src/compact.rs
 -                .await;
 -                sess.update_token_usage_info(turn_context, token_usage.as_ref())
 -                    .await?;
--                return Ok(CompactionResponse {
--                    response_id,
--                    output,
--                });
 +            Ok(ResponseEvent::OutputItemDone(item)) => output.push(item),
-+            Ok(event @ (ResponseEvent::ServerReasoningIncluded(_) | ResponseEvent::RateLimits(_))) => {
++            Ok(
++                event @ (ResponseEvent::ServerReasoningIncluded(_) | ResponseEvent::RateLimits(_)),
++            ) => {
 +                deferred_events.push(event);
 +            }
 +            Ok(event @ ResponseEvent::Completed { .. }) => {
-+                let ResponseEvent::Completed { ref response_id, .. } = event else {
++                let ResponseEvent::Completed {
++                    ref response_id, ..
++                } = event
++                else {
 +                    unreachable!();
 +                };
 +                let response_id = response_id.clone();
 +                deferred_events.push(event);
-+                return Ok(CompactionResponse { response_id, output, deferred_events });
+                 return Ok(CompactionResponse {
+                     response_id,
+                     output,
++                    deferred_events,
+                 });
              }
              Ok(_) => continue,
-             Err(e) => return Err(e),
 diff --git a/core/src/compact_deadline.rs b/core/src/compact_deadline.rs
 new file mode 100644
 --- /dev/null
@@ -573,8 +590,8 @@ diff --git a/core/src/compact_remote_v2.rs b/core/src/compact_remote_v2.rs
  use crate::compact::build_compaction_initial_context;
  use crate::compact::compaction_status_from_result;
  use crate::compact::insert_initial_context_before_last_real_user_or_summary;
-+use crate::compact_deadline::CompactionDeadline;
 +use crate::compact_deadline::COMPACTION_TIMEOUT_MESSAGE;
++use crate::compact_deadline::CompactionDeadline;
  use crate::compact_model_fallback::record_model_fallback;
  use crate::compact_model_fallback::should_retry_with_current_model;
  use crate::compact_remote_history::HistoryItemGroup;
@@ -634,28 +651,53 @@ diff --git a/core/src/compact_remote_v2.rs b/core/src/compact_remote_v2.rs
  ) -> CodexResult<RemoteCompactionV2Output> {
      let turn_context = &step_context.turn;
      let max_retries = turn_context
-@@ -398,7 +407,9 @@
+@@ -398,29 +407,57 @@
          .min(MAX_REMOTE_COMPACTION_V2_STREAM_RETRIES);
      let mut retry_state = ResponsesStreamRetryState::default();
      loop {
 -        let result = match client_session
+-            .stream(
+-                prompt,
+-                turn_context.model_info(),
+-                &turn_context.session_telemetry,
+-                sess.reasoning_effort_for_request(
+-                    &turn_context.initial_settings,
+-                    RequestEffortUsage::Compaction,
 +        let mut stream_slot = None;
 +        let request = async {
-+        match client_session
-             .stream(
-                 prompt,
-                 turn_context.model_info(),
-@@ -415,12 +426,35 @@
-             )
-             .await
-         {
++            match client_session
++                .stream(
++                    prompt,
++                    turn_context.model_info(),
++                    &turn_context.session_telemetry,
++                    sess.reasoning_effort_for_request(
++                        &turn_context.initial_settings,
++                        RequestEffortUsage::Compaction,
++                    )
++                    .await,
++                    turn_context.reasoning_summary(),
++                    step_context.settings.service_tier.clone(),
++                    responses_metadata,
++                    &InferenceTraceContext::disabled(),
+                 )
+-                .await,
+-                turn_context.reasoning_summary(),
+-                step_context.settings.service_tier.clone(),
+-                responses_metadata,
+-                &InferenceTraceContext::disabled(),
+-            )
+-            .await
+-        {
 -            Ok(stream) => collect_compaction_output(sess, turn_context, stream).await,
-+            Ok(stream) => {
-+                let stream = stream_slot.insert(stream);
-+                collect_compaction_output(stream).await
-+            },
-             Err(err) => Err(err),
-+        }
+-            Err(err) => Err(err),
++                .await
++            {
++                Ok(stream) => {
++                    let stream = stream_slot.insert(stream);
++                    collect_compaction_output(stream).await
++                }
++                Err(err) => Err(err),
++            }
 +        };
 +        let result = match deadline.run(request).await {
 +            Ok(result) => result,
@@ -675,15 +717,18 @@ diff --git a/core/src/compact_remote_v2.rs b/core/src/compact_remote_v2.rs
 -            Ok(compaction_output) => return Ok(compaction_output),
 +            Ok(compaction_output) => {
 +                sess.record_observed_response_completed(
-+                    turn_context, &compaction_output.response_id,
-+                    compaction_output.token_usage.as_ref(), compaction_output.usage_metadata.as_ref(),
-+                ).await;
++                    turn_context,
++                    &compaction_output.response_id,
++                    compaction_output.token_usage.as_ref(),
++                    compaction_output.usage_metadata.as_ref(),
++                )
++                .await;
 +                return Ok(compaction_output);
-+            },
++            }
              Err(err) => {
                  handle_response_stream_error(
                      &mut retry_state,
-@@ -438,15 +472,14 @@
+@@ -438,15 +475,14 @@
  }
  
  async fn collect_compaction_output(
@@ -701,7 +746,7 @@ diff --git a/core/src/compact_remote_v2.rs b/core/src/compact_remote_v2.rs
      while let Some(event) = stream.next().await {
          match event? {
              ResponseEvent::OutputItemDone(item) => {
-@@ -464,13 +497,7 @@
+@@ -464,13 +500,7 @@
                  usage_metadata,
                  ..
              } => {
@@ -716,7 +761,7 @@ diff --git a/core/src/compact_remote_v2.rs b/core/src/compact_remote_v2.rs
                  completed_response_id = Some(response_id);
                  completed_token_usage = token_usage;
                  break;
-@@ -498,6 +525,7 @@
+@@ -498,6 +528,7 @@
          compaction_output,
          response_id,
          token_usage: completed_token_usage,
@@ -724,7 +769,7 @@ diff --git a/core/src/compact_remote_v2.rs b/core/src/compact_remote_v2.rs
      })
  }
  
-@@ -844,6 +872,8 @@
+@@ -844,6 +875,8 @@
          }
          drop(tx_event);
          ResponseStream {
@@ -733,7 +778,7 @@ diff --git a/core/src/compact_remote_v2.rs b/core/src/compact_remote_v2.rs
              rx_event,
              interrupt: None,
              consumer_dropped: CancellationToken::new(),
-@@ -1234,7 +1264,7 @@
+@@ -1234,7 +1267,7 @@
              encrypted_content: "encrypted".to_string(),
              internal_chat_message_metadata_passthrough: None,
          };
@@ -742,7 +787,7 @@ diff --git a/core/src/compact_remote_v2.rs b/core/src/compact_remote_v2.rs
              Ok(ResponseEvent::OutputItemDone(message(
                  "assistant",
                  "IGNORED_COMPACT_REPLY",
-@@ -1260,21 +1290,14 @@
+@@ -1260,21 +1293,14 @@
              }),
          ]);
  
@@ -804,14 +849,14 @@ diff --git a/core/src/compact_remote_v2_attempt.rs b/core/src/compact_remote_v2_
 diff --git a/core/src/lib.rs b/core/src/lib.rs
 --- a/core/src/lib.rs
 +++ b/core/src/lib.rs
-@@ -34,6 +34,7 @@
+@@ -31,6 +31,7 @@
+ pub use responses_metadata::CodexResponsesMetadata;
+ pub use turn_metadata::detached_memory_responses_metadata;
+ mod codex_thread;
++mod compact_deadline;
  mod compact_model_fallback;
  mod compact_remote_history;
  mod compact_remote_v2;
-+mod compact_deadline;
- mod compact_token_budget;
- mod thread_startup_metadata;
- pub use codex_network_proxy::EnvironmentNetworkPolicy;
 diff --git a/core/src/model_request_tests.rs b/core/src/model_request_tests.rs
 --- a/core/src/model_request_tests.rs
 +++ b/core/src/model_request_tests.rs
