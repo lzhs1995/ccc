@@ -70,13 +70,13 @@ jobs:
         run: |
           set -o pipefail
           cargo fmt --all -- --config imports_granularity=Item --check 2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/rustfmt.log"
-      - name: Compile app-server, core, TUI, protocol and rollout with their tests
+      - name: Compile native packages and all Goal/state tests
         id: check
         continue-on-error: true
         working-directory: ${{ runner.temp }}/native-conditional/source/codex-rs
         run: |
           set -o pipefail
-          cargo check --locked -p codex-app-server -p codex-core -p codex-tui -p codex-app-server-protocol -p codex-protocol -p codex-rollout --tests 2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/cargo-check.log"
+          cargo check --locked -p codex-app-server -p codex-core -p codex-tui -p codex-app-server-protocol -p codex-protocol -p codex-rollout -p codex-goal-extension -p codex-state --tests 2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/cargo-check.log"
       - name: Run native admission, authority, occurrence and preserved timeout tests
         id: focused
         if: steps.check.outcome == 'success' && steps.producer.outcome == 'success'

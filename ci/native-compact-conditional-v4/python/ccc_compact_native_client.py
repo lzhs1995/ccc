@@ -17,7 +17,7 @@ import ccc_guard_scope as scope
 import ccc_shared_codex_turn as shared
 from ccc_client_thread_observation import read_foreground, COMPACT_INTERRUPT_CAPABILITY
 from ccc_request_observation_policy import request_observation_directory_matches
-from ccc_compact_support import owned_file
+from ccc_compact_support import owned_file, validate_native_receipt_fields
 from ccc_compact_guard import _current_config_clear
 from ccc_compact_sensor import native_compaction_start
 
@@ -201,4 +201,4 @@ def read_receipt(directory, key, phase, request):
             or value.get('original_intent') != request['intentPath']
             or not isinstance(value.get('fields'), dict)):
         raise ValueError('native receipt belongs to a different original request')
-    return value['fields']
+    return validate_native_receipt_fields(value['fields'], phase, request)

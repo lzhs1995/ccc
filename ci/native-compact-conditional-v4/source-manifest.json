@@ -1,22 +1,24 @@
 {
-  "schema": "ccc-native-conditional-source-v5",
+  "schema": "ccc-native-conditional-source-v6",
   "status": "COMPILER_DIAGNOSTIC_CANDIDATE_NOT_DEPLOYABLE",
   "baseline_prepare_sha256": "beae02abdd924b103f489ce54fdd9fb666ebff89ccb8592d43cfc18cdff81a12",
   "baseline_source_tree_sha256": "6a0540b9d82e9c947192a3bf675467af87562c35b047ce54c0767c2d4aec3d35",
-  "source_tree_sha256": "db4c6bdd59e8c38dcec355028a28fef8af23c10322422c3fbaca500c3e355791",
+  "source_tree_sha256": "ab6c735f4ad18f234aaa5843b96b06ad36460615438bb024f9574d01e3169b9e",
   "source_file_count": 8890,
-  "archive_sha256": "367c7110c35cb5bec569f9cd1ffccd2384f651a3417c9bc44f607a83163a4bcd",
+  "archive_sha256": "2e71403f5f7e725f1db0e3c5cf8141b9ecf1ac6378f8f2fbfbf77521afc575e5",
   "evidence": {
     "authority_manifest": "544e569f9323faa03e4a3277188fc3a4db54aa4559de4b774cc646e86a1f6dd2",
-    "reservation_manifest": "e83f27a39822dfef9594f5bbe9bb49999fe2a48b5568ee68fd636a3a479c6239",
+    "reservation_manifest": "7ff594c3a3a70e71508effed4a9dd7d305c70f3f60ea1d562a4b534b973329d2",
     "goal_runtime_gates_manifest": "fb1812f2678739a185fa99d0827a0f8d05142dae40c184b7177a5fdac7808b6e",
-    "python_producer_manifest": "0320eac9dc8fadd2c35695b542792f661cedab409d0ba3f793fb71e178603a2b",
+    "native_receipt_gate_manifest": "d63491fd27af0a9efc4668de6538a42bfd073739affff5158b85d56464539101",
+    "compiler_fix": "GHA39506212443 E0308: retain Arc<GoalRuntimeHandle>",
+    "python_producer_manifest": "d7f41a1dbdb29672e35f6058937f9234df3fcc258558354091404ac7e4a2b246",
     "experimental_exports_run": 39499309200,
     "experimental_exports_sha256": "38a72e7b8d517165cc87502568595996c2dba1bcc88d5d57f225ca1a0e8a3159"
   },
   "limitations": [
-    "start_if_idle ownership and deterministic FIFO gates in B V9 pending",
-    "core Session with real Goal and app-server receipt gates in A V8 pending",
+    "real core Session with Goal gate in A V9 pending",
+    "independent final crossreview B V10 pending",
     "native business adoption NOT_RUN"
   ],
   "changes": [
@@ -115,8 +117,8 @@
       "before": null,
       "after": {
         "kind": "file",
-        "sha256": "f2025e46bb8d8e74d8b9056f6128e05cabbd03c2de6f19c867688541032914b9",
-        "bytes": 10323,
+        "sha256": "328de0dbdcfa25f26e12552ebda133646dce05f4ec2b150ba5d3540e8a0ba3e9",
+        "bytes": 10064,
         "git_mode": "100644"
       }
     },
@@ -125,8 +127,8 @@
       "before": null,
       "after": {
         "kind": "file",
-        "sha256": "b40b516a95acb72332ad0e7e7ff19d7d584351b83ac027364b0cdc3dfb52fc99",
-        "bytes": 29960,
+        "sha256": "f295eb9495c08bc8a395e2bb994e964fa8601b440214428ad48bb3a3fa67abf1",
+        "bytes": 31416,
         "git_mode": "100644"
       }
     },
@@ -135,8 +137,8 @@
       "before": null,
       "after": {
         "kind": "file",
-        "sha256": "81b259bdf19e09b49f27b2ecb14f505201ba7414bc564b460070b5d19dd22ed5",
-        "bytes": 28448,
+        "sha256": "3313c5761cdd319cd3a07b2226f01e09109a2236ca84557dc755fc2966845dda",
+        "bytes": 33961,
         "git_mode": "100644"
       }
     },
@@ -170,8 +172,8 @@
       "before": null,
       "after": {
         "kind": "file",
-        "sha256": "70572a19ca1dd476a73549026f7db3f7214c68f1b7e210f1e5064ab99f2074de",
-        "bytes": 38773,
+        "sha256": "2114a182b84db283612b7e3ca3b168284d8bd88eca16e1fa381ed81d9fceb232",
+        "bytes": 46181,
         "git_mode": "100644"
       }
     },
@@ -260,8 +262,8 @@
       },
       "after": {
         "kind": "file",
-        "sha256": "cabcd093339b98f3f3fdf8a448cbc8e2b4caff1a8f187e37839bb2d1ceb5e5c8",
-        "bytes": 31170,
+        "sha256": "78cd57fd8c057788e0132c89004da623b5b39b53bb78c5ea672b21d63eaaafb3",
+        "bytes": 31693,
         "git_mode": "100644"
       }
     },
@@ -290,8 +292,8 @@
       },
       "after": {
         "kind": "file",
-        "sha256": "f0eb70333b64a11532ce46e78dbd20a260b05be979cc073aabc7fa2d81238f94",
-        "bytes": 13348,
+        "sha256": "e3c8c997c7a006e689385a1c1df11778903c9385f35c2fd0f8ebc36733e14a12",
+        "bytes": 13533,
         "git_mode": "100644"
       }
     },
@@ -305,8 +307,8 @@
       },
       "after": {
         "kind": "file",
-        "sha256": "fa6fbdee44cbeaf5c10ba925dbf64f813e6f74a28b907d3506fe31a7c0f9a3ca",
-        "bytes": 51629,
+        "sha256": "abe2eca5ba86e970aa63a681b95be2aa84bc7f85b9c3bdd5ff4c314c323612ba",
+        "bytes": 54603,
         "git_mode": "100644"
       }
     },
@@ -405,8 +407,8 @@
       },
       "after": {
         "kind": "file",
-        "sha256": "7a90507e574e5505c83207348586ed7e094d1e9c6f084044d01bc549e1d39c4e",
-        "bytes": 81046,
+        "sha256": "14797c4608b9decbfb7d59f74587c0316cd7762a312f73dbfd6274f94c9e785d",
+        "bytes": 81656,
         "git_mode": "100644"
       }
     },

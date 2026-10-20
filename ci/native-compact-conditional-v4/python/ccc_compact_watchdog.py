@@ -96,7 +96,7 @@ class Worker:
         self.journal_directory = OwnedDirectory(self.directory)
         self.journal = Journal(self.directory / 'events.jsonl', directory=self.journal_directory)
         self.state_path = self.directory / 'state.json'
-        self.state = json.loads(self.state_path.read_text()) if self.state_path.exists() else {
+        self.state = json.loads(pinned_file(self.state_path, limit=64 * 1024 * 1024)[1]) if self.state_path.exists() else {
             'episode': None, 'closed': [], 'progress_after': None}
         self.facts = RolloutFacts(target['path'])
         self.inputs = PendingInputs(self.directory / 'pending-inputs.json',
@@ -583,7 +583,12 @@ class Worker:
                                 or type(result.get('interruptionCompleted')) is not bool):
                             raise RuntimeError('original conditional response UNKNOWN')
                         if result['interruptionCompleted'] is False:
-                            self.close_episode('cancelled', reason='native conditional interruption denied')
+                            if not self.native_receipt_pending(ep):
+                                if self.state.get('episode', {}).get('phase') == 'control_pending':
+                                    raise RuntimeError('false native response has no original not-interrupted receipt')
+                            else:
+                                self.journal.record('CONDITIONAL_NATIVE_RECEIPT_PENDING', key=key,
+                                                    replay_authorized=False)
                             return
                     if self.native_receipt_pending(ep):
                         self.journal.record('CONDITIONAL_NATIVE_RECEIPT_PENDING', key=key,
@@ -730,6 +735,9 @@ class Worker:
                     return
                 if (not snap['turn'] or snap['turn']['id'] != ep['turn_id']
                         or snap['turn']['status'] != 'inProgress'
+                        or not snap.get('compact')
+                        or snap['compact'].get('key') != ep['compact_key']
+                        or snap['compact'].get('compaction_occurrence') != ep.get('compaction_occurrence')
                         or not self.unchanged(ep, snap)):
                     self.close_episode('cancelled', reason='external input or native turn changed')
                     return

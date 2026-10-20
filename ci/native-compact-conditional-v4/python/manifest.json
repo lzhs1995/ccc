@@ -1,5 +1,5 @@
 {
-  "schema": "ccc-python-native-producer-source-v5",
+  "schema": "ccc-python-native-producer-source-v6",
   "scope": "real producer/test dependency closure; not a deployable CCC release",
   "native_identity": "synthetic fixtures; live native admission NOT_RUN",
   "files": {
@@ -56,20 +56,20 @@
       "bytes": 14545
     },
     "ccc_compact_inputs.py": {
-      "sha256": "5a39e65ba11eed27405e172ce38256c47a862db406162bfb3502f6530e3ed209",
-      "bytes": 25529
+      "sha256": "24c4c44af420f45fd76255a924d91bcdbd66d4eda10ee36c6afeca344cb8ca75",
+      "bytes": 25691
     },
     "ccc_compact_intents.py": {
-      "sha256": "0df94eec63e0feafced92d0d2831a697597db92c69a8ae82c0c1b2534f7384bb",
-      "bytes": 29988
+      "sha256": "9b206fa1086892685860df0ccf6d5e37b9013b5c54d172edc2bb1fd56ea9369b",
+      "bytes": 30038
     },
     "ccc_compact_join_accounting.py": {
       "sha256": "4ac4cfb0fe40d4d0162c7201ebebae1ebe44fa9521f46a980e19abf597fc8126",
       "bytes": 3471
     },
     "ccc_compact_native_client.py": {
-      "sha256": "308e8ae1cb4977fda7c0ab6d10350b02beb563a4e822deb18a8efe51c8abc71d",
-      "bytes": 11644
+      "sha256": "25ecc04624208a57fcd88c7649daafb4ee914af39f0d96c67afd1a34aa746407",
+      "bytes": 11724
     },
     "ccc_compact_runtime.py": {
       "sha256": "fb8199352709926636f08a989dac6a0c8b76be51b6e335d7f4e7111b5c3a7311",
@@ -80,16 +80,16 @@
       "bytes": 23329
     },
     "ccc_compact_support.py": {
-      "sha256": "cc75174ea5ab7aba025808bee9eb35e0a6cc61d7b8e5e8b717a92c438e10b6e9",
-      "bytes": 9629
+      "sha256": "8f0a6ac53a197e4223101a8b25a7defc744eb0c004ec9cc5f24229f38a8f1501",
+      "bytes": 13524
     },
     "ccc_compact_trace.py": {
       "sha256": "9d9e85615e7d4ca98716f6ec9b0c4ab81e9a73ddcba2f9a93662a682aa072fba",
       "bytes": 2972
     },
     "ccc_compact_watchdog.py": {
-      "sha256": "bd838c35c5053e0de07dbddb41975ec6f61237b326f049cc70fc71222e04bebd",
-      "bytes": 52840
+      "sha256": "603c4bf0464ed566656816fa2677668e4394935135c20aeab7dee8a7dc2d9e88",
+      "bytes": 53490
     },
     "ccc_daemon_liveness.py": {
       "sha256": "9e5441fdee47e99a5c7576fecb892582bee662a48043fa7d58b75090f5210103",
@@ -272,8 +272,8 @@
       "bytes": 7819
     },
     "test_native_compact.py": {
-      "sha256": "e2527a7dd64937de4e2b5a3fa1b5d3ba85a0054e4fce9f894187ac06a7dbc7b8",
-      "bytes": 13584
+      "sha256": "f563dc975ed870734447c9a5b20d993b1c958d0e42d30cd1e41aa24950c8582e",
+      "bytes": 16986
     }
   }
 }

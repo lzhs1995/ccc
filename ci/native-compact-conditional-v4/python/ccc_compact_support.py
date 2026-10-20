@@ -115,6 +115,12 @@ class OwnedDirectory:
     def write_once(self, name, value):
         name = self._name(name)
         raw = (json.dumps(value, ensure_ascii=False, indent=2) + '\n').encode()
+        return self._write_once_bytes(name, raw)
+
+    def _write_once_bytes(self, name, raw):
+        name = self._name(name)
+        if not isinstance(raw, bytes):
+            raise TypeError('journal data must be bytes')
         self.verify()
         fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                      0o600, dir_fd=self.fds[-1])
@@ -122,19 +128,47 @@ class OwnedDirectory:
             stream.write(raw)
             stream.flush()
             os.fsync(stream.fileno())
+            info = os.fstat(stream.fileno())
+            self._file_identity(name, info)
         os.fsync(self.fds[-1])
         # A failed recheck consumes the original filename; never unlink or refund it.
         self.verify()
         return hashlib.sha256(raw).hexdigest()
 
+    def _file_identity(self, name, expected=None):
+        try:
+            current = os.stat(name, dir_fd=self.fds[-1], follow_symlinks=False)
+        except FileNotFoundError:
+            if expected is not None:
+                raise ValueError('journal file disappeared')
+            return None
+        if (not stat.S_ISREG(current.st_mode) or current.st_uid != os.geteuid()
+                or current.st_mode & 0o022 or current.st_nlink != 1):
+            raise ValueError('untrusted journal file')
+        if expected is not None and (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino):
+            raise ValueError('journal file replaced during write')
+        return current
+
     def atomic_json(self, name, value):
+        raw = (json.dumps(value, ensure_ascii=False, indent=2) + '\n').encode()
+        self.atomic_bytes(name, raw)
+
+    def atomic_bytes(self, name, raw):
         import secrets
         name = self._name(name)
-        temporary = '.' + name + '-' + secrets.token_hex(12) + '.tmp'
-        self.write_once(temporary, value)
         self.verify()
+        previous = self._file_identity(name)
+        temporary = '.' + name + '-' + secrets.token_hex(12) + '.tmp'
+        self._write_once_bytes(temporary, raw)
+        prepared = self._file_identity(temporary)
+        self.verify()
+        current = self._file_identity(name)
+        if (None if previous is None else (previous.st_dev, previous.st_ino)) != (
+                None if current is None else (current.st_dev, current.st_ino)):
+            raise ValueError('journal destination changed before rename')
         os.rename(temporary, name, src_dir_fd=self.fds[-1], dst_dir_fd=self.fds[-1])
         os.fsync(self.fds[-1])
+        self._file_identity(name, prepared)
         self.verify()
 
     def close(self):
@@ -153,6 +187,43 @@ def write_once(path, value):
     path = Path(path)
     with OwnedDirectory(path.parent) as directory:
         return directory.write_once(path.name, value)
+
+def validate_native_receipt_fields(fields, phase, request):
+    """Only an exact terminal native receipt releases the original input pins."""
+    if not isinstance(fields, dict) or not isinstance(request, dict):
+        raise ValueError('native receipt fields or original request missing')
+    old_turn, key = request.get('expectedTurnId'), request.get('attemptId')
+    if phase == 'client-claimed':
+        valid = fields == {'status': 'UNKNOWN'}
+    elif phase == 'interrupted':
+        valid = fields == {'turnId': old_turn}
+    elif phase == 'not-interrupted':
+        valid = fields == {'turnId': old_turn, 'attemptId': key}
+    elif phase == 'compact-denied':
+        valid = (set(fields) == {'turnId', 'attemptId', 'reason'}
+                 and fields.get('turnId') == old_turn and fields.get('attemptId') == key
+                 and fields.get('reason') in {'goal_join_accounting_rejected', 'goal_changed',
+                                             'settings_changed', 'compact_budget_consumed'})
+    elif phase == 'compact-started':
+        new_turn, join = fields.get('turnId'), fields.get('joinAccounting')
+        valid = (set(fields) == {'turnId', 'joinAccounting'}
+                 and (new_turn is None or isinstance(new_turn, str) and new_turn and new_turn != old_turn)
+                 and isinstance(join, dict))
+        if valid and join != {'status': 'not_accounted'}:
+            row_fields = {'goal_id', 'tokens_used', 'time_used_seconds', 'created_at_ms', 'updated_at_ms'}
+            valid = (set(join) == {'status', 'turnId', 'attemptId', 'before', 'after'}
+                     and join.get('status') == 'accounted'
+                     and join.get('turnId') == old_turn and join.get('attemptId') == key)
+            for row in (join.get('before'), join.get('after')):
+                valid = bool(valid and isinstance(row, dict) and set(row) == row_fields
+                             and isinstance(row.get('goal_id'), str) and row['goal_id']
+                             and all(type(row[k]) is int and row[k] >= 0 for k in row_fields - {'goal_id'}))
+    else:
+        raise ValueError('unknown native receipt phase')
+    if not valid:
+        raise ValueError('native receipt shape differs from the original operation')
+    return fields
+
 
 class Journal:
     def __init__(self, path, *, directory=None):

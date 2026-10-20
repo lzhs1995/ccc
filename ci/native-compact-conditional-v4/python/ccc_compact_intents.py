@@ -19,7 +19,7 @@ import threading
 import time
 
 from ccc_compact_inputs import receipt_matches, text_identity, verify_receipt
-from ccc_compact_support import sync_directory, owned_file, OwnedDirectory
+from ccc_compact_support import sync_directory, owned_file, OwnedDirectory, validate_native_receipt_fields
 
 STATE_ROOT = Path.home() / '.local/state/multi-agent-collaboration'
 ACTIVE_ROOT = Path('/tmp/multi-agent-collaboration/_active')
@@ -237,7 +237,7 @@ class IntentIndex:
                 request = lease.get('client_request') or {}
                 key = path.stem
                 if (lease.get('schema') != 'ccc-native-control-pin-v4'
-                        or request.get('attemptId') != key):
+                        or request.get('attemptId') != key or lease.get('replay_authorized') is not False):
                     raise ValueError('native control pin binding changed')
                 intent = Path(request.get('intentPath', ''))
                 if (not intent.is_absolute() or intent.parent.parent != self.path.parent
@@ -260,6 +260,7 @@ class IntentIndex:
                             or fields.get('turnId') != request.get('expectedTurnId')
                             or fields.get('attemptId') != key):
                         raise ValueError('native denial receipt is not for the original request')
+                    validate_native_receipt_fields(fields, phase, request)
                     continue
                 receipt, _ = read_json(receipt_path)
                 fields = receipt.get('fields')
@@ -267,6 +268,7 @@ class IntentIndex:
                         or receipt.get('original_intent') != str(intent)
                         or not isinstance(fields, dict) or 'turnId' not in fields):
                     raise ValueError('native terminal receipt is not for the original request')
+                validate_native_receipt_fields(fields, 'compact-started', request)
         return False
 
     def save(self):
@@ -276,14 +278,8 @@ class IntentIndex:
         if raw == self.saved:
             return
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        temp = self.path.with_suffix('.tmp')
-        with temp.open('wb') as stream:
-            os.fchmod(stream.fileno(), 0o600)
-            stream.write(raw)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temp, self.path)
-        sync_directory(self.path.parent)
+        with OwnedDirectory(self.path.parent) as directory:
+            directory.atomic_bytes(self.path.name, raw)
         self.saved = raw
 
     def _children(self, path):

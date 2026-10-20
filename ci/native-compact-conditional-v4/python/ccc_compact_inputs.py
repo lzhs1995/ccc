@@ -16,7 +16,7 @@ import time
 import math
 
 from ccc_codex_goal import _debug_fields
-from ccc_compact_support import sync_directory, owned_file
+from ccc_compact_support import sync_directory, owned_file, OwnedDirectory
 
 MAX_BODY = 65536
 MAX_ROWS = 2048
@@ -208,7 +208,12 @@ class PendingInputs:
         self.persisted = None
         self.pending_binding = None
         if self.path.exists():
-            raw = self.path.read_bytes()
+            with owned_file(self.path) as (stream, info):
+                if info.st_size > 64 * 1024 * 1024:
+                    raise ValueError('pending-input ledger exceeds its bound')
+                raw = stream.read(64 * 1024 * 1024 + 1)
+                if len(raw) != info.st_size:
+                    raise ValueError('pending-input ledger changed during read')
             self.state = json.loads(raw)
             if self.state.get('version') not in (2, LEDGER_VERSION):
                 raise RuntimeError('pending-input binding changed; observation only')
@@ -319,14 +324,8 @@ class PendingInputs:
         raw = (json.dumps(self.state, sort_keys=True, ensure_ascii=False) + '\n').encode()
         if raw == self.persisted:
             return
-        tmp = self.path.with_suffix('.tmp')
-        with tmp.open('wb') as stream:
-            os.fchmod(stream.fileno(), 0o600)
-            stream.write(raw)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(tmp, self.path)
-        sync_directory(self.path.parent)
+        with OwnedDirectory(self.path.parent) as directory:
+            directory.atomic_bytes(self.path.name, raw)
         self.persisted = raw
 
     def refresh(self, *, final=False):

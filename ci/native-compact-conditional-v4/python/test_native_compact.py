@@ -24,7 +24,7 @@ from ccc_compact_join_accounting import goal_after_join
 from ccc_compact_native_client import pinned_file
 from ccc_compact_runtime import conditional_submit, control_request
 from ccc_compact_sensor import RolloutFacts, native_compaction_start
-from ccc_compact_support import Journal, OwnedDirectory
+from ccc_compact_support import Journal, OwnedDirectory, validate_native_receipt_fields
 from ccc_compact_watchdog import Worker, make_episode
 
 
@@ -122,6 +122,63 @@ class NativeCompactTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'input evidence pinned'):
             pending.refresh()
         self.assertEqual(pending.path.read_bytes(), before)
+
+    def test_incomplete_terminal_receipt_does_not_release_input_pins(self):
+        self.f.index.freeze_for_control(self.f.request)
+        self.f.receipt('compact-started', {'turnId': 'turn-2'})
+        with self.assertRaisesRegex(ValueError, 'receipt shape'):
+            self.f.index.control_is_pending()
+        for fields in (
+            {'turnId': 'turn-2', 'joinAccounting': {}},
+            {'turnId': 'turn-1', 'joinAccounting': {'status': 'not_accounted'}},
+            {'turnId': 'turn-2', 'joinAccounting': {'status': 'accounted',
+                'turnId': 'turn-1', 'attemptId': 'foreign', 'before': {}, 'after': {}}},
+        ):
+            with self.assertRaises(ValueError):
+                validate_native_receipt_fields(fields, 'compact-started', self.f.request)
+        for reason in ('goal_join_accounting_rejected', 'goal_changed',
+                       'settings_changed', 'compact_budget_consumed'):
+            fields = {'turnId': 'turn-1', 'attemptId': self.f.key, 'reason': reason}
+            self.assertEqual(validate_native_receipt_fields(fields, 'compact-denied', self.f.request), fields)
+        with self.assertRaises(ValueError):
+            validate_native_receipt_fields({'turnId': 'turn-1', 'attemptId': self.f.key,
+                'reason': 'unknown_error'}, 'compact-denied', self.f.request)
+
+    def test_atomic_ledger_writes_do_not_follow_fixed_temp_or_destination_links(self):
+        outside = self.f.put('outside.json', {'original': True})
+        fixed = self.f.index.path.with_suffix('.tmp')
+        fixed.symlink_to(outside)
+        self.f.index.state['unknown']['new'] = 'pending'
+        self.f.index.save()
+        self.assertTrue(fixed.is_symlink())
+        self.assertEqual(json.loads(outside.read_bytes()), {'original': True})
+        self.f.index.path.unlink()
+        self.f.index.path.symlink_to(outside)
+        self.f.index.state['unknown']['next'] = 'pending'
+        with self.assertRaisesRegex(ValueError, 'untrusted journal file'):
+            self.f.index.save()
+        self.assertTrue(self.f.index.path.is_symlink())
+        self.assertEqual(json.loads(outside.read_bytes()), {'original': True})
+
+    def test_worker_cancels_a_replaced_compaction_occurrence_in_the_same_turn(self):
+        episode = dict(key=self.f.key, phase='compacting', turn_id='turn-1',
+            compact_key='original-occurrence', compaction_occurrence='original-id',
+            path=str(self.f.rollout), file_id=[1, 2], compacted_offset=0, started_at=100)
+        worker = object.__new__(Worker)
+        worker.lock = threading.RLock()
+        worker.state = {'episode': episode}
+        worker.native_receipt_pending = lambda ep: False
+        worker.snapshot = lambda **kwargs: dict(binding_ok=True, paused=False,
+            turn={'id': 'turn-1', 'status': 'inProgress'},
+            facts={'caught_up': True, 'path': str(self.f.rollout), 'file_id': [1, 2],
+                   'compacted_offset': 0, 'compacted_at': 0, 'replacement_items': 0},
+            compact={'key': 'new-occurrence', 'compaction_occurrence': 'new-id'})
+        worker.handoff_step = lambda snap: None
+        worker.unchanged = lambda ep, snap: True
+        closed = []
+        worker.close_episode = lambda phase, **fields: closed.append((phase, fields))
+        worker.tick()
+        self.assertEqual([phase for phase, _ in closed], ['cancelled'])
 
     def test_worker_waits_for_receipt_before_snapshot_or_process_adoption(self):
         self.f.put(self.f.key + '-interrupt.json', {'client_request': self.f.request},
