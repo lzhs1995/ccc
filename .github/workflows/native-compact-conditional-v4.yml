@@ -1,0 +1,104 @@
+name: Native conditional compact v4
+
+on:
+  push:
+    paths:
+      - .github/workflows/native-compact-conditional-v4.yml
+      - ci/native-compact-conditional-v4/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-conditional-v4-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      RUST_MIN_STACK: "8388608"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - name: Reconstruct and verify all pinned source files
+        id: source
+        run: |
+          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/native-conditional-target" >> "$GITHUB_ENV"
+          python3 -I -B ci/native-compact-conditional-v4/prepare.py \
+            --output "$RUNNER_TEMP/native-conditional/source" \
+            --report "$GITHUB_WORKSPACE/conditional-evidence/reconstruction.json"
+      - name: Require build capacity on the GitHub runner
+        run: |
+          python3 -I -B -c 'import os,shutil; free=shutil.disk_usage(os.environ["RUNNER_TEMP"]).free; print(f"Free GiB: {free/2**30:.1f}"); assert free>=25*2**30'
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config libcap-dev libasound2-dev bubblewrap
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582
+        with:
+          toolchain: 1.95.0
+          components: rustfmt,clippy
+      - uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532
+        with:
+          tool: just@1.51.0,nextest@0.9.103
+      - name: Check Rust formatting
+        id: fmt
+        continue-on-error: true
+        working-directory: ${{ runner.temp }}/native-conditional/source/codex-rs
+        run: |
+          set -o pipefail
+          cargo fmt --all -- --config imports_granularity=Item --check 2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/rustfmt.log"
+      - name: Compile app-server, core, TUI, protocol and rollout with their tests
+        id: check
+        continue-on-error: true
+        working-directory: ${{ runner.temp }}/native-conditional/source/codex-rs
+        run: |
+          set -o pipefail
+          cargo check --locked -p codex-app-server -p codex-core -p codex-tui -p codex-app-server-protocol -p codex-protocol -p codex-rollout --tests 2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/cargo-check.log"
+      - name: Run native admission, authority, occurrence and preserved timeout tests
+        id: focused
+        if: steps.check.outcome == 'success'
+        continue-on-error: true
+        working-directory: ${{ runner.temp }}/native-conditional/source/codex-rs
+        run: |
+          set -o pipefail
+          just test --locked -p codex-app-server -p codex-core -p codex-tui -p codex-rollout -p codex-api --lib \
+            -E 'test(compact_recovery) | test(compact_original_intent) | test(extension_interruption) | test(turn_timing) | test(client_thread_observation) | test(compact_interrupt) | test(compact_deadline) | test(compact_cancel_wait) | test(collect_compaction_output) | test(close_and_wait_joins_the_websocket_pump) | test(policy)' \
+            --retries 0 2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/focused-tests.log"
+      - name: Run protocol and Goal library regressions
+        id: regressions
+        if: steps.focused.outcome == 'success'
+        continue-on-error: true
+        working-directory: ${{ runner.temp }}/native-conditional/source/codex-rs
+        run: |
+          set -o pipefail
+          just test --locked -p codex-app-server-protocol -p codex-protocol -p codex-goal-extension --lib --retries 0 2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/library-regressions.log"
+      - name: Upload complete validation evidence
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: native-conditional-v4-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            conditional-evidence/
+            ${{ runner.temp }}/native-conditional-target/nextest/local/junit.xml
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Require every validation gate
+        if: always()
+        env:
+          SOURCE_RESULT: ${{ steps.source.outcome }}
+          FORMAT_RESULT: ${{ steps.fmt.outcome }}
+          CHECK_RESULT: ${{ steps.check.outcome }}
+          FOCUSED_RESULT: ${{ steps.focused.outcome }}
+          REGRESSION_RESULT: ${{ steps.regressions.outcome }}
+        run: |
+          python3 -I -B -c 'import os; r={k:os.environ[k] for k in ("SOURCE_RESULT","FORMAT_RESULT","CHECK_RESULT","FOCUSED_RESULT","REGRESSION_RESULT")}; print(r); assert all(v=="success" for v in r.values()), "Native conditional candidate failed or remains incomplete"'
