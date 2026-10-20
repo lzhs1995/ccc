@@ -43,6 +43,19 @@ jobs:
           python3 -I -B -c 'import os,shutil; free=shutil.disk_usage(os.environ["RUNNER_TEMP"]).free; print(f"Free GiB: {free/2**30:.1f}"); assert free>=25*2**30'
           sudo apt-get update -y
           sudo apt-get install -y --no-install-recommends build-essential pkg-config libcap-dev libasound2-dev bubblewrap
+      - name: Verify real Python producer sources and create native-reader files
+        id: producer
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          python3 -I -B ci/native-compact-conditional-v4/python/verify_source.py 2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/python-source.log"
+          CCC_COMPACT_TEST_RUNTIME="$GITHUB_WORKSPACE/ci/native-compact-conditional-v4/python" \
+            python3 -I -B ci/native-compact-conditional-v4/python/test_native_compact.py 2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/python-safety-tests.log"
+          python3 -I -B ci/native-compact-conditional-v4/python/generate_reader_fixtures.py \
+            --runtime "$GITHUB_WORKSPACE/ci/native-compact-conditional-v4/python" \
+            --output "$GITHUB_WORKSPACE/conditional-evidence/producer-fixtures" \
+            2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/producer-generation.log"
+          echo "CCC_REAL_PRODUCER_MANIFEST=$GITHUB_WORKSPACE/conditional-evidence/producer-fixtures/manifest.json" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582
         with:
           toolchain: 1.95.0
@@ -66,7 +79,7 @@ jobs:
           cargo check --locked -p codex-app-server -p codex-core -p codex-tui -p codex-app-server-protocol -p codex-protocol -p codex-rollout --tests 2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/cargo-check.log"
       - name: Run native admission, authority, occurrence and preserved timeout tests
         id: focused
-        if: steps.check.outcome == 'success'
+        if: steps.check.outcome == 'success' && steps.producer.outcome == 'success'
         continue-on-error: true
         working-directory: ${{ runner.temp }}/native-conditional/source/codex-rs
         run: |
@@ -82,6 +95,17 @@ jobs:
         run: |
           set -o pipefail
           just test --locked -p codex-app-server-protocol -p codex-protocol -p codex-goal-extension --lib --retries 0 2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/library-regressions.log"
+      - name: Run real Goal backend and state CAS regressions
+        id: goal_backend
+        if: steps.focused.outcome == 'success'
+        continue-on-error: true
+        working-directory: ${{ runner.temp }}/native-conditional/source/codex-rs
+        run: |
+          set -o pipefail
+          just test --locked -p codex-goal-extension --test goal_extension_backend --retries 0 \
+            2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/goal-backend-tests.log"
+          just test --locked -p codex-state --lib -E 'test(goals)' --retries 0 \
+            2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/state-goal-tests.log"
       - name: Upload complete validation evidence
         if: always()
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
@@ -96,9 +120,11 @@ jobs:
         if: always()
         env:
           SOURCE_RESULT: ${{ steps.source.outcome }}
+          PRODUCER_RESULT: ${{ steps.producer.outcome }}
           FORMAT_RESULT: ${{ steps.fmt.outcome }}
           CHECK_RESULT: ${{ steps.check.outcome }}
           FOCUSED_RESULT: ${{ steps.focused.outcome }}
           REGRESSION_RESULT: ${{ steps.regressions.outcome }}
+          GOAL_BACKEND_RESULT: ${{ steps.goal_backend.outcome }}
         run: |
-          python3 -I -B -c 'import os; r={k:os.environ[k] for k in ("SOURCE_RESULT","FORMAT_RESULT","CHECK_RESULT","FOCUSED_RESULT","REGRESSION_RESULT")}; print(r); assert all(v=="success" for v in r.values()), "Native conditional candidate failed or remains incomplete"'
+          python3 -I -B -c 'import os; r={k:os.environ[k] for k in ("SOURCE_RESULT","PRODUCER_RESULT","FORMAT_RESULT","CHECK_RESULT","FOCUSED_RESULT","REGRESSION_RESULT","GOAL_BACKEND_RESULT")}; print(r); assert all(v=="success" for v in r.values()), "Native conditional candidate failed or remains incomplete"'

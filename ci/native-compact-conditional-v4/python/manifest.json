@@ -1,0 +1,279 @@
+{
+  "schema": "ccc-python-native-producer-source-v5",
+  "scope": "real producer/test dependency closure; not a deployable CCC release",
+  "native_identity": "synthetic fixtures; live native admission NOT_RUN",
+  "files": {
+    "ccc_access_budget.py": {
+      "sha256": "c9e2df56020ea2662ca9faaded164e673b5d00d51513e2d0761a474ce1241ff1",
+      "bytes": 16134
+    },
+    "ccc_access_gateway.py": {
+      "sha256": "862e96bc0b6f46ac48296188a224e5bf0a3e568088c4f3b9f177ac640c6edc8d",
+      "bytes": 40859
+    },
+    "ccc_access_service.py": {
+      "sha256": "88f81fec9228ba9017f0b6ec887cb5795ee99dd9ce13c59cdc667493ec0dd2c9",
+      "bytes": 39319
+    },
+    "ccc_batch_guard.py": {
+      "sha256": "b085300878b8166468042bfaa4d2839a1125ffb7e5948557fb70705a7f1ab6ea",
+      "bytes": 82122
+    },
+    "ccc_batch_timing.py": {
+      "sha256": "a47927a5fa9522887f1bcadf1cd3400bcc806ed44cca238210e2eceb8ba3d774",
+      "bytes": 12623
+    },
+    "ccc_claude_closeout.py": {
+      "sha256": "3a34ba6465433ce9f5c0cf51bdad4a19aee159a31ac8c392bdbd7995fe2da3b5",
+      "bytes": 29410
+    },
+    "ccc_client_thread_observation.py": {
+      "sha256": "e45f52e7e24d851cb516ab8003f6c80aae0a1eed164a688954996bca0b729356",
+      "bytes": 6554
+    },
+    "ccc_codex_goal.py": {
+      "sha256": "4ec69507c2cc0e9fc268d96f78612ae8d32235863f7f25584aa360b16eaa7430",
+      "bytes": 25854
+    },
+    "ccc_codex_queue.py": {
+      "sha256": "5dc0de62f8f9bc22fcb97c69b1a6cfb0089bde3c6a81fd3290c23def5510968a",
+      "bytes": 72804
+    },
+    "ccc_compact_endpoint.py": {
+      "sha256": "522acc0e8731bd3ee7165a285951ebbb1810c0b24d320c70a582150d46425f76",
+      "bytes": 2711
+    },
+    "ccc_compact_goals.py": {
+      "sha256": "4707a7732ff4403c199ac8ffb87526906cd82723cd4a290333a599d8d8dd30e3",
+      "bytes": 9021
+    },
+    "ccc_compact_guard.py": {
+      "sha256": "6a8a21cbb0dc01de0fe302117c5c5795cebda9bac0e46a4fe99a27c29f816a4e",
+      "bytes": 40137
+    },
+    "ccc_compact_handoff.py": {
+      "sha256": "27b32639d8516af9c9b2fec3e2ab2465b3894e5845c064c5b8da2010a6231d0d",
+      "bytes": 14545
+    },
+    "ccc_compact_inputs.py": {
+      "sha256": "5a39e65ba11eed27405e172ce38256c47a862db406162bfb3502f6530e3ed209",
+      "bytes": 25529
+    },
+    "ccc_compact_intents.py": {
+      "sha256": "0df94eec63e0feafced92d0d2831a697597db92c69a8ae82c0c1b2534f7384bb",
+      "bytes": 29988
+    },
+    "ccc_compact_join_accounting.py": {
+      "sha256": "4ac4cfb0fe40d4d0162c7201ebebae1ebe44fa9521f46a980e19abf597fc8126",
+      "bytes": 3471
+    },
+    "ccc_compact_native_client.py": {
+      "sha256": "308e8ae1cb4977fda7c0ab6d10350b02beb563a4e822deb18a8efe51c8abc71d",
+      "bytes": 11644
+    },
+    "ccc_compact_runtime.py": {
+      "sha256": "fb8199352709926636f08a989dac6a0c8b76be51b6e335d7f4e7111b5c3a7311",
+      "bytes": 9079
+    },
+    "ccc_compact_sensor.py": {
+      "sha256": "8c277917ab9c508d8960e01312bc38cbf2def1f0c7bd04dbaaf58ce857ab6011",
+      "bytes": 23329
+    },
+    "ccc_compact_support.py": {
+      "sha256": "cc75174ea5ab7aba025808bee9eb35e0a6cc61d7b8e5e8b717a92c438e10b6e9",
+      "bytes": 9629
+    },
+    "ccc_compact_trace.py": {
+      "sha256": "9d9e85615e7d4ca98716f6ec9b0c4ab81e9a73ddcba2f9a93662a682aa072fba",
+      "bytes": 2972
+    },
+    "ccc_compact_watchdog.py": {
+      "sha256": "bd838c35c5053e0de07dbddb41975ec6f61237b326f049cc70fc71222e04bebd",
+      "bytes": 52840
+    },
+    "ccc_daemon_liveness.py": {
+      "sha256": "9e5441fdee47e99a5c7576fecb892582bee662a48043fa7d58b75090f5210103",
+      "bytes": 11609
+    },
+    "ccc_delivery.py": {
+      "sha256": "177075e654038645a1fca060c0f6cad0185077f163c234d90a6e4374fb7d421b",
+      "bytes": 36122
+    },
+    "ccc_guard_migration.py": {
+      "sha256": "439b150bcf37fd02801acbaa1bb7ad3cc40854e1bbac94af66fa56ddb76fd054",
+      "bytes": 22939
+    },
+    "ccc_guard_scope.py": {
+      "sha256": "3e92e1503ae2fc5f1bdd181623424c750b7ed61dbd6a734f60ebd29721258586",
+      "bytes": 7316
+    },
+    "ccc_guard_transport.py": {
+      "sha256": "3926bfa67847b96ea3ada3595d35bcf9528c94c6831bb2b4a7755d4cddf7a632",
+      "bytes": 5289
+    },
+    "ccc_inventory.py": {
+      "sha256": "bbca713a992cdeba66e812b5e2428979b34e489289d39e2c497721fd8bdfc064",
+      "bytes": 5343
+    },
+    "ccc_mihomo.py": {
+      "sha256": "abd06259ecf2b8f3cb8f370709f39faac25e49480f24ba63724a31f638188146",
+      "bytes": 48391
+    },
+    "ccc_native_lanes.py": {
+      "sha256": "64cc556e551477eeab477bba20a27e52f5ed8333f4de33d4b6d044fab0ece088",
+      "bytes": 36404
+    },
+    "ccc_native_processes.py": {
+      "sha256": "d441d113f99b9083e215093779f78ac60a0db8316f8eb446101d0613943f919a",
+      "bytes": 15456
+    },
+    "ccc_native_standby.py": {
+      "sha256": "91a8eef7a61f80bcde25e93fe6b969f09e755f12c20f3345c2134823e17f8710",
+      "bytes": 21861
+    },
+    "ccc_network_client.py": {
+      "sha256": "5a8a8e2de17554b9495aeca0507d431f4730ebd711c387a465525eae6dd22f50",
+      "bytes": 14190
+    },
+    "ccc_network_guard.py": {
+      "sha256": "360686d03c292144c18409d6430d9d92808794ec9f2363586f3e7a692a4e9704",
+      "bytes": 94981
+    },
+    "ccc_observation.py": {
+      "sha256": "0b3a8f1f9b38fe901b925aa651b4bac0407731ad3a06f7efd57a5bb686e9e01d",
+      "bytes": 33836
+    },
+    "ccc_private_check.py": {
+      "sha256": "38271e52899c9785b9bd6be2c80dede274e211cec4e417b3e087e308519ac8aa",
+      "bytes": 20759
+    },
+    "ccc_provider_retry.py": {
+      "sha256": "3dc65a6748e50acbc46fe3d7798600168718e43c370a274d00289aae938160ab",
+      "bytes": 24660
+    },
+    "ccc_request_key_binding.py": {
+      "sha256": "97c3019e29f3050cf7653808df00c36b8185d7be44f0cfbd175ca66925621816",
+      "bytes": 5054
+    },
+    "ccc_request_observation_policy.py": {
+      "sha256": "6df7377f25d5eedadebb5b261b20a1794002b334da716dc306826694533070f6",
+      "bytes": 2157
+    },
+    "ccc_scheduling.py": {
+      "sha256": "805a926cb12299da3d4992d0b099205c06360fcaa4e2442cc0c3f269e14264be",
+      "bytes": 31978
+    },
+    "ccc_shared_codex_turn.py": {
+      "sha256": "1e0c6d31823d912b5bbfb4d64f07d8cd0e64748e8d28b39880c74d4b23da2554",
+      "bytes": 13978
+    },
+    "ccc_standby_acceptance.py": {
+      "sha256": "96f55d18ee3358f9da6be2c532f07e350e025698d12c739b6e9fb458478c81a8",
+      "bytes": 23761
+    },
+    "ccc_standby_bootstrap.py": {
+      "sha256": "df59e5eec2a58165fcb2a1c94839e18e8b0de6db78ccd72adc91f579cf3d8944",
+      "bytes": 14158
+    },
+    "ccc_standby_entry.py": {
+      "sha256": "1261ef08299df5c0cb56556b9e4f4b0a236e36722ebd135d007c1fc731875c5a",
+      "bytes": 8813
+    },
+    "ccc_standby_environment.py": {
+      "sha256": "69f894d9c2a5966c9830f96b7d5105dccb3534840d2cab0ab2f26629f4470967",
+      "bytes": 7226
+    },
+    "ccc_standby_generation.py": {
+      "sha256": "b3b1a2139a374bd7e028b720546e5c9afd6ead3dd1271d5aa42f9952e069b38a",
+      "bytes": 26448
+    },
+    "ccc_standby_identity.py": {
+      "sha256": "721364ba6217f052520405880570a8e42b9ee71da23fe639c70ea634b07ea0fc",
+      "bytes": 13727
+    },
+    "ccc_standby_inventory.py": {
+      "sha256": "b08649dc3520607837babba166fe3ea7e81756a2673f06783367c1735c67859c",
+      "bytes": 12003
+    },
+    "ccc_standby_launch.py": {
+      "sha256": "622193e8566ff66a20124da1e482e0f837fcd851fa05f6e37e24bc94ab8812bf",
+      "bytes": 27139
+    },
+    "ccc_standby_prepare.py": {
+      "sha256": "82b079ce207aad8c09d017ca5ca9e7878e0fd6ed8753d9d98b1d99cf11ef86a2",
+      "bytes": 25654
+    },
+    "ccc_standby_readiness.py": {
+      "sha256": "d923f6984cf9bb8ca20670a08c4e03beea8d4ce18b949fb3e6921eb0c6277632",
+      "bytes": 35420
+    },
+    "ccc_standby_rollouts.py": {
+      "sha256": "46c8e0f91988c29255ed1487eb3627334060472a3d860bda0d94439e6b53d9d3",
+      "bytes": 12380
+    },
+    "ccc_standby_service.py": {
+      "sha256": "b885fdb2a9b20d2be1bed89262a9d944f03b1fb79d96cbd415d4e37c6eeb7901",
+      "bytes": 30262
+    },
+    "ccc_standby_settlement.py": {
+      "sha256": "7bb6d8826522e8a71be380adea1d26b9a464014b67db5955b9d822a9d9aea13b",
+      "bytes": 5565
+    },
+    "ccc_standby_sources.py": {
+      "sha256": "b54532c882b3dff0200a0e81c380f8ce71125cc5e77217bd804f652c10d3d820",
+      "bytes": 13631
+    },
+    "ccc_standby_target.py": {
+      "sha256": "27f17b72e4c0b969bb4b4738b0eabaf6cdff2c6125f026c752a5e29ce53fd41a",
+      "bytes": 9400
+    },
+    "ccc_standby_timing.py": {
+      "sha256": "38a30b92378a352aea9f7d2f4aefe45ee7e3fc0421a4d7ce5d097c0a9d1820a6",
+      "bytes": 16846
+    },
+    "ccc_standby_transport.py": {
+      "sha256": "577497f2b0a63c4c6da5da73fa43b54f3bbba34f3c216022ec5e2ff031ce6a31",
+      "bytes": 1160
+    },
+    "ccc_state_snapshot.py": {
+      "sha256": "60cafc9fc5ee31400d8276a1eac04d0619e03434ccaf8a7f4fbd73af1ca8d6af",
+      "bytes": 8864
+    },
+    "ccc_workspace_batch.py": {
+      "sha256": "9ee96c27bb9821af6ad0e42e7097291e2c7ee6edc5103869701dda77b6b1d565",
+      "bytes": 163655
+    },
+    "claude_ccc_protocol.py": {
+      "sha256": "d3d5b0f26d24bd61bc42bee00174600b40d7b37baa4908d274ba1298cb73ee63",
+      "bytes": 21568
+    },
+    "claude_dispatch_recovery.py": {
+      "sha256": "1ba1027ede8fd58b8a826fd1b71ae773913b1e0309a6e62cb8ce059e78a504c1",
+      "bytes": 19013
+    },
+    "claude_provider_legacy_migration.py": {
+      "sha256": "ff9776a4f0e88f6115be5572823138a8d9cd00370bb23a40de72c783add0c275",
+      "bytes": 3555
+    },
+    "claude_provider_native_evidence.py": {
+      "sha256": "21c40121a9c4512b8dc3386db81e7ab553052d80b8b0974800f37805111431ef",
+      "bytes": 13999
+    },
+    "claude_provider_recovery.py": {
+      "sha256": "5141a91f872211f7d2c67651b66c4cfc0e74283f242779169a60e45f6a84d5b8",
+      "bytes": 10658
+    },
+    "cmux_codex_watch.py": {
+      "sha256": "7784266cad612a6ee936ad1a19a02e936d7c4649ccb08d52cc923424f186eb26",
+      "bytes": 955534
+    },
+    "generate_reader_fixtures.py": {
+      "sha256": "899c949333e9c55c7d158d8d3412f4b579122c88f59ace0d15143a304164dade",
+      "bytes": 7819
+    },
+    "test_native_compact.py": {
+      "sha256": "e2527a7dd64937de4e2b5a3fa1b5d3ba85a0054e4fce9f894187ac06a7dbc7b8",
+      "bytes": 13584
+    }
+  }
+}
