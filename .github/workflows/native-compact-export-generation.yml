@@ -1,0 +1,59 @@
+name: Generate native conditional protocol exports
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/native-compact-export-generation.yml
+
+permissions:
+  contents: read
+
+jobs:
+  generate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - name: Reconstruct the exact pinned source
+        run: |
+          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/native-export-target" >> "$GITHUB_ENV"
+          python3 -I -B ci/native-compact-conditional-v4/prepare.py \
+            --output "$RUNNER_TEMP/native-export/source" \
+            --report "$GITHUB_WORKSPACE/export-evidence/reconstruction.json"
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582
+        with:
+          toolchain: 1.95.0
+      - name: Generate the experimental export using the real Rust writer
+        working-directory: ${{ runner.temp }}/native-export/source/codex-rs
+        run: |
+          set -o pipefail
+          python3 -B app-server-protocol/scripts/write_schema_fixtures.py --experimental 2>&1 | tee "$GITHUB_WORKSPACE/export-evidence/generation.log"
+      - name: Verify the generated exports against the same Rust definitions
+        working-directory: ${{ runner.temp }}/native-export/source/codex-rs
+        run: |
+          set -o pipefail
+          cargo test --locked -p codex-app-server-protocol --lib schema_fixtures_tests::experimental_precomputed_exports_match_generated -- --exact 2>&1 | tee "$GITHUB_WORKSPACE/export-evidence/verification.log"
+      - name: Pin the generated artifact and its input tree
+        env:
+          EXPORT_SOURCE: ${{ runner.temp }}/native-export/source
+        run: |
+          python3 -I -B -c 'import hashlib,json,os,pathlib,shutil; root=pathlib.Path(os.environ["EXPORT_SOURCE"]); src=root/"codex-rs/app-server-protocol/schema/precomputed/app-server-exports-experimental.json.zst"; out=pathlib.Path("export-evidence"); shutil.copyfile(src,out/src.name); report=json.loads((out/"reconstruction.json").read_text()); result={"schema":"ccc-generated-native-protocol-exports-v1","input_source_tree_sha256":report["source_tree_sha256"],"path":str(src.relative_to(root)),"sha256":hashlib.sha256(src.read_bytes()).hexdigest(),"bytes":src.stat().st_size,"generated_by":"real Rust write_schema_fixtures_from_env","full_candidate_verification":"NOT_RUN"}; (out/"manifest.json").write_text(json.dumps(result,indent=2)+"\n"); print(json.dumps(result,indent=2))'
+      - name: Upload exports and exact generation evidence
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: native-conditional-generated-exports-${{ github.run_id }}-${{ github.run_attempt }}
+          path: export-evidence/
+          if-no-files-found: error
+          retention-days: 14
