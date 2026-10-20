@@ -5,7 +5,7 @@
   "baseline_source_tree_sha256": "6a0540b9d82e9c947192a3bf675467af87562c35b047ce54c0767c2d4aec3d35",
   "source_tree_sha256": "dbc73d282da73a3d86147a28821d5500c1facb515a727791d70ef6ca936f096d",
   "source_file_count": 8888,
-  "archive_sha256": "1c3c2aa8adcdb7a28291bacd58e01830d12892bbb873f32fe5a33f6ad0e68daf",
+  "archive_sha256": "60692eee60c07583530e478abc61c0ee7c0256a7084875c65d791afd7f2a9ddc",
   "changes": [
     {
       "path": "codex-rs/Cargo.lock",
@@ -499,21 +499,6 @@
         "kind": "file",
         "sha256": "320baeec2dd2357bf651e7bd25f69a0f29f184041f4862f10e457f035dc0f13e",
         "bytes": 13774,
-        "git_mode": "100644"
-      }
-    },
-    {
-      "path": "codex-rs/vendor/bubblewrap/LICENSE",
-      "before": {
-        "kind": "symlink",
-        "sha256": "400d38e5cfee181230373a8b02d38f50271a5bf62c62410382efddb8e8b19e22",
-        "target": "COPYING",
-        "git_mode": "120000"
-      },
-      "after": {
-        "kind": "file",
-        "sha256": "b7993225104d90ddd8024fd838faf300bea5e83d91203eab98e29512acebd69c",
-        "bytes": 25383,
         "git_mode": "100644"
       }
     }
