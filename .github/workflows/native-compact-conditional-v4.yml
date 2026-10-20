@@ -85,7 +85,7 @@ jobs:
         run: |
           set -o pipefail
           just test --locked -p codex-app-server -p codex-core -p codex-tui -p codex-rollout -p codex-api --lib \
-            -E 'test(compact_recovery) | test(compact_original_intent) | test(extension_interruption) | test(turn_timing) | test(client_thread_observation) | test(compact_interrupt) | test(compact_deadline) | test(compact_cancel_wait) | test(collect_compaction_output) | test(close_and_wait_joins_the_websocket_pump) | test(policy)' \
+            -E 'test(input_queue) | test(compact_recovery) | test(compact_original_intent) | test(extension_interruption) | test(turn_timing) | test(client_thread_observation) | test(compact_interrupt) | test(compact_deadline) | test(compact_cancel_wait) | test(collect_compaction_output) | test(close_and_wait_joins_the_websocket_pump) | test(policy)' \
             --retries 0 2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/focused-tests.log"
       - name: Run protocol and Goal library regressions
         id: regressions
@@ -106,6 +106,15 @@ jobs:
             2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/goal-backend-tests.log"
           just test --locked -p codex-state --lib -E 'test(goals)' --retries 0 \
             2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/state-goal-tests.log"
+      - name: Run real core Session with installed Goal and truthful ordinary admission
+        id: goal_session
+        if: steps.check.outcome == 'success' && steps.producer.outcome == 'success'
+        continue-on-error: true
+        working-directory: ${{ runner.temp }}/native-conditional/source/codex-rs
+        run: |
+          set -o pipefail
+          just test --locked -p codex-app-server --test all -E 'test(native_compact_goal_f1)' --retries 0 \
+            2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/goal-session-tests.log"
       - name: Upload complete validation evidence
         if: always()
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
@@ -126,5 +135,6 @@ jobs:
           FOCUSED_RESULT: ${{ steps.focused.outcome }}
           REGRESSION_RESULT: ${{ steps.regressions.outcome }}
           GOAL_BACKEND_RESULT: ${{ steps.goal_backend.outcome }}
+          GOAL_SESSION_RESULT: ${{ steps.goal_session.outcome }}
         run: |
-          python3 -I -B -c 'import os; r={k:os.environ[k] for k in ("SOURCE_RESULT","PRODUCER_RESULT","FORMAT_RESULT","CHECK_RESULT","FOCUSED_RESULT","REGRESSION_RESULT","GOAL_BACKEND_RESULT")}; print(r); assert all(v=="success" for v in r.values()), "Native conditional candidate failed or remains incomplete"'
+          python3 -I -B -c 'import os; r={k:os.environ[k] for k in ("SOURCE_RESULT","PRODUCER_RESULT","FORMAT_RESULT","CHECK_RESULT","FOCUSED_RESULT","REGRESSION_RESULT","GOAL_BACKEND_RESULT","GOAL_SESSION_RESULT")}; print(r); assert all(v=="success" for v in r.values()), "Native conditional candidate failed or remains incomplete"'

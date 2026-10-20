@@ -272,15 +272,18 @@ class IntentIndex:
         return False
 
     def save(self):
-        raw = canonical(self.state) + b'\n'
-        if len(raw) > MAX_INDEX_BYTES:
-            raise ValueError('intent index limit; no partial persistence')
-        if raw == self.saved:
-            return
-        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        with OwnedDirectory(self.path.parent) as directory:
-            directory.atomic_bytes(self.path.name, raw)
-        self.saved = raw
+        with self.lock:
+            raw = canonical(self.state) + b'\n'
+            if len(raw) > MAX_INDEX_BYTES:
+                raise ValueError('intent index limit; no partial persistence')
+            if raw == self.saved:
+                return
+            if self.control_is_pending():
+                raise RuntimeError('original native control receipt pending; input evidence pinned')
+            self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            with OwnedDirectory(self.path.parent) as directory:
+                directory.atomic_bytes(self.path.name, raw)
+            self.saved = raw
 
     def _children(self, path):
         try:

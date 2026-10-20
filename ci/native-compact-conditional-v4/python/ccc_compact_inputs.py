@@ -5,7 +5,7 @@ only one exact, complete user response_item later than that fence can discharge
 it. Screen text, RPC returns, event_msg and another newer input cannot do so.
 Unknown inputs and lost evidence veto control, including after a restart.
 """
-from contextlib import closing
+from contextlib import closing, contextmanager
 import copy
 import hashlib
 import json
@@ -16,7 +16,7 @@ import time
 import math
 
 from ccc_codex_goal import _debug_fields
-from ccc_compact_support import sync_directory, owned_file, OwnedDirectory
+from ccc_compact_support import owned_file, OwnedDirectory
 
 MAX_BODY = 65536
 MAX_ROWS = 2048
@@ -215,6 +215,7 @@ class PendingInputs:
                 if len(raw) != info.st_size:
                     raise ValueError('pending-input ledger changed during read')
             self.state = json.loads(raw)
+            self.persisted = raw
             if self.state.get('version') not in (2, LEDGER_VERSION):
                 raise RuntimeError('pending-input binding changed; observation only')
             if self.state.get('binding') != binding:
@@ -238,6 +239,10 @@ class PendingInputs:
         This only updates observation identity. It never establishes coverage,
         settles a pending input, or grants control over an old operation.
         """
+        with self._evidence_write():
+            return self._adopt_binding(proof, facts)
+
+    def _adopt_binding(self, proof, facts):
         if self.pending_binding is None:
             return
         prior, current = self.state['binding'], self.pending_binding
@@ -264,16 +269,13 @@ class PendingInputs:
             raise RuntimeError('pending ledger changed during authentication')
         digest = hashlib.sha256(raw).hexdigest()
         backup = self.path.with_name(self.path.name + '.binding-' + digest + '.json')
-        try:
-            with backup.open('xb') as stream:
-                os.fchmod(stream.fileno(), 0o600)
-                stream.write(raw)
-                stream.flush()
-                os.fsync(stream.fileno())
-            sync_directory(backup.parent)
-        except FileExistsError:
-            with owned_file(backup) as (stream, _):
-                if stream.read() != raw:
+        with OwnedDirectory(self.path.parent) as directory:
+            if directory.read_bytes(self.path.name, limit=64 * 1024 * 1024) != raw:
+                raise RuntimeError('pending ledger changed before backup')
+            try:
+                directory.write_once_bytes(backup.name, raw)
+            except FileExistsError:
+                if directory.read_bytes(backup.name, limit=64 * 1024 * 1024) != raw:
                     raise RuntimeError('original input ledger backup changed')
         updated = copy.deepcopy(self.state)
         updated.setdefault('binding_adoptions', []).append(dict(
@@ -294,21 +296,22 @@ class PendingInputs:
         self.pending_binding = None
 
     def migrate_v2(self, raw):
+        with self._evidence_write():
+            return self._migrate_v2(raw)
+
+    def _migrate_v2(self, raw):
         # v2 admitted initial coverage using another thread's retained row.
         # Keep its exact evidence and all pending entries, but never inherit
         # that permission. Reopening the file must not silently bless it.
         digest = hashlib.sha256(raw).hexdigest()
         backup = self.path.with_name(self.path.name + '.v2-' + digest + '.json')
-        try:
-            with backup.open('xb') as stream:
-                os.fchmod(stream.fileno(), 0o600)
-                stream.write(raw)
-                stream.flush()
-                os.fsync(stream.fileno())
-            sync_directory(backup.parent)
-        except FileExistsError:
-            with owned_file(backup) as (stream, _):
-                if stream.read() != raw:
+        with OwnedDirectory(self.path.parent) as directory:
+            if directory.read_bytes(self.path.name, limit=64 * 1024 * 1024) != raw:
+                raise RuntimeError('legacy input ledger changed before backup')
+            try:
+                directory.write_once_bytes(backup.name, raw)
+            except FileExistsError:
+                if directory.read_bytes(backup.name, limit=64 * 1024 * 1024) != raw:
                     raise RuntimeError('legacy input ledger backup changed')
         self.state['coverage_migration'] = dict(
             from_version=2, original_path=str(backup), original_sha256=digest,
@@ -320,22 +323,29 @@ class PendingInputs:
             self.state['unknown'].append(reason)
         self.save()
 
+    @contextmanager
+    def _evidence_write(self):
+        if self.intent_index is None:
+            yield
+            return
+        with self.intent_index.lock:
+            if self.intent_index.control_is_pending():
+                raise RuntimeError('original native control receipt pending; input evidence pinned')
+            yield
+
     def save(self):
         raw = (json.dumps(self.state, sort_keys=True, ensure_ascii=False) + '\n').encode()
         if raw == self.persisted:
             return
-        with OwnedDirectory(self.path.parent) as directory:
-            directory.atomic_bytes(self.path.name, raw)
-        self.persisted = raw
+        with self._evidence_write():
+            with OwnedDirectory(self.path.parent) as directory:
+                directory.atomic_bytes(self.path.name, raw)
+            self.persisted = raw
 
     def refresh(self, *, final=False):
-        if self.intent_index is None:
-            return self._refresh(final=final)
         # Hold the shared index lock from the first local ledger change through
         # persistence. Another target cannot rewrite a native reader's input pin.
-        with self.intent_index.lock:
-            if self.intent_index.control_is_pending():
-                raise RuntimeError('original native control receipt pending; input evidence pinned')
+        with self._evidence_write():
             return self._refresh(final=final)
 
     def _refresh(self, *, final=False):

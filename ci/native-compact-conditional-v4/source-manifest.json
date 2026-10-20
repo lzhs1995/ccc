@@ -1,24 +1,28 @@
 {
-  "schema": "ccc-native-conditional-source-v6",
-  "status": "COMPILER_DIAGNOSTIC_CANDIDATE_NOT_DEPLOYABLE",
+  "schema": "ccc-native-conditional-source-v7",
+  "status": "INTEGRATED_VERIFICATION_CANDIDATE_NOT_DEPLOYABLE",
   "baseline_prepare_sha256": "beae02abdd924b103f489ce54fdd9fb666ebff89ccb8592d43cfc18cdff81a12",
   "baseline_source_tree_sha256": "6a0540b9d82e9c947192a3bf675467af87562c35b047ce54c0767c2d4aec3d35",
-  "source_tree_sha256": "ab6c735f4ad18f234aaa5843b96b06ad36460615438bb024f9574d01e3169b9e",
-  "source_file_count": 8890,
-  "archive_sha256": "2e71403f5f7e725f1db0e3c5cf8141b9ecf1ac6378f8f2fbfbf77521afc575e5",
+  "source_tree_sha256": "6947d9e6caa210a9ed946decd3666c4c2c420ab541f153a389e9c55f50bff0b3",
+  "source_file_count": 8891,
+  "archive_sha256": "f28548419fc29c458b732c09565444b4adbe5831df8694f50ac569ec2715c809",
   "evidence": {
     "authority_manifest": "544e569f9323faa03e4a3277188fc3a4db54aa4559de4b774cc646e86a1f6dd2",
     "reservation_manifest": "7ff594c3a3a70e71508effed4a9dd7d305c70f3f60ea1d562a4b534b973329d2",
     "goal_runtime_gates_manifest": "fb1812f2678739a185fa99d0827a0f8d05142dae40c184b7177a5fdac7808b6e",
     "native_receipt_gate_manifest": "d63491fd27af0a9efc4668de6538a42bfd073739affff5158b85d56464539101",
+    "real_goal_assertions_manifest": "d49c1890f0e658c3a3117f135fe94468420f98a2322d6c785e6f7538c8b2944c",
+    "mail_lineage_manifest": "1cd813458687dd1d9cfa3cd519b74011c8d61cf0b9b56402f8e0569d22cbbdf6",
+    "native_crossreview_manifest": "4bb21e198f1ffa7ed081a70146a4202ca81d51fe531747bd1d7fc7e73f2511c4",
+    "previous_validation": "GHA39509774268 check PASS; focused338/339, corrected mailbox-only expectation",
     "compiler_fix": "GHA39506212443 E0308: retain Arc<GoalRuntimeHandle>",
-    "python_producer_manifest": "d7f41a1dbdb29672e35f6058937f9234df3fcc258558354091404ac7e4a2b246",
+    "python_producer_manifest": "4c30c0929edf9611c685a0365fe521bd11d7c41755edcbd024efa6a64694850f",
     "experimental_exports_run": 39499309200,
     "experimental_exports_sha256": "38a72e7b8d517165cc87502568595996c2dba1bcc88d5d57f225ca1a0e8a3159"
   },
   "limitations": [
-    "real core Session with Goal gate in A V9 pending",
-    "independent final crossreview B V10 pending",
+    "A10 real core Session with Goal test execution pending GHA",
+    "B11 input lineage regressions execution pending GHA",
     "native business adoption NOT_RUN"
   ],
   "changes": [
@@ -158,6 +162,31 @@
       }
     },
     {
+      "path": "codex-rs/app-server/tests/suite/mod.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "db3509153cc574d2a11191ea6308e6a433b8ec59f3860a83e00b154ebaaae799",
+        "bytes": 99,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "d4088e1a4579bfc8c3053a9253a06aca5b7be9d562a4a38fff6233edf5fc0e5d",
+        "bytes": 127,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/app-server/tests/suite/native_compact_goal_f1.rs",
+      "before": null,
+      "after": {
+        "kind": "file",
+        "sha256": "6e2182411618c902ce79740e1d7e229da6f6cbcad81e21bdfb86589a83f344ca",
+        "bytes": 16474,
+        "git_mode": "100644"
+      }
+    },
+    {
       "path": "codex-rs/core/src/session/compact_recovery.rs",
       "before": null,
       "after": {
@@ -172,8 +201,8 @@
       "before": null,
       "after": {
         "kind": "file",
-        "sha256": "2114a182b84db283612b7e3ca3b168284d8bd88eca16e1fa381ed81d9fceb232",
-        "bytes": 46181,
+        "sha256": "7bac8a31c8aa2066190bc3ebf0bcce69933aa0221011a94520dcfc93ae574b4a",
+        "bytes": 57161,
         "git_mode": "100644"
       }
     },
@@ -232,8 +261,8 @@
       },
       "after": {
         "kind": "file",
-        "sha256": "afd926ec202a8d936b12bf45a54c020d60258a39d6a5ec5da86416b90c037d7b",
-        "bytes": 27340,
+        "sha256": "5f873ec3abd4e6850cf495ba6906e70ef0d3d17d7f7758c971f92224d9b86ed8",
+        "bytes": 29350,
         "git_mode": "100644"
       }
     },
@@ -247,8 +276,8 @@
       },
       "after": {
         "kind": "file",
-        "sha256": "adf5812cb09a090d4770eb665a76df2149e82bd38e67cfe222e58b4e75881ca5",
-        "bytes": 210833,
+        "sha256": "bafcb5e4d56c3e040808e4ef9e51adf466a9c11d0150160c10d9084bb3fec102",
+        "bytes": 210885,
         "git_mode": "100644"
       }
     },
@@ -307,8 +336,8 @@
       },
       "after": {
         "kind": "file",
-        "sha256": "abe2eca5ba86e970aa63a681b95be2aa84bc7f85b9c3bdd5ff4c314c323612ba",
-        "bytes": 54603,
+        "sha256": "8da0c0d0c37a698a4611ea8cec9fe424143c90d6872117c7f6094fc56ae23c6c",
+        "bytes": 55750,
         "git_mode": "100644"
       }
     },

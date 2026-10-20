@@ -1,5 +1,5 @@
 {
-  "schema": "ccc-python-native-producer-source-v6",
+  "schema": "ccc-python-native-producer-source-v7",
   "scope": "real producer/test dependency closure; not a deployable CCC release",
   "native_identity": "synthetic fixtures; live native admission NOT_RUN",
   "files": {
@@ -56,12 +56,12 @@
       "bytes": 14545
     },
     "ccc_compact_inputs.py": {
-      "sha256": "24c4c44af420f45fd76255a924d91bcdbd66d4eda10ee36c6afeca344cb8ca75",
-      "bytes": 25691
+      "sha256": "4da0925515ccb49613cff832f2ed78628d9165348e79f76401a3eb55caaf0570",
+      "bytes": 26192
     },
     "ccc_compact_intents.py": {
-      "sha256": "9b206fa1086892685860df0ccf6d5e37b9013b5c54d172edc2bb1fd56ea9369b",
-      "bytes": 30038
+      "sha256": "fb2b38b7898f2047f90a0cbb14bd2ffaafb48adbe11f7f37793a493d88429848",
+      "bytes": 30241
     },
     "ccc_compact_join_accounting.py": {
       "sha256": "4ac4cfb0fe40d4d0162c7201ebebae1ebe44fa9521f46a980e19abf597fc8126",
@@ -80,8 +80,8 @@
       "bytes": 23329
     },
     "ccc_compact_support.py": {
-      "sha256": "8f0a6ac53a197e4223101a8b25a7defc744eb0c004ec9cc5f24229f38a8f1501",
-      "bytes": 13524
+      "sha256": "de1c620fb3ba46bd0cb3ed87b28d921660e7938d4cfa99a9acaad66241fd6a3a",
+      "bytes": 14791
     },
     "ccc_compact_trace.py": {
       "sha256": "9d9e85615e7d4ca98716f6ec9b0c4ab81e9a73ddcba2f9a93662a682aa072fba",
@@ -272,8 +272,9 @@
       "bytes": 7819
     },
     "test_native_compact.py": {
-      "sha256": "f563dc975ed870734447c9a5b20d993b1c958d0e42d30cd1e41aa24950c8582e",
-      "bytes": 16986
+      "sha256": "f1a442b3e95a46098b9a1eb00689cbfebfe61da6d5b6cbd32ac87bb26d38a32b",
+      "bytes": 20889
     }
-  }
+  },
+  "tests": 16
 }

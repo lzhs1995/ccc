@@ -115,9 +115,9 @@ class OwnedDirectory:
     def write_once(self, name, value):
         name = self._name(name)
         raw = (json.dumps(value, ensure_ascii=False, indent=2) + '\n').encode()
-        return self._write_once_bytes(name, raw)
+        return self.write_once_bytes(name, raw)
 
-    def _write_once_bytes(self, name, raw):
+    def write_once_bytes(self, name, raw):
         name = self._name(name)
         if not isinstance(raw, bytes):
             raise TypeError('journal data must be bytes')
@@ -134,6 +134,32 @@ class OwnedDirectory:
         # A failed recheck consumes the original filename; never unlink or refund it.
         self.verify()
         return hashlib.sha256(raw).hexdigest()
+
+    def read_bytes(self, name, *, limit):
+        name = self._name(name)
+        self.verify()
+        expected = self._file_identity(name)
+        if expected is None:
+            raise FileNotFoundError(name)
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                     dir_fd=self.fds[-1])
+        with os.fdopen(fd, 'rb') as stream:
+            before = os.fstat(stream.fileno())
+            self._file_identity(name, before)
+            if (before.st_dev, before.st_ino) != (expected.st_dev, expected.st_ino):
+                raise ValueError('journal file replaced before read')
+            if before.st_size > limit:
+                raise ValueError('journal file exceeds its read bound')
+            raw = stream.read(limit + 1)
+            after = os.fstat(stream.fileno())
+            signature = lambda st: (st.st_dev, st.st_ino, st.st_size,
+                                    st.st_mtime_ns, st.st_ctime_ns)
+            current = self._file_identity(name, before)
+            if (len(raw) != before.st_size or signature(before) != signature(after)
+                    or signature(before) != signature(current)):
+                raise ValueError('journal file changed during read')
+        self.verify()
+        return raw
 
     def _file_identity(self, name, expected=None):
         try:
@@ -159,7 +185,7 @@ class OwnedDirectory:
         self.verify()
         previous = self._file_identity(name)
         temporary = '.' + name + '-' + secrets.token_hex(12) + '.tmp'
-        self._write_once_bytes(temporary, raw)
+        self.write_once_bytes(temporary, raw)
         prepared = self._file_identity(temporary)
         self.verify()
         current = self._file_identity(name)

@@ -144,6 +144,75 @@ class NativeCompactTests(unittest.TestCase):
             validate_native_receipt_fields({'turnId': 'turn-1', 'attemptId': self.f.key,
                 'reason': 'unknown_error'}, 'compact-denied', self.f.request)
 
+    def test_pending_control_blocks_migration_and_direct_ledger_writes(self):
+        db = self.f.base / 'migration.sqlite'
+        with sqlite3.connect(db):
+            pass
+        path = self.f.journal / 'pending-inputs.json'
+        facts = RolloutFacts(self.f.rollout)
+        pending = PendingInputs(path, self.f.sid, facts, db, intent_index=self.f.index)
+        pending.save()
+        legacy = dict(pending.state, version=2, initial_coverage=True)
+        self.f.put(path.name, legacy, directory=self.f.journal)
+        original = path.read_bytes()
+        self.f.index.freeze_for_control(self.f.request)
+        with self.assertRaisesRegex(RuntimeError, 'input evidence pinned'):
+            PendingInputs(path, self.f.sid, facts, db, intent_index=self.f.index)
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(list(self.f.journal.glob('pending-inputs.json.v2-*')), [])
+        pending.state['unknown'].append('new observation')
+        with self.assertRaisesRegex(RuntimeError, 'input evidence pinned'):
+            pending.save()
+        self.assertEqual(path.read_bytes(), original)
+        before = self.f.index.path.read_bytes()
+        self.f.index.state['unknown']['new'] = {'reason': 'new observation'}
+        with self.assertRaisesRegex(RuntimeError, 'input evidence pinned'):
+            self.f.index.save()
+        self.assertEqual(self.f.index.path.read_bytes(), before)
+
+    def test_legacy_migration_preserves_raw_evidence_and_rejects_backup_links(self):
+        db = self.f.base / 'migration.sqlite'
+        with sqlite3.connect(db):
+            pass
+        facts = RolloutFacts(self.f.rollout)
+        path = self.f.journal / 'pending-inputs.json'
+        pending = PendingInputs(path, self.f.sid, facts, db, intent_index=self.f.index)
+        legacy = dict(pending.state, version=2, initial_coverage=True)
+        self.f.put(path.name, legacy, directory=self.f.journal)
+        raw = path.read_bytes()
+        migrated = PendingInputs(path, self.f.sid, facts, db, intent_index=self.f.index)
+        backup = Path(migrated.state['coverage_migration']['original_path'])
+        self.assertEqual(backup.read_bytes(), raw)
+        self.assertEqual(migrated.state['version'], 3)
+        self.assertFalse(migrated.state['initial_coverage'])
+        current = path.stat().st_ino
+        reopened = PendingInputs(path, self.f.sid, facts, db, intent_index=self.f.index)
+        reopened.save()
+        self.assertEqual(path.stat().st_ino, current)
+        linked = self.f.journal / 'linked-inputs.json'
+        self.f.put(linked.name, legacy, directory=self.f.journal)
+        linked_raw = linked.read_bytes()
+        digest = hashlib.sha256(linked_raw).hexdigest()
+        linked_backup = linked.with_name(linked.name + '.v2-' + digest + '.json')
+        linked_backup.symlink_to(backup)
+        with self.assertRaisesRegex(ValueError, 'untrusted journal file'):
+            PendingInputs(linked, self.f.sid, facts, db, intent_index=self.f.index)
+        self.assertEqual(linked.read_bytes(), linked_raw)
+        self.assertTrue(linked_backup.is_symlink())
+
+    def test_owned_read_and_raw_backup_refuse_redirected_ancestor(self):
+        with OwnedDirectory(self.f.journal) as directory:
+            directory.write_once_bytes('original.bin', b'exact legacy bytes')
+            self.assertEqual(directory.read_bytes('original.bin', limit=64), b'exact legacy bytes')
+            moved = self.f.base / 'moved-journal'
+            self.f.journal.rename(moved)
+            self.f.journal.symlink_to(moved, target_is_directory=True)
+            with self.assertRaises((ValueError, OSError)):
+                directory.read_bytes('original.bin', limit=64)
+            with self.assertRaises((ValueError, OSError)):
+                directory.write_once_bytes('backup.bin', b'exact legacy bytes')
+            self.assertFalse((moved / 'backup.bin').exists())
+
     def test_atomic_ledger_writes_do_not_follow_fixed_temp_or_destination_links(self):
         outside = self.f.put('outside.json', {'original': True})
         fixed = self.f.index.path.with_suffix('.tmp')

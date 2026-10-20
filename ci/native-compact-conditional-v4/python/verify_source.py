@@ -4,7 +4,7 @@ import hashlib
 import json
 from pathlib import Path
 
-EXPECTED_MANIFEST = "d7f41a1dbdb29672e35f6058937f9234df3fcc258558354091404ac7e4a2b246"
+EXPECTED_MANIFEST = "4c30c0929edf9611c685a0365fe521bd11d7c41755edcbd024efa6a64694850f"
 
 def main():
     root = Path(__file__).resolve().parent
