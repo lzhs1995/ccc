@@ -1,6 +1,6 @@
 {
   "schema": "ccc-python-native-producer-source-v8",
-  "scope": "Complete pinned CCC runtime modules, full canonical MAC0.4.58 source, actual producer fixtures and portable fault regressions; verification candidate",
+  "scope": "Complete pinned CCC runtime modules, full canonical MAC0.4.58 source, actual producer fixtures and portable fault regressions; verification candidate; portable public copy with equal-width fixture path normalization",
   "native_identity": "Synthetic producer identity; business native admission NOT_RUN",
   "files": {
     "baseline/ccc_compact_intents.py": {
@@ -96,12 +96,12 @@
       "bytes": 11782
     },
     "ccc_compact_runtime.py": {
-      "sha256": "20eee6bd8106ac198292cbade02c52396d023923aed8eba2851642a8717cdcec",
-      "bytes": 10191
+      "sha256": "41c85d94bfa3fa2d1678a2aff19a45beaacaa40a231c2f81138b327d2f6e31f4",
+      "bytes": 10187
     },
     "ccc_compact_sensor.py": {
-      "sha256": "8c277917ab9c508d8960e01312bc38cbf2def1f0c7bd04dbaaf58ce857ab6011",
-      "bytes": 23329
+      "sha256": "bdc30bdbbe556c2e8f770e97d66c4e4aa7eb234fcce92f137a4cc376fc0e7507",
+      "bytes": 23336
     },
     "ccc_compact_support.py": {
       "sha256": "de1c620fb3ba46bd0cb3ed87b28d921660e7938d4cfa99a9acaad66241fd6a3a",
@@ -1396,7 +1396,7 @@
       "bytes": 35762
     },
     "mac/source/scripts/test_panel_guard_quoted_launch.py": {
-      "sha256": "1bf335412d1b875dd30939b0cd0e0ac4158d836a1389cb75f568417abbe0f921",
+      "sha256": "b5946736f286416bcc4df5810c4c012785df3339710172d5f7e132749b955667",
       "bytes": 9152
     },
     "mac/source/scripts/test_probe_clear_recovery.py": {
@@ -1588,11 +1588,11 @@
       "bytes": 801
     },
     "mac/source/verification/fixtures/claude-c2596-screen-20261008.txt": {
-      "sha256": "36c6210df48931ade6d13798b3bcd3109aca689d7289f929744a9200ace25f54",
+      "sha256": "4d42771165ab077563ad3eed15e5cc3dc56b1fac0b4eee700b94171490f17f1c",
       "bytes": 34434
     },
     "mac/source/verification/fixtures/claude-c41-screen-20261008.txt": {
-      "sha256": "7bedbce7bc215b7237a855be6e4cb77c73326b636a511f28706b9b8b059a5ff9",
+      "sha256": "80c4f1ae1fdde380cc3ffdd9033e143f80b156e1552105d0bc2f0e39c323d94f",
       "bytes": 40549
     },
     "mac/source/verification/fixtures/claude-clear-hint-a-20261009.txt": {
@@ -1684,8 +1684,8 @@
       "bytes": 19041
     },
     "test_native_compact.py": {
-      "sha256": "f1a442b3e95a46098b9a1eb00689cbfebfe61da6d5b6cbd32ac87bb26d38a32b",
-      "bytes": 20889
+      "sha256": "48310ef5f020285edec2f0e1a0901f137a96e6a3727ec2a5d83caf9c58f63c21",
+      "bytes": 20786
     },
     "test_pin_retirement.py": {
       "sha256": "c309b8988ea510bb8d9c2d968b72c8cdb59126d663eb5b45108348e3d36aa3b9",
@@ -1721,5 +1721,42 @@
     "same-UID hostile compare-unlink race remains documented",
     "301s real Session test execution pending GHA",
     "Not a deployed CCC release"
-  ]
+  ],
+  "public_packaging": {
+    "schema": "portable-producer-source-v1",
+    "prior_manifest_sha256": "b2d25fc2d40b14ebf2bb51b6fa90fddb58428defcfef4a351206e5909b9fa437",
+    "original_changed_files": {
+      "ccc_compact_runtime.py": {
+        "sha256": "20eee6bd8106ac198292cbade02c52396d023923aed8eba2851642a8717cdcec",
+        "bytes": 10191
+      },
+      "ccc_compact_sensor.py": {
+        "sha256": "8c277917ab9c508d8960e01312bc38cbf2def1f0c7bd04dbaaf58ce857ab6011",
+        "bytes": 23329
+      },
+      "test_native_compact.py": {
+        "sha256": "f1a442b3e95a46098b9a1eb00689cbfebfe61da6d5b6cbd32ac87bb26d38a32b",
+        "bytes": 20889
+      },
+      "mac/source/scripts/test_panel_guard_quoted_launch.py": {
+        "sha256": "1bf335412d1b875dd30939b0cd0e0ac4158d836a1389cb75f568417abbe0f921",
+        "bytes": 9152
+      },
+      "mac/source/verification/fixtures/claude-c41-screen-20261008.txt": {
+        "sha256": "7bedbce7bc215b7237a855be6e4cb77c73326b636a511f28706b9b8b059a5ff9",
+        "bytes": 40549
+      },
+      "mac/source/verification/fixtures/claude-c2596-screen-20261008.txt": {
+        "sha256": "36c6210df48931ade6d13798b3bcd3109aca689d7289f929744a9200ace25f54",
+        "bytes": 34434
+      }
+    },
+    "changes": {
+      "runtime_paths": "Current HOME for CCC config and Codex log database",
+      "test_runtime": "Bundled directory default, explicit environment override retained",
+      "quoted_launch_fixture": "Synthetic absolute helper path; command is never executed",
+      "screen_fixtures": "Equal-width demo HOME substitution preserves terminal wrapping"
+    },
+    "canonical_mac_skill_unchanged": true
+  }
 }

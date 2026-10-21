@@ -20,7 +20,7 @@ from pathlib import Path
 from ccc_codex_goal import _debug_fields
 from ccc_compact_trace import native_trace, trace_id
 
-LOG_DB = '/Users/lzhs/.codex/logs_2.sqlite'
+LOG_DB = str(Path.home() / '.codex/logs_2.sqlite')
 TRUSTED_SPANS = {
     'codex_mcp::connection_manager::tool_catalog',
     'codex_http_client::client', 'feedback_tags',

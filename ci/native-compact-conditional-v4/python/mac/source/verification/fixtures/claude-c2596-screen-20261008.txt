@@ -1,14 +1,14 @@
-  ⎿  Shell cwd was reset to /Users/lzhs/Documents/cnm/tasks/06_Mintransition
+  ⎿  Shell cwd was reset to /Users/demo/Documents/cnm/tasks/06_Mintransition
   ⎿  (timeout 10m)
 
   Thought for 1m 32s (ctrl+o to expand)
 
-⏺ Bash(cd "/Users/lzhs/Documents/cnm/tasks/01_R_analysis/CMAverse_恢复工程_20260927/next_phase/PLAN13_全稿实证复核与修订_20260929/exploratory_specification_se
+⏺ Bash(cd "/Users/demo/Documents/cnm/tasks/01_R_analysis/CMAverse_恢复工程_20260927/next_phase/PLAN13_全稿实证复核与修订_20260929/exploratory_specification_se
       arch_20261005_v1/limit…)
   ⎿  'C2596_STATUS_20261008T131247Z | status: r22 cmaverse-source-\n \n  GPT-6-Astra xhigh · ~/project · Context 28% used
                                                                                    \n  tab to queue message'
      '                                                         \n  tab to queue message'
-  ⎿  Shell cwd was reset to /Users/lzhs/Documents/cnm/tasks/06_Mintransition
+  ⎿  Shell cwd was reset to /Users/demo/Documents/cnm/tasks/06_Mintransition
 
   Thought for 1m 3s (ctrl+o to expand)
 
@@ -44,38 +44,38 @@
 
   Thought for 45s (ctrl+o to expand)
 
-⏺ Bash(cd "/Users/lzhs/Documents/cnm/tasks/01_R_analysis/CMAverse_恢复工程_20260927/next_phase/PLAN13_全稿实证复核与修订_20260929/exploratory_specification_se
+⏺ Bash(cd "/Users/demo/Documents/cnm/tasks/01_R_analysis/CMAverse_恢复工程_20260927/next_phase/PLAN13_全稿实证复核与修订_20260929/exploratory_specification_se
       arch_20261005_v1/limit…)
   ⎿  Ran 14 tests in 0.009s
      OK
      mutation(no settle):
      … +3 lines (ctrl+o to expand)
-  ⎿  Shell cwd was reset to /Users/lzhs/Documents/cnm/tasks/06_Mintransition
+  ⎿  Shell cwd was reset to /Users/demo/Documents/cnm/tasks/06_Mintransition
   ⎿  (timeout 10m)
 
   Thought for 2m 29s (ctrl+o to expand)
 
 ⏺ 764/764 pass, and the mutation is killed. Next I'm replaying r23's real post-Enter screen offline against the new predicate.
 
-⏺ Bash(cd "/Users/lzhs/Documents/cnm/tasks/01_R_analysis/CMAverse_恢复工程_20260927/next_phase/PLAN13_全稿实证复核与修订_20260929/exploratory_specification_se
+⏺ Bash(cd "/Users/demo/Documents/cnm/tasks/01_R_analysis/CMAverse_恢复工程_20260927/next_phase/PLAN13_全稿实证复核与修订_20260929/exploratory_specification_se
       arch_20261005_v1/limit…)
 
   Thought for 30s (ctrl+o to expand)
 
-⏺ Bash(cd "/Users/lzhs/Documents/cnm/tasks/01_R_analysis/CMAverse_恢复工程_20260927/next_phase/PLAN13_全稿实证复核与修订_20260929/exploratory_specification_se
+⏺ Bash(cd "/Users/demo/Documents/cnm/tasks/01_R_analysis/CMAverse_恢复工程_20260927/next_phase/PLAN13_全稿实证复核与修订_20260929/exploratory_specification_se
       arch_20261005_v1/limit…)
   ⎿  ok 2 files changed, 52 insertions(+)
      ok
      6de5244 fix: re-observe a mid-render composer before deciding Tab (r23 callback)
      … +12 lines (ctrl+o to expand)
-  ⎿  Shell cwd was reset to /Users/lzhs/Documents/cnm/tasks/06_Mintransition
+  ⎿  Shell cwd was reset to /Users/demo/Documents/cnm/tasks/06_Mintransition
 
 ⏺ Now I'm building the new release: a copy of the live closeout770 source with only this fix's diff applied as a patch.
   ⎿       736 /tmp/stranded.patch
      patching file 'scripts/cmux_bridge.py'
      patching file 'scripts/cmux_message_journal.py'
      … +6 lines (ctrl+o to expand)
-  ⎿  Shell cwd was reset to /Users/lzhs/Documents/cnm/tasks/06_Mintransition
+  ⎿  Shell cwd was reset to /Users/demo/Documents/cnm/tasks/06_Mintransition
 
   Thought for 8s (ctrl+o to expand)
 
@@ -85,7 +85,7 @@
      ./references/availability-and-resources.md
      ./references/bounded-collaboration.md
      … +8 lines (ctrl+o to expand)
-  ⎿  Shell cwd was reset to /Users/lzhs/Documents/cnm/tasks/06_Mintransition
+  ⎿  Shell cwd was reset to /Users/demo/Documents/cnm/tasks/06_Mintransition
   ⎿  (timeout 10m)
 
   Thought for 13s (ctrl+o to expand)
@@ -96,23 +96,23 @@
 
      OK
      … +2 lines (ctrl+o to expand)
-  ⎿  Shell cwd was reset to /Users/lzhs/Documents/cnm/tasks/06_Mintransition
+  ⎿  Shell cwd was reset to /Users/demo/Documents/cnm/tasks/06_Mintransition
       find . -…)
   ⎿  2026-10-08T21:23:22Z scripts/__pycache__
      2026-10-08T15:42:57Z VERSION
      bfs: error: bfs -S dfs -regextype findutils-default . -newermt "-15 minutes" -print
      … +10 lines (ctrl+o to expand)
-  ⎿  Shell cwd was reset to /Users/lzhs/Documents/cnm/tasks/06_Mintransition
+  ⎿  Shell cwd was reset to /Users/demo/Documents/cnm/tasks/06_Mintransition
 
   Thought for 42s (ctrl+o to expand)
 
 ⏺ Bash(cd ~/.local/share/multi-agent-collaboration/releases/0.1.2-closeout770-a076954649fb && /opt/homebrew/opt/python@3.14/bin/python3.14 -B -c "
       import json; m=json.…)
-  ⎿  a076954649fb412a7d1312667cceb095c43de65cb7d64d8c7e21152ccea8effb /Users/lzhs/Documents/cnm/tasks/06_Mintransition/.worktrees/collaboration-hook-entr
+  ⎿  a076954649fb412a7d1312667cceb095c43de65cb7d64d8c7e21152ccea8effb /Users/demo/Documents/cnm/tasks/06_Mintransition/.worktrees/collaboration-hook-entr
      y740
-     /Users/lzhs/Documents/cnm/tasks/06_Mintransition/verification/claude41-handshake-20261008-01/runtime-package771/release_support.py:28:def digest(val
+     /Users/demo/Documents/cnm/tasks/06_Mintransition/verification/claude41-handshake-20261008-01/runtime-package771/release_support.py:28:def digest(val
      … +2 lines (ctrl+o to expand)
-  ⎿  Shell cwd was reset to /Users/lzhs/Documents/cnm/tasks/06_Mintransition
+  ⎿  Shell cwd was reset to /Users/demo/Documents/cnm/tasks/06_Mintransition
 
   Read 1 file (ctrl+o to expand)
 
@@ -133,7 +133,7 @@
       import json,hashlib,os,shutil…)
   ⎿  files 117 changed/new ['scripts/cmux_bridge.py', 'scripts/cmux_message_journal.py', 'scripts/cmux_submit_confirmation_guard.py', 'scripts/test_stran
      ded_compose.py', 'scripts/test_stranded_guard.py'] missing []
-     /Users/lzhs/.local/share/multi-agent-collaboration/releases/0.1.2-stranded-be37613ec978
+     /Users/demo/.local/share/multi-agent-collaboration/releases/0.1.2-stranded-be37613ec978
 
   Thought for 2m 34s (ctrl+o to expand)
 
@@ -148,8 +148,8 @@
 
 ⏺ Bash(/opt/homebrew/opt/python@3.14/bin/python3.14 -B - <<'EOF'
       from pathlib import Path…)
-  ⎿  updated /Users/lzhs/.claude/skills/multi-agent-collaboration/SKILL.md
-     updated /Users/lzhs/.claude/skills/论文精炼助手/SKILL.md
+  ⎿  updated /Users/demo/.claude/skills/multi-agent-collaboration/SKILL.md
+     updated /Users/demo/.claude/skills/论文精炼助手/SKILL.md
 
   Thought for 26s (ctrl+o to expand)
 
@@ -164,18 +164,18 @@
 
   Thought for 31s (ctrl+o to expand)
 
-⏺ Bash(cd "/Users/lzhs/Documents/cnm/tasks/01_R_analysis/CMAverse_恢复工程_20260927/next_phase/PLAN13_全稿实证复核与修订_20260929/exploratory_specification_se
+⏺ Bash(cd "/Users/demo/Documents/cnm/tasks/01_R_analysis/CMAverse_恢复工程_20260927/next_phase/PLAN13_全稿实证复核与修订_20260929/exploratory_specification_se
       arch_20261005_v1/limit…)
   ⎿  remote:      https://github.com/lzhs1995/multi-agent-collaboration/pull/new/fix/stranded-compose-enter-not-delivery-20261008
      remote:
      https://github.com/lzhs1995/multi-agent-collaboration/pull/24
-  ⎿  Shell cwd was reset to /Users/lzhs/Documents/cnm/tasks/06_Mintransition
+  ⎿  Shell cwd was reset to /Users/demo/Documents/cnm/tasks/06_Mintransition
   ⎿  (timeout 2m)
 
 ⏺ Next I'm checking the state of r22 and r23.
 
 ⏺ Bash(cmux read-screen --surface surface:40 --lines 60 2>/dev/null | tail -12 | cut -c1-180; ls
-      /Users/lzhs/Documents/cnm/tasks/01_R_analysis/CMAverse_恢复工程_20260927/n…)
+      /Users/demo/Documents/cnm/tasks/01_R_analysis/CMAverse_恢复工程_20260927/n…)
   ⎿  • Reconnecting... 1/10 (2h 02m 27s • esc to interrupt)
        └ Rate limit exceeded: Your requests to gpt-6-astra for gpt-6-astra in eastus2 have exceeded token rate limit.
      … +34 lines (ctrl+o to expand)
@@ -204,7 +204,7 @@
 ⏺ Bash(/opt/homebrew/opt/python@3.14/bin/python3.14 -B - <<'EOF'
       import os,glob,time…)
   ⎿  13:40:43Z /final_observed_closeout_20261008_v7/scope_notice_2596_20261008T1343Z.txt
-     7:- C2596 在原会话实现 fix/stranded-compose-enter-not-delivery-20261008，工作树 /Users/lzhs/Documents/cnm/tasks/01_R_analysis/CMAverse_恢复工程_2026
+     7:- C2596 在原会话实现 fix/stranded-compose-enter-not-delivery-20261008，工作树 /Users/demo/Documents/cnm/tasks/01_R_analysis/CMAverse_恢复工程_2026
      0927/next_phase/PLAN13_全稿实证复核与修订_20260929/exploratory_specification_search_20261005_v1/limited_followup_20261006_v1/paper_closeout_after_nu
      … +11 lines (ctrl+o to expand)
 
@@ -230,37 +230,37 @@
 
 ⏺ Updating memory: the existing compose-occupied memory gets this new cause and its fix.
 
-⏺ Bash(cd /Users/lzhs/.claude/projects/-Users-lzhs-Documents-cnm/memory && ls | grep -i "compose-occupied\|stranded"; grep -n "COMPOSE_OCCUPIED 封死"
+⏺ Bash(cd /Users/demo/.claude/projects/-Users-lzhs-Documents-cnm/memory && ls | grep -i "compose-occupied\|stranded"; grep -n "COMPOSE_OCCUPIED 封死"
       MEMORY.md | cut -c1…)
   ⎿  compose-occupied-blocks-handback-dispatch.md
-  ⎿  Shell cwd was reset to /Users/lzhs/Documents/cnm/tasks/06_Mintransition
+  ⎿  Shell cwd was reset to /Users/demo/Documents/cnm/tasks/06_Mintransition
 
   Wrote 1 memory (ctrl+o to expand)
 
-⏺ Bash(cd /Users/lzhs/.claude/projects/-Users-lzhs-Documents-cnm/memory && /opt/homebrew/opt/python@3.14/bin/python3.14 -B - <<'EOF'
+⏺ Bash(cd /Users/demo/.claude/projects/-Users-lzhs-Documents-cnm/memory && /opt/homebrew/opt/python@3.14/bin/python3.14 -B - <<'EOF'
 
-⏺ Bash(cd /Users/lzhs/.claude/projects/-Users-lzhs-Documents-cnm/memory && grep -n "compose-occupied-blocks-handback-dispatch" MEMORY.md | cut -c1-60)
-  ⎿  Shell cwd was reset to /Users/lzhs/Documents/cnm/tasks/06_Mintransition
+⏺ Bash(cd /Users/demo/.claude/projects/-Users-lzhs-Documents-cnm/memory && grep -n "compose-occupied-blocks-handback-dispatch" MEMORY.md | cut -c1-60)
+  ⎿  Shell cwd was reset to /Users/demo/Documents/cnm/tasks/06_Mintransition
 
   Thought for 1m 56s (ctrl+o to expand)
 
-⏺ Bash(cd /Users/lzhs/.claude/projects/-Users-lzhs-Documents-cnm/memory && wc -l MEMORY.md && grep -n "COMPOSE_OCCUPIED\|compose-occupied" MEMORY.md | cut
+⏺ Bash(cd /Users/demo/.claude/projects/-Users-lzhs-Documents-cnm/memory && wc -l MEMORY.md && grep -n "COMPOSE_OCCUPIED\|compose-occupied" MEMORY.md | cut
       -c1-100; tai…)
   ⎿  74
      - [收紧 terminal_report 会解封工具](tightening-terminal-report-unseals-tools.md) — 返回 None=不封印;新拒绝要加在消费证据那侧
      - [本机没有 timeout/gtimeout](timeout-binary-absent-silent-false-negatives.md) — rc=127+stdout 空被我读成「零命中」三次;否定搜索必配正控
      - [正文引用 banner 名会骗过 lane 判定](payload-quoting-banner-defeats-lane-detection.md) — 没有待决区的屏幕被产品入口判成已排队;steer 道≠Tab 道
-  ⎿  Shell cwd was reset to /Users/lzhs/Documents/cnm/tasks/06_Mintransition
+  ⎿  Shell cwd was reset to /Users/demo/Documents/cnm/tasks/06_Mintransition
 
   Thought for 40s (ctrl+o to expand)
 
 ⏺ Another session has rewritten MEMORY.md, so I'm appending my index line at the end.
 
-⏺ Bash(cd /Users/lzhs/.claude/projects/-Users-lzhs-Documents-cnm/memory && /opt/homebrew/opt/python@3.14/bin/python3.14 -B - <<'EOF'
+⏺ Bash(cd /Users/demo/.claude/projects/-Users-lzhs-Documents-cnm/memory && /opt/homebrew/opt/python@3.14/bin/python3.14 -B - <<'EOF'
       from pathlib import Path…)
   ⎿  ok
      - [Enter≠送达:STRANDED_IN_COMPOSE](enter-is-not-delivery-stranded-compose.md) — qu
-  ⎿  Shell cwd was reset to /Users/lzhs/Documents/cnm/tasks/06_Mintransition
+  ⎿  Shell cwd was reset to /Users/demo/Documents/cnm/tasks/06_Mintransition
 
   Thought for 6s (ctrl+o to expand)
 
@@ -292,13 +292,13 @@
   当时的真实屏幕回放，判断都正确。还没有在真实卡住的消息上用新流程实际跑过一次。
   - hook： 发完消息后的检查 hook 现在按本会话自己未确认的发送记录来判断"还在输入框里"，自定义标记也能查出来。之前就是因为标记格式对不上，这个 hook
   直接放行了我那条。
-  - 安装： 新版本在 /Users/lzhs/.local/share/multi-agent-collaboration/releases/0.1.2-stranded-be37613ec978，已改指向的文件：
+  - 安装： 新版本在 /Users/demo/.local/share/multi-agent-collaboration/releases/0.1.2-stranded-be37613ec978，已改指向的文件：
     - 每个文件旁边都有 *.bak-stranded-20261008T145959Z 备份，回滚就是把备份拷回去。
 
   需要你知道的冲突。 ROOT 在 13:43Z 发过一条通知，要求论文收尾期间暂停工具改码、PR 和安装。那条通知没送到我这里，我是 15:05Z
   在文件里才看到的。我是按你的直接指令改的，这次改动也动到了 Codex 自己的 hooks.json。我已经用文件把这些情况告诉了 ROOT，没往它的输入框里发，因为那里还被 r23
   那条占着：
-  /Users/lzhs/Documents/cnm/tasks/01_R_analysis/CMAverse_恢复工程_20260927/next_phase/PLAN13_全稿实证复核与修订_20260929/exploratory_specification_search_2026
+  /Users/demo/Documents/cnm/tasks/01_R_analysis/CMAverse_恢复工程_20260927/next_phase/PLAN13_全稿实证复核与修订_20260929/exploratory_specification_search_2026
   1005_v1/limited_followup_20261006_v1/paper_closeout_after_numerical_v1/final_closeout_execution_20261007_v2/minimal_final_execution_20261007_v3/claude_idle_
   escalation_hook_2596/READY_FOR_PAPER_PACK_2596_20261008T1510Z.json
 
@@ -339,7 +339,7 @@
 
   Thought for 2m 1s (ctrl+o to expand)
 
-⏺ Bash(W="/Users/lzhs/Documents/cnm/tasks/01_R_analysis/CMAverse_恢复工程_20260927/next_phase/PLAN13_全稿实证复核与修订_20260929/exploratory_specification_sea
+⏺ Bash(W="/Users/demo/Documents/cnm/tasks/01_R_analysis/CMAverse_恢复工程_20260927/next_phase/PLAN13_全稿实证复核与修订_20260929/exploratory_specification_sea
       rch_20261005_v1/limite…)
   ⎿  OFFLINE_TESTS total=764 failures=0 errors=0
      rc=0
@@ -377,7 +377,7 @@
        3   "received_note": "Both notices were queued attachments that never displayed in this session; read from the message-dispatch journal screens
          nstall write has been made since; nothing is rolled back.",o SKILL.md entry edits at ~15:00Z (see install_changes). No live config, entry or i
        4   "branch": "fix/stranded-compose-enter-not-delivery-20261008",
-       5   "worktree": "/Users/lzhs/Documents/cnm/tasks/01_R_analysis/CMAverse_恢复工程_20260927/next_phase/PLAN13_全稿实证复核与修订_20260929/explorat
+       5   "worktree": "/Users/demo/Documents/cnm/tasks/01_R_analysis/CMAverse_恢复工程_20260927/next_phase/PLAN13_全稿实证复核与修订_20260929/explorat
          al_final_execution_20261007_v3/claude_idle_escalation_hook_2596/fix_stranded_compose",_numerical_v1/final_closeout_execution_20261007_v2/minim
        6   "frozen_commit": "6de5244",
        8               "6de5244 fix: re-observe a mid-render composer before deciding Tab (r23 callback)"],,
@@ -387,32 +387,32 @@
 
   Thought for 1m 2s (ctrl+o to expand)
 
-⏺ Bash(cd "/Users/lzhs/Documents/cnm/tasks/01_R_analysis/CMAverse_恢复工程_20260927/next_phase/PLAN13_全稿实证复核与修订_20260929/exploratory_specification_se
+⏺ Bash(cd "/Users/demo/Documents/cnm/tasks/01_R_analysis/CMAverse_恢复工程_20260927/next_phase/PLAN13_全稿实证复核与修订_20260929/exploratory_specification_se
       arch_20261005_v1/limit…)
   ⎿  62 cmux_executor_closeout_guard.py
      167 executor_closeout.py
      719 cmux_consensus_stop_guard.py
      … +4 lines (ctrl+o to expand)
-  ⎿  Shell cwd was reset to /Users/lzhs/Documents/cnm/tasks/06_Mintransition
+  ⎿  Shell cwd was reset to /Users/demo/Documents/cnm/tasks/06_Mintransition
 
   Thought for 15s, read 2 files (ctrl+o to expand)
 
-⏺ Bash(cd "/Users/lzhs/Documents/cnm/tasks/01_R_analysis/CMAverse_恢复工程_20260927/next_phase/PLAN13_全稿实证复核与修订_20260929/exploratory_specification_se
+⏺ Bash(cd "/Users/demo/Documents/cnm/tasks/01_R_analysis/CMAverse_恢复工程_20260927/next_phase/PLAN13_全稿实证复核与修订_20260929/exploratory_specification_se
       arch_20261005_v1/limit…)
   ⎿  12:    mentions of codex/claude in ordinary chat are never blocked.
      20:    Missing/!PASS → block turn-end (exit 2) with remediation steps.
      24:Exit codes: 0 = allow turn-end, 2 = block turn-end (Claude must act/retract).
      … +68 lines (ctrl+o to expand)
-  ⎿  Shell cwd was reset to /Users/lzhs/Documents/cnm/tasks/06_Mintransition
+  ⎿  Shell cwd was reset to /Users/demo/Documents/cnm/tasks/06_Mintransition
 
   Thought for 1m 38s, read 3 files (ctrl+o to expand)
 
-⏺ Bash(cd "/Users/lzhs/Documents/cnm/tasks/01_R_analysis/CMAverse_恢复工程_20260927/next_phase/PLAN13_全稿实证复核与修订_20260929/exploratory_specification_se
+⏺ Bash(cd "/Users/demo/Documents/cnm/tasks/01_R_analysis/CMAverse_恢复工程_20260927/next_phase/PLAN13_全稿实证复核与修订_20260929/exploratory_specification_se
       arch_20261005_v1/limit…)
   ⎿  ==> cmux_bridge.py <==
      #!/usr/bin/env python3
      … +82 lines (ctrl+o to expand)
-  ⎿  Shell cwd was reset to /Users/lzhs/Documents/cnm/tasks/06_Mintransition
+  ⎿  Shell cwd was reset to /Users/demo/Documents/cnm/tasks/06_Mintransition
 
   Thought for 2m 10s (ctrl+o to expand)
 
@@ -438,13 +438,13 @@
 
 ⏺ Next I'm wiring it into the closeout guard and making the sealed-state message spell out the legal actions.
 
-⏺ Bash(cd "/Users/lzhs/Documents/cnm/tasks/01_R_analysis/CMAverse_恢复工程_20260927/next_phase/PLAN13_全稿实证复核与修订_20260929/exploratory_specification_se
+⏺ Bash(cd "/Users/demo/Documents/cnm/tasks/01_R_analysis/CMAverse_恢复工程_20260927/next_phase/PLAN13_全稿实证复核与修订_20260929/exploratory_specification_se
       arch_20261005_v1/limit…)
   ⎿  ok
      """The closeout hook allows one fixed queue-only entrypoint, never resending."""
      import copy
      … +79 lines (ctrl+o to expand)
-  ⎿  Shell cwd was reset to /Users/lzhs/Documents/cnm/tasks/06_Mintransition
+  ⎿  Shell cwd was reset to /Users/demo/Documents/cnm/tasks/06_Mintransition
 
   Thought for 40s (ctrl+o to expand)
 
@@ -467,17 +467,17 @@
 
   Thought for 1m 42s (ctrl+o to expand)
 
-⏺ Bash(cd "/Users/lzhs/Documents/cnm/tasks/01_R_analysis/CMAverse_恢复工程_20260927/next_phase/PLAN13_全稿实证复核与修订_20260929/exploratory_specification_se
+⏺ Bash(cd "/Users/demo/Documents/cnm/tasks/01_R_analysis/CMAverse_恢复工程_20260927/next_phase/PLAN13_全稿实证复核与修订_20260929/exploratory_specification_se
       arch_20261005_v1/limit…)
   ⎿  test_exact_reconcile_command_is_allowed_while_sealed (test_callback_reconcile.CallbackReconcileTests.test_exact_reconcile_command_is_allowed_while_s
      ealed) ... ok
      test_main_uses_reconcile_only_and_never_input (test_callback_reconcile.CallbackReconcileTests.test_main_uses_reconcile_only_and_never_input) ... ok
      … +14 lines (ctrl+o to expand)
-  ⎿  Shell cwd was reset to /Users/lzhs/Documents/cnm/tasks/06_Mintransition
+  ⎿  Shell cwd was reset to /Users/demo/Documents/cnm/tasks/06_Mintransition
 
   Thought for 2m 13s (ctrl+o to expand)
 
-⏺ Bash(cd "/Users/lzhs/Documents/cnm/tasks/01_R_analysis/CMAverse_恢复工程_20260927/next_phase/PLAN13_全稿实证复核与修订_20260929/exploratory_specification_se
+⏺ Bash(cd "/Users/demo/Documents/cnm/tasks/01_R_analysis/CMAverse_恢复工程_20260927/next_phase/PLAN13_全稿实证复核与修订_20260929/exploratory_specification_se
       arch_20261005_v1/limit…)
   ⎿  test_exact_reconcile_command_is_allowed_while_sealed
      test_reconcile_stays_legal_after_queue_tab_was_used

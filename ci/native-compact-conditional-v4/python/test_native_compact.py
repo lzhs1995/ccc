@@ -15,7 +15,7 @@ import unittest
 from unittest.mock import patch
 import uuid
 
-RUNTIME = Path(os.environ.get('CCC_COMPACT_TEST_RUNTIME', "/Users/lzhs/Documents/cnm/tasks/06_Mintransition/verification/ccc-successor-01a12b57-20261020-53bc-v1/native-compact-integrated-v4/python"))
+RUNTIME = Path(os.environ.get('CCC_COMPACT_TEST_RUNTIME', str(Path(__file__).resolve().parent)))
 sys.path.insert(0, str(RUNTIME))
 from ccc_client_thread_observation import COMPACT_INTERRUPT_CAPABILITY
 from ccc_compact_inputs import PendingInputs

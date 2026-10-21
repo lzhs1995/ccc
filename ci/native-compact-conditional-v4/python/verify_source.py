@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import re
 
-EXPECTED_MANIFEST = "b2d25fc2d40b14ebf2bb51b6fa90fddb58428defcfef4a351206e5909b9fa437"
+EXPECTED_MANIFEST = "cfed1c51af737077de6e2d328a75cae718949bbc7e980b99504dc709ca128289"
 
 
 def main():

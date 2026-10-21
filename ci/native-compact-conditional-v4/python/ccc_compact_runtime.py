@@ -14,7 +14,7 @@ import time
 # here silently discards current input, identity and wakeup fixes.
 CCC = Path(__file__).resolve().parent
 MAC = CCC / 'mac' / 'source' / 'scripts'
-CONFIG = Path('/Users/lzhs/Library/Application Support/cmux-codex-continue/config.json')
+CONFIG = Path.home() / 'Library/Application Support/cmux-codex-continue/config.json'
 
 
 class ControlLockBusy(RuntimeError):

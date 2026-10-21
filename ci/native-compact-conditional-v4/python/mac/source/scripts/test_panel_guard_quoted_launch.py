@@ -14,9 +14,9 @@ import render_cmux_agent as renderer
 
 
 GUARD = Path(__file__).with_name("cmux_agent_panel_guard.py").resolve()
-HELPER = Path("/Users/lzhs/.local/bin/cmux-agent")
+HELPER = Path("/tmp/ccc-quoted-launch/cmux-agent")
 ORIGINAL = (
-    "rtk proxy /Users/lzhs/.local/bin/cmux-agent send "
+    "rtk proxy /tmp/ccc-quoted-launch/cmux-agent send "
     "E765373A-4081-4038-ACC8-EACEE2540F08 'STATUS: RESUME8701R2-20261013. "
     "Compact completed in your original session; supervisor restored the same task reservation. "
     "Continue original stata8701-runtime-wire-v2 from PROGRESS.md/candidate with unchanged pack "
