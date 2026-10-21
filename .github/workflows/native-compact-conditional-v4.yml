@@ -121,14 +121,14 @@ jobs:
             2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/goal-backend-tests.log"
           just test --locked -p codex-state --lib -E 'test(goals)' --retries 0 \
             2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/state-goal-tests.log"
-      - name: Run real core Session with installed Goal and truthful ordinary admission
+      - name: Run real Goal admission and canceled Zsh command completion
         id: goal_session
         if: steps.check.outcome == 'success' && steps.producer.outcome == 'success'
         continue-on-error: true
         working-directory: ${{ runner.temp }}/native-conditional/source/codex-rs
         run: |
           set -o pipefail
-          just test --locked -p codex-app-server --test all -E 'test(native_compact_goal_f1)' --retries 0 \
+          just test --locked -p codex-app-server --test all -E 'test(native_compact_goal_f1) | test(turn_start_shell_zsh_fork_subcommand_decline_marks_parent_declined_v2)' --retries 0 \
             2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/goal-session-tests.log"
       - name: Upload complete validation evidence
         if: always()
