@@ -1,11 +1,11 @@
 {
-  "schema": "ccc-native-conditional-source-v10",
+  "schema": "ccc-native-conditional-source-v11",
   "status": "INTEGRATED_VERIFICATION_CANDIDATE_NOT_DEPLOYABLE",
   "baseline_prepare_sha256": "beae02abdd924b103f489ce54fdd9fb666ebff89ccb8592d43cfc18cdff81a12",
   "baseline_source_tree_sha256": "6a0540b9d82e9c947192a3bf675467af87562c35b047ce54c0767c2d4aec3d35",
-  "source_tree_sha256": "90b574cf103e4c12fcce9e683ff38f3c13d2c8988acf926c65716878d4c2d7d1",
+  "source_tree_sha256": "72d07e381d4b528adff639a69aacece3baf23db42fd4082321d091687b5e06db",
   "source_file_count": 8891,
-  "archive_sha256": "a9338208ac32a4f327f4577844b8c8bebdbfc8bfcb89d4e55e11805fe66599cc",
+  "archive_sha256": "01530bbff7f6f148ec4e22edf1c2619f4f6ac82b264431ee593a7dd7b2c24062",
   "evidence": {
     "authority_manifest": "544e569f9323faa03e4a3277188fc3a4db54aa4559de4b774cc646e86a1f6dd2",
     "reservation_manifest": "7ff594c3a3a70e71508effed4a9dd7d305c70f3f60ea1d562a4b534b973329d2",
@@ -35,12 +35,19 @@
     "zsh_completion_review_manifest": "1e6ca18365d483087b1b1b3c38ea27ca38f3003c03aa36ca9d1cdbe4bf6c1fb0",
     "v9_conditional_success": "GHA39609056442 commit424898b1c424a1f025df8bbbcab1bb24327ecd6a: real Goal301.648s and Zsh cancel PASS",
     "v9_full_compile_failure": "GHA39617818876 ext/skills/src/host_roots_tests.rs421 E0308: toml macro Table needs Into<Value>; no runtime product defect",
-    "v10_delta": "Only .into() in existing skills test fixture; include codex-skills-extension tests in conditional gate"
+    "v10_delta": "Only .into() in existing skills test fixture; include codex-skills-extension tests in conditional gate",
+    "v10_conditional_success": "GHA39626334301: conditional gates passed",
+    "v10_full_failure": "GHA39633214432: 21112 passed, 24 failed, 47 skipped; Clippy/Mac skipped",
+    "v11_delta": "12 files: isolated fixtures, Abort parent completion, typed io get_ref descent, TLS and exec-server diagnostics",
+    "v11_a35": "Frozen candidate read; callback acceptance remains pending at packaging",
+    "v11_b35": "Typed descent and two additive units independently accepted, original callback verified/disarmed",
+    "v11_b36": "Original callback verified/disarmed; diagnostic bounded and corrected by Root; no TLS policy/feature pin"
   },
   "limitations": [
-    "Exact v10 conditional and full Rust suites, Clippy and Mac build pending",
-    "Local just fmt attempted; Rust formatter unavailable, remaining formatters completed; cloud formatting required",
-    "Native adoption and new B50/500 live verification pending"
+    "Exact v11 conditional and full suites, Clippy and Mac build pending",
+    "Rust not compiled or formatted locally; required cloud rustfmt check retained",
+    "TLS first-attempt backend and blocked-descriptor websocket reset require runner diagnostics",
+    "Native adoption and current B50/live continuation/Goal checks remain pending"
   ],
   "changes": [
     {
@@ -149,6 +156,21 @@
       }
     },
     {
+      "path": "codex-rs/app-server/src/bespoke_event_handling.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "32dc66a8a6d77412be5d6a9dc7db6d3383b7d0d8d54949de02503cade1774982",
+        "bytes": 155200,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "510f3d8b2837cd17839bf7c488a8f8cfcb8d2a1ee324da7d1874ae08d2dce6e3",
+        "bytes": 155352,
+        "git_mode": "100644"
+      }
+    },
+    {
       "path": "codex-rs/app-server/src/message_processor.rs",
       "before": {
         "kind": "file",
@@ -234,6 +256,21 @@
       }
     },
     {
+      "path": "codex-rs/app-server/tests/suite/v2/skills_list.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "277a1ddbed179ed3b9f44b6892e2ab85460cf127bc754235d6a5e9b79d75db0f",
+        "bytes": 48450,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "b18aa3391578987ba3e8be374540fa79c8576756f70fc7258c20da896682ba84",
+        "bytes": 48591,
+        "git_mode": "100644"
+      }
+    },
+    {
       "path": "codex-rs/cli/tests/app_server_daemon.rs",
       "before": {
         "kind": "file",
@@ -243,8 +280,8 @@
       },
       "after": {
         "kind": "file",
-        "sha256": "e2c03cfaf9f8e3d42dc808e228dd5151b7240b0866843dbe9a676a102adbf74d",
-        "bytes": 25849,
+        "sha256": "f6eb800bbf392543eb6b0964106b7034e4c1f87a2d2bca0a9cd1576cd76253a0",
+        "bytes": 25640,
         "git_mode": "100644"
       }
     },
@@ -464,6 +501,36 @@
       }
     },
     {
+      "path": "codex-rs/core/tests/suite/hooks.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "615345d43c48a1111c058733fd4c12c1fa46293d557e0a95009cd2a46cc208f7",
+        "bytes": 201741,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "9ec2e9b67585be32f6913d8880a90a9e452008ddc8c685678478093c998418b3",
+        "bytes": 201821,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/core/tests/suite/realtime_conversation.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "4669742d64027f60ebbad82bf02dfe526c2445f6475835fb6ca7d947732857cd",
+        "bytes": 223035,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "398afd23255fde5e0a81dfbcb851f02fbe420a5523ae47e66b5473b29664adee",
+        "bytes": 223334,
+        "git_mode": "100644"
+      }
+    },
+    {
       "path": "codex-rs/exec-server/src/shell_snapshot.rs",
       "before": {
         "kind": "file",
@@ -475,6 +542,36 @@
         "kind": "file",
         "sha256": "b6e08e54dc6088130d3f5d97f19e6900ae2240f03503035bb6f496f2ec2381f0",
         "bytes": 19014,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/exec-server/src/shell_snapshot_tests.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "2dada2bd29d700a5da6b2fc56f079f719a2a2023ad27e8ad6298e933011adae2",
+        "bytes": 12858,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "f2ef379a28c13ac6be7ab9e1df78b322eeb227cd79597b13a261821a314d8826",
+        "bytes": 12895,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/exec-server/tests/common/exec_server.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "2b06f9ae2f8315067a97954b61ad49a18a0302dc1ad46a997bb36e7c8a3c7ec2",
+        "bytes": 13638,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "639fbbfaa9fda84c976105b1bd0d78491bff780c63ecd072272f86abecdd1ec8",
+        "bytes": 13785,
         "git_mode": "100644"
       }
     },
@@ -579,6 +676,66 @@
       }
     },
     {
+      "path": "codex-rs/http-client/src/route_aware_client_pool.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "1c53cd22d10342ca74bc4424e3eb7e5a924bd1eb5bb84a36090b2bce67ca6866",
+        "bytes": 20883,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "0561b27f9c1f4f7fc96126d925bf94a7e90f9209a10f7c617118459ebeb0f1b0",
+        "bytes": 21149,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/http-client/src/route_aware_client_pool_tests.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "22a9c088ba0656c57a7b2b71267220c6c569c995d87d5eff70d7781cd2415b8f",
+        "bytes": 42719,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "97bc1bdf8be4c49034d8f68a19a92a150391d9821dfffc45ddf6487cbc6819fd",
+        "bytes": 44229,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/http-client/src/route_aware_tls_fallback_tests.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "b0058d1ad0736222f6a19cab10708935e1911e233d219e85662e2a785b1011da",
+        "bytes": 19972,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "58c2c4322c39e934cafe90d4634cea7c1999292ee7c1e1dacfbf3e6b0b1c920c",
+        "bytes": 23073,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/linux-sandbox/tests/suite/landlock.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "7baaa8f0448645f25bd08ff6c9cfcfdb6396707cdd2e6aa0ae3a85f94513d0bb",
+        "bytes": 53437,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "6a60018e5e2ce83d5e3c749067c503ce705023a530023eb8736fc90316c7c3cf",
+        "bytes": 53430,
+        "git_mode": "100644"
+      }
+    },
+    {
       "path": "codex-rs/protocol/src/protocol.rs",
       "before": {
         "kind": "file",
@@ -675,6 +832,21 @@
         "kind": "file",
         "sha256": "be0ad26061acf1bf72443adf0af7583696cbbf38c4fa073af3f32c9620417d2b",
         "bytes": 5109,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/tui/src/app/tests/startup_defaults_tests.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "2bed44a2f52b2f1c88066443253658f87581d701a363471a21aade37066adf96",
+        "bytes": 21480,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "a313f109b34845d8aecaea502a03878403699424fd260e2be7e5a6a981798016",
+        "bytes": 21578,
         "git_mode": "100644"
       }
     },

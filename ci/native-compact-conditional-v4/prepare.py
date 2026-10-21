@@ -9,7 +9,7 @@ import subprocess
 import sys
 import tarfile
 
-MANIFEST_SHA256 = 'ade4251b4e8ff8c478f2834fb462f4adddd46471761ce108103c1cb927f02a3c'
+MANIFEST_SHA256 = '186fce02e3ef6024010a3d472b68135dbfb93e2316a0659d6a44e12faf2c5996'
 
 
 def digest(path):

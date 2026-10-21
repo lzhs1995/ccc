@@ -130,6 +130,26 @@ jobs:
           set -o pipefail
           just test --locked -p codex-app-server --test all -E 'test(native_compact_goal_f1) | test(turn_start_shell_zsh_fork_subcommand_decline_marks_parent_declined_v2)' --retries 0 \
             2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/goal-session-tests.log"
+      - name: Run corrected full-suite regressions and TLS diagnostics
+        id: previous_failures
+        if: steps.check.outcome == 'success' && steps.producer.outcome == 'success'
+        continue-on-error: true
+        working-directory: ${{ runner.temp }}/native-conditional/source/codex-rs
+        run: |
+          set -o pipefail
+          cargo build --locked -p codex-linux-sandbox --bin codex-linux-sandbox \
+            2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/regression-sandbox-helper.log"
+          export CARGO_BIN_EXE_codex_linux_sandbox="$CARGO_TARGET_DIR/debug/codex-linux-sandbox"
+          export TMPDIR="$RUNNER_TEMP/nativefulltesttmp"
+          mkdir -m 700 "$TMPDIR"
+          cargo tree --locked -p codex-http-client -e features -i reqwest@0.12.28 \
+            --target x86_64-unknown-linux-gnu > "$GITHUB_WORKSPACE/conditional-evidence/reqwest-features.txt"
+          env -u CODEX_CA_CERTIFICATE -u SSL_CERT_FILE -u SSH_CLIENT -u SSH2_CLIENT \
+            just test --locked -p codex-app-server -p codex-cli -p codex-core \
+            -p codex-exec-server -p codex-external-agent-migration -p codex-http-client \
+            -p codex-linux-sandbox -p codex-tui \
+            -E 'test(external_agent_config_secondary_source_imports_session_and_plugin_end_to_end) | test(skills_list_uses_cached_result_after_session_default_writes_until_force_reload) | test(packaged_daemon_explicit_replacement_migrates_running_legacy) | test(permission_request_hook_allows_exec_command_without_user_approval) | test(conversation_second_start_replaces_runtime) | test(snapshot_failure_retries_are_bounded_and_single_flight) | test(detects_cur_sessions_in_batches_and_redetects_modified_imports) | test(detects_cur_transcript_with_project_cwd) | test(resolves_cur_project_names_with_common_separators) | test(skips_cur_subagent_transcripts) | test(shell_snapshot_concurrent_replays_keep_independent_readers) | test(route_aware_client_pool) | test(sandbox_keeps_parent_repo_discovery_while_blocking_child_metadata) | test(fresh_startup_reads_destination_and_cleared_model_uses_catalog)' \
+            --retries 0 2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/previous-failures-tests.log"
       - name: Upload complete validation evidence
         if: always()
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
@@ -151,5 +171,6 @@ jobs:
           REGRESSION_RESULT: ${{ steps.regressions.outcome }}
           GOAL_BACKEND_RESULT: ${{ steps.goal_backend.outcome }}
           GOAL_SESSION_RESULT: ${{ steps.goal_session.outcome }}
+          PREVIOUS_FAILURES_RESULT: ${{ steps.previous_failures.outcome }}
         run: |
-          python3 -I -B -c 'import os; r={k:os.environ[k] for k in ("SOURCE_RESULT","PRODUCER_RESULT","FORMAT_RESULT","CHECK_RESULT","FOCUSED_RESULT","REGRESSION_RESULT","GOAL_BACKEND_RESULT","GOAL_SESSION_RESULT")}; print(r); assert all(v=="success" for v in r.values()), "Native conditional candidate failed or remains incomplete"'
+          python3 -I -B -c 'import os; r={k:os.environ[k] for k in ("SOURCE_RESULT","PRODUCER_RESULT","FORMAT_RESULT","CHECK_RESULT","FOCUSED_RESULT","REGRESSION_RESULT","GOAL_BACKEND_RESULT","GOAL_SESSION_RESULT","PREVIOUS_FAILURES_RESULT")}; print(r); assert all(v=="success" for v in r.values()), "Native conditional candidate failed or remains incomplete"'
