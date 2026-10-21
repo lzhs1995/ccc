@@ -129,6 +129,41 @@ jobs:
         with:
           version: '0.11.3'
           enable-cache: false
+      - name: Verify the upstream pinned sandbox V8 inputs for the complete Linux workspace
+        run: |
+          python3 -I -B - <<'PY'
+          import hashlib, json, os, subprocess, urllib.request
+          from pathlib import Path
+          source = Path(os.environ["RUNNER_TEMP"]) / "native-full/source"
+          version = subprocess.check_output(["python3", str(source / ".github/scripts/rusty_v8_bazel.py"), "resolved-v8-crate-version"], text=True).strip()
+          profile = "ptrcomp_sandbox_release"
+          target = "x86_64-unknown-linux-gnu"
+          checksum_name = f"rusty_v8_{profile}_{target}.sha256"
+          trusted = source / f"third_party/v8/rusty_v8_{version.replace('.', '_')}_release_manifests.sha256"
+          manifest_checksums = {line.split()[1]: line.split()[0] for line in trusted.read_text().splitlines() if line.strip()}
+          destination = Path(os.environ["RUNNER_TEMP"]) / "native-full-v8"
+          destination.mkdir()
+          base = f"https://github.com/openai/codex/releases/download/rusty-v8-v{version}"
+          def download(name, expected):
+              with urllib.request.urlopen(f"{base}/{name}", timeout=120) as response:
+                  data = response.read()
+              actual = hashlib.sha256(data).hexdigest()
+              assert actual == expected, (name, expected, actual)
+              path = destination / name
+              path.write_bytes(data)
+              return path
+          checksum_path = download(checksum_name, manifest_checksums[checksum_name])
+          checksums = {line.split()[1]: line.split()[0] for line in checksum_path.read_text().splitlines() if line.strip()}
+          archive = f"librusty_v8_{profile}_{target}.a.gz"
+          binding = f"src_binding_{profile}_{target}.rs"
+          assert set(checksums) == {archive, binding}
+          archive_path = download(archive, checksums[archive])
+          binding_path = download(binding, checksums[binding])
+          with open(os.environ["GITHUB_ENV"], "a") as output:
+              output.write(f"RUSTY_V8_ARCHIVE={archive_path}\nRUSTY_V8_SRC_BINDING_PATH={binding_path}\n")
+          evidence = Path(os.environ["GITHUB_WORKSPACE"]) / "full-release-evidence"
+          (evidence / "v8-inputs.json").write_text(json.dumps({"version": version, "manifest_sha256": manifest_checksums[checksum_name], "inputs": checksums}, indent=2) + "\n")
+          PY
       - name: Initialize isolated Git metadata for upstream formatters and Clippy
         run: |
           source_dir="$RUNNER_TEMP/native-full/source"
