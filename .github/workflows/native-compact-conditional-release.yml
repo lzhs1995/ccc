@@ -76,6 +76,11 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
+          persist-credentials: false
+      - name: Retain the workflow-owned native dependency builder
+        run: cp ci/native-compact-conditional-release/prepare_native_dependencies.py "$RUNNER_TEMP/prepare_native_dependencies.py"
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
           ref: ${{ needs.validation.outputs.source_sha }}
           persist-credentials: false
       - name: Reconstruct the entire exact source tree
@@ -88,7 +93,7 @@ jobs:
         run: |
           python3 -I -B -c 'import os,shutil; free=shutil.disk_usage(os.environ["RUNNER_TEMP"]).free; print(f"Free GiB: {free/2**30:.1f}"); assert free>=50*2**30'
           sudo apt-get update -y
-          sudo apt-get install -y --no-install-recommends build-essential pkg-config libcap-dev libasound2-dev bubblewrap
+          sudo apt-get install -y --no-install-recommends build-essential cmake pkg-config libcap-dev libasound2-dev bubblewrap
           sudo sysctl -w kernel.unprivileged_userns_clone=1
           if sudo sysctl -a 2>/dev/null | grep -q '^kernel.apparmor_restrict_unprivileged_userns'; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
@@ -96,6 +101,14 @@ jobs:
       - uses: facebook/install-dotslash@1e4e7b3e07eaca387acb98f1d4720e0bee8dbb6a
       - name: Provide the upstream stable DotSlash path
         run: sudo cp "$(command -v dotslash)" /usr/local/bin/dotslash
+      - name: Build the pinned GLib and GStreamer 1.28 dependencies for the complete workspace
+        run: |
+          set -o pipefail
+          python3 -I -B "$RUNNER_TEMP/prepare_native_dependencies.py" \
+            --source "$RUNNER_TEMP/native-full/source" \
+            --output "$RUNNER_TEMP/native-full-dependencies" \
+            --evidence "$GITHUB_WORKSPACE/full-release-evidence" \
+            2>&1 | tee "$GITHUB_WORKSPACE/full-release-evidence/native-dependencies.log"
       - name: Generate real producer files used by the full suite
         run: |
           set -o pipefail
