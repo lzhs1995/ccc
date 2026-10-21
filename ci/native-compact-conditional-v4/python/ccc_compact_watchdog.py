@@ -28,6 +28,7 @@ from ccc_compact_runtime import (CONFIG, ControlLockBusy, binding, goal_identity
 from ccc_compact_trace import intent_trace, new_request, request_bytes
 from ccc_compact_native_client import (client_snapshot, write_authority, read_receipt, pinned_file)
 from ccc_compact_join_accounting import goal_after_join
+from ccc_compact_control_health import ControlEvidenceBusy, control_health
 from ccc_compact_handoff import (handoff_ready, handoff_record, revoke_reasons, settle_record,
                                  settle_rejects)
 
@@ -552,14 +553,33 @@ class Worker:
                         return fresh
 
                     def prepare(fresh):
-                        ep['phase'] = 'control_pending'
-                        self.save()
                         params = {'threadId': locked_target['session_id'], 'turnId': ep['turn_id']}
                         index = self.inputs.intent_index
                         with index.lock:
                             if index.control_is_pending():
-                                raise RuntimeError('another original native control is pending')
+                                raise ControlEvidenceBusy('another original native control is pending')
+                        # Host queries do not serialize with native changes. Never
+                        # hold the fleet ledger lock while querying the cmux CLI.
+                        check_locks()
+                        if binding(self.target, self.lib[0], self.lib[1]) != dict(
+                                identity=locked_target['identity'], process=locked_target['process']):
+                            raise RuntimeError('native process or target changed before pinning')
+                        with index.lock:
+                            # A peer may have pinned evidence during the host query.
+                            if index.control_is_pending():
+                                raise ControlEvidenceBusy('another original native control is pending')
+                            check_locks()
+                            ep['phase'] = 'control_pending'
+                            self.save()
                             self.intent(ep, 'interrupt', params, fresh, request=request)
+                            authority_path = self.directory / (ep['key'] + '-authority.json')
+                            _authority_pin, raw = pinned_file(authority_path)
+                            authority = json.loads(raw)
+                            for pin in [authority['foreground'], authority['enrollment'],
+                                        authority['config'], *authority['pinned_inputs']]:
+                                if pinned_file(pin['path'])[0] != pin:
+                                    raise RuntimeError('original authority pin changed before freeze')
+                            check_locks()
                             index.freeze_for_control(request)
                         # After pinning, reads must not refresh the ledger or mutate this episode.
                         authority_path = self.directory / (ep['key'] + '-authority.json')
@@ -600,6 +620,28 @@ class Worker:
                         self.save()
                         self.journal.record('CONDITIONAL_NATIVE_RECEIPT_PENDING', key=key,
                                             replay_authorized=False)
+            except ControlEvidenceBusy as exc:
+                if ep.get('phase') == 'control_pending':
+                    self.state['control_outcome'] = dict(key=ep['key'], status='UNKNOWN',
+                        reason=str(exc)[:500], at=time.time(), replay_authorized=False)
+                    self.save()
+                    self.journal.record('CONDITIONAL_OUTCOME_UNKNOWN', key=ep['key'],
+                                        reason=str(exc)[:500], replay_authorized=False)
+                    return
+                if ep.get('phase') != 'compacting':
+                    self.close_episode('uncertain', reason=str(exc)[:500])
+                    return
+                now = time.time()
+                deferred = ep.get('recovery_deferred') or {}
+                ep['recovery_deferred'] = dict(reason='shared_control_evidence_pinned',
+                    first_at=deferred.get('first_at', now), last_at=now,
+                    retry_not_before=now + LOCK_RETRY_SECONDS,
+                    count=deferred.get('count', 0) + 1,
+                    last_warning=deferred.get('last_warning', 0))
+                self.save()
+                self.journal.record('RECOVERY_DEFERRED_SHARED_CONTROL', key=ep['key'],
+                                    deadline=ep['started_at'] + LIMIT,
+                                    retry_not_before=now + LOCK_RETRY_SECONDS, zero_input=True)
             except ControlLockBusy as exc:
                 if ep.get('phase') == 'control_pending':
                     self.state['control_outcome'] = dict(key=ep['key'], status='UNKNOWN',
@@ -782,8 +824,10 @@ class Worker:
             while not self.stop.is_set():
                 try:
                     self.tick()
+                    evidence_health = control_health(self.inputs.intent_index, worker=self)
                     atomic_json(self.directory / 'worker-health.json', dict(
-                        at=time.time(), state='observing', surface_id=self.target['surface_id'],
+                        at=time.time(), state=(evidence_health or {}).get('state', 'observing'),
+                        control_evidence=evidence_health, surface_id=self.target['surface_id'],
                         session_id=self.target['session_id'],
                         binding_verified=self.state.get('native', {}).get('binding_ok', False)))
                     self.last_error = None
@@ -798,14 +842,26 @@ class Worker:
                     except Exception as observation_error:
                         read_only_error = f'{type(observation_error).__name__}: {observation_error}'[:500]
                     try:
+                        evidence_health = control_health(self.inputs.intent_index, worker=self)
                         atomic_json(self.directory / 'worker-health.json', dict(
-                            at=time.time(), state='read_only_observing' if read_only else 'observation_unavailable',
+                            at=time.time(), state=((evidence_health or {}).get('state')
+                                or ('read_only_observing' if read_only else 'observation_unavailable')),
+                            control_evidence=evidence_health,
                             surface_id=self.target['surface_id'], session_id=self.target['session_id'],
                             error=error, control_verified=False,
                             read_only_observed_at=read_only['at'] if read_only else None,
                             read_only_error=read_only_error))
-                    except OSError:
-                        pass
+                    except Exception as health_error:
+                        self.journal.record('CONTROL_HEALTH_UNAVAILABLE',
+                                            error=str(health_error)[:500], control_verified=False)
+                        # Replace a prior healthy heartbeat even when retained
+                        # evidence cannot be read; it grants no control permission.
+                        atomic_json(self.directory / 'worker-health.json', dict(
+                            at=time.time(), state='control_evidence_unavailable',
+                            surface_id=self.target['surface_id'],
+                            session_id=self.target['session_id'],
+                            error=str(health_error)[:500], control_verified=False,
+                            binding_verified=False))
                     self.last_error = error
                 ep = self.state.get('episode') or {}
                 self.stop.wait(1 if ep.get('phase') in {'compacting', 'control_pending', 'uncertain'} else 3)

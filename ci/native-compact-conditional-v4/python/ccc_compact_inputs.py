@@ -17,6 +17,7 @@ import math
 
 from ccc_codex_goal import _debug_fields
 from ccc_compact_support import owned_file, OwnedDirectory
+from ccc_compact_backup import publish_backup
 
 MAX_BODY = 65536
 MAX_ROWS = 2048
@@ -263,8 +264,8 @@ class PendingInputs:
                 or type(process.get('pid')) is not int
                 or not isinstance(process.get('birth'), list) or len(process['birth']) != 2):
             raise RuntimeError('storage adoption lacks current original-session proof')
-        with owned_file(self.path) as (stream, _):
-            raw = stream.read()
+        with OwnedDirectory(self.path.parent) as directory:
+            raw = directory.read_bytes(self.path.name, limit=64 * 1024 * 1024)
         if json.loads(raw) != self.state:
             raise RuntimeError('pending ledger changed during authentication')
         digest = hashlib.sha256(raw).hexdigest()
@@ -273,7 +274,7 @@ class PendingInputs:
             if directory.read_bytes(self.path.name, limit=64 * 1024 * 1024) != raw:
                 raise RuntimeError('pending ledger changed before backup')
             try:
-                directory.write_once_bytes(backup.name, raw)
+                publish_backup(directory, backup.name, raw)
             except FileExistsError:
                 if directory.read_bytes(backup.name, limit=64 * 1024 * 1024) != raw:
                     raise RuntimeError('original input ledger backup changed')
@@ -309,7 +310,7 @@ class PendingInputs:
             if directory.read_bytes(self.path.name, limit=64 * 1024 * 1024) != raw:
                 raise RuntimeError('legacy input ledger changed before backup')
             try:
-                directory.write_once_bytes(backup.name, raw)
+                publish_backup(directory, backup.name, raw)
             except FileExistsError:
                 if directory.read_bytes(backup.name, limit=64 * 1024 * 1024) != raw:
                     raise RuntimeError('legacy input ledger backup changed')
@@ -330,7 +331,8 @@ class PendingInputs:
             return
         with self.intent_index.lock:
             if self.intent_index.control_is_pending():
-                raise RuntimeError('original native control receipt pending; input evidence pinned')
+                from ccc_compact_control_health import ControlEvidenceBusy
+                raise ControlEvidenceBusy('original native control receipt pending; input evidence pinned')
             yield
 
     def save(self):

@@ -158,6 +158,7 @@ def conditional_submit(worker, request, snapshot, check_locks, recheck, prepare)
     """
     target = worker.target
     rpc = None
+    submission_recorded = False
     try:
         try:
             rpc = worker.lib[4](binding=dict(identity=target['identity'],
@@ -180,6 +181,7 @@ def conditional_submit(worker, request, snapshot, check_locks, recheck, prepare)
             dict(status='UNKNOWN', transport=transport, client_request=request,
                  client_epoch=snapshot['client_epoch'], text=text, attempted_at=time.time(),
                  replay_authorized=False))
+        submission_recorded = True
         check_locks()
         if rpc is not None:
             result = control_request(rpc, target['session_id'], 'thread/compact/interrupt', request)
@@ -188,6 +190,24 @@ def conditional_submit(worker, request, snapshot, check_locks, recheck, prepare)
         acknowledgement = worker.lib[0].submit_text_protected(target['surface_id'], text)
         return dict(transport=transport, host=acknowledgement, input_operations=2,
                     replay_authorized=False)
+    except Exception as exc:
+        if not submission_recorded:
+            try:
+                from ccc_compact_control_health import record_not_transmitted
+                record_not_transmitted(worker, request, exc)
+            except Exception as marker_error:
+                # Failure to add health evidence never replaces the original
+                # control error or authorizes a second transport attempt.
+                try:
+                    worker.journal.record('CONDITIONAL_NOT_TRANSMITTED_MARKER_FAILED',
+                        key=request['attemptId'], original_error=str(exc)[:500],
+                        marker_error=str(marker_error)[:500], replay_authorized=False)
+                except Exception as journal_error:
+                    if hasattr(exc, 'add_note'):
+                        exc.add_note('Control health/journal failed: ' + str(journal_error)[:300])
+                if hasattr(exc, 'add_note'):
+                    exc.add_note('Control health marker failed: ' + str(marker_error)[:300])
+        raise
     finally:
         if rpc is not None:
             rpc.close()

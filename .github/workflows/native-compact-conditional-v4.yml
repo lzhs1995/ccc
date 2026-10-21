@@ -51,6 +51,21 @@ jobs:
           python3 -I -B ci/native-compact-conditional-v4/python/verify_source.py 2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/python-source.log"
           CCC_COMPACT_TEST_RUNTIME="$GITHUB_WORKSPACE/ci/native-compact-conditional-v4/python" \
             python3 -I -B ci/native-compact-conditional-v4/python/test_native_compact.py 2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/python-safety-tests.log"
+          export CCC_COMPACT_TEST_RUNTIME="$GITHUB_WORKSPACE/ci/native-compact-conditional-v4/python"
+          python3 -I -B ci/native-compact-conditional-v4/python/test_control_durability.py \
+            2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/python-control-durability.log"
+          python3 -I -B ci/native-compact-conditional-v4/python/test_backup_ownership.py \
+            2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/python-backup-ownership.log"
+          V13_INTENTS_DIR="$CCC_COMPACT_TEST_RUNTIME" \
+            CCC_BASELINE_INTENTS_DIR="$CCC_COMPACT_TEST_RUNTIME/baseline" \
+            python3 -I -B ci/native-compact-conditional-v4/python/test_pin_retirement.py \
+            2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/python-pin-retirement.log"
+          python3 -I -B ci/native-compact-conditional-v4/python/test_archive_process_death.py \
+            2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/python-archive-process-death.log"
+          python3 -I -B ci/native-compact-conditional-v4/python/test_health_lock_gates.py \
+            2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/python-health-lock-gates.log"
+          python3 -I -B ci/native-compact-conditional-v4/python/test_backup_kernel_faults.py \
+            2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/python-backup-kernel-faults.log"
           python3 -I -B ci/native-compact-conditional-v4/python/generate_reader_fixtures.py \
             --runtime "$GITHUB_WORKSPACE/ci/native-compact-conditional-v4/python" \
             --output "$GITHUB_WORKSPACE/conditional-evidence/producer-fixtures" \

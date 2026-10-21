@@ -98,6 +98,17 @@ def _observer(value, health, sid, surface, now):
     health_at = health.get('at')
     if not _finite(health_at) or not 0 <= now - health_at <= MAX_AGE:
         return dict(state='stale', reason='compaction worker heartbeat expired')
+    retained_states = {'pinned_before_submission', 'pinned_not_transmitted', 'native_receipt_pending'}
+    if health.get('state') in retained_states:
+        # A current retained-control heartbeat is useful operator evidence,
+        # never permission to submit or release the original input.
+        return dict(state=health['state'],
+                    reason='original control evidence retained: ' + health['state'],
+                    observed_at=at, control_evidence=health.get('control_evidence'))
+    if (value.get('episode') or {}).get('phase') == 'control_pending':
+        return dict(state='control_evidence_unavailable',
+                    reason='original control pending without a matching health heartbeat',
+                    observed_at=at)
     if health.get('state') != 'observing' or health.get('binding_verified') is not True:
         raise ValueError(str(health.get('error') or 'compaction observer unavailable')[:160])
     facts = native.get('facts')

@@ -1,0 +1,6 @@
+• Working (39m 20s • esc to interrupt)
+
+› DONE|example-task|example-nonce|REPORT=/tmp/example-report.md
+
+  GPT-6-Astra xhigh · ~/work · Context 32% used · 258K window · Fa… Pursuing goal
+  tab to queue message

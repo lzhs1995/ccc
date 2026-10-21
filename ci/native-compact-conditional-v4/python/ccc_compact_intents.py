@@ -20,6 +20,7 @@ import time
 
 from ccc_compact_inputs import receipt_matches, text_identity, verify_receipt
 from ccc_compact_support import sync_directory, owned_file, OwnedDirectory, validate_native_receipt_fields
+import ccc_compact_pin_retirement as pin_retirement
 
 STATE_ROOT = Path.home() / '.local/state/multi-agent-collaboration'
 ACTIVE_ROOT = Path('/tmp/multi-agent-collaboration/_active')
@@ -215,6 +216,9 @@ class IntentIndex:
         if (not isinstance(key, str) or not re.fullmatch(r'[0-9a-f]{24}', key)
                 or not Path(request.get('intentPath', '')).is_absolute()):
             raise ValueError('control freeze requires the original bound request')
+        if pin_retirement.settled_exists(self.path.parent, key):
+            # A settled original never becomes a new pin or submission budget.
+            raise ValueError('original native control already settled; no new pin')
         directory = self.path.parent / 'native-control-pins-v4'
         directory.mkdir(mode=0o700, exist_ok=True)
         with OwnedDirectory(directory) as owned:
@@ -222,54 +226,13 @@ class IntentIndex:
                 client_request=request, replay_authorized=False))
 
     def control_is_pending(self):
-        """No shared index writes while a native reader can still validate its pins."""
-        directory = self.path.parent / 'native-control-pins-v4'
-        if not directory.exists():
-            return False
-        with OwnedDirectory(directory):
-            paths = list(directory.iterdir())
-            if len(paths) > 1024:
-                raise ValueError('native control pin ledger exceeds its bound')
-            for path in paths:
-                if not re.fullmatch(r'[0-9a-f]{24}\.json', path.name):
-                    raise ValueError('unknown native control pin entry')
-                lease, _ = read_json(path)
-                request = lease.get('client_request') or {}
-                key = path.stem
-                if (lease.get('schema') != 'ccc-native-control-pin-v4'
-                        or request.get('attemptId') != key or lease.get('replay_authorized') is not False):
-                    raise ValueError('native control pin binding changed')
-                intent = Path(request.get('intentPath', ''))
-                if (not intent.is_absolute() or intent.parent.parent != self.path.parent
-                        or intent.name != key + '-interrupt.json'):
-                    raise ValueError('native control pin is outside the enrolled journal')
-                receipt_path = intent.with_name(key + '-compact-started.json')
-                if not receipt_path.exists():
-                    denial = None
-                    for phase in ('not-interrupted', 'compact-denied'):
-                        candidate = intent.with_name(key + '-' + phase + '.json')
-                        if candidate.exists():
-                            denial, _ = read_json(candidate)
-                            break
-                    if denial is None:
-                        return True
-                    fields = denial.get('fields')
-                    if (denial.get('episode_key') != key
-                            or denial.get('original_intent') != str(intent)
-                            or not isinstance(fields, dict)
-                            or fields.get('turnId') != request.get('expectedTurnId')
-                            or fields.get('attemptId') != key):
-                        raise ValueError('native denial receipt is not for the original request')
-                    validate_native_receipt_fields(fields, phase, request)
-                    continue
-                receipt, _ = read_json(receipt_path)
-                fields = receipt.get('fields')
-                if (receipt.get('episode_key') != key
-                        or receipt.get('original_intent') != str(intent)
-                        or not isinstance(fields, dict) or 'turnId' not in fields):
-                    raise ValueError('native terminal receipt is not for the original request')
-                validate_native_receipt_fields(fields, 'compact-started', request)
-        return False
+        """No shared index writes while a native reader can still validate its pins.
+
+        Exactly receipted pins are archived write-once and retired; unresolved
+        pins stay active forever. Settled history is not re-read per call.
+        """
+        with self.lock:
+            return pin_retirement.control_is_pending(self.path)
 
     def save(self):
         with self.lock:

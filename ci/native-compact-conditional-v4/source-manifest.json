@@ -1,11 +1,11 @@
 {
-  "schema": "ccc-native-conditional-source-v7",
+  "schema": "ccc-native-conditional-source-v8",
   "status": "INTEGRATED_VERIFICATION_CANDIDATE_NOT_DEPLOYABLE",
   "baseline_prepare_sha256": "beae02abdd924b103f489ce54fdd9fb666ebff89ccb8592d43cfc18cdff81a12",
   "baseline_source_tree_sha256": "6a0540b9d82e9c947192a3bf675467af87562c35b047ce54c0767c2d4aec3d35",
-  "source_tree_sha256": "6947d9e6caa210a9ed946decd3666c4c2c420ab541f153a389e9c55f50bff0b3",
+  "source_tree_sha256": "11517fbe495278f0943806878fcde1039e85865987aff84fe4de0da3c9f38c58",
   "source_file_count": 8891,
-  "archive_sha256": "f28548419fc29c458b732c09565444b4adbe5831df8694f50ac569ec2715c809",
+  "archive_sha256": "c94c29e2d2646bb90b6946f7ca6aeb876743a8fcab624c99700bf4056791f370",
   "evidence": {
     "authority_manifest": "544e569f9323faa03e4a3277188fc3a4db54aa4559de4b774cc646e86a1f6dd2",
     "reservation_manifest": "7ff594c3a3a70e71508effed4a9dd7d305c70f3f60ea1d562a4b534b973329d2",
@@ -14,18 +14,39 @@
     "real_goal_assertions_manifest": "d49c1890f0e658c3a3117f135fe94468420f98a2322d6c785e6f7538c8b2944c",
     "mail_lineage_manifest": "1cd813458687dd1d9cfa3cd519b74011c8d61cf0b9b56402f8e0569d22cbbdf6",
     "native_crossreview_manifest": "4bb21e198f1ffa7ed081a70146a4202ca81d51fe531747bd1d7fc7e73f2511c4",
-    "previous_validation": "GHA39509774268 check PASS; focused338/339, corrected mailbox-only expectation",
+    "previous_validation": "GHA39515754036 focused355/355, protocol+Goal libraries683/683, backend35/35, state23/23 PASS; real Session test failed premature interrupt assertion",
     "compiler_fix": "GHA39506212443 E0308: retain Arc<GoalRuntimeHandle>",
-    "python_producer_manifest": "4c30c0929edf9611c685a0365fe521bd11d7c41755edcbd024efa6a64694850f",
+    "python_producer_manifest": "b2d25fc2d40b14ebf2bb51b6fa90fddb58428defcfef4a351206e5909b9fa437",
+    "real_goal_300s_manifest": "0de4d1387424cafaf2f20719e8b7b74dd96335f0a8b5514f09dcc02a4005665e",
+    "python_ledger_audit_manifest": "4244fe6c767287b5e6095bec2fdc942a921505f89db1578b28902d0ce88af36b",
+    "terminal_pin_retirement_manifest": "fb92b9a4c6c5114143617e610fd23ee23443630ada54e0479f83bc5a10f52e68",
+    "backup_independent_review_manifest": "bcce49e138847bd7aa7d144baffc7940a7bd725f1af809b78fa849b358f3378d",
+    "python_health_lock_gates_manifest": "d4f59993136827aebb0655b309ee210c74b5fcbd339c2ac2b6b71d99704cb352",
+    "backup_kernel_review_manifest": "21c36fad1e0972285069e3cc92770d6d8306d67b86313929087c00a97604997d",
     "experimental_exports_run": 39499309200,
     "experimental_exports_sha256": "38a72e7b8d517165cc87502568595996c2dba1bcc88d5d57f225ca1a0e8a3159"
   },
   "limitations": [
-    "A10 real core Session with Goal test execution pending GHA",
-    "B11 input lineage regressions execution pending GHA",
+    "A11 real 301s core Session+Goal test execution pending GHA",
+    "Whole Rust workspace, scoped Clippy and Mac native build pending",
     "native business adoption NOT_RUN"
   ],
   "changes": [
+    {
+      "path": "codex-rs/.config/nextest.toml",
+      "before": {
+        "kind": "file",
+        "sha256": "277f6bba1e104c103c658073f91ef50057d0b0ca70f87e58493215536495553b",
+        "bytes": 4622,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "63f1263674ac9f324b061fdf94ac03f6f0aa04b2a24eb8b1618af7764eb8b409",
+        "bytes": 5489,
+        "git_mode": "100644"
+      }
+    },
     {
       "path": "codex-rs/Cargo.lock",
       "before": {
@@ -181,8 +202,8 @@
       "before": null,
       "after": {
         "kind": "file",
-        "sha256": "6e2182411618c902ce79740e1d7e229da6f6cbcad81e21bdfb86589a83f344ca",
-        "bytes": 16474,
+        "sha256": "7c76141b9eebc0ac92dd4f6f151f1c1546afcc4cf9a14a22fdb97acaf351bfdd",
+        "bytes": 18001,
         "git_mode": "100644"
       }
     },
@@ -291,8 +312,8 @@
       },
       "after": {
         "kind": "file",
-        "sha256": "78cd57fd8c057788e0132c89004da623b5b39b53bb78c5ea672b21d63eaaafb3",
-        "bytes": 31693,
+        "sha256": "5df4f36719ecc27af9c3704ae6bc97cc646a51525265ba8b60cb9d7e45e49a01",
+        "bytes": 31678,
         "git_mode": "100644"
       }
     },
@@ -336,8 +357,8 @@
       },
       "after": {
         "kind": "file",
-        "sha256": "8da0c0d0c37a698a4611ea8cec9fe424143c90d6872117c7f6094fc56ae23c6c",
-        "bytes": 55750,
+        "sha256": "56354d007ee0acc8182207ff4b1070be6aec6d9f23775eaec16d971563f2030b",
+        "bytes": 55746,
         "git_mode": "100644"
       }
     },
