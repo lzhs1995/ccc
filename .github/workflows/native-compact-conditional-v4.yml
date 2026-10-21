@@ -91,7 +91,7 @@ jobs:
         working-directory: ${{ runner.temp }}/native-conditional/source/codex-rs
         run: |
           set -o pipefail
-          cargo check --locked -p codex-app-server -p codex-core -p codex-tui -p codex-app-server-protocol -p codex-protocol -p codex-rollout -p codex-goal-extension -p codex-state --tests 2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/cargo-check.log"
+          cargo check --locked -p codex-app-server -p codex-core -p codex-tui -p codex-app-server-protocol -p codex-protocol -p codex-rollout -p codex-goal-extension -p codex-state -p codex-skills-extension --tests 2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/cargo-check.log"
       - name: Run native admission, authority, occurrence and preserved timeout tests
         id: focused
         if: steps.check.outcome == 'success' && steps.producer.outcome == 'success'
@@ -109,7 +109,7 @@ jobs:
         working-directory: ${{ runner.temp }}/native-conditional/source/codex-rs
         run: |
           set -o pipefail
-          just test --locked -p codex-app-server-protocol -p codex-protocol -p codex-goal-extension --lib --retries 0 2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/library-regressions.log"
+          just test --locked -p codex-app-server-protocol -p codex-protocol -p codex-goal-extension -p codex-skills-extension --lib --retries 0 2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/library-regressions.log"
       - name: Run real Goal backend and state CAS regressions
         id: goal_backend
         if: steps.focused.outcome == 'success'
