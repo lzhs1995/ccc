@@ -111,7 +111,11 @@ jobs:
           components: rustfmt,clippy
       - uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532
         with:
-          tool: just@1.51.0,nextest@0.9.103,uv@0.11.3
+          tool: just@1.51.0,nextest@0.9.103
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+        with:
+          version: '0.11.3'
+          enable-cache: false
       - name: Initialize isolated Git metadata for upstream formatters and Clippy
         run: |
           source_dir="$RUNNER_TEMP/native-full/source"
