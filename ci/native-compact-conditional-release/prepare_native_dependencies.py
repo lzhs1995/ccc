@@ -76,6 +76,11 @@ def main():
     if built["manifest_sha256"] != receipt["source_manifest_sha256"]:
         raise ValueError("native dependency build manifest changed")
     prefix = build / "prefix"
+    plugins = prefix / "lib/gstreamer-1.0"
+    for name in "app audioconvert audioresample coreelements opus rtp rtpmanager".split():
+        plugin = plugins / f"libgst{name}.so"
+        if not plugin.is_file():
+            raise ValueError(f"required test runtime plugin missing: {plugin}")
     system_pc_paths = subprocess.check_output(
         ["pkg-config", "--variable=pc_path", "pkg-config"], text=True).strip()
     # The voice helper also needs the runner's declared ALSA inputs. Prefer all
@@ -97,6 +102,7 @@ def main():
     with open(os.environ["GITHUB_ENV"], "a") as handle:
         handle.write(f"PKG_CONFIG_PATH=\nPKG_CONFIG_LIBDIR={pc_paths}\n")
         handle.write(f"LD_LIBRARY_PATH={prefix}/lib\n")
+        handle.write(f"CODEX_TEST_VOICE_RUNTIME={prefix}\n")
     print(json.dumps(receipt, indent=2))
 
 

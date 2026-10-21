@@ -11,18 +11,18 @@ on:
       validation_run_id:
         description: Completed native conditional validation run for these exact source pins
         required: true
-        default: '39532221465'
+        default: '39609056442'
       source_sha:
         description: Commit whose complete source and Python manifests were validated
         required: true
-        default: '2f645919edb82f261f32adc4c485efe9c3767e14'
+        default: '424898b1c424a1f025df8bbbcab1bb24327ecd6a'
 
 permissions:
   contents: read
   actions: read
 
 concurrency:
-  group: native-full-release-${{ inputs.source_sha || '2f645919edb82f261f32adc4c485efe9c3767e14' }}
+  group: native-full-release-${{ inputs.source_sha || '424898b1c424a1f025df8bbbcab1bb24327ecd6a' }}
   cancel-in-progress: false
 
 jobs:
@@ -44,13 +44,13 @@ jobs:
         run: cp ci/native-compact-conditional-release/verify_validation.py "$RUNNER_TEMP/verify_validation.py"
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: ${{ inputs.source_sha || '2f645919edb82f261f32adc4c485efe9c3767e14' }}
+          ref: ${{ inputs.source_sha || '424898b1c424a1f025df8bbbcab1bb24327ecd6a' }}
           persist-credentials: false
       - name: Require the completed exact-source validation
         id: proof
         env:
-          VALIDATION_RUN_ID: ${{ inputs.validation_run_id || '39532221465' }}
-          SOURCE_SHA: ${{ inputs.source_sha || '2f645919edb82f261f32adc4c485efe9c3767e14' }}
+          VALIDATION_RUN_ID: ${{ inputs.validation_run_id || '39609056442' }}
+          SOURCE_SHA: ${{ inputs.source_sha || '424898b1c424a1f025df8bbbcab1bb24327ecd6a' }}
           GH_TOKEN: ${{ github.token }}
         run: python3 -I -B "$RUNNER_TEMP/verify_validation.py"
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
@@ -228,9 +228,27 @@ jobs:
         if: steps.fmt.outcome == 'success' && steps.helper.outcome == 'success'
         continue-on-error: true
         working-directory: ${{ runner.temp }}/native-full/source/codex-rs
+        env:
+          CODEX_CLOUD_TASKS_ERROR_LOG: ${{ github.workspace }}/full-release-evidence/cloud-tasks-error.log
         run: |
           set -o pipefail
-          just test --locked --retries 0 2>&1 | tee "$GITHUB_WORKSPACE/full-release-evidence/workspace-tests.log"
+          python3 -I -B - <<'PY'
+          import json, os
+          from pathlib import Path
+          variables = ("CODEX_CA_CERTIFICATE", "SSL_CERT_FILE", "SSH_CLIENT", "SSH2_CLIENT")
+          record = {key: bool(os.environ.get(key)) for key in variables}
+          record["temporary_ancestor_markers"] = {
+              str(Path(directory) / ".git"): (Path(directory) / ".git").exists()
+              for directory in ("/", "/tmp", os.environ["RUNNER_TEMP"])
+          }
+          Path(os.environ["GITHUB_WORKSPACE"], "full-release-evidence/test-environment.json").write_text(json.dumps(record, indent=2) + "\n")
+          print(json.dumps(record, indent=2))
+          PY
+          cargo tree --locked -e features -i reqwest@0.12.28 > "$GITHUB_WORKSPACE/full-release-evidence/reqwest-features.txt"
+          export TMPDIR="$RUNNER_TEMP/native-full-test-tmp"
+          mkdir -m 700 "$TMPDIR"
+          env -u CODEX_CA_CERTIFICATE -u SSL_CERT_FILE -u SSH_CLIENT -u SSH2_CLIENT \
+            just test --locked --retries 0 2>&1 | tee "$GITHUB_WORKSPACE/full-release-evidence/workspace-tests.log"
       - name: Run scoped upstream Clippy fixes
         id: lint
         if: steps.tests.outcome == 'success'
