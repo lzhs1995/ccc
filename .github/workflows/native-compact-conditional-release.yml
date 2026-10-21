@@ -1,0 +1,525 @@
+name: Native conditional full regression and macOS candidate
+
+on:
+  push:
+    branches: [fix/ccc-live-recovery-20261011-6054]
+    paths:
+      - .github/workflows/native-compact-conditional-release.yml
+      - ci/native-compact-conditional-release/**
+  workflow_dispatch:
+    inputs:
+      validation_run_id:
+        description: Completed native conditional validation run for these exact source pins
+        required: true
+        default: '39532221465'
+      source_sha:
+        description: Commit whose complete source and Python manifests were validated
+        required: true
+        default: '2f645919edb82f261f32adc4c485efe9c3767e14'
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: native-full-release-${{ inputs.source_sha || '2f645919edb82f261f32adc4c485efe9c3767e14' }}
+  cancel-in-progress: false
+
+jobs:
+  validation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      source_sha: ${{ steps.proof.outputs.source_sha }}
+      validation_run_id: ${{ steps.proof.outputs.validation_run_id }}
+      validation_run_attempt: ${{ steps.proof.outputs.validation_run_attempt }}
+      source_manifest_sha256: ${{ steps.proof.outputs.source_manifest_sha256 }}
+      python_manifest_sha256: ${{ steps.proof.outputs.python_manifest_sha256 }}
+      source_tree_sha256: ${{ steps.proof.outputs.source_tree_sha256 }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - name: Retain the workflow-owned validation reader
+        run: cp ci/native-compact-conditional-release/verify_validation.py "$RUNNER_TEMP/verify_validation.py"
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ inputs.source_sha || '2f645919edb82f261f32adc4c485efe9c3767e14' }}
+          persist-credentials: false
+      - name: Require the completed exact-source validation
+        id: proof
+        env:
+          VALIDATION_RUN_ID: ${{ inputs.validation_run_id || '39532221465' }}
+          SOURCE_SHA: ${{ inputs.source_sha || '2f645919edb82f261f32adc4c485efe9c3767e14' }}
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I -B "$RUNNER_TEMP/verify_validation.py"
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        if: always()
+        with:
+          name: native-full-validation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: full-release-evidence/
+          retention-days: 14
+
+  full:
+    needs: validation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      PYTHONDONTWRITEBYTECODE: '1'
+      RUST_MIN_STACK: '8388608'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ needs.validation.outputs.source_sha }}
+          persist-credentials: false
+      - name: Reconstruct the entire exact source tree
+        run: |
+          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/native-full-target" >> "$GITHUB_ENV"
+          python3 -I -B ci/native-compact-conditional-v4/prepare.py \
+            --output "$RUNNER_TEMP/native-full/source" \
+            --report "$GITHUB_WORKSPACE/full-release-evidence/reconstruction.json"
+      - name: Require capacity and install upstream build dependencies
+        run: |
+          python3 -I -B -c 'import os,shutil; free=shutil.disk_usage(os.environ["RUNNER_TEMP"]).free; print(f"Free GiB: {free/2**30:.1f}"); assert free>=50*2**30'
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config libcap-dev libasound2-dev bubblewrap
+          sudo sysctl -w kernel.unprivileged_userns_clone=1
+          if sudo sysctl -a 2>/dev/null | grep -q '^kernel.apparmor_restrict_unprivileged_userns'; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - uses: facebook/install-dotslash@1e4e7b3e07eaca387acb98f1d4720e0bee8dbb6a
+      - name: Provide the upstream stable DotSlash path
+        run: sudo cp "$(command -v dotslash)" /usr/local/bin/dotslash
+      - name: Generate real producer files used by the full suite
+        run: |
+          set -o pipefail
+          python3 -I -B ci/native-compact-conditional-v4/python/verify_source.py
+          python3 -I -B ci/native-compact-conditional-v4/python/generate_reader_fixtures.py \
+            --runtime "$GITHUB_WORKSPACE/ci/native-compact-conditional-v4/python" \
+            --output "$GITHUB_WORKSPACE/full-release-evidence/producer-fixtures" \
+            2>&1 | tee "$GITHUB_WORKSPACE/full-release-evidence/producer-generation.log"
+          echo "CCC_REAL_PRODUCER_MANIFEST=$GITHUB_WORKSPACE/full-release-evidence/producer-fixtures/manifest.json" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582
+        with:
+          toolchain: 1.95.0
+          components: rustfmt,clippy
+      - uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532
+        with:
+          tool: just@1.51.0,nextest@0.9.103,uv@0.11.3
+      - name: Initialize isolated Git metadata for upstream formatters and Clippy
+        run: |
+          source_dir="$RUNNER_TEMP/native-full/source"
+          git init --separate-git-dir="$RUNNER_TEMP/native-full/format-git" "$source_dir"
+          git -C "$source_dir" add -f .
+          git -C "$source_dir" -c user.name="CCC verification" -c user.email="ccc-verification@localhost" commit --quiet -m "Exact reconstructed validation source"
+          python3 -I -B - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          source = Path(os.environ["RUNNER_TEMP"]) / "native-full/source"
+          metadata = source / ".git"
+          st = metadata.lstat()
+          expected = f'gitdir: {os.environ["RUNNER_TEMP"]}/native-full/format-git\n'.encode()
+          assert metadata.read_bytes() == expected
+          record = {"path": str(metadata), "device": st.st_dev, "inode": st.st_ino,
+                    "bytes": len(expected), "sha256": hashlib.sha256(expected).hexdigest(),
+                    "meaning": "generated tool metadata, excluded from immutable source only after exact identity checks"}
+          Path("full-release-evidence/source-tool-metadata.json").write_text(json.dumps(record, indent=2) + "\n")
+          PY
+      - name: Keep each formatter environment outside the immutable source
+        run: |
+          python3 -I -B - <<'PY'
+          import os, shlex, shutil
+          from pathlib import Path
+          directory = Path(os.environ["RUNNER_TEMP"]) / "native-full-format-tools"
+          directory.mkdir()
+          real_uv = shutil.which("uv")
+          assert real_uv
+          script = '#!/bin/bash\nset -euo pipefail\nproject=""\nprevious=""\n'
+          script += 'for arg in "$@"; do\n if [[ "$previous" == "--project" ]]; then project="$arg"; break; fi\n previous="$arg"\ndone\n'
+          script += 'case "$project" in scripts) environment="scripts" ;; sdk/python) environment="sdk-python" ;; *) echo "Unexpected formatter project" >&2; exit 2 ;; esac\n'
+          script += 'export UV_PROJECT_ENVIRONMENT="$RUNNER_TEMP/native-full-format-env/$environment"\n'
+          script += 'exec ' + shlex.quote(real_uv) + ' "$@"\n'
+          wrapper = directory / "uv"
+          wrapper.write_text(script)
+          wrapper.chmod(0o755)
+          with open(os.environ["GITHUB_PATH"], "a") as output:
+              output.write(str(directory) + "\n")
+          with open(os.environ["GITHUB_ENV"], "a") as output:
+              output.write('RUFF_CACHE_DIR=' + os.environ["RUNNER_TEMP"] + '/native-full-ruff-cache\n')
+          PY
+      - name: Run the complete upstream formatter
+        id: fmt
+        continue-on-error: true
+        working-directory: ${{ runner.temp }}/native-full/source
+        run: |
+          set -o pipefail
+          just fmt 2>&1 | tee "$GITHUB_WORKSPACE/full-release-evidence/format.log"
+      - name: Build the upstream Linux sandbox runtime helper
+        id: helper
+        if: steps.fmt.outcome == 'success'
+        continue-on-error: true
+        working-directory: ${{ runner.temp }}/native-full/source/codex-rs
+        run: |
+          set -o pipefail
+          cargo build --locked -p codex-linux-sandbox --bin codex-linux-sandbox \
+            2>&1 | tee "$GITHUB_WORKSPACE/full-release-evidence/linux-sandbox-helper.log"
+          echo "CARGO_BIN_EXE_codex-linux-sandbox=$CARGO_TARGET_DIR/debug/codex-linux-sandbox" >> "$GITHUB_ENV"
+          echo "CARGO_BIN_EXE_codex_linux_sandbox=$CARGO_TARGET_DIR/debug/codex-linux-sandbox" >> "$GITHUB_ENV"
+      - name: Run the complete upstream Rust workspace suite
+        id: tests
+        if: steps.fmt.outcome == 'success' && steps.helper.outcome == 'success'
+        continue-on-error: true
+        working-directory: ${{ runner.temp }}/native-full/source/codex-rs
+        run: |
+          set -o pipefail
+          just test --locked --retries 0 2>&1 | tee "$GITHUB_WORKSPACE/full-release-evidence/workspace-tests.log"
+      - name: Run scoped upstream Clippy fixes
+        id: lint
+        if: steps.tests.outcome == 'success'
+        continue-on-error: true
+        working-directory: ${{ runner.temp }}/native-full/source/codex-rs
+        run: |
+          set -o pipefail
+          just fix --locked -p codex-core -p codex-tui -p codex-app-server \
+            -p codex-app-server-protocol -p codex-protocol -p codex-goal-extension \
+            -p codex-state -p codex-api -p codex-rollout \
+            2>&1 | tee "$GITHUB_WORKSPACE/full-release-evidence/clippy-fix.log"
+      - name: Require the source tree to remain exactly the validated tree
+        id: unchanged
+        if: always()
+        run: |
+          python3 -I -B - <<'PY'
+          import hashlib, importlib.util, json, os, shutil
+          from pathlib import Path
+          workspace = Path(os.environ['GITHUB_WORKSPACE'])
+          helper = workspace / 'ci/native-compact-v2/prepare.py'
+          spec = importlib.util.spec_from_file_location('source_snapshot', helper)
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          source = Path(os.environ['RUNNER_TEMP']) / 'native-full/source'
+          metadata = source / '.git'
+          record = json.loads((workspace / 'full-release-evidence/source-tool-metadata.json').read_bytes())
+          st = metadata.lstat()
+          raw = metadata.read_bytes()
+          assert (str(metadata), st.st_dev, st.st_ino, len(raw), hashlib.sha256(raw).hexdigest()) == (
+              record['path'], record['device'], record['inode'], record['bytes'], record['sha256'])
+          # Preserve only the exact tool-created pointer before taking the full snapshot.
+          metadata.rename(workspace / 'full-release-evidence/source-git-pointer.txt')
+          actual = module.snapshot(source)
+          manifest = json.loads((workspace / 'ci/native-compact-conditional-v4/source-manifest.json').read_bytes())
+          digest = module.tree_digest(actual)
+          evidence = workspace / 'full-release-evidence'
+          evidence.mkdir(exist_ok=True)
+          (evidence / 'after-tests-tree.json').write_text(json.dumps({'sha256': digest, 'files': actual}, indent=2) + '\n')
+          if digest != manifest['source_tree_sha256']:
+              changed = evidence / 'changed-source'
+              changed.mkdir(exist_ok=True)
+              # Preserve the full small source tree if a linter or test rewrote it.
+              import tarfile
+              with tarfile.open(changed / 'after-tests-source.tar.gz', 'w:gz') as archive:
+                  for name, info in actual.items():
+                      archive.add(source / name, arcname=name, recursive=False)
+          assert digest == manifest['source_tree_sha256'], 'Tests or Clippy modified pinned source; integrate fixes before packaging'
+          PY
+      - name: Upload complete full-suite and lint evidence
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: native-full-regression-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            full-release-evidence/
+            ${{ runner.temp }}/native-full-target/nextest/local/junit.xml
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Require full regression and lint completion
+        if: always()
+        env:
+          FORMAT_RESULT: ${{ steps.fmt.outcome }}
+          HELPER_RESULT: ${{ steps.helper.outcome }}
+          TEST_RESULT: ${{ steps.tests.outcome }}
+          LINT_RESULT: ${{ steps.lint.outcome }}
+          SOURCE_RESULT: ${{ steps.unchanged.outcome }}
+        run: python3 -I -B -c 'import os; r={k:os.environ[k] for k in ("FORMAT_RESULT","HELPER_RESULT","TEST_RESULT","LINT_RESULT","SOURCE_RESULT")}; print(r); assert all(v=="success" for v in r.values())'
+  macos:
+    needs: [validation, full]
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
+      CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: "off"
+      PYTHONDONTWRITEBYTECODE: "1"
+      RUST_MIN_STACK: "8388608"
+      STABLE_GIT_COMMIT: ${{ needs.validation.outputs.source_sha }}
+      VALIDATED_RUN_ID: ${{ needs.validation.outputs.validation_run_id }}
+      VALIDATED_RUN_ATTEMPT: ${{ needs.validation.outputs.validation_run_attempt }}
+      VALIDATED_SOURCE_MANIFEST: ${{ needs.validation.outputs.source_manifest_sha256 }}
+      VALIDATED_PYTHON_MANIFEST: ${{ needs.validation.outputs.python_manifest_sha256 }}
+      VALIDATED_SOURCE_TREE: ${{ needs.validation.outputs.source_tree_sha256 }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - name: Retain the actual build workflow
+        run: cp .github/workflows/native-compact-conditional-release.yml "$RUNNER_TEMP/native-compact-conditional-release.yml"
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ needs.validation.outputs.source_sha }}
+          persist-credentials: false
+
+      - name: Require a standard hosted arm64 macOS runner
+        run: |
+          python3 -I -B - <<'PY'
+          import json, os, platform, shutil, subprocess
+          from pathlib import Path
+          evidence = Path("compact-macos-evidence")
+          evidence.mkdir()
+          runner = {
+              "runner_label": "macos-15",
+              "runner_arch": os.environ.get("RUNNER_ARCH"),
+              "machine": platform.machine(),
+              "system": platform.system(),
+              "os_version": platform.mac_ver()[0],
+              "logical_cpus": os.cpu_count(),
+              "memory_bytes": int(subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True)),
+              "free_disk_bytes": shutil.disk_usage(os.environ["RUNNER_TEMP"]).free,
+              "image_version": os.environ.get("ImageVersion"),
+          }
+          (evidence / "runner.json").write_text(json.dumps(runner, indent=2) + "\n")
+          print(json.dumps(runner, indent=2))
+          assert runner["system"] == "Darwin" and runner["machine"] == "arm64"
+          assert runner["runner_arch"] == "ARM64"
+          assert runner["free_disk_bytes"] >= 20 * 2**30
+          with open(os.environ["GITHUB_ENV"], "a") as output:
+              output.write(f'CARGO_TARGET_DIR={os.environ["RUNNER_TEMP"]}/native-compact-macos-target\n')
+          PY
+
+      - name: Reconstruct and verify the exact formatted candidate
+        run: |
+          python3 -I -B ci/native-compact-conditional-v4/prepare.py \
+            --output "$RUNNER_TEMP/native-compact-macos/source" \
+            --report "$GITHUB_WORKSPACE/compact-macos-evidence/reconstruction.json"
+          python3 -I -B - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          report = json.loads(Path("compact-macos-evidence/reconstruction.json").read_text())
+          assert report["source_tree_sha256"] == os.environ["VALIDATED_SOURCE_TREE"]
+          assert report["manifest_sha256"] == os.environ["VALIDATED_SOURCE_MANIFEST"]
+          toolchain = Path(os.environ["RUNNER_TEMP"]) / "native-compact-macos/source/codex-rs/rust-toolchain.toml"
+          assert hashlib.sha256(toolchain.read_bytes()).hexdigest() == "570656042681cfd8795403a455baf9a33035331a07db0645e866bbcea89a3d64"
+          PY
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582
+        with:
+          toolchain: 1.95.0
+          targets: aarch64-apple-darwin
+
+      - name: Record the actual compiler and Cargo hashes
+        working-directory: ${{ runner.temp }}/native-compact-macos/source/codex-rs
+        run: |
+          python3 -I -B - <<'PY'
+          import hashlib, json, os, subprocess
+          from pathlib import Path
+          evidence = Path(os.environ["GITHUB_WORKSPACE"]) / "compact-macos-evidence"
+          versions = {}
+          for name in ("rustc", "cargo"):
+              actual = Path(subprocess.check_output(["rustup", "which", "--toolchain", "1.95.0", name], text=True).strip())
+              verbose = subprocess.check_output([str(actual), "--version", "--verbose"], text=True)
+              versions[name] = {"path": str(actual), "sha256": hashlib.sha256(actual.read_bytes()).hexdigest(), "version_verbose": verbose}
+              print(verbose)
+          assert "release: 1.95.0\n" in versions["rustc"]["version_verbose"]
+          assert "host: aarch64-apple-darwin\n" in versions["rustc"]["version_verbose"]
+          versions["rust_toolchain_toml_sha256"] = hashlib.sha256(Path("rust-toolchain.toml").read_bytes()).hexdigest()
+          (evidence / "toolchain.json").write_text(json.dumps(versions, indent=2) + "\n")
+          PY
+
+      - name: Verify the upstream pinned prebuilt V8 inputs
+        run: |
+          python3 -I -B - <<'PY'
+          import hashlib, json, os, subprocess, urllib.request
+          from pathlib import Path
+          source = Path(os.environ["RUNNER_TEMP"]) / "native-compact-macos/source"
+          version = subprocess.check_output(["python3", str(source / ".github/scripts/rusty_v8_bazel.py"), "resolved-v8-crate-version"], text=True).strip()
+          profile = "ptrcomp_sandbox_release"
+          target = "aarch64-apple-darwin"
+          checksum_name = f"rusty_v8_{profile}_{target}.sha256"
+          trusted = source / f"third_party/v8/rusty_v8_{version.replace('.', '_')}_release_manifests.sha256"
+          manifest_checksums = {line.split()[1]: line.split()[0] for line in trusted.read_text().splitlines() if line.strip()}
+          destination = Path(os.environ["RUNNER_TEMP"]) / "native-compact-macos-v8"
+          destination.mkdir()
+          base = f"https://github.com/openai/codex/releases/download/rusty-v8-v{version}"
+          def download(name, expected):
+              with urllib.request.urlopen(f"{base}/{name}", timeout=120) as response:
+                  data = response.read()
+              actual = hashlib.sha256(data).hexdigest()
+              assert actual == expected, (name, expected, actual)
+              path = destination / name
+              path.write_bytes(data)
+              return path
+          checksum_path = download(checksum_name, manifest_checksums[checksum_name])
+          checksums = {line.split()[1]: line.split()[0] for line in checksum_path.read_text().splitlines() if line.strip()}
+          archive = f"librusty_v8_{profile}_{target}.a.gz"
+          binding = f"src_binding_{profile}_{target}.rs"
+          assert set(checksums) == {archive, binding}
+          archive_path = download(archive, checksums[archive])
+          binding_path = download(binding, checksums[binding])
+          with open(os.environ["GITHUB_ENV"], "a") as output:
+              output.write(f"RUSTY_V8_ARCHIVE={archive_path}\nRUSTY_V8_SRC_BINDING_PATH={binding_path}\n")
+          evidence = Path(os.environ["GITHUB_WORKSPACE"]) / "compact-macos-evidence"
+          (evidence / "v8-inputs.json").write_text(json.dumps({"version": version, "manifest_sha256": manifest_checksums[checksum_name], "inputs": checksums}, indent=2) + "\n")
+          PY
+
+      - name: Build the immutable native CLI candidate
+        working-directory: ${{ runner.temp }}/native-compact-macos/source/codex-rs
+        run: |
+          set -o pipefail
+          cargo build --locked --target aarch64-apple-darwin --release \
+            -p codex-cli --bin codex --timings 2>&1 | tee "$GITHUB_WORKSPACE/compact-macos-evidence/cargo-build.log"
+
+      - name: Require the complete Mac source tree to remain unchanged after compilation
+        run: |
+          python3 -I -B - <<'PY'
+          import hashlib, importlib.util, json, os, tarfile
+          from pathlib import Path
+          workspace = Path(os.environ["GITHUB_WORKSPACE"])
+          helper = workspace / "ci/native-compact-v2/prepare.py"
+          spec = importlib.util.spec_from_file_location("mac_source_snapshot", helper)
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          source = Path(os.environ["RUNNER_TEMP"]) / "native-compact-macos/source"
+          actual = module.snapshot(source)
+          digest = module.tree_digest(actual)
+          evidence = workspace / "compact-macos-evidence"
+          record = {"sha256": digest, "files": len(actual),
+                    "expected_sha256": os.environ["VALIDATED_SOURCE_TREE"]}
+          (evidence / "after-build-tree.json").write_text(json.dumps(record, indent=2) + "\n")
+          if digest != os.environ["VALIDATED_SOURCE_TREE"]:
+              with tarfile.open(evidence / "changed-after-build-source.tar.gz", "w:gz") as archive:
+                  for name in actual:
+                      archive.add(source / name, arcname=name, recursive=False)
+          assert digest == os.environ["VALIDATED_SOURCE_TREE"], "Mac build changed the exact validated source"
+          PY
+
+      - name: Inspect, smoke and package the candidate
+        run: |
+          python3 -I -B - <<'PY'
+          import hashlib, json, os, shutil, subprocess, tarfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+          workspace = Path(os.environ["GITHUB_WORKSPACE"])
+          evidence = workspace / "compact-macos-evidence"
+          binary = Path(os.environ["CARGO_TARGET_DIR"]) / "aarch64-apple-darwin/release/codex"
+          def run(*args):
+              return subprocess.check_output(args, text=True, stderr=subprocess.STDOUT, timeout=30).strip()
+          assert run("lipo", "-archs", str(binary)) == "arm64"
+          version = run(str(binary), "--version")
+          assert "0.160.0" in version, version
+          smoke = {"version": version, "file": run("file", str(binary)), "linked_libraries": run("otool", "-L", str(binary)), "codesign": run("codesign", "--verify", "--verbose=2", str(binary))}
+          schema_dir = evidence / "binary-protocol"
+          run(str(binary), "app-server", "generate-json-schema", "--experimental", "--out", str(schema_dir))
+          wanted = {"threadId", "expectedTurnId", "compactionOccurrence", "attemptId", "intentPath", "clientPid"}
+          def has_shape(value):
+              if isinstance(value, dict):
+                  if set(value.get("properties", {})) == wanted and set(value.get("required", [])) == wanted:
+                      return True
+                  return any(has_shape(child) for child in value.values())
+              if isinstance(value, list):
+                  return any(has_shape(child) for child in value)
+              return False
+          schemas = [json.loads(path.read_bytes()) for path in schema_dir.rglob("*.json")]
+          assert schemas and any(has_shape(value) for value in schemas), "built binary omits the conditional compact protocol"
+          assert any("thread/compact/interrupt" in json.dumps(value) for value in schemas), "built binary omits the native method"
+          smoke["conditional_protocol"] = "EXACT_SIX_FIELD_SCHEMA_PRESENT"
+          (evidence / "smoke.json").write_text(json.dumps(smoke, indent=2) + "\n")
+          stage = Path(os.environ["RUNNER_TEMP"]) / "native-compact-macos-package"
+          (stage / "bin").mkdir(parents=True)
+          shutil.copy2(Path(os.environ["RUNNER_TEMP"]) / "native-compact-conditional-release.yml", stage / "build-workflow.yml")
+          shutil.copy2(binary, stage / "bin/codex")
+          bundle = workspace / "ci/native-compact-conditional-v4"
+          manifest = {
+              "created_at": datetime.now(timezone.utc).isoformat(),
+              "status": "BUILT_RUNNER_SMOKE_PASSED_NOT_ADOPTED",
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "head_sha": os.environ["STABLE_GIT_COMMIT"],
+              "workflow_sha": os.environ["GITHUB_SHA"],
+              "conditional_validation_run": int(os.environ["VALIDATED_RUN_ID"]),
+              "conditional_validation_attempt": int(os.environ["VALIDATED_RUN_ATTEMPT"]),
+              "python_manifest_sha256": os.environ["VALIDATED_PYTHON_MANIFEST"],
+              "full_regression_run": os.environ["GITHUB_RUN_ID"],
+              "run_id": os.environ["GITHUB_RUN_ID"],
+              "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "target": "aarch64-apple-darwin",
+              "version": version,
+              "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+              "binary_bytes": binary.stat().st_size,
+              "source_archive_sha256": hashlib.sha256((bundle / "source-overlay.tar.gz").read_bytes()).hexdigest(),
+              "source_manifest_sha256": hashlib.sha256((bundle / "source-manifest.json").read_bytes()).hexdigest(),
+              "workflow_sha256": hashlib.sha256((Path(os.environ["RUNNER_TEMP"]) / "native-compact-conditional-release.yml").read_bytes()).hexdigest(),
+              "reconstruction": json.loads((evidence / "reconstruction.json").read_text()),
+              "toolchain": json.loads((evidence / "toolchain.json").read_text()),
+              "runner": json.loads((evidence / "runner.json").read_text()),
+              "build_command": "cargo build --locked --target aarch64-apple-darwin --release -p codex-cli --bin codex --timings",
+              "build_environment": {key: os.environ[key] for key in ("CARGO_INCREMENTAL", "CARGO_BUILD_JOBS", "CARGO_PROFILE_RELEASE_DEBUG", "CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO", "STABLE_GIT_COMMIT")},
+              "integration_validation": "EXACT_SOURCE_CONDITIONAL_AND_FULL_SUITE_PASSED",
+              "live_client_adoption": "NOT_PERFORMED",
+          }
+          (stage / "build-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+          (evidence / "build-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+          for name in ("reconstruction.json", "after-build-tree.json", "toolchain.json", "runner.json", "v8-inputs.json", "smoke.json"):
+              shutil.copy2(evidence / name, stage / name)
+          for name in ("source-manifest.json", "source-overlay.tar.gz"):
+              shutil.copy2(bundle / name, stage / name)
+          shutil.copytree(schema_dir, stage / "binary-protocol")
+          artifacts = workspace / "compact-macos-artifact"
+          artifacts.mkdir()
+          archive = artifacts / f'codex-aarch64-apple-darwin-{os.environ["STABLE_GIT_COMMIT"]}.tar.gz'
+          with tarfile.open(archive, "w:gz") as output:
+              for path in sorted(stage.rglob("*")):
+                  output.add(path, arcname=str(path.relative_to(stage)), recursive=False)
+          checksum = hashlib.sha256(archive.read_bytes()).hexdigest()
+          (artifacts / "SHA256SUMS").write_text(f"{checksum}  {archive.name}\n")
+          print(json.dumps({"archive": archive.name, "archive_sha256": checksum, "binary_sha256": manifest["binary_sha256"], "version": version}, indent=2))
+          PY
+
+      - name: Upload the immutable candidate binary
+        id: candidate
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: native-conditional-macos-arm64-${{ needs.validation.outputs.source_sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: compact-macos-artifact/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Record the immutable artifact identity
+        env:
+          ARTIFACT_ID: ${{ steps.candidate.outputs.artifact-id }}
+          ARTIFACT_URL: ${{ steps.candidate.outputs.artifact-url }}
+          ARTIFACT_DIGEST: ${{ steps.candidate.outputs.artifact-digest }}
+        run: |
+          python3 -I -B - <<'PY'
+          import json, os
+          from pathlib import Path
+          record = {key: os.environ[key] for key in ("ARTIFACT_ID", "ARTIFACT_URL", "ARTIFACT_DIGEST")}
+          Path("compact-macos-evidence/artifact.json").write_text(json.dumps(record, indent=2) + "\n")
+          print(json.dumps(record, indent=2))
+          PY
+
+      - name: Upload the build and verification evidence
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: native-conditional-macos-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            compact-macos-evidence/
+            ${{ runner.temp }}/native-compact-macos-target/cargo-timings/
+          if-no-files-found: warn
+          retention-days: 14
