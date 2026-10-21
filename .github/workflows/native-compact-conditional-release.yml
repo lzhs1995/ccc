@@ -11,18 +11,18 @@ on:
       validation_run_id:
         description: Completed native conditional validation run for these exact source pins
         required: true
-        default: '39609056442'
+        default: '39626334301'
       source_sha:
         description: Commit whose complete source and Python manifests were validated
         required: true
-        default: '424898b1c424a1f025df8bbbcab1bb24327ecd6a'
+        default: '4ce814944d275da77a12b33c3d0bf643e2ae1486'
 
 permissions:
   contents: read
   actions: read
 
 concurrency:
-  group: native-full-release-${{ inputs.source_sha || '424898b1c424a1f025df8bbbcab1bb24327ecd6a' }}
+  group: native-full-release-${{ inputs.source_sha || '4ce814944d275da77a12b33c3d0bf643e2ae1486' }}
   cancel-in-progress: false
 
 jobs:
@@ -44,13 +44,13 @@ jobs:
         run: cp ci/native-compact-conditional-release/verify_validation.py "$RUNNER_TEMP/verify_validation.py"
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: ${{ inputs.source_sha || '424898b1c424a1f025df8bbbcab1bb24327ecd6a' }}
+          ref: ${{ inputs.source_sha || '4ce814944d275da77a12b33c3d0bf643e2ae1486' }}
           persist-credentials: false
       - name: Require the completed exact-source validation
         id: proof
         env:
-          VALIDATION_RUN_ID: ${{ inputs.validation_run_id || '39609056442' }}
-          SOURCE_SHA: ${{ inputs.source_sha || '424898b1c424a1f025df8bbbcab1bb24327ecd6a' }}
+          VALIDATION_RUN_ID: ${{ inputs.validation_run_id || '39626334301' }}
+          SOURCE_SHA: ${{ inputs.source_sha || '4ce814944d275da77a12b33c3d0bf643e2ae1486' }}
           GH_TOKEN: ${{ github.token }}
         run: python3 -I -B "$RUNNER_TEMP/verify_validation.py"
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
