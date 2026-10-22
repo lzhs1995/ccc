@@ -55,6 +55,7 @@ WATCH_LABELS = {
     "pool": "整池",
     "starting": "整池／启动中",
     "excluded": "已排除",
+    "identity_pending": "待检测",
 }
 
 # 程序 column vocabulary.  Module level so the README-consistency test can prove
@@ -433,6 +434,55 @@ def source_label(source: str) -> str:
     return SOURCE_LABELS.get(source, source)
 
 
+def native_display_labels(records, classified, top):
+    """Recover missing display TTYs from one verified local process snapshot.
+
+    cmux may omit the TTY while a native terminal is running. The UUID join,
+    kernel foreground group, device and process generation still must match.
+    These display facts never authorize input.
+    """
+    import os
+    import stat
+    import ccc_native_processes as native
+    import ccc_guard_scope as scope
+
+    needs_tty = any(record.get("native_display_target")
+                    and not record["native_display_target"].get("tty")
+                    and core.surface_process_label(classified, record).get("agent_kind", "unknown") == "unknown"
+                    for record in records)
+    if not needs_tty:
+        return records, native.display_process_labels(records, classified, top)
+    try:
+        processes = scope.scan(reader=native.display_process)
+        groups = {}
+        for row in processes:
+            groups.setdefault(row["surface_id"], []).append(row)
+        devices = {row["tdev"] for row in processes}
+        ttys = {}
+        with os.scandir("/dev") as entries:
+            for entry in entries:
+                if not (entry.name.startswith("tty") and entry.name.isascii() and entry.name.isalnum()):
+                    continue
+                try:
+                    info = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                if stat.S_ISCHR(info.st_mode) and info.st_rdev in devices:
+                    ttys.setdefault(info.st_rdev, []).append(entry.name)
+        result = []
+        for record in records:
+            target = record.get("native_display_target")
+            rows = groups.get(record.get("surface_id"), [])
+            if target and not target.get("tty") and len(rows) == 1:
+                names = ttys.get(rows[0]["tdev"], [])
+                if len(names) == 1:
+                    record = {**record, "native_display_target": {**target, "tty": names[0]}}
+            result.append(record)
+        return result, native.display_process_labels(result, classified, top, processes=processes)
+    except (OSError, ValueError, RuntimeError, KeyError, TypeError):
+        return records, dict(classified)
+
+
 def is_idling(candidate: Candidate) -> bool:
     """Registered and not paused, but nothing that looks like Codex is running.
 
@@ -479,6 +529,8 @@ def is_idling(candidate: Candidate) -> bool:
         return False
     if candidate.state in DETAIL_FALLBACKS:
         return False
+    if candidate.agent_kind == "unknown":
+        return False
     if candidate.source == "workspace_non_codex":
         return True
     if candidate.paused or candidate.source == "workspace_excluded":
@@ -507,6 +559,8 @@ def watch_kind(candidate: Candidate) -> str:
         return "paused" if candidate.paused else "starting"
     if candidate.paused and candidate.source != "workspace_non_codex":
         return "paused"
+    if candidate.agent_kind == "unknown" and candidate.source in MONITORED_SOURCES and not candidate.paused:
+        return "identity_pending"
     if candidate.source in {"workspace_rule", "workspace_non_codex"}:
         return "pool_idling" if is_idling(candidate) else "pool"
     if candidate.source in SINGLE_SOURCES:
@@ -515,6 +569,8 @@ def watch_kind(candidate: Candidate) -> str:
 
 
 def watch_label(candidate: Candidate) -> str:
+    if watch_kind(candidate) == "identity_pending":
+        return WATCH_LABELS["identity_pending"]
     if candidate.source == "workspace_starting":
         return WATCH_LABELS[watch_kind(candidate)]
     if candidate.access and candidate.enabled and not candidate.paused:
@@ -2240,11 +2296,15 @@ def location_text(record: Mapping[str, Any], workspace_ref: str = "") -> str:
     vanished still show its real workspace instead of "ws?" — config-only
     fallback records never carried workspace_ref.
     """
-    return "ws{}/p{}/s{}".format(
+    legacy = "ws{}/p{}/s{}".format(
         _ref_digits(workspace_ref or record.get("workspace_ref")),
         _ref_digits(record.get("pane_ref")),
         _ref_digits(record.get("ref")),
     )
+    if len(legacy) <= 14:
+        return legacy
+    display = str(record.get("display_location") or "")
+    return display if display and len(display) <= 14 else "位置待验"
 
 
 def target_name(record: Mapping[str, Any]) -> str:
@@ -2441,14 +2501,18 @@ def group_counts(candidates: list[Candidate]) -> dict[str, int]:
     idling = sum(1 for item in candidates if is_idling(item))
     return {
         "watching": sum(1 for item in candidates
-                        if item.source in SINGLE_SOURCES and item.enabled and not item.paused and not is_idling(item)),
+                        if item.source in SINGLE_SOURCES and item.enabled and not item.paused
+                        and item.agent_kind in {"codex", "claude"} and not is_idling(item)),
         "idling": idling,
         "paused": sum(1 for item in candidates
                       if item.enabled and not is_idling(item)
                       and (item.paused or item.source == "workspace_excluded")),
         "disabled": sum(1 for item in candidates if item.source != "untracked" and not item.enabled),
         "pool": sum(1 for item in candidates if item.source in POOL_SOURCES and item.enabled
-                    and (not item.paused or item.source == "workspace_non_codex")),
+                    and not item.paused and item.agent_kind in {"codex", "claude"}
+                    and not is_idling(item)),
+        "identity_pending": sum(1 for item in candidates if item.enabled
+                                and item.source in MONITORED_SOURCES and item.agent_kind == "unknown"),
         "pool_authorized": int(any(item.record.get("workspace_authorized") or item.source in POOL_SOURCES
                                    for item in candidates)),
         "untracked": sum(1 for item in candidates if item.source == "untracked"),
@@ -2645,6 +2709,8 @@ def group_row_text(row: ViewRow, width: int) -> str:
         bits.append(f"{watched} 监控")
     if row.counts.get("idling"):
         bits.append(f"{row.counts['idling']} 空转")
+    if row.counts.get("identity_pending"):
+        bits.append(f"{row.counts['identity_pending']} 程序待验")
     if row.counts.get("paused"):
         bits.append(f"{row.counts['paused']} 已暂停")
     if row.counts.get("disabled"):
@@ -3033,21 +3099,30 @@ class SupervisorModel:
                 self._control_socket.configure(self.client.capabilities())
                 self._control_ready = True
             if self._inventory is None:
-                tree, top = self.client.tree(), self.client.top_all()
+                tree = self.client.tree()
+                try:
+                    top = self.client.top_all()
+                except (core.CmuxError, RuntimeError, OSError):
+                    top = {}
             else:
                 # Display can use bounded last-good data; it never authorizes
                 # input. Force-refresh does not bypass the global scan budget.
                 from ccc_inventory import InventoryUnavailable
                 try:
                     tree = self._inventory.get("tree", self.client.tree, ttl=1)
-                    top = self._inventory.get("top", self.client.top_all, ttl=5)
                 except InventoryUnavailable:
                     tree = self._inventory.peek("tree", max_age=30)
-                    top = self._inventory.peek("top", max_age=30)
-                    if tree is None or top is None:
-                        raise core.CmuxError("等待 cmux 清单恢复；授权操作仍可使用")
+                    if tree is None:
+                        raise core.CmuxError("等待 cmux 拓扑恢复；授权操作仍可使用")
+                try:
+                    top = self._inventory.get("top", self.client.top_all, ttl=5)
+                except InventoryUnavailable:
+                    top = self._inventory.peek("top", max_age=5) or {}
             candidates = core.main_surface_records(tree, allow_ref_only=True)
             process_by_id = core.classify_surface_processes(top)
+            from ccc_native_processes import display_surface_records
+            candidates = display_surface_records(tree, candidates)
+            candidates, process_by_id = native_display_labels(candidates, process_by_id, top)
             # One resolution pass per refresh, on a worker thread.  Started
             # before the rows are built so the ids that land are used by the
             # *next* redraw; the current one shows the previous snapshot rather
@@ -3133,6 +3208,9 @@ class SupervisorModel:
                     target = dynamic_by_id[surface_id]
                     source = target["source"]
                 elif rule is not None and agent_kind == "codex":
+                    source = "workspace_rule"
+                    target = {"paused": False}
+                elif rule is not None and agent_kind == "unknown":
                     source = "workspace_rule"
                     target = {"paused": False}
                 elif rule is not None:

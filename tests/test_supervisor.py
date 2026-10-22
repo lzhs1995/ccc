@@ -5377,8 +5377,10 @@ class CollabColumnTests(unittest.TestCase):
 
     def test_a_narrow_pane_drops_the_column_for_rows_and_header_alike(self):
         drawn = self._drawn([self._marker(now=time.time())], width=100)
-        self.assertNotIn("协作", drawn)
+        table = drawn[drawn.index("     监控"):].split("\n---", 1)[0]
+        self.assertNotIn("协作", table)
         self.assertNotIn("╭", drawn)
+        self.assertIn("task=fin-demo", drawn)  # Focus details remain available.
 
     def test_the_draw_path_reads_v2_directory_markers_and_counts_the_group(self):
         drawn = self._drawn([self._marker_v2(now=time.time())])
