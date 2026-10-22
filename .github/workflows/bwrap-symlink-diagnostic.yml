@@ -1,0 +1,39 @@
+name: Bubblewrap denied descriptor direct diagnostic
+
+on:
+  push:
+    branches: [ci/bwrap-symlink-20261022]
+    paths:
+      - .github/workflows/bwrap-symlink-diagnostic.yml
+      - ci/bwrap-symlink-diagnostic/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  direct-probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - name: Match native validation system bubblewrap conditions
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends bubblewrap strace
+          sudo sysctl -w kernel.unprivileged_userns_clone=1
+          if sudo sysctl -a 2>/dev/null | grep -q '^kernel.apparmor_restrict_unprivileged_userns'; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Measure original and single-variable descriptor masks
+        run: python3 -I -B ci/bwrap-symlink-diagnostic/probe.py --output direct-evidence
+      - name: Upload exact identity and syscall evidence
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: bwrap-direct-${{ github.run_id }}-${{ github.run_attempt }}
+          path: direct-evidence/
+          if-no-files-found: error
+          retention-days: 14
