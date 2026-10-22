@@ -1,4 +1,6 @@
 import json
+import ctypes
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -149,6 +151,91 @@ class BaselineTests(unittest.TestCase):
 
     def test_original_session_loss_is_failure(self):
         self.assertFalse(self.cleanup(matches=False)['passed'])
+
+    def backend_proof(self, *, ppid=1, tty=0xffffffff, uid=None, birth=None, argv=None):
+        def kernel(pid, flavor, arg, pointer, size):
+            info = ctypes.cast(pointer, ctypes.POINTER(subject.scope.native._BsdInfo)).contents
+            info.pid, info.ppid = pid, ppid
+            info.ids[0] = os.geteuid() if uid is None else uid
+            info.misc[3] = tty
+            info.start_sec, info.start_usec = birth or self.row['birth']
+            return size
+        with patch.object(subject.sys, 'platform', 'darwin'), \
+                patch.object(subject.scope.native, '_proc_pidinfo', side_effect=kernel), \
+                patch.object(subject.scope, 'arguments', return_value=(argv or [
+                    '/owned/bin/codex', 'app-server', '--listen', 'unix:///owned/c.sock'], {})), \
+                patch.object(subject.scope, 'matches', return_value=True):
+            return subject._detached_backend(self.row)
+
+    def test_detached_backend_requires_kernel_identity_and_exact_command(self):
+        self.assertEqual(self.backend_proof()['original'], self.row)
+        rejected = [dict(ppid=2), dict(tty=17), dict(uid=os.geteuid() + 1),
+                    dict(birth=[10, 21]),
+                    dict(argv=['codex', 'app-server', '--listen', 'http://localhost']),
+                    dict(argv=['codex', 'resume', '--listen', 'unix:///owned/c.sock']),
+                    dict(argv=['codex', 'app-server', '--listen', 'unix:///owned/c.sock', '--extra'])]
+        for change in rejected:
+            with self.subTest(change=change):
+                self.assertIsNone(self.backend_proof(**change))
+
+    def test_detached_backend_final_identity_reread_required(self):
+        with patch.object(subject.sys, 'platform', 'darwin'), \
+                patch.object(subject.scope.native, '_proc_pidinfo', return_value=0), \
+                patch.object(subject.scope, 'matches', return_value=True):
+            self.assertIsNone(subject._detached_backend(self.row))
+
+    def test_missing_surface_keeps_all_backend_rows(self):
+        self.tree['windows'][0]['workspaces'][0]['panes'][0]['surfaces'] = []
+        proof = self.backend_proof()
+        with patch.object(subject, '_detached_backend', return_value=proof):
+            result = self.capture()
+        self.assertEqual(result['processes'], [self.row])
+        self.assertEqual(result['detached_backends'], {'123': proof})
+
+    def test_missing_surface_without_backend_proof_is_refused(self):
+        self.tree['windows'][0]['workspaces'][0]['panes'][0]['surfaces'] = []
+        with patch.object(subject, '_detached_backend', return_value=None), \
+                self.assertRaisesRegex(ValueError, 'membership unavailable'):
+            self.capture()
+        self.assertFalse((self.root / 'cleanup-baseline.json').exists())
+
+    def test_detached_backend_drift_is_refused_before_creating_baseline(self):
+        self.tree['windows'][0]['workspaces'][0]['panes'][0]['surfaces'] = []
+        proof = self.backend_proof()
+        with patch.object(subject, '_detached_backend', side_effect=[proof, None]), \
+                self.assertRaisesRegex(ValueError, 'detached backend changed'):
+            self.capture()
+        self.assertFalse((self.root / 'cleanup-baseline.json').exists())
+
+    def verify_detached(self, mutate=None):
+        self.tree['windows'][0]['workspaces'][0]['panes'][0]['surfaces'] = []
+        proof = self.backend_proof()
+        with patch.object(subject, '_detached_backend', return_value=proof):
+            return self.verify(mutate)
+
+    def test_detached_backend_is_preserved_in_both_historical_samples(self):
+        self.assertIn('observation_sha256', self.verify_detached())
+
+    def test_historical_backend_cannot_disappear_or_reclaim_a_surface(self):
+        def reappears(record):
+            record['passes'][1]['tree']['windows'][0]['workspaces'][0]['panes'][0]['surfaces'] = [
+                {'id': self.ids[3], 'type': 'terminal'}]
+        for mutate in (lambda r: r['passes'][1]['preserved'][0].update(
+                detached_backend_matches=False), reappears):
+            with self.subTest(mutate=mutate), \
+                    self.assertRaisesRegex(ValueError, 'preservation not established'):
+                self.verify_detached(mutate)
+            # Each attempt retains its original evidence; use a new directory.
+            self.temp.cleanup()
+            self.setUp()
+
+    def test_saved_backend_proof_requires_complete_exact_coverage(self):
+        baseline = {'processes': [self.row], 'detached_backends': {'123': self.backend_proof()}}
+        self.assertEqual(subject._baseline_backends(baseline, {}), baseline['detached_backends'])
+        for proofs in ({}, {'123': None}, {'124': self.backend_proof()},
+                       {'123': {**self.backend_proof(), 'parent_pid': 2}}):
+            with self.subTest(proofs=proofs), self.assertRaises(ValueError):
+                subject._baseline_backends({**baseline, 'detached_backends': proofs}, {})
 
 
 if __name__ == '__main__':

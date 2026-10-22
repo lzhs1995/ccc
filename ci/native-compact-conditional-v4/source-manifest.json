@@ -1,11 +1,11 @@
 {
-  "schema": "ccc-native-conditional-source-v13",
+  "schema": "ccc-native-conditional-source-v14",
   "status": "INTEGRATED_VERIFICATION_CANDIDATE_NOT_DEPLOYABLE",
   "baseline_prepare_sha256": "beae02abdd924b103f489ce54fdd9fb666ebff89ccb8592d43cfc18cdff81a12",
   "baseline_source_tree_sha256": "6a0540b9d82e9c947192a3bf675467af87562c35b047ce54c0767c2d4aec3d35",
-  "source_tree_sha256": "ee2ce48504f779a2f17eb302c9063707c918a6b3c70c0bf1abefc44e265fca80",
+  "source_tree_sha256": "96ad371487ff593138df8875f633a2843aba95ad6108942df013b1e83788ce08",
   "source_file_count": 8891,
-  "archive_sha256": "1d46a9c388d1de096e7d4255f1ebba4fe654e807ecbd443b9ace201b80cbbcd0",
+  "archive_sha256": "1a14379d30958ec4b1b0e984c2879a57d7d9914a998abced5c3e8d847d932872",
   "evidence": {
     "authority_manifest": "544e569f9323faa03e4a3277188fc3a4db54aa4559de4b774cc646e86a1f6dd2",
     "reservation_manifest": "7ff594c3a3a70e71508effed4a9dd7d305c70f3f60ea1d562a4b534b973329d2",
@@ -46,11 +46,16 @@
     "v12_delta": "Two exact cloud-rustfmt formatting corrections. No native assertion, timeout, skip, TLS policy or feature changes.",
     "v12_validation_failure": "GHA39709412921: compiled/Goal301/Zsh passed; historical57 passed50, five TLS plus descriptor/fixture failed.",
     "v13_delta": "B40 exact typed rustls ProtocolVersion + io.get_ref traversal, four discrimination units; Landlock alias parent placed in existing writable cwd. No backend/features/timeouts/retry counts or weakened assertions.",
-    "v13_descriptor": "B41 diagnosis-only: preserve failing condition, display stderr/status/closed before panic. Root verified exact one-string change; root cause still UNKNOWN."
+    "v13_descriptor": "B41 diagnosis-only: preserve failing condition, display stderr/status/closed before panic. Root verified exact one-string change; root cause still UNKNOWN.",
+    "v13_validation_failure": "GHA39726711416: previous failures57 tests56PASS1FAIL; bwrap cannot mount tmpfs on absent /newroot/dev/fd. Compile/Goal301s/TLS corrected regressions otherwise passed.",
+    "v14_delta": "Only linux-sandbox/bwrap.rs: create denied directory under fresh /dev before --perms/--tmpfs; three additive argv regressions. Root removed new environmental skip and inlined one-use predicate. Original assertions, Deny modes and writable-symlink refusals unchanged.",
+    "v14_a43_manifest": "21f0856612a15d2cf1234828ff4aff4059358e1824a433f8df3117eaea0b7537",
+    "v14_a43_root_review": "3ad41a38a69ce8449031bc00cdc20b6df2f7d931c2d1bfac5cfb1df4dc17d281",
+    "v14_format": "Official prebuilt rustfmt1.95.0 sha c54af79a + driver149e85a2, candidate9e8ef0c9 unchanged, exit0; no local Rust compilation."
   },
   "limitations": [
-    "Exact v13 conditional/full/Clippy/macOS gates pending.",
-    "Blocked descriptor root cause unresolved; all original assertions and required gate remain, with diagnostic context added.",
+    "Exact v14 conditional/full/Clippy/macOS gates pending.",
+    "Rust 1.95.0 standalone formatting passed locally on the only native delta; Rust compilation/tests remain required cloud gates.",
     "Current Root compact capability/adoption absent; no native restart performed."
   ],
   "changes": [
@@ -766,6 +771,21 @@
         "kind": "file",
         "sha256": "1b772be5a42d16d1e95c14383eac1c9f2fea10f9d3984ca3f1c115dfe8f67266",
         "bytes": 9896,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/linux-sandbox/src/bwrap.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "1d3dfe853f9b5f1cafd7283cf760e38ff739eb7c1ac54650ae2ed510b92b870a",
+        "bytes": 118552,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "9e8ef0c93e1791bc9cb118042cba524c9c8547fde954a5e094cc3d046b46dac4",
+        "bytes": 125025,
         "git_mode": "100644"
       }
     },
