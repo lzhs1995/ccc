@@ -49,6 +49,10 @@ def main():
     pty_check = ["/usr/bin/python3", "-I", "-B", "-c", "import os; a,b=os.openpty(); print(os.ttyname(b)); os.close(a); os.close(b)"]
     cases["filtered_dev_pty"] = filtered + mask + ["--proc", "/proc", "--", *pty_check]
     cases["filtered_dev_nested_private_pty"] = filtered + ["--dev", "/dev/pts", "--symlink", "pts/pts/ptmx", "/dev/ptmx"] + mask + ["--proc", "/proc", "--", *pty_check]
+    private_pts = ["--dev", "/dev/.codex-pty", "--symlink", ".codex-pty/pts", "/dev/pts", "--symlink", "pts/ptmx", "/dev/ptmx"]
+    alias_check = ["/usr/bin/python3", "-I", "-B", "-c", "import os,stat; a,b=os.openpty(); name=os.ttyname(b); n=name.rsplit('/',1)[1]; c=os.open('/dev/pts/'+n,os.O_RDWR|os.O_NOCTTY); assert os.fstat(b).st_rdev==os.fstat(c).st_rdev; assert not stat.S_ISLNK(os.lstat('/dev/fd').st_mode); os.close(c); os.close(a); os.close(b); print('PRIVATE_PTY_STANDARD_PATH_OK')"]
+    cases["filtered_dev_alias_private_pty"] = filtered + private_pts + mask + ["--proc", "/proc", "--", *alias_check]
+    cases["filtered_dev_alias_denial"] = filtered + private_pts + mask + ["--proc", "/proc", "--", *check]
     cases["normal_dev_pty_control"] = base + ["--proc", "/proc", "--", *pty_check]
     results = []
     with tempfile.TemporaryDirectory() as empty:
