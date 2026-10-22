@@ -1,11 +1,11 @@
 {
-  "schema": "ccc-native-conditional-source-v11",
+  "schema": "ccc-native-conditional-source-v12",
   "status": "INTEGRATED_VERIFICATION_CANDIDATE_NOT_DEPLOYABLE",
   "baseline_prepare_sha256": "beae02abdd924b103f489ce54fdd9fb666ebff89ccb8592d43cfc18cdff81a12",
   "baseline_source_tree_sha256": "6a0540b9d82e9c947192a3bf675467af87562c35b047ce54c0767c2d4aec3d35",
-  "source_tree_sha256": "72d07e381d4b528adff639a69aacece3baf23db42fd4082321d091687b5e06db",
+  "source_tree_sha256": "1d44e04c850c1b86af6666383949c9dde2828387b220c6cc625ed11f8fed8bd3",
   "source_file_count": 8891,
-  "archive_sha256": "01530bbff7f6f148ec4e22edf1c2619f4f6ac82b264431ee593a7dd7b2c24062",
+  "archive_sha256": "337c7e4d4877addb92c436df433922bd884065e237b009cf57a3bc4008561de7",
   "evidence": {
     "authority_manifest": "544e569f9323faa03e4a3277188fc3a4db54aa4559de4b774cc646e86a1f6dd2",
     "reservation_manifest": "7ff594c3a3a70e71508effed4a9dd7d305c70f3f60ea1d562a4b534b973329d2",
@@ -41,13 +41,14 @@
     "v11_delta": "12 files: isolated fixtures, Abort parent completion, typed io get_ref descent, TLS and exec-server diagnostics",
     "v11_a35": "Frozen candidate read; callback acceptance remains pending at packaging",
     "v11_b35": "Typed descent and two additive units independently accepted, original callback verified/disarmed",
-    "v11_b36": "Original callback verified/disarmed; diagnostic bounded and corrected by Root; no TLS policy/feature pin"
+    "v11_b36": "Original callback verified/disarmed; diagnostic bounded and corrected by Root; no TLS policy/feature pin",
+    "v11_validation_failure": "GHA39673342942 and GHA39679814682: core/Goal/Zsh passed; five TLS tests, runner uid-map and formatting failed.",
+    "v12_delta": "Two exact cloud-rustfmt formatting corrections. No native assertion, timeout, skip, TLS policy or feature changes."
   },
   "limitations": [
-    "Exact v11 conditional and full suites, Clippy and Mac build pending",
-    "Rust not compiled or formatted locally; required cloud rustfmt check retained",
-    "TLS first-attempt backend and blocked-descriptor websocket reset require runner diagnostics",
-    "Native adoption and current B50/live continuation/Goal checks remain pending"
+    "Exact v12 conditional validation, full suite, Clippy and macOS build pending.",
+    "TLS first-attempt backend remains unresolved; success stdout and compiled-feature fingerprints preserved by workflow.",
+    "Current original Root lacks published compact-interrupt capability; no enrollment or native restart performed."
   ],
   "changes": [
     {
@@ -510,8 +511,8 @@
       },
       "after": {
         "kind": "file",
-        "sha256": "9ec2e9b67585be32f6913d8880a90a9e452008ddc8c685678478093c998418b3",
-        "bytes": 201821,
+        "sha256": "272e2992d933475b05f0e6a09ab8b7f173d834d45cb600d8919666d9c82f9616",
+        "bytes": 201857,
         "git_mode": "100644"
       }
     },
@@ -845,8 +846,8 @@
       },
       "after": {
         "kind": "file",
-        "sha256": "a313f109b34845d8aecaea502a03878403699424fd260e2be7e5a6a981798016",
-        "bytes": 21578,
+        "sha256": "beaefbcfcb6723726ff03b2b0d6bce62d950995fe42cbaf6e612649251ebb487",
+        "bytes": 21608,
         "git_mode": "100644"
       }
     },

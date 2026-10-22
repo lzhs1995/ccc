@@ -43,6 +43,10 @@ jobs:
           python3 -I -B -c 'import os,shutil; free=shutil.disk_usage(os.environ["RUNNER_TEMP"]).free; print(f"Free GiB: {free/2**30:.1f}"); assert free>=25*2**30'
           sudo apt-get update -y
           sudo apt-get install -y --no-install-recommends build-essential pkg-config libcap-dev libasound2-dev bubblewrap
+          sudo sysctl -w kernel.unprivileged_userns_clone=1
+          if sudo sysctl -a 2>/dev/null | grep -q '^kernel.apparmor_restrict_unprivileged_userns'; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
       - name: Verify real Python producer sources and create native-reader files
         id: producer
         continue-on-error: true
@@ -144,12 +148,17 @@ jobs:
           mkdir -m 700 "$TMPDIR"
           cargo tree --locked -p codex-http-client -e features -i reqwest@0.12.28 \
             --target x86_64-unknown-linux-gnu > "$GITHUB_WORKSPACE/conditional-evidence/reqwest-features.txt"
+          test_status=0
           env -u CODEX_CA_CERTIFICATE -u SSL_CERT_FILE -u SSH_CLIENT -u SSH2_CLIENT \
             just test --locked -p codex-app-server -p codex-cli -p codex-core \
             -p codex-exec-server -p codex-external-agent-migration -p codex-http-client \
             -p codex-linux-sandbox -p codex-tui \
             -E 'test(external_agent_config_secondary_source_imports_session_and_plugin_end_to_end) | test(skills_list_uses_cached_result_after_session_default_writes_until_force_reload) | test(packaged_daemon_explicit_replacement_migrates_running_legacy) | test(permission_request_hook_allows_exec_command_without_user_approval) | test(conversation_second_start_replaces_runtime) | test(snapshot_failure_retries_are_bounded_and_single_flight) | test(detects_cur_sessions_in_batches_and_redetects_modified_imports) | test(detects_cur_transcript_with_project_cwd) | test(resolves_cur_project_names_with_common_separators) | test(skips_cur_subagent_transcripts) | test(shell_snapshot_concurrent_replays_keep_independent_readers) | test(route_aware_client_pool) | test(sandbox_keeps_parent_repo_discovery_while_blocking_child_metadata) | test(fresh_startup_reads_destination_and_cleared_model_uses_catalog)' \
-            --retries 0 2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/previous-failures-tests.log"
+            --success-output immediate --retries 0 2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/previous-failures-tests.log" || test_status=$?
+          python3 -I -B "$GITHUB_WORKSPACE/ci/native-compact-conditional-v4/collect_tls_features.py" \
+            --target "$CARGO_TARGET_DIR" \
+            --output "$GITHUB_WORKSPACE/conditional-evidence/tls-compiled-features.json"
+          exit "$test_status"
       - name: Upload complete validation evidence
         if: always()
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
