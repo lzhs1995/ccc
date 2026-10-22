@@ -1,11 +1,11 @@
 {
-  "schema": "ccc-native-conditional-source-v15",
+  "schema": "ccc-native-conditional-source-v16",
   "status": "INTEGRATED_VERIFICATION_CANDIDATE_NOT_DEPLOYABLE",
   "baseline_prepare_sha256": "beae02abdd924b103f489ce54fdd9fb666ebff89ccb8592d43cfc18cdff81a12",
   "baseline_source_tree_sha256": "6a0540b9d82e9c947192a3bf675467af87562c35b047ce54c0767c2d4aec3d35",
-  "source_tree_sha256": "4035153fc6f804b40349bdbe0588c25ba5e93a786583a0315a7e523e4020ed65",
+  "source_tree_sha256": "1955b4a13162cf164d345a9375444fb6a507b5ede917e21b0cb69ffa3a6cb934",
   "source_file_count": 8891,
-  "archive_sha256": "54bf6bd00ffe5a394ce399f18d27d8ce26fc1e4b97bc3c7aefa5f6eff4a509b9",
+  "archive_sha256": "ff5031fad4ec19fe556906ffa6afabed240adffc2425482250e618f839460475",
   "evidence": {
     "authority_manifest": "544e569f9323faa03e4a3277188fc3a4db54aa4559de4b774cc646e86a1f6dd2",
     "reservation_manifest": "7ff594c3a3a70e71508effed4a9dd7d305c70f3f60ea1d562a4b534b973329d2",
@@ -54,12 +54,17 @@
     "v14_format": "Official prebuilt rustfmt1.95.0 sha c54af79a + driver149e85a2, candidate9e8ef0c9 unchanged, exit0; no local Rust compilation.",
     "v14_failure": "GHA39751989534: corrected regressions60 tests59PASS1FAIL; blocked_descriptor_path exec-server SIGPIPE, then WebSocket reset/recovery timeout. Prior /newroot/dev/fd mount failure resolved.",
     "v15_delta": "Test-only ctor SIGPIPE initialization to match Rust main runtime plus closed-stdin server-survival regression. Product signal policy, original60 regressions, all assertions and timeouts preserved.",
-    "v15_review": "solo_self_review: exact ExecProcess API and bounded pipe writer confirmed. First draft stale read fields and EPIPE-close assumption corrected before packaging. Official prebuilt rustfmt1.95 passed; no local compilation."
+    "v15_review": "solo_self_review: exact ExecProcess API and bounded pipe writer confirmed. First draft stale read fields and EPIPE-close assumption corrected before packaging. Official prebuilt rustfmt1.95 passed; no local compilation.",
+    "v15_actual_result": "GHA39768230336: 61 selected tests, 60 PASS, blocked_descriptor_path FAIL with unresolved absolute /dev/fd symlink mount. SIGPIPE survival regression and real 301s Goal gate passed.",
+    "v16_cause": "GHA39798392659 Linux syscall measurements refute proc-order and physical-proc-mask repairs. Absolute /dev/fd symlink resolves outside newroot; masking /proc/self/fd covers the setup process only.",
+    "v16_delta": "One product module, exact /dev/fd deny policy only: symlink-free minimal dev tree, private devpts with standard /dev/pts alias, original immutable directory mask. Actual bwrap child regression checks denial, standard nodes and PTY reopen; all prior assertions and timeouts retained.",
+    "v16_direct_validation": "GHA39805811418: filtered logical deny PASS and PRIVATE_PTY_STANDARD_PATH_OK. GHA39805050042 showed the simpler no-PTY skeleton breaks PTYs and was rejected.",
+    "v16_review": "Root solo_self_review implementation; original B50 independent syscall review received separately. Exact candidate peer review and native compilation still pending."
   },
   "limitations": [
-    "Exact v15 compilation and conditional/full/Clippy/macOS gates pending.",
-    "SIGPIPE cause is a test-runtime hypothesis, not yet cloud proven.",
-    "No native client restart or current Root compact-capability adoption."
+    "Exact v16 compilation and conditional/full/Clippy/macOS gates pending.",
+    "Direct Linux argv probes do not replace compiled product regression execution.",
+    "Current Root compact capability and original-session live acceptance pending."
   ],
   "changes": [
     {
@@ -802,8 +807,8 @@
       },
       "after": {
         "kind": "file",
-        "sha256": "9e8ef0c93e1791bc9cb118042cba524c9c8547fde954a5e094cc3d046b46dac4",
-        "bytes": 125025,
+        "sha256": "a73203755965366ed5b949f9e44ff912f24c2d11463d4bacbd730eb846beffcf",
+        "bytes": 131306,
         "git_mode": "100644"
       }
     },
