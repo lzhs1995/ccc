@@ -34,6 +34,22 @@ def main():
         "proc_before_logical_mask": base + ["--proc", "/proc"] + mask + ["--", *check],
         "proc_before_physical_mask": base + ["--proc", "/proc", "--perms", "000", "--tmpfs", "/proc/self/fd", "--remount-ro", "/proc/self/fd", "--", *check],
     }
+    # Candidate construction, not product adoption: create a device directory
+    # without the absolute fd symlink, then apply the original immutable mask.
+    # Measure nested PTY compatibility separately before considering this route.
+    filtered = ["--unshare-user", "--unshare-pid", "--as-pid-1", "--ro-bind", "/", "/", "--tmpfs", "/dev"]
+    for name in ("null", "zero", "full", "random", "urandom", "tty"):
+        filtered += ["--dev-bind", "/dev/" + name, "/dev/" + name]
+    for name, descriptor in (("stdin", "0"), ("stdout", "1"), ("stderr", "2")):
+        filtered += ["--symlink", "/proc/self/fd/" + descriptor, "/dev/" + name]
+    filtered += ["--dir", "/dev/shm", "--symlink", "/proc/kcore", "/dev/core"]
+    cases["filtered_dev_denial"] = filtered + mask + ["--proc", "/proc", "--", *check]
+    io_check = ["/bin/sh", "-c", "printf ok >/dev/null && test -c /dev/zero && test -c /dev/urandom && printf IO_OK"]
+    cases["filtered_dev_io"] = filtered + mask + ["--proc", "/proc", "--", *io_check]
+    pty_check = ["/usr/bin/python3", "-I", "-B", "-c", "import os; a,b=os.openpty(); print(os.ttyname(b)); os.close(a); os.close(b)"]
+    cases["filtered_dev_pty"] = filtered + mask + ["--proc", "/proc", "--", *pty_check]
+    cases["filtered_dev_nested_private_pty"] = filtered + ["--dev", "/dev/pts", "--symlink", "pts/pts/ptmx", "/dev/ptmx"] + mask + ["--proc", "/proc", "--", *pty_check]
+    cases["normal_dev_pty_control"] = base + ["--proc", "/proc", "--", *pty_check]
     results = []
     with tempfile.TemporaryDirectory() as empty:
         cases["readonly_empty_bind"] = base + ["--ro-bind", empty, "/dev/fd", "--proc", "/proc", "--", *check]
@@ -49,6 +65,8 @@ def main():
     (output / "results.json").write_text(json.dumps(results, indent=2) + "\n")
     assert results[0]["rc"] == 0, "unmasked environment control must succeed"
     assert results[1]["rc"] != 0 and "Can't mount tmpfs on /newroot/dev/fd" in results[1]["stderr"], "original fault must reproduce"
+    denial = next(item for item in results if item["name"] == "filtered_dev_denial")
+    assert denial["rc"] == 0 and denial["stdout"].strip() == "DENIED", "candidate must deny the original logical path"
 
 
 if __name__ == "__main__":
