@@ -162,7 +162,10 @@ def _retryable_completed_message(message):
     exhausted_429 = bool(re.fullmatch(
         r'exceededretrylimit,laststatus:429toomanyrequests(?:,requestid:[a-z0-9._:-]+)?',
         prefix))
-    return (exhausted_429
+    terminal_502 = bool(re.fullmatch(
+        r'unexpectedstatus502badgateway:unknownerror,url:https?://[^\s,<>"\x27`]+/v1/responses',
+        prefix))
+    return (exhausted_429 or terminal_502
             or any(x in normalized for x in ("currently experiencing high demand", "rate limit exceeded",
                                               "temporarily unavailable", "stream disconnected before completion"))
             or normalized == "connection failed: error sending request")

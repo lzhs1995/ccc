@@ -1,11 +1,11 @@
 {
-  "schema": "ccc-native-conditional-source-v12",
+  "schema": "ccc-native-conditional-source-v13",
   "status": "INTEGRATED_VERIFICATION_CANDIDATE_NOT_DEPLOYABLE",
   "baseline_prepare_sha256": "beae02abdd924b103f489ce54fdd9fb666ebff89ccb8592d43cfc18cdff81a12",
   "baseline_source_tree_sha256": "6a0540b9d82e9c947192a3bf675467af87562c35b047ce54c0767c2d4aec3d35",
-  "source_tree_sha256": "1d44e04c850c1b86af6666383949c9dde2828387b220c6cc625ed11f8fed8bd3",
+  "source_tree_sha256": "ee2ce48504f779a2f17eb302c9063707c918a6b3c70c0bf1abefc44e265fca80",
   "source_file_count": 8891,
-  "archive_sha256": "337c7e4d4877addb92c436df433922bd884065e237b009cf57a3bc4008561de7",
+  "archive_sha256": "1d46a9c388d1de096e7d4255f1ebba4fe654e807ecbd443b9ace201b80cbbcd0",
   "evidence": {
     "authority_manifest": "544e569f9323faa03e4a3277188fc3a4db54aa4559de4b774cc646e86a1f6dd2",
     "reservation_manifest": "7ff594c3a3a70e71508effed4a9dd7d305c70f3f60ea1d562a4b534b973329d2",
@@ -43,12 +43,15 @@
     "v11_b35": "Typed descent and two additive units independently accepted, original callback verified/disarmed",
     "v11_b36": "Original callback verified/disarmed; diagnostic bounded and corrected by Root; no TLS policy/feature pin",
     "v11_validation_failure": "GHA39673342942 and GHA39679814682: core/Goal/Zsh passed; five TLS tests, runner uid-map and formatting failed.",
-    "v12_delta": "Two exact cloud-rustfmt formatting corrections. No native assertion, timeout, skip, TLS policy or feature changes."
+    "v12_delta": "Two exact cloud-rustfmt formatting corrections. No native assertion, timeout, skip, TLS policy or feature changes.",
+    "v12_validation_failure": "GHA39709412921: compiled/Goal301/Zsh passed; historical57 passed50, five TLS plus descriptor/fixture failed.",
+    "v13_delta": "B40 exact typed rustls ProtocolVersion + io.get_ref traversal, four discrimination units; Landlock alias parent placed in existing writable cwd. No backend/features/timeouts/retry counts or weakened assertions.",
+    "v13_descriptor": "B41 diagnosis-only: preserve failing condition, display stderr/status/closed before panic. Root verified exact one-string change; root cause still UNKNOWN."
   },
   "limitations": [
-    "Exact v12 conditional validation, full suite, Clippy and macOS build pending.",
-    "TLS first-attempt backend remains unresolved; success stdout and compiled-feature fingerprints preserved by workflow.",
-    "Current original Root lacks published compact-interrupt capability; no enrollment or native restart performed."
+    "Exact v13 conditional/full/Clippy/macOS gates pending.",
+    "Blocked descriptor root cause unresolved; all original assertions and required gate remain, with diagnostic context added.",
+    "Current Root compact capability/adoption absent; no native restart performed."
   ],
   "changes": [
     {
@@ -577,6 +580,21 @@
       }
     },
     {
+      "path": "codex-rs/exec-server/tests/exec_process/shell_snapshot.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "46b258a730e7a381369d5efc42df764536db96e991df372a50ad95fe822aed1f",
+        "bytes": 8439,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "0af0e9de338eeacf68f47260bfe57f3cba095d55d7c84f16510e7424b62689fe",
+        "bytes": 8491,
+        "git_mode": "100644"
+      }
+    },
+    {
       "path": "codex-rs/ext/goal/src/extension.rs",
       "before": {
         "kind": "file",
@@ -722,6 +740,36 @@
       }
     },
     {
+      "path": "codex-rs/http-client/src/tls_backend_fallback.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "bfad1ec0d0dadce462a88e4d5a5d48dd1824312bea97acb013aa61a7bd005462",
+        "bytes": 5113,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "66b1f0f5577a8d744b1c540158289bf0465fa4965a70b58331681c2cb571e0c9",
+        "bytes": 5955,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/http-client/src/tls_backend_fallback_tests.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "c3e87ee3e170a92dd2587bcda09ac43734f78c9e9e77b830cf62cbbdd67ed656",
+        "bytes": 7531,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "1b772be5a42d16d1e95c14383eac1c9f2fea10f9d3984ca3f1c115dfe8f67266",
+        "bytes": 9896,
+        "git_mode": "100644"
+      }
+    },
+    {
       "path": "codex-rs/linux-sandbox/tests/suite/landlock.rs",
       "before": {
         "kind": "file",
@@ -731,8 +779,8 @@
       },
       "after": {
         "kind": "file",
-        "sha256": "6a60018e5e2ce83d5e3c749067c503ce705023a530023eb8736fc90316c7c3cf",
-        "bytes": 53430,
+        "sha256": "e9849a1317a6951a1ce6f305be8e1463346153b8faa02ad46cac2949134e5ad6",
+        "bytes": 53507,
         "git_mode": "100644"
       }
     },

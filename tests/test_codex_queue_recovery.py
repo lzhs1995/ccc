@@ -11,9 +11,31 @@ from ccc_codex_queue import QueueRecovery, completed_error, _retryable_completed
 
 EXHAUSTED_429 = ('exceeded retry limit, last status: 429 Too Many Requests, '
                  'request id: req_fixture_429')
+TERMINAL_502 = ('unexpected status 502 Bad Gateway: Unknown error, '
+                'url: http://127.0.0.1:18765/v1/responses')
 
 
 class QueueRecoveryTests(unittest.TestCase):
+    def test_terminal_502_banner_is_retryable_including_hard_wraps(self):
+        for message in (TERMINAL_502, '■ ' + TERMINAL_502, TERMINAL_502.upper(),
+                        TERMINAL_502.replace('Gateway', 'Gate\nway'),
+                        TERMINAL_502.replace('127.0.0.1', '127.0.\n0.1')):
+            with self.subTest(message=message):
+                self.assertTrue(_retryable_completed_message(message))
+
+    def test_terminal_502_quotes_truncation_and_provider_blockers_do_not_retry(self):
+        messages = [prefix + TERMINAL_502 for prefix in (
+            'Example: ', 'Documentation: ', 'Quoted: ', 'Sample: ',
+            'User: ', 'Assistant: ', 'Please explain ', '> ', '```\n', '"')]
+        messages += [TERMINAL_502[:-4], TERMINAL_502.replace('502', '5020', 1),
+                     TERMINAL_502 + ' is an example.', 'HTTP 502',
+                     TERMINAL_502 + ' {"error":{"code":"insufficient_quota"}}',
+                     TERMINAL_502 + ' unexpected status 401 Unauthorized',
+                     TERMINAL_502 + ' unexpected status 403 Forbidden']
+        for message in messages:
+            with self.subTest(message=message):
+                self.assertFalse(_retryable_completed_message(message))
+
     def test_exhausted_429_banner_is_retryable_with_native_request_id(self):
         for message in (EXHAUSTED_429, EXHAUSTED_429.upper(),
                         EXHAUSTED_429.split(', request id:')[0], '■ ' + EXHAUSTED_429,
@@ -172,6 +194,8 @@ class QueueRecoveryTests(unittest.TestCase):
         for message, allowed in (("Connection failed: error sending request", True),
                                  ("stream disconnected before completion", True),
                                  (EXHAUSTED_429, True),
+                                 (TERMINAL_502, True),
+                                 ('Example: ' + TERMINAL_502, False),
                                  ('Example: ' + EXHAUSTED_429, False),
                                  (EXHAUSTED_429 + ' {"error":{"code":"insufficient_quota"}}', False),
                                  ("Connection failed: permission denied", False),
@@ -203,6 +227,24 @@ class QueueRecoveryTests(unittest.TestCase):
         recovery.current_turn = Mock(return_value={
             'kind': 'user_message', 'at': now - 10, 'error': {'message': EXHAUSTED_429}})
         self.assertIsNone(recovery.evidence(self.target))
+
+    def test_new_input_and_unfinished_turn_supersede_terminal_502(self):
+        now = time.time()
+        path = self.root / 'session.jsonl'
+        for kind in ('user_message', 'task_started'):
+            with self.subTest(kind=kind):
+                records = [
+                    {'type': 'session_meta', 'payload': {'id': 'original'}},
+                    {'timestamp': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(now - 10)),
+                     'type': 'event_msg', 'payload': {'type': 'task_complete',
+                        'turn_id': 'failed', 'error': {'message': TERMINAL_502}}},
+                ]
+                path.write_text('\n'.join(json.dumps(x) for x in records) + '\n')
+                self.assertIsNotNone(completed_error(path, 'original', now))
+                records.append({'timestamp': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(now - 5)),
+                                'type': 'event_msg', 'payload': {'type': kind, 'turn_id': 'new'}})
+                path.write_text('\n'.join(json.dumps(x) for x in records) + '\n')
+                self.assertIsNone(completed_error(path, 'original', now))
 
 
 if __name__ == "__main__":
