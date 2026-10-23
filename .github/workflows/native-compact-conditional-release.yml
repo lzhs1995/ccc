@@ -1,28 +1,21 @@
-name: Native conditional full regression and macOS candidate
+name: Native conditional v5 full regression and macOS candidate
 
 on:
-  push:
-    branches: [fix/ccc-live-recovery-20261011-6054]
-    paths:
-      - .github/workflows/native-compact-conditional-release.yml
-      - ci/native-compact-conditional-release/**
   workflow_dispatch:
     inputs:
       validation_run_id:
         description: Completed native conditional validation run for these exact source pins
         required: true
-        default: '39948791325'
       source_sha:
         description: Commit whose complete source and Python manifests were validated
         required: true
-        default: '8cb19d5809d9e096e315244d98d3fc479248044b'
 
 permissions:
   contents: read
   actions: read
 
 concurrency:
-  group: native-full-release-${{ inputs.source_sha || '8cb19d5809d9e096e315244d98d3fc479248044b' }}
+  group: native-full-release-v5-${{ inputs.source_sha }}
   cancel-in-progress: false
 
 jobs:
@@ -41,16 +34,16 @@ jobs:
         with:
           persist-credentials: false
       - name: Retain the workflow-owned validation reader
-        run: cp ci/native-compact-conditional-release/verify_validation.py "$RUNNER_TEMP/verify_validation.py"
+        run: cp ci/native-compact-conditional-release-v5/verify_validation.py "$RUNNER_TEMP/verify_validation.py"
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: ${{ inputs.source_sha || '8cb19d5809d9e096e315244d98d3fc479248044b' }}
+          ref: ${{ inputs.source_sha }}
           persist-credentials: false
       - name: Require the completed exact-source validation
         id: proof
         env:
-          VALIDATION_RUN_ID: ${{ inputs.validation_run_id || '39948791325' }}
-          SOURCE_SHA: ${{ inputs.source_sha || '8cb19d5809d9e096e315244d98d3fc479248044b' }}
+          VALIDATION_RUN_ID: ${{ inputs.validation_run_id }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
           GH_TOKEN: ${{ github.token }}
         run: python3 -I -B "$RUNNER_TEMP/verify_validation.py"
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
@@ -78,7 +71,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Retain the workflow-owned native dependency builder
-        run: cp ci/native-compact-conditional-release/prepare_native_dependencies.py "$RUNNER_TEMP/prepare_native_dependencies.py"
+        run: cp ci/native-compact-conditional-release-v5/prepare_native_dependencies.py "$RUNNER_TEMP/prepare_native_dependencies.py"
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           ref: ${{ needs.validation.outputs.source_sha }}
@@ -86,7 +79,7 @@ jobs:
       - name: Reconstruct the entire exact source tree
         run: |
           echo "CARGO_TARGET_DIR=$RUNNER_TEMP/native-full-target" >> "$GITHUB_ENV"
-          python3 -I -B ci/native-compact-conditional-v4/prepare.py \
+          python3 -I -B ci/native-compact-conditional-v5/prepare.py \
             --output "$RUNNER_TEMP/native-full/source" \
             --report "$GITHUB_WORKSPACE/full-release-evidence/reconstruction.json"
       - name: Require capacity and install upstream build dependencies
@@ -113,9 +106,9 @@ jobs:
       - name: Generate real producer files used by the full suite
         run: |
           set -o pipefail
-          python3 -I -B ci/native-compact-conditional-v4/python/verify_source.py
-          python3 -I -B ci/native-compact-conditional-v4/python/generate_reader_fixtures.py \
-            --runtime "$GITHUB_WORKSPACE/ci/native-compact-conditional-v4/python" \
+          python3 -I -B ci/native-compact-conditional-v5/python/verify_source.py
+          python3 -I -B ci/native-compact-conditional-v5/python/generate_reader_fixtures.py \
+            --runtime "$GITHUB_WORKSPACE/ci/native-compact-conditional-v5/python" \
             --output "$GITHUB_WORKSPACE/full-release-evidence/producer-fixtures" \
             2>&1 | tee "$GITHUB_WORKSPACE/full-release-evidence/producer-generation.log"
           echo "CCC_REAL_PRODUCER_MANIFEST=$GITHUB_WORKSPACE/full-release-evidence/producer-fixtures/manifest.json" >> "$GITHUB_ENV"
@@ -246,7 +239,7 @@ jobs:
           print(json.dumps(record, indent=2))
           PY
           cargo tree --locked -e features -i reqwest@0.12.28 > "$GITHUB_WORKSPACE/full-release-evidence/reqwest-features.txt"
-          export TMPDIR="$RUNNER_TEMP/native-full-test-tmp"
+          export TMPDIR="$RUNNER_TEMP/native_full_test_tmp"
           mkdir -m 700 "$TMPDIR"
           env -u CODEX_CA_CERTIFICATE -u SSL_CERT_FILE -u SSH_CLIENT -u SSH2_CLIENT \
             just test --locked --retries 0 2>&1 | tee "$GITHUB_WORKSPACE/full-release-evidence/workspace-tests.log"
@@ -290,7 +283,7 @@ jobs:
               # Setup can fail before tool metadata exists; still verify the raw source.
               assert not metadata.exists() and not metadata.is_symlink(), 'Unrecorded source git metadata'
           actual = module.snapshot(source)
-          manifest = json.loads((workspace / 'ci/native-compact-conditional-v4/source-manifest.json').read_bytes())
+          manifest = json.loads((workspace / 'ci/native-compact-conditional-v5/source-manifest.json').read_bytes())
           digest = module.tree_digest(actual)
           (evidence / 'after-tests-tree.json').write_text(json.dumps({'sha256': digest, 'files': actual}, indent=2) + '\n')
           if digest != manifest['source_tree_sha256']:
@@ -346,7 +339,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Retain the actual build workflow
-        run: cp .github/workflows/native-compact-conditional-release.yml "$RUNNER_TEMP/native-compact-conditional-release.yml"
+        run: cp .github/workflows/native-compact-conditional-release-v5.yml "$RUNNER_TEMP/native-compact-conditional-release-v5.yml"
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           ref: ${{ needs.validation.outputs.source_sha }}
@@ -381,7 +374,7 @@ jobs:
 
       - name: Reconstruct and verify the exact formatted candidate
         run: |
-          python3 -I -B ci/native-compact-conditional-v4/prepare.py \
+          python3 -I -B ci/native-compact-conditional-v5/prepare.py \
             --output "$RUNNER_TEMP/native-compact-macos/source" \
             --report "$GITHUB_WORKSPACE/compact-macos-evidence/reconstruction.json"
           python3 -I -B - <<'PY'
@@ -518,9 +511,9 @@ jobs:
           (evidence / "smoke.json").write_text(json.dumps(smoke, indent=2) + "\n")
           stage = Path(os.environ["RUNNER_TEMP"]) / "native-compact-macos-package"
           (stage / "bin").mkdir(parents=True)
-          shutil.copy2(Path(os.environ["RUNNER_TEMP"]) / "native-compact-conditional-release.yml", stage / "build-workflow.yml")
+          shutil.copy2(Path(os.environ["RUNNER_TEMP"]) / "native-compact-conditional-release-v5.yml", stage / "build-workflow.yml")
           shutil.copy2(binary, stage / "bin/codex")
-          bundle = workspace / "ci/native-compact-conditional-v4"
+          bundle = workspace / "ci/native-compact-conditional-v5"
           manifest = {
               "created_at": datetime.now(timezone.utc).isoformat(),
               "status": "BUILT_RUNNER_SMOKE_PASSED_NOT_ADOPTED",
@@ -539,7 +532,7 @@ jobs:
               "binary_bytes": binary.stat().st_size,
               "source_archive_sha256": hashlib.sha256((bundle / "source-overlay.tar.gz").read_bytes()).hexdigest(),
               "source_manifest_sha256": hashlib.sha256((bundle / "source-manifest.json").read_bytes()).hexdigest(),
-              "workflow_sha256": hashlib.sha256((Path(os.environ["RUNNER_TEMP"]) / "native-compact-conditional-release.yml").read_bytes()).hexdigest(),
+              "workflow_sha256": hashlib.sha256((Path(os.environ["RUNNER_TEMP"]) / "native-compact-conditional-release-v5.yml").read_bytes()).hexdigest(),
               "reconstruction": json.loads((evidence / "reconstruction.json").read_text()),
               "toolchain": json.loads((evidence / "toolchain.json").read_text()),
               "runner": json.loads((evidence / "runner.json").read_text()),
