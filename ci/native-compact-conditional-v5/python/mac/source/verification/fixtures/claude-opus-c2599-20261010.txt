@@ -1,0 +1,11 @@
+Synthetic history for the measured Claude footer geometry.
+Archived report: WAITING_SUPERVISOR; no live task or receipt evidence.
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  [Opus 5] │ fixture/tool-overflow git:(main) │ ⏱️  128h 15m
+  上下文 ████░░░░░░ 41%
+  1 CLAUDE.md | 9 MCPs | 7 钩子
+  ✓ Bash ×11 | ✓ Edit ×3 | ✓ Write ×3 | ✓ Read ×2 | +1 more
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents
