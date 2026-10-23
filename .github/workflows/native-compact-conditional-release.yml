@@ -90,11 +90,11 @@ jobs:
             --output "$RUNNER_TEMP/native-full/source" \
             --report "$GITHUB_WORKSPACE/full-release-evidence/reconstruction.json"
       - name: Require capacity and install upstream build dependencies
-        timeout-minutes: 8
+        timeout-minutes: 10
         run: |
           python3 -I -B -c 'import os,shutil; free=shutil.disk_usage(os.environ["RUNNER_TEMP"]).free; print(f"Free GiB: {free/2**30:.1f}"); assert free>=50*2**30'
           sudo timeout --kill-after=10s 180s apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update -y
-          sudo timeout --kill-after=10s 180s apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y --no-install-recommends build-essential cmake pkg-config libcap-dev libasound2-dev bubblewrap
+          sudo timeout --kill-after=10s 300s apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y --no-install-recommends build-essential cmake pkg-config libcap-dev libasound2-dev bubblewrap
           sudo sysctl -w kernel.unprivileged_userns_clone=1
           if sudo sysctl -a 2>/dev/null | grep -q '^kernel.apparmor_restrict_unprivileged_userns'; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
@@ -275,18 +275,23 @@ jobs:
           spec.loader.exec_module(module)
           source = Path(os.environ['RUNNER_TEMP']) / 'native-full/source'
           metadata = source / '.git'
-          record = json.loads((workspace / 'full-release-evidence/source-tool-metadata.json').read_bytes())
-          st = metadata.lstat()
-          raw = metadata.read_bytes()
-          assert (str(metadata), st.st_dev, st.st_ino, len(raw), hashlib.sha256(raw).hexdigest()) == (
-              record['path'], record['device'], record['inode'], record['bytes'], record['sha256'])
-          # Preserve only the exact tool-created pointer before taking the full snapshot.
-          metadata.rename(workspace / 'full-release-evidence/source-git-pointer.txt')
+          evidence = workspace / 'full-release-evidence'
+          evidence.mkdir(exist_ok=True)
+          record_path = evidence / 'source-tool-metadata.json'
+          if record_path.exists():
+              record = json.loads(record_path.read_bytes())
+              st = metadata.lstat()
+              raw = metadata.read_bytes()
+              assert (str(metadata), st.st_dev, st.st_ino, len(raw), hashlib.sha256(raw).hexdigest()) == (
+                  record['path'], record['device'], record['inode'], record['bytes'], record['sha256'])
+              # Preserve only the exact tool-created pointer before taking the full snapshot.
+              metadata.rename(evidence / 'source-git-pointer.txt')
+          else:
+              # Setup can fail before tool metadata exists; still verify the raw source.
+              assert not metadata.exists() and not metadata.is_symlink(), 'Unrecorded source git metadata'
           actual = module.snapshot(source)
           manifest = json.loads((workspace / 'ci/native-compact-conditional-v4/source-manifest.json').read_bytes())
           digest = module.tree_digest(actual)
-          evidence = workspace / 'full-release-evidence'
-          evidence.mkdir(exist_ok=True)
           (evidence / 'after-tests-tree.json').write_text(json.dumps({'sha256': digest, 'files': actual}, indent=2) + '\n')
           if digest != manifest['source_tree_sha256']:
               changed = evidence / 'changed-source'
