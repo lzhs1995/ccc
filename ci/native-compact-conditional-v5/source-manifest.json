@@ -3,9 +3,9 @@
   "status": "INTEGRATED_VERIFICATION_CANDIDATE_NOT_DEPLOYABLE",
   "baseline_prepare_sha256": "beae02abdd924b103f489ce54fdd9fb666ebff89ccb8592d43cfc18cdff81a12",
   "baseline_source_tree_sha256": "6a0540b9d82e9c947192a3bf675467af87562c35b047ce54c0767c2d4aec3d35",
-  "source_tree_sha256": "2c15cd2bc70e614386e4997b52031d1ba1fc2a4293e9611ddfbe552482185498",
+  "source_tree_sha256": "d3e37ce9facffa5e4d66892d87505d452feddd85f03cecba0130ea6b4a245309",
   "source_file_count": 8891,
-  "archive_sha256": "3b84677b8032190d9d179e41e45f5eb6c29607b695d6db9d568db72faff0c7b6",
+  "archive_sha256": "66ef92fe5a997cc35e6e7d98cbeb12bc36171feb4a89c6f9776a25b48f6ded54",
   "evidence": {
     "authority_manifest": "544e569f9323faa03e4a3277188fc3a4db54aa4559de4b774cc646e86a1f6dd2",
     "reservation_manifest": "7ff594c3a3a70e71508effed4a9dd7d305c70f3f60ea1d562a4b534b973329d2",
@@ -82,7 +82,8 @@
     ],
     "guardian_review": "solo_self_review; independent peer review pending before full acceptance",
     "previous_full_run": 39960514415,
-    "previous_full_result": "21149 executed, seven failed, 47 skipped; not accepted"
+    "previous_full_result": "21149 executed, seven failed, 47 skipped; not accepted",
+    "v19_realtime_format": "Official prebuilt Rust1.95 formatter only; tokens except optional trailing commas, all string literals and file prefix/suffix outside the fixture preserved. Preformat v5 commit80622a9921c7e3a0157b441be3e5baa34a1f8255 and exact local archive preserved."
   },
   "limitations": [
     "Exact v17 conditional/full/Clippy/macOS gates pending.",
@@ -564,8 +565,8 @@
       },
       "after": {
         "kind": "file",
-        "sha256": "82ed1fcac60ef7f1590c1b6deee0813a0c596214eb0883173ee61485d77f5afa",
-        "bytes": 223633,
+        "sha256": "8943fd7799f1172d4ef1e5f99767733e0cc4fa3dbc8be1707c52d0fb69973df6",
+        "bytes": 223530,
         "git_mode": "100644"
       }
     },
