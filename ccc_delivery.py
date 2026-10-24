@@ -21,7 +21,7 @@ FIELDS = (
     "send_started_at", "send_io_started_at", "send_completed_at", "send_attempt_evidence",
     "last_send_error", "last_send_at", "send_count", "awaiting", "awaiting_suppressed",
     "sent_fingerprint", "sent_screen_signature", "codex_sent_turn_key",
-    "codex_observed_turn_key", "codex_goal_resume", "codex_goal_proof", "codex_private_check", "codex_input_phase", "codex_input_not_sent",
+    "codex_observed_turn_key", "codex_goal_resume", "codex_goal_proof", "codex_goal_diagnostics", "codex_private_check", "codex_input_phase", "codex_input_not_sent",
     "episode_id", "episode_started_at", "error_type",
 )
 
@@ -43,7 +43,7 @@ class _PreInputAttempt:
         self.identity = self._identity_json(identity) if identity else None
         self.recovery = None
         if (self.saved['delivery_status'] != 'sending'
-                or self.saved['codex_input_phase'] not in {'text_pending', 'paste_submit_pending'}
+                or self.saved['codex_input_phase'] not in {'text_pending', 'paste_submit_pending', 'goal_native_pending'}
                 or self.saved['send_io_started_at'] != 0 or self.saved['send_completed_at'] != 0
                 or self.saved['codex_input_not_sent']
                 or not self.saved['codex_sent_turn_key']
@@ -232,6 +232,8 @@ class DeliveryStore:
             raise ValueError("invalid durable delivery private check")
         if "codex_goal_proof" in saved and not isinstance(saved["codex_goal_proof"], dict):
             raise ValueError("invalid durable delivery goal proof")
+        if "codex_goal_diagnostics" in saved and not isinstance(saved["codex_goal_diagnostics"], dict):
+            raise ValueError("invalid durable goal diagnostics")
         if "codex_input_not_sent" in saved and not isinstance(saved["codex_input_not_sent"], dict):
             raise ValueError("invalid durable zero-write proof")
         if saved.get("codex_input_phase") == "input_not_sent":
@@ -247,7 +249,8 @@ class DeliveryStore:
         if saved.get("delivery_status", "") not in {"", "sending", "accepted", "confirmed", "failed", "unknown", "cancelled", "retryable"}:
             raise ValueError("invalid durable delivery status")
         if saved.get("codex_input_phase", "") not in {"", "text_pending", "enter_pending", "enter_acknowledged", "text_retained",
-                                                        "paste_submit_pending", "paste_submit_acknowledged", "input_not_sent"}:
+                                                        "paste_submit_pending", "paste_submit_acknowledged", "input_not_sent",
+                                                        "goal_native_pending", "goal_native_acknowledged"}:
             raise ValueError("invalid durable native input phase")
         return sid, saved
 

@@ -57,7 +57,9 @@ class ObservationTimingTests(unittest.TestCase):
         self.daemon._apply_claude_process_observation = Mock(side_effect=self.cost(17))
         self.daemon._recover_stranded_codex_queue = Mock(side_effect=lambda t, r, s, *args: s)
         self.daemon._reconcile_codex_delivery = Mock(return_value=False)
+        self.daemon._resume_retained_goal_draft = Mock(return_value=False)
         self.daemon._reconcile_claude_submit = Mock(return_value=False)
+        self.daemon._restore_unsent_claude_deferred = Mock()
         self.daemon._maybe_send_deferred_claude_stop = Mock(return_value=False)
         self.daemon._codex_turn_ready = Mock(side_effect=self.cost(19, True))
         self.daemon._handle_state = Mock(side_effect=self.cost(23))
@@ -122,9 +124,11 @@ class ObservationTimingTests(unittest.TestCase):
             ("runtime_guards", "_apply_claude_runtime_guards", self.state),
             ("context_guard", "_apply_claude_context_guard", self.state),
             ("codex_queue_recovery", "_recover_stranded_codex_queue", self.state),
+            ("retained_goal_submit", "_resume_retained_goal_draft", False),
             ("codex_delivery", "_reconcile_codex_delivery", False),
             ("fresh_authorization", "_active_send_target", self.target),
             ("claude_submit", "_reconcile_claude_submit", False),
+            ("restore_unsent_deferred", "_restore_unsent_claude_deferred", None),
             ("restore_deferred", "_restore_expired_claude_deferred", None),
             ("deferred_stop", "_maybe_send_deferred_claude_stop", False),
             ("hook_gap_fallback", "_maybe_send_claude_hook_gap_fallback", False),
@@ -199,7 +203,7 @@ class ObservationTimingTests(unittest.TestCase):
 
     def test_reconcile_short_circuit_returns_do_not_count_later_phases(self):
         for retry in (False, True):
-            for name, result in (("codex_delivery", True), ("fresh_authorization", None),
+            for name, result in (("retained_goal_submit", True), ("codex_delivery", True), ("fresh_authorization", None),
                                  ("claude_submit", True), ("deferred_stop", True),
                                  ("hook_gap_fallback", True)):
                 with self.subTest(retry=retry, phase=name):

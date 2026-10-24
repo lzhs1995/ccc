@@ -385,7 +385,13 @@ class HandshakeWaitTests(unittest.TestCase):
 
     def test_measured_dispatch_formats_release_wait_and_retry_only_new_native_failure(self):
         for index, build in enumerate((business_dispatch, skill_first_dispatch)):
-            with self.subTest(build=build.__name__):
+            # The first retry advances through a persisted cooldown. Keep the
+            # next native task later than that send, rather than moving time
+            # backwards and making its Stop legitimately already covered.
+            trial_now = max(time.time(), self.runtime.last_send_at + 40)
+            with self.subTest(build=build.__name__), mock.patch.object(
+                    core.time, 'time', return_value=trial_now):
+                self.at = trial_now - 30
                 base = index * 5
                 self.challenge(offset=base, nonce=f'new785{index}xx')
                 self.ack(offset=base + 1, nonce=f'new785{index}xx')
@@ -400,6 +406,13 @@ class HandshakeWaitTests(unittest.TestCase):
                 stop = self.event('StopFailure', offset=base + 3, error_kind='claude_api')
                 self.handle(stop)
                 self.handle(stop)
+                self.assertEqual((len(self.client.sent_text), len(self.client.sent_keys)), before)
+                with mock.patch.object(core.time, 'time',
+                        return_value=self.runtime.claude_provider_guard['retry_after'] + 1):
+                    self.daemon._maybe_send_deferred_claude_stop(
+                        self.target, self.runtime, self.screen(), self.client)
+                    self.daemon._maybe_send_deferred_claude_stop(
+                        self.target, self.runtime, self.screen(), self.client)
                 self.assertEqual((len(self.client.sent_text), len(self.client.sent_keys)),
                                  (before[0] + 1, before[1] + 1))
 

@@ -47,6 +47,12 @@ class ClaudeObservationRelaunchTests(unittest.TestCase):
             p = self.app / name
             p.write_text('#!/bin/sh\nexit 0\n')
             p.chmod(0o700)
+        self.mcp_contract = resume.managed_mcp_contract(WRAPPER)
+        if self.mcp_contract == 'environment_token':
+            policy = self.app.parent / 'cmux-cua/client-policy.sh'
+            policy.parent.mkdir()
+            shutil.copyfile(WRAPPER.parent.parent / 'cmux-cua/client-policy.sh', policy)
+            policy.chmod(0o600)
         self.token = self.root / 'mcp-token'
         self.token.write_text('fake-fresh-token')
         self.token.chmod(0o600)
@@ -55,6 +61,8 @@ class ClaudeObservationRelaunchTests(unittest.TestCase):
             ANTHROPIC_API_KEY='fake-original-key', BUN_OPTIONS='--smol',
             CMUX_CUA_AUTH_TOKEN_FILE=str(self.token), CMUX_CUA_SOCKET_AUTH_TOKEN='fake-stale',
             CMUX_CLAUDE_PID='8123', CMUX_AGENT_LAUNCH_EXECUTABLE='/old/shim')
+        if self.mcp_contract == 'environment_token':
+            self.env['CMUX_CUA_CLIENT_PATH'] = str(self.app / 'cmux-cua')
         self.process = dict(pid=8123, birth=[100, 22], argv=['Claude', '--resume', self.sid],
             environment=self.env, cwd=str(self.root), executable=str(self.native),
             executable_identity=capture.file_identity(self.native.stat()))
@@ -247,10 +255,21 @@ class ClaudeObservationRelaunchTests(unittest.TestCase):
             'CMUX_CUA_UPDATE_CHECK':'false','CMUX_CUA_CURSOR_GRADIENT':'#12c7f5,#2d8cff,#6c5cff',
             'CMUX_CUA_CURSOR_BLOOM':'#2d8cff','CMUX_CUA_CURSOR_LABEL':'cmux',
             'CMUX_CUA_STATE_DIR':'/original/state','NODE_OPTIONS':'','BUN_OPTIONS':''})
+        if self.mcp_contract == 'environment_token':
+            server['command'] = str((self.app / 'cmux-cua').resolve())
+            del server['env']['CMUX_CUA_SOCKET_AUTH_TOKEN']
+            env['CMUX_CUA_SOCKET_AUTH_TOKEN'] = ' fake-token \r'
         def args(value):
             return [str(self.native),'--mcp-config='+json.dumps({'mcpServers':{'cmux-cua':value}}),
                     '--resume',self.sid]
         resume.validate_final_inputs(plan,args(server),env)
+        if self.mcp_contract == 'environment_token':
+            for key, value in (('CMUX_CUA_SOCKET_AUTH_TOKEN', 'fake-stale'),
+                               ('CMUX_CUA_SOCKET_AUTH_TOKEN', ''),
+                               ('CMUX_CUA_AUTH_TOKEN_FILE', '/other/token'),
+                               ('CMUX_CUA_CLIENT_PATH', '/other/cmux-cua')):
+                with self.subTest(inherited=key, value=value), self.assertRaises(ValueError):
+                    resume.validate_final_inputs(plan,args(server),dict(env,**{key:value}))
         mutations = [('command','/other/cmux-cua'),('args',['mcp','--socket','/other/cua.sock'])]
         variants = []
         for field, value in mutations:
@@ -348,7 +367,13 @@ class ClaudeObservationRelaunchTests(unittest.TestCase):
         cua = final_mcps[0]['mcpServers']['cmux-cua']['env']
         self.assertEqual(cua['CMUX_CUA_STATE_OWNER_PID'], observed['env']['CMUX_CLAUDE_PID'])
         self.assertNotEqual(cua['CMUX_CUA_STATE_OWNER_PID'], '8123')
-        self.assertEqual(cua['CMUX_CUA_SOCKET_AUTH_TOKEN'], 'fake-fresh-token')
+        if self.mcp_contract == 'environment_token':
+            self.assertNotIn('CMUX_CUA_SOCKET_AUTH_TOKEN', cua)
+            self.assertEqual(observed['env']['CMUX_CUA_SOCKET_AUTH_TOKEN'], 'fake-fresh-token')
+            self.assertEqual(final_mcps[0]['mcpServers']['cmux-cua']['command'],
+                             str((self.app / 'cmux-cua').resolve()))
+        else:
+            self.assertEqual(cua['CMUX_CUA_SOCKET_AUTH_TOKEN'], 'fake-fresh-token')
         self.assertEqual(final_mcps[1:], mcps)
 
 

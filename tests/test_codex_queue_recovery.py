@@ -19,7 +19,10 @@ class QueueRecoveryTests(unittest.TestCase):
     def test_terminal_502_banner_is_retryable_including_hard_wraps(self):
         for message in (TERMINAL_502, '■ ' + TERMINAL_502, TERMINAL_502.upper(),
                         TERMINAL_502.replace('Gateway', 'Gate\nway'),
-                        TERMINAL_502.replace('127.0.0.1', '127.0.\n0.1')):
+                        TERMINAL_502.replace('127.0.0.1', '127.0.\n0.1'),
+                        # The complete native 5xx status is retry evidence;
+                        # the URL/body detail does not determine that status.
+                        TERMINAL_502[:-4], TERMINAL_502 + ' is an example.'):
             with self.subTest(message=message):
                 self.assertTrue(_retryable_completed_message(message))
 
@@ -27,8 +30,7 @@ class QueueRecoveryTests(unittest.TestCase):
         messages = [prefix + TERMINAL_502 for prefix in (
             'Example: ', 'Documentation: ', 'Quoted: ', 'Sample: ',
             'User: ', 'Assistant: ', 'Please explain ', '> ', '```\n', '"')]
-        messages += [TERMINAL_502[:-4], TERMINAL_502.replace('502', '5020', 1),
-                     TERMINAL_502 + ' is an example.', 'HTTP 502',
+        messages += [TERMINAL_502.replace('502', '5020', 1), 'HTTP 502',
                      TERMINAL_502 + ' {"error":{"code":"insufficient_quota"}}',
                      TERMINAL_502 + ' unexpected status 401 Unauthorized',
                      TERMINAL_502 + ' unexpected status 403 Forbidden']
@@ -49,12 +51,14 @@ class QueueRecoveryTests(unittest.TestCase):
                 '{"error":{"code":"insufficient_quota"}}',
                 '{"error":{"code":"invalid_encrypted_content"}}',
                 '{"error":{"type":"invalid_request_error","message":"Invalid request"}}',
-                '{"error":{"code":"resource_mismatch"}}',
                 'unexpected status 401 Unauthorized',
                 'unknown status code 403',
                 'HTTP 400 Bad Request'):
             with self.subTest(detail=detail):
                 self.assertFalse(_retryable_completed_message(EXHAUSTED_429 + ': ' + detail))
+        # The same specific resource cause is now explicitly retryable.
+        self.assertTrue(_retryable_completed_message(
+            EXHAUSTED_429 + ': {"error":{"code":"resource_mismatch"}}'))
 
     def test_exhausted_429_quote_user_text_and_other_status_are_not_retry_evidence(self):
         messages = [prefix + EXHAUSTED_429 for prefix in (

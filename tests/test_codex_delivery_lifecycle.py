@@ -129,6 +129,14 @@ class CodexDeliveryLifecycleTests(unittest.TestCase):
         self.assertEqual(runtime.delivery_confirmed_at, 0)
 
     def test_failed_goal_persistence_without_native_identity_cannot_authorize_retry(self):
+        # Rate limits now follow the ordinary route even beside a Goal. Use
+        # the actual budgeted Goal-resume error for this persistence fixture.
+        message = 'unexpected status 502 Bad Gateway: Unknown error, url: http://127.0.0.1:18765/v1/responses'
+        self.frame = status_payload(message)
+        self.turn['error'] = {'message': message}
+        evidence = self.daemon._provider_retry.observe('original', 'synthetic-provider',
+            'failed-one', 'http_502', message, self.turn['at'])
+        self.now = self.daemon._provider_retry.evaluate(evidence).retry_at + .001
         row = self.frame['render_grid']['cursor']['row']
         self.frame['render_grid']['row_spans'].append(
             span(row + 2, 2, 'GPT-6-Astra · Goal stalled (/goal resume)', 1))
@@ -137,14 +145,18 @@ class CodexDeliveryLifecycleTests(unittest.TestCase):
         proof = {**self.turn, 'goal_id': 'original-goal'}
         with mock.patch.object(self.daemon, '_current_blocked_goal', return_value=proof):
             with mock.patch.object(self.daemon._delivery_store, 'persist',
-                                   side_effect=RuntimeError('transaction unavailable')):
+                                   side_effect=RuntimeError('transaction unavailable')) as persist:
                 self.daemon.process_once(self.client)
+                # This deliberately incomplete native identity is rejected
+                # before any transaction or input intent can be created.
+                persist.assert_not_called()
             runtime = self.daemon.runtime['surface-uuid']
             self.assertEqual(self.client.sent, [])
             self.client.payload = grid_payload([], working=True)
             self.client.text = visible_text(self.client.payload)
             self.daemon.process_once(self.client)
-            self.assertEqual(runtime.delivery_status, 'failed')
+            self.assertEqual(runtime.delivery_status, '')
+            self.assertFalse(runtime.send_attempt_id)
             self.client.payload, self.client.text = self.frame, visible_text(self.frame)
             self.daemon.process_once(self.client)
             self.daemon.process_once(self.client)

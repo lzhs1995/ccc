@@ -187,11 +187,12 @@ class ProviderGuardTests(unittest.TestCase):
             d2, r2 = self.restart(d, c)
             for runtime in (r2, w.TargetRuntime()):
                 for state in (w.ScreenState("claude_stopped"), w.ScreenState("working")):
-                    self.assertEqual(d2._claude_provider_guard_reason(t, runtime, state), "claude_provider_blocked")
+                    self.assertEqual(d2._claude_provider_guard_reason(t, runtime, state), "claude_provider_retry_wait")
                 d2._remember_claude_provider_failure(t, runtime, classify_stop_failure("", RPM))
-                self.assertEqual(runtime.claude_provider_guard["status"], "blocked")
+                self.assertEqual(runtime.claude_provider_guard["status"], "retry_wait")
             self.assertEqual(len(d2.claude_event_ledger.events), 2)
-            self.assertEqual(self._notify_async.call_count, 1)
+            # retry_wait 是有界续跑，不发人工通知；durable 持有才通知。
+            self.assertEqual(self._notify_async.call_count, 0)
             self.assert_no_input(c)
 
     def test_claim_crash_is_replayed_and_blocks_until_hold_is_durable(self):
@@ -205,7 +206,7 @@ class ProviderGuardTests(unittest.TestCase):
             self.assertEqual(d._claude_provider_guard_reason(t, r), "claude_provider_verifying")
             d2, r2 = self.restart(d, c)
             d2._handle_claude_event(failure, c)
-            self.assertEqual(r2.claude_provider_guard["status"], "blocked")
+            self.assertEqual(r2.claude_provider_guard["status"], "retry_wait")
             self.assertIn(failure["event_id"], d2.claude_event_ledger.known_ids())
             self.assert_no_input(c)
 
@@ -242,7 +243,10 @@ class ProviderGuardTests(unittest.TestCase):
                 with mock.patch.object(w.time, "time", return_value=stamp):
                     guard = d._remember_claude_provider_failure(t, r, hook, event=hook)
                     same = d._remember_claude_provider_failure(t, r, hook, event=hook)
-                self.assertEqual((guard["retry_count"], guard["retry_after"]), (count, stamp + delay))
+                # 同一 event_id 不重备：计数与期限保持首次落盘值，
+                # 第二次调用返回完全相同的 guard（见下一行的等值断言）。
+                self.assertEqual(guard["retry_count"], 1)
+                self.assertEqual(guard["retry_after"], now + 60)
                 self.assertEqual(same, guard)
             self.assertEqual(self._notify_async.call_count, 0)
 
@@ -306,7 +310,7 @@ class ProviderGuardTests(unittest.TestCase):
             self.assertFalse(d._recover_claude_dispatch_wait(t["surface_id"], r, state))
             self.assertTrue(d._maybe_send_claude_dispatch_gap(t, r, state, c))
             self.assertTrue(d._maybe_send_claude_hook_gap_fallback(t, r, state, None, c))
-            self.assertEqual(d._apply_claude_runtime_guards(t["surface_id"], r, state).kind, "claude_provider_blocked")
+            self.assertEqual(d._apply_claude_runtime_guards(t["surface_id"], r, state).kind, "claude_provider_retry_wait")
             self.assert_no_input(c)
 
     def test_text_guard_catches_fresh_replay_and_last_identity_or_migration_io(self):
@@ -421,7 +425,7 @@ class ProviderGuardTests(unittest.TestCase):
                 before = {k: v for k, v in r.to_dict().items() if k.startswith(("claude_submit_", "claude_orphan_"))}
                 with mock.patch.object(w.dispatch_recovery, "native_path", return_value=path):
                     d._handle_claude_event(prompt, c)
-                self.assertEqual(r.claude_provider_guard["status"], "released" if valid else "blocked")
+                self.assertEqual(r.claude_provider_guard["status"], "released" if valid else "retry_wait")
                 if valid:
                     archived = d.claude_event_ledger.events[e["event_id"]]["provider_superseded_submission"]
                     self.assertEqual({k: archived["pending_submit"][k] for k in before}, before)
@@ -561,8 +565,9 @@ class ProviderGuardTests(unittest.TestCase):
                     with mock.patch.object(w.time, "time", return_value=now + 4):
                         d._handle_claude_event(stop, c)
                         d._handle_claude_event(stop, c)
-                    self.assertEqual((len(c.sent_text), len(c.sent_keys)),
-                                     (1, 1) if mode in {"blocked", "active_retry_wait"} else (2, 2))
+                    # 每个 distinct 失败回合在自己的期限后各续一次：
+                    # 2 次发送来自 2 个事件，不是同一事件的重复输入。
+                    self.assertEqual((len(c.sent_text), len(c.sent_keys)), (2, 2))
 
     def test_provider_receipt_rejects_wrong_hash_identity_time_and_unrelated_anchor(self):
         changes = ({"message_hash": "f" * 64}, {"message_hash": "too-short"},
@@ -694,7 +699,7 @@ class ProviderGuardTests(unittest.TestCase):
                 prompt, path = self.native_prompt(root, e)
                 with mock.patch.object(w.dispatch_recovery, "native_path", return_value=path):
                     self.assertFalse(d._release_claude_provider_guard(t["surface_id"], r, {**prompt, **changes}, reason="native_human_prompt"))
-                self.assertEqual(r.claude_provider_guard["status"], "blocked")
+                self.assertEqual(r.claude_provider_guard["status"], "retry_wait")
         with tempfile.TemporaryDirectory() as root:
             d, t, r, e, c = self.case(root, pending=True)
             self.hold(d, t, r, e)
@@ -716,7 +721,7 @@ class ProviderGuardTests(unittest.TestCase):
             with mock.patch.object(w.dispatch_recovery, "native_path", return_value=path), \
                  mock.patch.object(d.claude_event_ledger, "put_provider_guard", side_effect=changing):
                 self.assertFalse(d._release_claude_provider_guard(t["surface_id"], r, prompt, reason="native_human_prompt"))
-            self.assertEqual(r.claude_provider_guard["status"], "blocked")
+            self.assertEqual(r.claude_provider_guard["status"], "retry_wait")
             self.assertIn("release_candidate", r.claude_provider_guard)
             self.assert_no_input(c)
 
@@ -729,7 +734,7 @@ class ProviderGuardTests(unittest.TestCase):
                          "agent_pid": 1234, "synthetic_fallback": False, "created_at": time.time() - 1,
                          "session_id": "new-session" if new else r.claude_session_id}
                 d._handle_claude_event(event, c)
-                self.assertEqual(r.claude_provider_guard["status"], "released" if new else "blocked")
+                self.assertEqual(r.claude_provider_guard["status"], "released" if new else "retry_wait")
         for observation, released in (({}, False),
                 ({"pid": 1234, "generation": "generation-a", "started_epoch": time.time() - 1}, False),
                 ({"pid": 2345, "generation": "generation-b", "started_epoch": time.time() - 1}, True)):
@@ -737,7 +742,7 @@ class ProviderGuardTests(unittest.TestCase):
                 d, t, r, e, c = self.case(root)
                 self.hold(d, t, r, e)
                 d._release_claude_provider_generation(r, observation)
-                self.assertEqual(r.claude_provider_guard["status"], "released" if released else "blocked")
+                self.assertEqual(r.claude_provider_guard["status"], "released" if released else "retry_wait")
 
     def test_release_watermark_blocks_old_deferred_pending_and_stale_snapshot(self):
         with tempfile.TemporaryDirectory() as root:
@@ -764,10 +769,142 @@ class ProviderGuardTests(unittest.TestCase):
             prompt, path = self.native_prompt(root, e)
             with mock.patch.object(w.dispatch_recovery, "native_path", return_value=path):
                 self.assertTrue(d._release_claude_provider_guard(t["surface_id"], r, prompt, reason="native_human_prompt"))
+            # The old repaint remains fenced until a new native lifecycle.
             self.assertEqual(d._claude_provider_guard_reason(t, r, state), "")
             self.assertEqual(r.claude_provider_guard["status"], "released")
             d._claude_provider_guard_reason(t, r, w.ScreenState("working", claude_native_activity="working"))
-            self.assertEqual(d._claude_provider_guard_reason(t, r, state), "claude_provider_blocked")
+            self.assertEqual(d._claude_provider_guard_reason(t, r, state), "claude_provider_retry_wait")
+            self.assertEqual((r.claude_provider_guard["status"], r.claude_provider_guard["retry_count"]), ("retry_wait", 1))
+            self.assertNotIn("invalid", r.claude_provider_guard)
+    def consume(self, d, r, attempt, stamp, *, surface="surface-uuid", generation="generation-a"):
+        """Credit one identity-bound durable submission to a recorded attempt."""
+        guard = dict(r.claude_provider_guard)
+        with d.claude_event_ledger._lock:
+            row = dict(d.claude_event_ledger.events.get(attempt["event_id"]) or {})
+            row.update({key: guard.get(key) for key in (
+                "surface_id", "workspace_id", "session_id", "agent_pid", "process_generation",
+                "error_kind", "error_reason", "stop_failure_error", "error_evidence_hash")})
+            row.update(event_name="StopFailure", created_at=attempt["created_at"])
+            row["watchdog_submission"] = {
+                "surface_id": surface, "session_id": r.claude_session_id,
+                "generation": generation, "agent_pid": r.claude_process_pid,
+                "message_hash": "a" * 64, "submitted_at": stamp}
+            d.claude_event_ledger.events[attempt["event_id"]] = row
+        return row
+
+    def test_consumed_retries_escalate_bounded_deadlines_but_wrong_identity_does_not(self):
+        with tempfile.TemporaryDirectory() as root:
+            d, t, r, e, c = self.case(root)
+            now = time.time()
+            first = self.failure(e, RPM, stamp=now, event_id="429-1")
+            with mock.patch.object(w.time, "time", return_value=now):
+                guard = d._remember_claude_provider_failure(t, r, first, event=first)
+            self.assertEqual((guard["retry_count"], guard["retry_after"]), (1, now + 60))
+            previous, seen = first, [(1, 60.0)]
+            for count, delay in enumerate((120, 240, 480, 900, 900), 2):
+                stamp = now + count * 1000
+                self.consume(d, r, previous, stamp - 1)
+                event = self.failure(e, RPM, stamp=stamp, event_id=f"429-{count}")
+                with mock.patch.object(w.time, "time", return_value=stamp):
+                    guard = d._remember_claude_provider_failure(t, r, event, event=event)
+                seen.append((guard["retry_count"], guard["retry_after"] - stamp))
+                previous = event
+            # The ladder itself, not whatever the code happened to produce.
+            self.assertEqual(seen, [(1, 60.0), (2, 120.0), (3, 240.0), (4, 480.0), (5, 900.0), (6, 900.0)])
+            # Each consumed attempt opens its own consumption window; the count
+            # carries the ladder, the episode stamp does not.
+            self.assertEqual(guard["retry_episode_started_at"], now + 6000)
+        for field, value in (("session_id", "other-session"), ("agent_pid", 4321),
+                             ("generation", "generation-z"), ("message_hash", ""),
+                             ("surface_id", "other-surface")):
+            with self.subTest(receipt=field), tempfile.TemporaryDirectory() as root:
+                d, t, r, e, c = self.case(root)
+                now = time.time()
+                first = self.failure(e, RPM, stamp=now, event_id="429-1")
+                with mock.patch.object(w.time, "time", return_value=now):
+                    d._remember_claude_provider_failure(t, r, first, event=first)
+                stamp = now + 1000
+                row = self.consume(d, r, first, stamp - 1)
+                row["watchdog_submission"][field] = value
+                event = self.failure(e, RPM, stamp=stamp, event_id="429-2")
+                with mock.patch.object(w.time, "time", return_value=stamp):
+                    guard = d._remember_claude_provider_failure(t, r, event, event=event)
+                # A receipt from another identity is not this episode's attempt:
+                # the count stays 1 and the original deadline does not move.
+                self.assertEqual((guard["retry_count"], guard["retry_after"]), (1, now + 60))
+
+    def screen(self, text=AUTH):
+        return w.classify_claude_grid(w.Grid.from_rpc(claude_grid_payload(lines=[text]), "surface-uuid"))
+
+    def released(self, root, d, t, r, e, state):
+        self.hold(d, t, r, e)
+        d._claude_provider_guard_reason(t, r, state)
+        prompt, path = self.native_prompt(root, e)
+        with mock.patch.object(w.dispatch_recovery, "native_path", return_value=path):
+            self.assertTrue(d._release_claude_provider_guard(
+                t["surface_id"], r, prompt, reason="native_human_prompt"))
+
+    def test_hook_born_hold_records_its_screen_so_release_can_fence_that_repaint(self):
+        with tempfile.TemporaryDirectory() as root:
+            d, t, r, e, c = self.case(root)
+            state = self.screen()
+            fingerprint = str(state.claude_provider_failure["screen_fingerprint"])
+            self.assertTrue(fingerprint)
+            self.hold(d, t, r, e)
+            # A Hook-born hold has no viewport of its own.
+            self.assertEqual(r.claude_provider_guard["screen_fingerprint"], "")
+            d._claude_provider_guard_reason(t, r, state)
+            self.assertEqual(r.claude_provider_guard["screen_fingerprint"], fingerprint)
+            prompt, path = self.native_prompt(root, e)
+            with mock.patch.object(w.dispatch_recovery, "native_path", return_value=path):
+                self.assertTrue(d._release_claude_provider_guard(
+                    t["surface_id"], r, prompt, reason="native_human_prompt"))
+            self.assertEqual(r.claude_provider_guard["released_screen_fingerprint"], fingerprint)
+            self.assertEqual(d._claude_provider_guard_reason(t, r, state), "")
+            self.assertEqual(r.claude_provider_guard["status"], "released")
+            d._claude_provider_guard_reason(t, r, w.ScreenState("working", claude_native_activity="working"))
+            self.assertEqual(r.claude_provider_guard["released_screen_fingerprint"], "")
+            # The same screen after native work is a new rejection: one bounded
+            # episode, never the invalid fail-closed hold.
+            self.assertEqual(d._claude_provider_guard_reason(t, r, state), "claude_provider_retry_wait")
+            guard = r.claude_provider_guard
+            self.assertEqual((guard["status"], guard["retry_count"], guard.get("invalid")),
+                             ("retry_wait", 1, None))
+
+    def test_release_fence_ignores_unknown_other_and_foreign_screens(self):
+        for case, text in (("unknown", ""), ("other_error", RPM)):
+            with self.subTest(screen=case), tempfile.TemporaryDirectory() as root:
+                d, t, r, e, c = self.case(root)
+                state = self.screen()
+                self.released(root, d, t, r, e, state)
+                failure = dict(state.claude_provider_failure)
+                if text:
+                    failure = dict(self.screen(text).claude_provider_failure)
+                else:
+                    failure["screen_fingerprint"] = ""
+                d._remember_claude_provider_failure(t, r, failure)
+                self.assertEqual(r.claude_provider_guard["status"], "retry_wait")
+        with tempfile.TemporaryDirectory() as root:
+            d, t, r, e, c = self.case(root)
+            state = self.screen()
+            self.released(root, d, t, r, e, state)
+            r.claude_process_pid = 4321
+            d._claude_send_process_identity = mock.Mock(return_value={
+                "pid": 4321, "generation": "generation-a", "started_epoch": 1.0})
+            d._remember_claude_provider_failure(t, r, state.claude_provider_failure)
+            guard = r.claude_provider_guard
+            self.assertEqual((guard["status"], guard["agent_pid"]), ("retry_wait", 4321))
+            self.assertEqual(float(guard["release_created_at"]), 0.0)
+        with tempfile.TemporaryDirectory() as root:
+            d, t, r, e, c = self.case(root)
+            state = self.screen()
+            self.released(root, d, t, r, e, state)
+            self.assertEqual(d._claude_provider_guard_reason(t, r, state), "")
+            # A verified new StopFailure stays eligible behind the screen fence.
+            event = self.failure(e, event_id="provider-error-2", stamp=time.time())
+            d._remember_claude_provider_failure(t, r, event, event=event)
+            self.assertEqual(r.claude_provider_guard["status"], "retry_wait")
+            self.assertEqual(r.claude_provider_guard["source_event_id"], "provider-error-2")
 
 
 if __name__ == "__main__":

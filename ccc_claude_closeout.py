@@ -5,6 +5,7 @@ import builtins
 import copy
 from datetime import datetime
 import fcntl
+import functools
 import hashlib
 import json
 import math
@@ -130,17 +131,26 @@ def native_tail(path):
                   "bytes_read": len(data), "sha256": hashlib.sha256(data).hexdigest()}
 
 
+@functools.lru_cache(maxsize=1)
+def _native_journal_rows(data):
+    """Reuse decoding only for identical freshly authenticated tail bytes.
+
+    Never cache source proof, wait decisions or task identity. The caller still
+    performs native_tail on every observation, including lock/stat validation.
+    """
+    return tuple(json.loads(line) for line in data.splitlines())
+
+
 def native_event_from_journal(path, accepted):
     """Recover only the exact already-accepted Hook, never synthesize/replay it."""
     data, proof = native_tail(path)
     matches = []
-    for line in data.splitlines():
-        row = json.loads(line)
+    for row in _native_journal_rows(data):
         if isinstance(row, dict) and row.get("event_id") == accepted.get("event_id"):
             matches.append(row)
     if len(matches) != 1:
         raise ValueError("original accepted Hook is outside the bounded journal tail")
-    event = matches[0]
+    event = copy.deepcopy(matches[0])
     for key in ("event_name", "session_id", "agent_pid", "surface_id", "workspace_id", "created_at"):
         if not accepted.get(key) or event.get(key) != accepted[key]:
             raise ValueError("original Hook does not match its accepted identity")

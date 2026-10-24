@@ -277,7 +277,7 @@ class ContinuationHealthTests(unittest.TestCase):
     def test_supervisor_keeps_monitoring_label_and_shows_unconfirmed_delivery(self):
         import cmux_supervisor_tui as tui
         target = {"surface_id": "s", "workspace_id": "w"}
-        for runtime, expected in (({"viewport_checked_at": 100}, "监控中"),
+        for runtime, expected in (({"viewport_checked_at": 100}, "检测延迟"),
                                   ({"viewport_checked_at": 110, "delivery_status": "unknown"}, "投递待验")):
             with mock.patch.object(tui.time, "time", return_value=110):
                 fields = tui.continuation_fields(target, runtime)

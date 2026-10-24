@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import select
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 STALL_SECONDS = 90.0
@@ -48,18 +50,52 @@ def retry_timeout(journal, *, now=None):
         return STALL_SECONDS
 
 
-def observations_current(targets, state, *, now, cadence=1):
-    """A fresh health file alone cannot prove that observation work completed."""
-    for target in targets:
-        if not target.get('enabled', True) or target.get('paused', False):
-            continue
-        row = state.get(str(target['surface_id']), {})
-        timing = row.get('observation_timings') or {}
-        stamp = timing.get('completed_at', 0)
-        if (type(stamp) not in (int, float) or not 0 < stamp <= now
-                or now - stamp > max(30, 3 * cadence)):
-            return False
-    return True
+class ObservationProgress:
+    """Consume new completion records, independently of per-target health.
+
+    The parent and native workers already publish completion timestamps only
+    after an observation returns. A health heartbeat may read those records
+    repeatedly, but each timestamp can advance liveness at most once. Retain
+    watermarks across removal, pause and re-enrollment of the same surface.
+    """
+
+    def __init__(self):
+        self._completed = {}
+        self._seen = {}
+        self._now = None
+        self._lock = threading.Lock()
+
+    def advanced(self, targets, state, *, now, cadence=1, paused=False):
+        with self._lock:
+            # A wall-clock rollback needs a new baseline, not an indefinitely
+            # unreachable old watermark or a synthetic progress heartbeat.
+            rebasing = self._now is not None and now < self._now
+            self._now = now
+            if rebasing:
+                self._completed.clear()
+            active, progressed = False, False
+            for target in targets:
+                sid = str(target['surface_id'])
+                enabled = (not paused and target.get('enabled', True)
+                           and not target.get('paused', False))
+                active |= enabled
+                timing = state.get(sid, {}).get('observation_timings') or {}
+                stamp = timing.get('completed_at', 0)
+                if type(stamp) not in (int, float) or not math.isfinite(stamp):
+                    continue
+                changed = stamp != self._seen.get(sid)
+                self._seen[sid] = stamp
+                if not 0 < stamp <= now:
+                    continue
+                previous = self._completed.get(sid, 0)
+                self._completed[sid] = max(previous, stamp)
+                if (enabled and not rebasing and changed and stamp > previous
+                        and now - stamp <= max(30, 3 * cadence)):
+                    progressed = True
+            # No observation is due while every target is paused/disabled or
+            # absent. Otherwise one progressing worker keeps the daemon alive;
+            # stale peers remain degraded in the unchanged health report.
+            return not active or progressed
 
 
 def process_birth(pid):

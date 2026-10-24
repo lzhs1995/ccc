@@ -5,6 +5,7 @@ No test sends terminal input or reads an operator's real session/ledger.
 """
 import json
 from pathlib import Path
+import sqlite3
 import tempfile
 import time
 from types import SimpleNamespace
@@ -58,8 +59,8 @@ class StructuredProviderEnvelopeTests(unittest.TestCase):
     def test_resource_without_http_status_overrides_generic_retry_wrappers(self):
         for prefix in ("", STREAM, HIGH_DEMAND):
             with self.subTest(prefix=prefix):
-                self.assert_envelope(prefix + RESOURCE, "resource_mismatch", "provider_blocked")
-                self.assertFalse(_retryable_completed_message(prefix + RESOURCE))
+                self.assert_envelope(prefix + RESOURCE, "resource_mismatch", "recoverable_error")
+                self.assertTrue(_retryable_completed_message(prefix + RESOURCE))
 
     def test_plaintext_deployment_and_balance_block_every_recovery_layer(self):
         for body, expected in ((DEPLOYMENT, 'deployment_not_found'), (BALANCE, 'billing_exhausted')):
@@ -129,13 +130,15 @@ class StructuredProviderEnvelopeTests(unittest.TestCase):
                 self.assert_envelope(body, expected, kind)
                 self.assertFalse(_retryable_completed_message(STREAM + body))
 
-    def test_resource_prevents_native_goal_resume(self):
+    def test_resource_keeps_the_stalled_goal_visible_for_ordinary_retry(self):
         payload = grid_payload([], error=STREAM + RESOURCE, columns=600)
         payload["render_grid"]["row_spans"].append(
             span(payload["render_grid"]["cursor"]["row"] + 1, 0, "Goal stalled (/goal resume)", 0))
         state = core.classify_grid(core.Grid.from_rpc(payload, "surface-uuid"))
-        self.assertEqual((state.kind, state.error_type), ("provider_blocked", "resource_mismatch"))
-        self.assertFalse(state.native_goal_stalled)
+        self.assertEqual((state.kind, state.error_type), ("recoverable_error", "resource_mismatch"))
+        # resource 不再是阻塞卡，stalled goal 因此不被掩盖；
+        # 负对照见 test_plaintext_deployment_and_balance_block_every_recovery_layer。
+        self.assertTrue(state.native_goal_stalled)
 
     def test_documentation_scrollback_and_superseded_errors_are_not_current_failures(self):
         documentation = grid_payload(["Documentation: " + RESOURCE], columns=600)
@@ -172,7 +175,9 @@ class NativeQueueEnvelopeTests(unittest.TestCase):
                 "at": 1250, "error": {"message": high_demand}}
         evidence = {"session_id": "s", "pid": 123, "process_start": 1,
                     "turn_id": "latest", "completed_at": 1250}
-        for message in (RESOURCE, invalid_request, STREAM + DEPLOYMENT, BALANCE):
+        # resource_mismatch 现按授权可续跑，不再是阻塞卡；其余三种仍阻塞。
+        for message, blocks in ((RESOURCE, False), (invalid_request, True),
+                                (STREAM + DEPLOYMENT, True), (BALANCE, True)):
             for columns in (600, 74):
                 for replacement in ("none", "user", "high_demand", "continue_echo"):
                     with self.subTest(message=message, columns=columns, replacement=replacement):
@@ -190,7 +195,7 @@ class NativeQueueEnvelopeTests(unittest.TestCase):
                         rows = payload["render_grid"]["row_spans"]
                         rows.extend(span(i, 0, text, style) for i, (text, style) in enumerate(content))
                         row = payload["render_grid"]["cursor"]["row"]
-                        rows.extend([span(row - 3, 0, "Queued follow-up input", 0),
+                        rows.extend([span(row - 3, 0, "• Queued follow-up inputs", 0),
                                      span(row - 2, 0, "↳ 任务请继续", 0),
                                      span(row - 1, 0, "alt+up to edit last queued message", 0)])
                         views = []
@@ -219,8 +224,10 @@ class NativeQueueEnvelopeTests(unittest.TestCase):
                         self.assertEqual(views[0]["queued"], ["任务请继续"])
                         self.assertEqual([str(item) for item in client.mock_calls],
                                          ["call.replay('workspace', 'surface-uuid')"])
-                        self.assertEqual(views[0]["busy"], replacement in {"none", "continue_echo"},
-                                         "current provider errors block; CCC echoes are not newer work")
+                        self.assertEqual(
+                            views[0]["busy"],
+                            blocks and replacement in {"none", "continue_echo"},
+                            "current provider errors block; CCC echoes are not newer work")
 
     def test_queue_view_ignores_documented_or_superseded_resource_errors(self):
         high_demand = "We're currently experiencing high demand, which may cause temporary errors."
@@ -240,7 +247,7 @@ class NativeQueueEnvelopeTests(unittest.TestCase):
                     rows.extend([span(1, 0, "■ " + RESOURCE, 3), span(2, 0, "› 任务请继续", 0)])
                 else:
                     rows.append(span(1, 0, "Documentation: ordinary API example", 0))
-                rows.extend([span(row - 3, 0, "Queued follow-up input", 0),
+                rows.extend([span(row - 3, 0, "• Queued follow-up inputs", 0),
                              span(row - 2, 0, "↳ 任务请继续", 0),
                              span(row - 1, 0, "alt+up to edit last queued message", 0)])
                 views = []
@@ -276,7 +283,7 @@ class NativeQueueEnvelopeTests(unittest.TestCase):
             root = Path(directory)
             path = root / "session.jsonl"
             recovery = QueueRecovery(root / "queue.json", root / "bindings", root, "任务请继续")
-            cases = ((STREAM + RESOURCE, False), (HIGH_DEMAND + RESOURCE, False),
+            cases = ((STREAM + RESOURCE, True), (HIGH_DEMAND + RESOURCE, True),
                      (STREAM + DEPLOYMENT, False), (STREAM + BALANCE, False),
                      (STREAM + "unexpected status 429 Too Many Requests: " + RATE, True),
                      (STREAM + "unexpected status 500 Internal Server Error: " + SERVER, True),
@@ -310,7 +317,7 @@ class NativeProviderBlockGateTests(unittest.TestCase):
         evidence = self.store.observe("s", "p", "t", "http_500", "HTTP 500", 1000)
         self.store.clock = lambda: 1200
         self.assertTrue(self.store.reserve(evidence, "original-unknown-attempt"))
-        self.ledger_before = self.store.path.read_bytes()
+        self.reservation_before = self.reservation()
         self.daemon = core.WatchDaemon.__new__(core.WatchDaemon)
         self.daemon.logger = Mock()
         self.daemon._provider_retry = self.store
@@ -337,9 +344,38 @@ class NativeProviderBlockGateTests(unittest.TestCase):
         self.assertEqual(self.runtime.delivery_status, "unknown")
         self.assertEqual(self.runtime.send_count, 4)
         self.assertEqual(self.runtime.send_attempt_id, "original-unknown-attempt")
-        self.assertEqual(self.store.path.read_bytes(), self.ledger_before)
+        self.assertEqual(self.reservation(), self.reservation_before)
         self.daemon.codex_queue_recovery.recover.assert_not_called()
         self.assertEqual(self.client.mock_calls, [])
+
+    def reservation(self):
+        """只取预留身份字段。retryable 原因会合法新增观测与 waiter 行，
+        整文件字节相等因此不再是「未消费原 attempt」的判据。"""
+        with sqlite3.connect(self.store.path) as connection:
+            rows = list(connection.execute("select identity, record from episodes"))
+        keys = ("attempt", "reserved_stamp", "last_reserved_at")
+        return sorted((identity, tuple(json.loads(record).get(k) for k in keys))
+                      for identity, record in rows)
+
+    def assert_retryable_health(self):
+        snapshot = self.runtime.to_dict()
+        unknown = health.continuation_row(self.target, snapshot, now=1301)
+        self.assertEqual(unknown["status"], "delivery_unknown")
+        # 原因可续跑时健康面不得报 blocked，也不得报 ok。
+        snapshot["delivery_status"] = "confirmed"
+        row = health.continuation_row(self.target, snapshot, now=1301)
+        self.assertEqual((row["status"], row["reason_code"]),
+                         ("unknown", "task_progress_unconfirmed"))
+        report = health.continuation_report([self.target], {"surface": snapshot}, now=1301)
+        self.assertEqual(report["counts"]["blocked"], 0)
+
+    def assert_waiting_health(self):
+        snapshot = self.runtime.to_dict()
+        snapshot["delivery_status"] = "confirmed"
+        row = health.continuation_row(self.target, snapshot, now=1301)
+        self.assertEqual((row["status"], row["reason_code"]), ("waiting", "followup_queued"))
+        report = health.continuation_report([self.target], {"surface": snapshot}, now=1301)
+        self.assertEqual(report["counts"]["blocked"], 0)
 
     def assert_blocked_health(self, expected='resource_mismatch'):
         snapshot = self.runtime.to_dict()
@@ -358,9 +394,9 @@ class NativeProviderBlockGateTests(unittest.TestCase):
         self.assertFalse(self.daemon._provider_retry_gate(
             self.target, self.runtime, self.queued, attempt="must-not-consume"))
         self.assertEqual((self.runtime.observed_state, self.runtime.observed_error_type),
-                         ("provider_blocked", "resource_mismatch"))
+                         ("", None))
         self.assert_preserved()
-        self.assert_blocked_health()
+        self.assert_retryable_health()
 
     def test_plaintext_native_blockers_survive_queued_state_and_keep_unknown_delivery(self):
         for message, expected in ((STREAM + DEPLOYMENT, 'deployment_not_found'),
@@ -381,19 +417,19 @@ class NativeProviderBlockGateTests(unittest.TestCase):
         self.assertFalse(self.daemon._provider_retry_gate(
             self.target, self.runtime, self.queued, attempt="must-not-consume"))
         self.assertEqual((self.runtime.observed_state, self.runtime.observed_error_type),
-                         ("provider_blocked", "resource_mismatch"))
+                         ("", None))
         self.assert_preserved()
-        self.assert_blocked_health()
+        self.assert_retryable_health()
 
     def test_queued_native_blocker_survives_callers_state_recording(self):
         result = self.daemon._recover_stranded_codex_queue(
             self.target, self.runtime, self.queued, self.client, lambda **kwargs: True)
         self.assert_preserved()
-        self.assertEqual((result.kind, result.error_type), ("provider_blocked", "resource_mismatch"))
+        self.assertEqual((result.kind, result.error_type), ("queued_followup", None))
         self.daemon._record_state("surface", self.runtime, result)
         self.assertEqual((self.runtime.observed_state, self.runtime.observed_error_type),
-                         ("provider_blocked", "resource_mismatch"))
-        self.assert_blocked_health()
+                         ("queued_followup", None))
+        self.assert_waiting_health()
 
     def test_queued_goal_blocker_survives_callers_state_recording(self):
         self.daemon.codex_queue_recovery.current_turn.return_value = {"kind": "unknown"}
@@ -402,9 +438,9 @@ class NativeProviderBlockGateTests(unittest.TestCase):
         result = self.daemon._recover_stranded_codex_queue(
             self.target, self.runtime, self.queued, self.client, lambda **kwargs: True)
         self.assert_preserved()
-        self.assertEqual((result.kind, result.error_type), ("provider_blocked", "resource_mismatch"))
+        self.assertEqual((result.kind, result.error_type), ("queued_followup", None))
         self.daemon._record_state("surface", self.runtime, result)
-        self.assert_blocked_health()
+        self.assert_waiting_health()
 
 
 if __name__ == "__main__":

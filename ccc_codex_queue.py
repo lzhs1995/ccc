@@ -13,6 +13,7 @@ import ctypes
 import fcntl
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -58,8 +59,9 @@ def task_snapshot(path, session_id):
 
     Some Codex versions persist accepted user input only as response_item, not
     event_msg/user_message. Ignoring it could reuse a failure from before that
-    input. A complete terminal record at EOF also proves that all earlier
-    transcript messages preceded completion, independently of an older Goal DB.
+    input. A complete terminal record followed only by authenticated passive
+    child-completion events proves the same terminal boundary. The proof hashes
+    the entire span through the stable EOF, independently of an older Goal DB.
     """
     path = Path(path)
     before = path.stat()
@@ -84,6 +86,8 @@ def task_snapshot(path, session_id):
             if offset:
                 lines = lines[1:]
             end = before.st_size
+            passive_tail = []
+            passive_only = True
             for line in reversed(lines):
                 start, record_end = end - len(line), end
                 end = start
@@ -106,15 +110,35 @@ def task_snapshot(path, session_id):
                 }:
                     latest = event
                     latest_kind = payload['type']
-                    if latest_kind == 'task_complete' and record_end == before.st_size:
-                        terminal_tail = {'offset': start, 'end': record_end,
-                                         'sha256': hashlib.sha256(line).hexdigest()}
+                    turn_id = payload.get('turn_id')
+                    if latest_kind == 'task_complete' and (
+                            record_end == before.st_size or (
+                                passive_only and passive_tail
+                                and isinstance(turn_id, str) and turn_id
+                                and isinstance(payload.get('error'), dict)
+                                and isinstance(payload['error'].get('message'), str)
+                                and _retryable_completed_message(payload['error']['message'])
+                                and all(item[0] == turn_id for item in passive_tail))):
+                        span = line + b''.join(item[1] for item in reversed(passive_tail))
+                        terminal_tail = {'offset': start, 'end': before.st_size,
+                                         'sha256': hashlib.sha256(span).hexdigest()}
                     break
                 if event.get('type') == 'response_item':
                     latest = event
                     latest_kind = ('user_message' if payload.get('type') == 'message'
                                    and payload.get('role') == 'user' else 'native_activity')
                     break
+                item = payload.get('item')
+                if (event.get('type') == 'event_msg'
+                        and payload.get('type') == 'item_completed'
+                        and payload.get('thread_id') == session_id
+                        and isinstance(payload.get('turn_id'), str) and payload['turn_id']
+                        and isinstance(item, dict)
+                        and item.get('type') == 'SubAgentActivity'
+                        and item.get('kind') == 'completed'):
+                    passive_tail.append((payload['turn_id'], line))
+                else:
+                    passive_only = False
             if limit >= min(before.st_size, 1024 * 1024):
                 break
             limit = min(before.st_size, 1024 * 1024, max(1, limit * 4))
@@ -145,13 +169,14 @@ def task_snapshot(path, session_id):
 def _retryable_completed_message(message):
     normalized = " ".join(message.lower().split())
     compact = re.sub(r'\s+', '', normalized)
+    structured = structured_error_type(message)
     prefix = compact.lstrip('■⚠└')
     if prefix.startswith(('documentation:', 'example:', 'quoted:', 'sample:')):
         return False
-    if (structured_error_type(message) in PROVIDER_BLOCKED
+    if (structured in PROVIDER_BLOCKED
             or ('"error":{' in compact and '"insufficient_quota"' in compact)
             or 'invalid_encrypted_content' in normalized
-            or re.search(r'(?:unexpected\s+status(?:\s+code)?|unknown\s+status\s+code|http(?:/\d(?:\.\d)?)?|last\s+status)\s*[:=]?\s*(?:400|401|403)\b', normalized)
+            or (structured != 'upstream_invalid' and re.search(r'(?:unexpected\s+status(?:\s+code)?|unknown\s+status\s+code|http(?:/\d(?:\.\d)?)?|last\s+status)\s*[:=]?\s*(?:400|401|403)\b', normalized))
             or '401' in normalized and any(x in normalized for x in (
                 '额度已用尽', 'remainquota', 'insufficient_quota', 'quota exceeded'))):
         return False
@@ -162,10 +187,17 @@ def _retryable_completed_message(message):
     exhausted_429 = bool(re.fullmatch(
         r'exceededretrylimit,laststatus:429toomanyrequests(?:,requestid:[a-z0-9._:-]+)?',
         prefix))
-    terminal_502 = bool(re.fullmatch(
-        r'unexpectedstatus502badgateway:unknownerror,url:https?://[^\s,<>"\x27`]+/v1/responses',
-        prefix))
-    return (exhausted_429 or terminal_502
+    # 2026-10-20 user rule: an exact Azure "different resource" failure is
+    # retryable like rate limits (ccc_provider_retry.RETRYABLE). Reuse the
+    # shared structured classifier, not a free-text substring.
+    # Native completed provider 5xx banners already RETRYABLE on screen
+    # (http_500/502/503/504/524). Only the complete leading status banner;
+    # every block/quota/4xx veto above has already run. 405/408 excluded.
+    native_5xx = re.match(r'unexpected\s+status(?:\s+code)?\s*[:=]?\s*(?:500|502|503|504|524)\b',
+                          normalized.lstrip('■⚠└ '))
+    return (exhausted_429
+            or bool(native_5xx)
+            or structured in ('resource_mismatch', 'upstream_invalid', 'budget_pool_exhausted')
             or any(x in normalized for x in ("currently experiencing high demand", "rate limit exceeded",
                                               "temporarily unavailable", "stream disconnected before completion"))
             or normalized == "connection failed: error sending request")
@@ -586,6 +618,11 @@ class NativeCompletionWatcher:
         self.daemon_threads = daemon_threads
         self.lifecycle, self.coverage = {}, {}
         self.scan_seconds = 0.0
+        self.scans_completed = 0
+        self.scan_failures = 0
+        self.last_scan_at = None
+        self.last_scan_error = None
+        self._last_error_log_at = float('-inf')
         self.coverage_seconds = max(1, 3 * interval)
         self.stop = threading.Event()
         self.thread = None
@@ -683,6 +720,21 @@ class NativeCompletionWatcher:
         # immediately, and bound the measured scan allowance to five seconds.
         # Missing/unreadable/mismatched sources are removed on that same pass.
         self.coverage_seconds = max(1, min(5, 2 * self.scan_seconds + 3 * self.interval))
+        self.scans_completed += 1
+        self.last_scan_at = self.clock()
+        self.last_scan_error = None
+
+    def status(self):
+        """Report real scanner progress, separately from daemon liveness."""
+        checked = self.last_scan_at
+        return {
+            "alive": self.thread is not None and self.thread.is_alive(),
+            "scans_completed": self.scans_completed,
+            "scan_failures": self.scan_failures,
+            "last_scan_age_sec": None if checked is None else max(0, self.clock() - checked),
+            "scan_seconds": self.scan_seconds,
+            "last_error": self.last_scan_error,
+        }
 
     def observation_interval(self, target, fallback):
         """Healthy native monitoring replaces redundant reads, never send guards.
@@ -691,6 +743,8 @@ class NativeCompletionWatcher:
         bounded lease. Native failures still request an immediate priority read.
         """
         identity = (str(target["surface_id"]), str(target["workspace_id"]))
+        if self.thread is not None and not self.thread.is_alive():
+            return fallback
         # Live retries are painted before task_complete. A covered transcript
         # cannot replace fast viewport reads while a turn is active or aborted.
         # The native scanner publishes on another thread. Iterate an owned
@@ -711,8 +765,18 @@ class NativeCompletionWatcher:
                 started = self.clock()
                 try:
                     self.scan()
-                except (OSError, ValueError, TypeError, AttributeError, KeyError):
-                    pass  # A hint failure cannot disable regular viewport scans.
+                except Exception as exc:
+                    # This is a read-only scheduling hint. A failed pass must
+                    # neither kill its thread nor retain a healthy coverage
+                    # lease. Regular guarded viewport checks remain available.
+                    self.coverage = {}
+                    self.scan_failures += 1
+                    self.last_scan_error = f"{type(exc).__name__}: {exc}"[:300]
+                    now = self.clock()
+                    if now - self._last_error_log_at >= 30:
+                        logging.getLogger(__name__).exception(
+                            "native completion scan failed; retaining viewport fallback")
+                        self._last_error_log_at = now
                 self.stop.wait(max(0, self.interval - (self.clock() - started)))
         self.thread = threading.Thread(target=run, name="ccc-native-wakeup", daemon=self.daemon_threads)
         self.thread.start()
@@ -858,10 +922,16 @@ class QueueRecovery:
                           for sid, r in _selected_bindings(records, set(active.items())))
         chosen = {}
         root_key = str(self.sessions_root)
-        if self.wakeup_root_cache[0] != root_key:
-            self.wakeup_root_cache = (root_key, self.sessions_root.resolve())
-            self.wakeup_path_cache = {}
-        root = self.wakeup_root_cache[1]
+        with self.lock:
+            if self.wakeup_root_cache[0] != root_key:
+                self.wakeup_root_cache = (root_key, self.sessions_root.resolve())
+                self.wakeup_path_cache = {}
+            root = self.wakeup_root_cache[1]
+            # The main dispatcher and native watcher scan different target
+            # sets concurrently. Each pass owns its cache snapshot; never
+            # iterate or update the other pass's in-progress dictionary.
+            path_cache = self.wakeup_path_cache.copy()
+            process_cache = self.wakeup_process_cache
         from ccc_guard_scope import birth
         from ccc_shared_codex_turn import _protected_root
         protected = _protected_root()
@@ -874,10 +944,10 @@ class QueueRecovery:
             try:
                 path_key = str(source["path"])
                 paths.add(path_key)
-                path = self.wakeup_path_cache.get(path_key)
+                path = path_cache.get(path_key)
                 if path is None:
                     path = Path(path_key).resolve()
-                    self.wakeup_path_cache[path_key] = path
+                    path_cache[path_key] = path
                 # Check provenance on EVERY candidate, including cache hits.
                 # A Hook naming the same protected path must not inherit a
                 # native source's cached placement or original process proof.
@@ -906,7 +976,6 @@ class QueueRecovery:
                     chosen[sid] = {**source, "path": path}
             except (OSError, ValueError, TypeError):
                 continue
-        self.wakeup_path_cache = {key: value for key, value in self.wakeup_path_cache.items() if key in paths}
         # Scheduling must not depend on cmux's expensive GUI process snapshot:
         # its normal refresh gap used to discard every healthy native monitor
         # at once, producing another full-fleet burst of viewport requests.
@@ -914,11 +983,15 @@ class QueueRecovery:
         # This is advisory coverage only; send still performs its full guards.
         pids = frozenset(s["pid"] for s in chosen.values()
                          if not s.get('native_foreground') and type(s.get("pid")) is int and s["pid"] > 0)
-        cached_at, cached_pids, starts = self.wakeup_process_cache
+        cached_at, cached_pids, starts = process_cache
         now = time.monotonic()
         if pids != cached_pids or now - cached_at >= 1:
             starts = codex_process_starts(pids) if pids else {}
-            self.wakeup_process_cache = (now, pids, starts)
+            process_cache = (now, pids, starts)
+        with self.lock:
+            if self.wakeup_root_cache[0] == root_key:
+                self.wakeup_path_cache = {key: value for key, value in path_cache.items() if key in paths}
+                self.wakeup_process_cache = process_cache
         return [{**source, "identity_current": (True if source.get('native_foreground') else
                   bool(source.get("pid") in starts
                        and abs(starts[source["pid"]] - source["process_start"]) < 1))}

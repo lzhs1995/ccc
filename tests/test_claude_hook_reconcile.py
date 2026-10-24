@@ -345,14 +345,16 @@ class ClaudeModelBlockTests(unittest.TestCase):
             claude_grid_payload(error='API Error: 524 request failed'), 'surface-uuid'))
         self.assertEqual(verdict.kind, 'recoverable_error')
 
-    def test_current_invalid_model_blocks_without_hiding_hook_health(self):
+    def test_current_invalid_model_keeps_diagnosis_without_a_permanent_hold(self):
         lines = ["There's an issue with the selected model (claude-opus-4-8[1m]). It may not",
                  "exist or you may not have access to it. Run /model to pick a different",
                  "model."]
         grid = core.Grid.from_rpc(claude_grid_payload(lines=lines, completed=True), 'surface-uuid')
         state = core.classify_claude_grid(grid)
-        self.assertEqual(state.kind, 'claude_model_unavailable')
-        self.assertNotIn(state.kind, core.SEND_ELIGIBLE_STATES)
+        self.assertEqual(state.kind, 'recoverable_error')
+        self.assertEqual(state.error_type, 'claude_model_unavailable')
+        self.assertEqual(state.claude_provider_failure['error_kind'], 'claude_model_unavailable')
+        self.assertFalse(state.claude_provider_failure['provider_blocked'])
 
     def test_old_invalid_model_does_not_block_newer_output(self):
         lines = ["There's an issue with the selected model (old). It may not exist or you may not have access to it. Run /model to pick a different model.",

@@ -654,7 +654,7 @@ def run_native_lane(initial, flags, lane_cell, commands, results):
     daemon._delivery_store.start()
     scheduler = SurfaceScheduler(daemon._scheduled_native, lambda *_:None,
         interval=.1, observe_workers=4, send_workers=1, event_workers=50,
-        event_handler=daemon._scheduled_native, supersede_reads=False,
+        event_handler=daemon._scheduled_native_event, supersede_reads=False,
         on_dispatch=daemon._record_dispatch, on_error=daemon._scheduled_error)
     daemon._scheduler = scheduler
     native = NativeCompletionWatcher(

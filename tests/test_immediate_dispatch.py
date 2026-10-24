@@ -24,7 +24,7 @@ class ImmediateSchedulerTests(unittest.TestCase):
             held, release = threading.Event(), threading.Event()
             client = FakeClient(grid_payload([], error=HIGH_DEMAND_TEXT), '■ ' + HIGH_DEMAND_TEXT)
             daemon = armed_daemon(directory, client)
-            bind_native_failure(daemon, HIGH_DEMAND_TEXT)
+            failure_reader = bind_native_failure(daemon, HIGH_DEMAND_TEXT)
             read = client.read_screen
             first = [True]
             def delayed(*args):
@@ -40,6 +40,9 @@ class ImmediateSchedulerTests(unittest.TestCase):
                 scheduler.tick(targets)
                 self.assertTrue(held.wait(1))
                 began = time.monotonic()
+                failure = failure_reader(targets[0])
+                daemon._native_failed('surface-uuid', 'workspace-uuid',
+                                      failure['session_id'], failure['turn_id'], failure['at'])
                 scheduler.request_observation('surface-uuid', 'workspace-uuid')
                 while not client.sent and time.monotonic() - began < .8:
                     scheduler.tick(targets)

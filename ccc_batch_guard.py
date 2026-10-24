@@ -1554,6 +1554,32 @@ class GuardService:
             address.unlink(missing_ok=True)
 
 
+def _managed_proxy_args(args, environment):
+    """返回 (args, env 增量)。选中 provider 已指向托管 loopback 时，只有本服务记录核验为 live 才放行
+    （不凭环境标记或 argv 形状信任外来 argv）；否则交 prepare() 改写。工厂惰性解析，只读命令不需 pin。"""
+    import ccc_codex_proxy_launch as pl
+    if pl.is_read_only(args):
+        return list(args), {}
+    provider, base_url = pl.resolve_provider(args, environment)
+    host_port = base_url.split("://", 1)[-1].split("/", 1)[0]
+    if host_port in ("127.0.0.1:%d" % pl.PORT, "localhost:%d" % pl.PORT):
+        state = environment.get("CCC_CODEX_PROXY_STATE_DIR")
+        script, sha = environment.get("CCC_CODEX_PROXY_SCRIPT"), environment.get("CCC_CODEX_PROXY_SCRIPT_SHA256")
+        if not (state and script and sha):
+            raise pl.ProxyLaunchRefused("PROXY_SERVICE_UNPINNED", "managed loopback needs pinned service")
+        from ccc_proxy_service import ProxyService, ServiceError
+        try:
+            record = read_json(Path(state) / "proxy-service.json")
+            live, _ = ProxyService(state, script, sha, pl.PORT, record.get("upstream", "")).status()
+        except (OSError, ValueError, ServiceError) as exc:
+            raise pl.ProxyLaunchRefused("MANAGED_LOOPBACK_UNVERIFIED", str(exc)) from exc
+        if live != "live":
+            raise pl.ProxyLaunchRefused("MANAGED_LOOPBACK_UNVERIFIED", live)
+        return list(args), {"NO_PROXY": pl.merged_no_proxy(environment.get("NO_PROXY")),
+                            "no_proxy": pl.merged_no_proxy(environment.get("no_proxy"))}
+    return pl.prepare(args, environment, lambda **kw: pl.default_service_factory(environment)(**kw))
+
+
 def launch(config_path, *, job_id=None, index=None, resume_session=None, config_args=None,
            record_path=None, cli_args=None):
     wid, sid = uid(os.environ.get("CMUX_WORKSPACE_ID")), uid(os.environ.get("CMUX_SURFACE_ID"))
@@ -1589,6 +1615,14 @@ def launch(config_path, *, job_id=None, index=None, resume_session=None, config_
             environment["PWD"] = str(directory)
             args += context
         args += ["-c", "sqlite_home=" + json.dumps(str(sqlite_home(config_path, job_id, index).resolve()))]
+    if environment.get("CCC_CODEX_MANAGED_PROXY") == "1":
+        # 托管代理（显式 opt-in）：在注册与 execve 之前改写本次选中 provider 的 base_url；
+        # 拒绝时不注册、不启动，抛出具名错误。未 opt-in 时行为不变。
+        # config_args（后端 app-server 用）与 cli_args（前端）都过同一检查；同一 port/upstream 只 ensure 一次。
+        args, delta = _managed_proxy_args(args, environment)
+        if cli_args is not None:
+            cli_args, _ = _managed_proxy_args(cli_args, environment)
+        environment.update(delta)
     ensure_service(config_path)
     response = request(config_path, "register", timeout=10, workspace_id=wid, surface_id=sid,
         frontend_pid=os.getpid(), cwd=os.getcwd(), environment=environment, config_args=args,

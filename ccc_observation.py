@@ -355,7 +355,8 @@ def continuation_row(target, runtime, *, now, poll_interval=1.0, observation=Non
     elif (current and observed.get("status") == "unknown"
           and observed.get("reason_code") == "process_inventory_incomplete"
           and (not target.get("paused") or pause_health(target)[0] != "paused")
-          and delivery not in {"unknown", "failed", "sending"}
+           and delivery not in {"unknown", "failed", "sending"}
+           and not phase.startswith("codex_compact_")
           and phase not in {"cmux_unavailable", "send_guard_unavailable", "incompatible", "claude_viewport_blind",
                             "provider_blocked", "token_exhausted", "network_wait", "queue_recovery_unconfirmed",
                             "claude_hook_config_degraded", "claude_hook_gap_exhausted", "claude_model_unavailable"}):
@@ -375,6 +376,18 @@ def continuation_row(target, runtime, *, now, poll_interval=1.0, observation=Non
         status, reason = "delivery_unknown", "send_acknowledgement_overdue"
     elif delivery == "failed":
         status, reason = "send_failed", "cmux_rejected_send"
+    elif phase.startswith("codex_compact_"):
+        # A live viewport does not prove continuation is available. Preserve
+        # the compaction controller's explicit ownership/failure verdict.
+        status = {
+            "codex_compact_compacting": "waiting",
+            "codex_compact_control_pending": "waiting",
+            "codex_compact_compacted": "waiting",
+            "codex_compact_unavailable": "unavailable",
+            "codex_compact_uncertain": "unknown",
+            "codex_compact_exhausted": "blocked",
+        }.get(phase, "unknown")
+        reason = phase
     elif phase in {"cmux_unavailable", "send_guard_unavailable", "incompatible", "claude_viewport_blind"}:
         status, reason = "unavailable", phase
     elif phase in {"provider_blocked", "token_exhausted", "network_wait"}:
@@ -439,6 +452,98 @@ def continuation_report(targets, runtime, *, now, poll_interval=1.0, observation
     status = "degraded" if bad else "unknown" if counts["unknown"] else "ok"
     return {**pause_summary(status, rows),
             "observed_at": now, "scope": "authorized_targets", "counts": counts, "targets": rows}
+
+
+def session_start_observation_candidate(events, target, observation, runtime, ledger, *, now):
+    """Bind an original rejected SessionStart as evidence, never a lifecycle event."""
+    def valid_time(value, *, zero=False):
+        return (type(value) in (int, float) and math.isfinite(value)
+                and (value >= 0 if zero else value > 0) and value <= now)
+
+    if type(now) not in (int, float) or not math.isfinite(now) or now <= 0:
+        return None, "observation_time_unverified"
+    relevant = []
+    for event in events:
+        if not isinstance(event, Mapping):
+            return None, "event_identity_unverified"
+        if event.get("surface_id") != target.get("surface_id") or event.get("synthetic_fallback"):
+            continue
+        if not valid_time(event.get("created_at")):
+            return None, "event_time_unverified"
+        relevant.append(event)
+    if not relevant:
+        return None, "no_session_start"
+    latest = max(enumerate(relevant), key=lambda item: (item[1]["created_at"], item[0]))[1]
+    if latest.get("event_name") != "SessionStart" or latest.get("completed"):
+        return None, "latest_event_not_session_start"
+    strings = ("event_id", "surface_id", "workspace_id", "session_id", "transcript_id", "message_hash", "source")
+    if (type(latest.get("version")) is not int or latest["version"] != 1
+            or any(not isinstance(latest.get(key), str) or not latest[key].strip() for key in strings)
+            or latest["workspace_id"] != target.get("workspace_id")):
+        return None, "event_identity_unverified"
+    if any(e["created_at"] == latest["created_at"] and e != latest for e in relevant):
+        return None, "ambiguous_session_start"
+    row = ledger.get(latest["event_id"], {})
+    if (not isinstance(row, Mapping) or row.get("status") != "unmapped"
+            or row.get("detail") != "surface is not authorized"):
+        return None, "session_start_not_originally_unmapped"
+    identity = ("surface_id", "workspace_id", "session_id", "event_name", "agent_pid",
+                "created_at", "transcript_id", "message_hash")
+    if (any(row.get(key) != latest.get(key) for key in identity)
+            or any(key in row and row[key] != latest.get(key)
+                   for key in ("event_id", "version", "source", "cwd_hash", "process_generation"))
+            or type(row.get("agent_pid")) is not int
+            or not valid_time(row.get("created_at"))
+            or not valid_time(row.get("handled_at")) or row["handled_at"] < latest["created_at"]):
+        return None, "original_rejection_identity_unverified"
+    pid, generation, born = observation.get("pid"), observation.get("generation"), observation.get("started_epoch")
+    if (type(pid) is not int or pid <= 0 or type(latest.get("agent_pid")) is not int
+            or latest["agent_pid"] != pid
+            or pid not in [p for p in observation.get("identity_verified_pids", []) if type(p) is int]
+            or not isinstance(generation, str) or not generation
+            or not valid_time(born) or born > latest["created_at"]
+            or ("process_generation" in latest and latest["process_generation"] != generation)):
+        return None, "session_start_process_unverified"
+    if (type(runtime.get("claude_process_pid")) is not int or runtime["claude_process_pid"] != pid
+            or runtime.get("claude_process_generation") != generation
+            or runtime.get("claude_session_id") not in (None, "", latest["session_id"])):
+        return None, "session_start_runtime_identity_mismatch"
+    for key in ("claude_last_hook_at", "claude_turn_started_at", "claude_last_rejected_hook_at", "last_send_at"):
+        watermark = runtime.get(key, 0)
+        if not valid_time(watermark, zero=True) or watermark > latest["created_at"]:
+            return None, "session_start_superseded"
+    # A handler may have advanced the ledger while the journal was being read.
+    for event_id, other in ledger.items():
+        if (event_id != latest["event_id"] and isinstance(other, Mapping)
+                and other.get("surface_id") == latest["surface_id"] and not other.get("synthetic_fallback")
+                and (not valid_time(other.get("created_at")) or other["created_at"] >= latest["created_at"])):
+            return None, "session_start_ledger_advanced"
+    return {
+        "version": 1, "kind": "session_start_observation", "observed_at": now,
+        "execution_authority": False,
+        "process": {"pid": pid, "generation": generation, "started_epoch": born},
+        "event": copy.deepcopy(dict(latest)), "original_rejection": copy.deepcopy(dict(row)),
+    }, "session_start_observed"
+
+
+def session_start_observation_matches(proof, target, observation, runtime, *, now):
+    """Recheck stored evidence against current identity without granting input."""
+    if (type(now) not in (int, float) or not math.isfinite(now) or now <= 0
+            or not isinstance(proof, Mapping) or type(proof.get("version")) is not int or proof["version"] != 1
+            or proof.get("kind") != "session_start_observation" or proof.get("execution_authority") is not False
+            or type(proof.get("observed_at")) not in (int, float) or not math.isfinite(proof["observed_at"])
+            or not 0 < proof["observed_at"] <= now):
+        return False
+    event, process = proof.get("event"), proof.get("process")
+    if (not isinstance(event, Mapping) or not isinstance(process, Mapping)
+            or not isinstance(event.get("event_id"), str)
+            or any(process.get(k) != observation.get(k) for k in ("pid", "generation", "started_epoch"))
+            or type(event.get("created_at")) not in (int, float)
+            or event["created_at"] > proof["observed_at"]):
+        return False
+    candidate, _ = session_start_observation_candidate(
+        [event], target, observation, runtime, {event["event_id"]: proof.get("original_rejection")}, now=now)
+    return candidate is not None and candidate["original_rejection"]["handled_at"] <= proof["observed_at"]
 
 
 def registration_rejection(row):

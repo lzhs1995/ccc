@@ -98,11 +98,12 @@ class InputNotSentTests(unittest.TestCase):
         self.now = [time.time()]
         f.daemon._provider_retry = ProviderRetryStore(f.daemon._provider_retry.path,
             clock=lambda: self.now[0], jitter=lambda: 0)
-        self.rows, self.pending = [], []
+        self.rows, self.pending, self.inputs = [], [], []
         self.deny = True
         self.fault = None
         self.atomic = True
         self.after_input = lambda method: None
+        self.make_draft = lambda text: native.draft_frame(f.sid, text)
         case = self
 
         class Server(socketserver.ThreadingUnixStreamServer):
@@ -118,12 +119,13 @@ class InputNotSentTests(unittest.TestCase):
                     if method == 'system.tree':
                         result = f.client.tree()
                     elif method == 'terminal.replay':
-                        result.update(native.draft_frame(f.sid, 'User draft') if case.deny else f.client.payload)
+                        result.update(case.make_draft('User draft') if case.deny else f.client.payload)
                     elif method in {'terminal.paste', 'surface.send_text', 'surface.send_key'}:
+                        case.inputs.append(req)
                         restored = case.restored()
                         case.pending.append((method, restored.delivery_status, restored.codex_input_phase))
                         if method == 'surface.send_text':
-                            f.client.payload = native.draft_frame(f.sid, req['params']['text'])
+                            f.client.payload = case.make_draft(req['params']['text'])
                             if case.fault == 'exit_after_text': case.deny = True
                         if case.fault == 'eof': return
                         if method == 'terminal.paste':
@@ -308,6 +310,7 @@ class InputNotSentTests(unittest.TestCase):
         goal_patch = patch('ccc_codex_goal.blocked_goal', side_effect=lambda *a, **kw: self.goal[0])
         goal_patch.start()
         self.addCleanup(goal_patch.stop)
+        self.goal_patch = goal_patch
         # Exercise the real stale-goal filter, not a mocked readiness verdict.
         self.assertLess(self.goal[0]['at'], turn['at'])
         self.assertNotEqual(self.goal[0]['turn_id'], turn['turn_id'])
@@ -318,24 +321,33 @@ class InputNotSentTests(unittest.TestCase):
         self.exercise_recovery()
         self.assertFalse(self.f.runtime.codex_goal_resume)
 
-    def test_effective_goal_during_unwritten_retry_withholds_plain_input(self):
+    def test_goal_paused_after_failure_retains_original_unwritten_attempt(self):
         self.stale_goal_footer()
         attempt = self.initial_refusal()
         self.deny = False
         f = self.f
+        self.goal_patch.stop()
+        from ccc_codex_goal import goal_state_for_turn
+        from tests.native_goal_fixture import install
+        turn = f.daemon.codex_queue_recovery.current_turn(f.target)
+        fixture = install(f, turn)
+        paused = (turn['session_id'], 'current-goal', 'paused', int(time.time() * 1000))
+        self.assertEqual(goal_state_for_turn(f.target, turn)['status'], 'absent')
         save = f.daemon._save_delivery
         changed = []
         def goal_became_current(sid, runtime, *args, **kwargs):
             result = save(sid, runtime, *args, **kwargs)
             if runtime.delivery_status == 'sending' and not changed:
-                turn = f.daemon.codex_queue_recovery.current_turn(f.target)
-                self.goal[0] = {**turn, 'kind': 'goal_blocked', 'goal_id': 'current-goal'}
+                with closing(sqlite3.connect(fixture['database'])) as db:
+                    db.execute('INSERT INTO thread_goals VALUES (?,?,?,?)', paused)
+                    db.commit()
                 changed.append(True)
             return result
         with patch.object(f.daemon, '_save_delivery', side_effect=goal_became_current):
             self.send()
         self.assertTrue(changed)
-        self.assertIsNotNone(f.daemon._current_blocked_goal(f.target))
+        self.assertIsNone(f.daemon._current_blocked_goal(f.target))
+        self.assertEqual(goal_state_for_turn(f.target, turn)['status'], 'paused')
         self.assertFalse(self.pending)
         self.assertEqual(f.runtime.send_attempt_id, attempt)
         self.assertEqual(f.runtime.delivery_status, 'retryable')
@@ -343,6 +355,8 @@ class InputNotSentTests(unittest.TestCase):
         self.send()
         self.assertFalse(self.pending)
         self.assertEqual(self.episode()['count'], 1)
+        with closing(sqlite3.connect(fixture['database'])) as db:
+            self.assertEqual(db.execute('SELECT * FROM thread_goals').fetchall(), [paused])
 
     def assert_stale_goal_footer_refuses_turn_change(self, change):
         self.stale_goal_footer()
@@ -638,15 +652,21 @@ class InputNotSentTests(unittest.TestCase):
             self.send()
         self.assertFalse(self.pending)
 
-    def test_identity_drift_during_private_selection_cannot_create_new_attempt(self):
+    def test_unwritten_retry_does_not_select_a_new_private_route(self):
         attempt = self.initial_refusal()
         self.deny = False
         def select(*args):
             self.change_provider()
-        with patch.object(self.f.daemon.private_checks, 'select', side_effect=select):
+        with patch.object(self.f.daemon.private_checks, 'select', side_effect=select) as selection:
             self.send()
-        self.assertFalse(self.pending)
+        selection.assert_not_called()
+        self.assertEqual(self.pending, [('terminal.paste', 'sending', 'paste_submit_pending')])
+        self.assertEqual(self.inputs[0]['params']['text'], '任务请继续')
+        self.assertEqual(self.f.runtime.codex_private_check, {})
         self.assertEqual(self.f.runtime.send_attempt_id, attempt)
+        self.assertEqual(self.episode()['count'], 1)
+        self.send()
+        self.assertEqual(len(self.pending), 1)
 
     def test_identity_drift_after_pending_commit_blocks_actual_paste(self):
         self.initial_refusal()

@@ -16,14 +16,15 @@ import sqlite3
 import time
 
 
-RETRYABLE = frozenset({'rate_limit', 'http_500', 'http_502', 'http_503', 'http_504', 'http_524'})
+# 2026-10-20 user rule: Azure "different resource" also auto-sends 任务请继续 under the same bounded backoff.
+RETRYABLE = frozenset({'rate_limit', 'resource_mismatch', 'upstream_invalid', 'budget_pool_exhausted', 'http_500', 'http_502', 'http_503', 'http_504', 'http_524'})
 BLOCKED_REASONS = {
     'token_exhausted': 'provider token out of quota; needs a new key or a top-up',
     'invalid_encrypted_content': 'provider rejected encrypted session content; repair required; session preserved',
     'http_400': 'provider request rejected (400); inspect parameters/protocol; session preserved',
     'http_401': 'provider authentication rejected (401); verify credentials/quota; session preserved',
     'http_403': 'provider permission rejected (403); verify access policy; session preserved',
-    'resource_mismatch': 'provider rejected an item from a different OpenAI resource; restore original resource affinity; session preserved',
+    'http_413': 'provider rejected an oversized request (413); resolve payload or upstream size limit before retrying; session preserved',
     'deployment_not_found': 'provider has no deployment matching the requested model; restore the deployment; session and model preserved',
     'billing_exhausted': 'provider explicitly reported insufficient balance; top up the original account; session preserved',
     'invalid_request': 'provider rejected the request; inspect parameters/protocol; session preserved',
@@ -39,6 +40,31 @@ class ProviderRetryEvidenceError(ValueError):
     """The caller lacks a dated, bound failure; the ledger was not accessed."""
 
 
+BUDGET_POOL_SENTENCE = 'budgetpoolquotahasbeenexhausted.'
+BUDGET_POOL_BANNER_RE = re.compile(r'unexpectedstatus(?:code)?[:=]?402paymentrequired:' + re.escape(BUDGET_POOL_SENTENCE))
+
+
+def _budget_pool_error(error, prefix, payload):
+    """Parsed error object: exact budget-pool message plus an authoritative 402.
+
+    error.status and any numeric error.code must all be 402; without them the
+    native banner prefix must say 402. A top-level or nested example 402 is
+    never authority, and specific blockers are classified before this check.
+    """
+    detail = error.get('message')
+    if not isinstance(detail, str) or not detail.startswith(BUDGET_POOL_SENTENCE):
+        return False
+    outer = [str(payload[key]) for key in ('status', 'code')
+             if type(payload.get(key)) is int or (isinstance(payload.get(key), str) and payload[key].isdigit())]
+    if any(value != '402' for value in outer):
+        return False
+    inner = [str(error[key]) for key in ('status', 'code')
+             if type(error.get(key)) is int or (isinstance(error.get(key), str) and error[key].isdigit())]
+    if inner:
+        return all(value == '402' for value in inner)
+    return bool(re.fullmatch(r'unexpectedstatus(?:code)?[:=]?402paymentrequired:?', prefix))
+
+
 def structured_error_type(message):
     """Classify specific provider failures, including hard-wrapped JSON/text.
 
@@ -50,6 +76,14 @@ def structured_error_type(message):
     compact = re.sub(r'\s+', '', str(message)).lower()
     if compact.lstrip('■⚠└').startswith(('documentation:', 'example:', 'quoted:', 'sample:')):
         return None
+    # A completed remote compact can fail with a plain nginx HTML 413, without
+    # a JSON error envelope. Repeating that payload cannot fix its size. Keep
+    # the exact status ahead of generic stream/high-demand wrappers, including
+    # terminal hard wraps, so the shared UI/native classifier reports a block.
+    if re.search(
+            r'(?:unexpectedstatus(?:code)?|unknownstatuscode|http(?:/\d(?:\.\d)?)?|laststatus)'
+            r'[:=]?413(?!\d)', compact):
+        return 'http_413'
     # These measured failures have no JSON envelope. Preserve their concrete
     # cause before callers consider an outer stream/high-demand/HTTP wrapper.
     deployment = ('couldnotfindanexistingdeploymenttomatchthemodelintherequest.'
@@ -62,7 +96,8 @@ def structured_error_type(message):
         return 'billing_exhausted'
     start = compact.find('{')
     if start < 0:
-        return None
+        # 2026-10-20 user rule: only the complete native budget-pool 402 banner is retryable.
+        return 'budget_pool_exhausted' if BUDGET_POOL_BANNER_RE.match(compact.lstrip('■⚠└')) else None
     prefix = compact[:start].lstrip('■⚠└')
     if prefix.startswith(('documentation:', 'example:', 'quoted:', 'sample:')):
         return None
@@ -96,6 +131,8 @@ def structured_error_type(message):
                 '额度已用尽', 'remainquota', 'insufficient_quota', 'quotaexceeded')):
             return 'token_exhausted'
         return 'http_' + status[1]
+    if _budget_pool_error(error, prefix, payload):
+        return 'budget_pool_exhausted'
     # Preserve the known parameter remedy even when providers emit a null
     # code and only put the 400 status in the message. Ownership, encrypted
     # content, quota and authentication failures above remain blockers.
@@ -106,6 +143,17 @@ def structured_error_type(message):
     # invalid_request_error type used by some providers for every failure.
     if codes & {'rate_limit_exceeded', 'rate_limit_error', 'rate_limited'}:
         return 'rate_limit'
+    # The measured masked upstream failure may succeed after the upstream
+    # recovers. Only this exact null-code, empty-param envelope is retryable;
+    # concrete parameter, ownership, quota and authentication errors keep
+    # their existing classifications. A trace identifies the failed request,
+    # but is not evidence that a local parameter or model needs changing.
+    if (set(payload) == {'error'} and set(error) == {'message', 'type', 'param', 'code'}
+            and error['type'] == 'invalid_request_error'
+            and error['param'] == '' and error['code'] is None
+            and re.fullmatch(r'upstreamrejectedtherequestasinvalid\[trace_id=[0-9a-f]{32}\]', detail)
+            and (status is None or status[1] in {'400', '500', '502', '503', '504', '524'})):
+        return 'upstream_invalid'
     if codes & {'invalid_request_error', 'invalid_request', 'invalid_parameter'}:
         return 'invalid_request'
     # Explicit status still classifies message-only/unknown envelopes.
@@ -322,14 +370,21 @@ class ProviderRetryStore:
             # Eligible live callers keep their place across provider cooldowns.
             # A fast polling session must not repeatedly win every shared slot.
             # Leases prevent a paused/exited caller from blocking other sessions.
+            # Fairness follows the two independent provider admission clocks.
+            # A transient waiter in its 120s backoff must not occupy the head
+            # of the rate-limit queue, which ignores that synthetic cooldown.
+            # Encode both cohorts to prevent collisions with literal provider
+            # names. Same-stamp refresh retains its original queued_at.
+            fair_provider = json.dumps([evidence['provider'],
+                'rate_limit' if sustained_rate_limit else 'transient'], separators=(',', ':'))
             connection.execute('DELETE FROM waiters WHERE seen_at < ?', (now - 60,))
             connection.execute('INSERT INTO waiters VALUES (?, ?, ?, ?, ?) '
                 'ON CONFLICT(identity) DO UPDATE SET '
                 'queued_at=CASE WHEN stamp=excluded.stamp THEN queued_at ELSE excluded.queued_at END, '
                 'provider=excluded.provider, stamp=excluded.stamp, seen_at=excluded.seen_at',
-                (evidence['identity'], evidence['provider'], evidence['stamp'], now, now))
+                (evidence['identity'], fair_provider, evidence['stamp'], now, now))
             first = connection.execute('SELECT identity FROM waiters WHERE provider=? ORDER BY queued_at, identity LIMIT 1',
-                                       (evidence['provider'],)).fetchone()
+                                       (fair_provider,)).fetchone()
             if floor and now < floor[0]:
                 return ProviderRetryDecision(False, 'provider_retry_server_floor', floor[0])
             if cooldown and now < cooldown[0]:

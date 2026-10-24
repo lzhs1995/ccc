@@ -4198,8 +4198,20 @@ class SessionResolverTests(unittest.TestCase):
             self.assertNotIn(forbidden, source, forbidden)
 
 
+def assert_session_preview(test, text, session):
+    """A shortened identity must be visibly marked and keep both ends."""
+    if session in text:
+        return True
+    preview = session[:8] + "…" + session[-4:]
+    if session[:8] in text:
+        test.assertIn(preview, text, "an unmarked/truncated UUID is not a usable preview")
+        return True
+    test.assertNotIn(session[-4:], text, "an isolated suffix is not a session preview")
+    return False
+
+
 class SessionRenderTests(unittest.TestCase):
-    """The all-or-nothing cell, header/data agreement, and CJK widths."""
+    """Explicit identity previews, full-copy reachability and CJK widths."""
 
     CELLS = ("监控中", "ws11/p24/s59", "Claude", "正常", "45%", "空闲", "-", "3")
 
@@ -4208,44 +4220,29 @@ class SessionRenderTests(unittest.TestCase):
 
         return tui._row_text("  *  ", self.CELLS, title, width, session)
 
-    def test_a_partial_uuid_is_never_rendered(self):
-        """`9f7aa928-0525` looks valid, copies cleanly, and resumes nothing."""
+    def test_a_shortened_uuid_is_explicitly_marked(self):
 
         import cmux_supervisor_tui as tui
 
         for pane in (80, 100, 108, 120, 130, 131, 132, 145, 200):
-            visible = self._row(pane - 1)[: pane - 1]
-            if SID_A in visible:
-                continue
-            for length in range(8, len(SID_A)):
-                self.assertNotIn(
-                    SID_A[:length], visible,
-                    f"pane {pane} leaked a {length}-char UUID prefix")
+            visible = tui.clip_to_width(self._row(pane - 1), pane - 1)
+            assert_session_preview(self, visible, SID_A)
 
-    def test_the_full_uuid_appears_once_the_cell_fits(self):
+    def test_identity_previews_remain_visible_before_full_width(self):
         import cmux_supervisor_tui as tui
 
-        self.assertIn(SID_A, self._row(131))   # clip for a 132-column pane
-        self.assertIn(SID_A, self._row(144))
+        for width in (131, 144):
+            self.assertTrue(assert_session_preview(self, self._row(width), SID_A))
+        self.assertIn(SID_A, self._row(200))
 
-    def test_a_narrow_terminal_omits_the_column_with_no_marker(self):
-        """Narrow rows now END, they do not carry a clipped hint.
-
-        The marker used to be re-drawn on every row and then clipped by the very
-        width that triggered it, so a narrow terminal showed a column of
-        fragments.  The replacement invariant is absence: no marker anywhere, no
-        UUID fragment anywhere, and the full ID still reachable in focus detail.
-        """
+    def test_narrow_terminals_keep_a_marked_session_preview(self):
 
         import cmux_supervisor_tui as tui
 
         for pane in (100, 108, 120, 130, 131):
             row = self._row(pane - 1)
             self.assertNotIn(tui.SESSION_NARROW_MARKER, row, f"pane {pane}")
-            self.assertNotIn(SID_A, row, f"pane {pane}")
-            for length in range(8, len(SID_A)):
-                self.assertNotIn(SID_A[:length], row, f"pane {pane} / {length}")
-            # Absence must be a clean end of row, not a padded blank column.
+            self.assertTrue(assert_session_preview(self, row, SID_A))
             self.assertEqual(row, row.rstrip(), f"pane {pane}")
 
     def test_the_omitted_column_is_never_a_marker_at_any_width(self):
@@ -4259,22 +4256,22 @@ class SessionRenderTests(unittest.TestCase):
         import cmux_supervisor_tui as tui
 
         for clip in list(range(30, 201)) + [98, 99, 100, 101, 102, 103, 400]:
-            row = self._row(clip)
+            row = tui.clip_to_width(self._row(clip), clip)
             self.assertNotIn(tui.SESSION_NARROW_MARKER, row, f"clip {clip}")
-            if SID_A not in row:
-                for length in range(8, len(SID_A)):
-                    self.assertNotIn(SID_A[:length], row, f"clip {clip} / {length}")
+            assert_session_preview(self, row, SID_A)
 
     def test_header_and_rows_agree_about_the_column(self):
         import cmux_supervisor_tui as tui
 
         for pane in (80, 100, 108, 120, 130, 131, 132, 145):
             clip = pane - 1
-            header = tui.header_text(clip)[:clip]
-            row = self._row(clip)[:clip]
+            header = tui.clip_to_width(tui.header_text(clip), clip)
+            row = tui.clip_to_width(self._row(clip), clip)
             self.assertEqual(
-                "session" in header, SID_A in row,
-                f"pane {pane}: header says {'session' in header}, row says {SID_A in row}")
+                "session" in header, assert_session_preview(self, row, SID_A),
+                f"pane {pane}: session header and identity must agree")
+            if SID_A not in row and "session" in header:
+                self.assertIn("session~", header)
 
     def test_the_title_is_a_fixed_twelve_columns(self):
         import cmux_supervisor_tui as tui
@@ -4361,13 +4358,7 @@ class SessionDrawChainWidthTests(unittest.TestCase):
         tui._safe_addnstr(_Screen(), 0, 0, tui.header_text(clip), clip)
         return written[0] if written else ""
 
-    def test_130_and_131_omit_the_column_with_no_marker_or_fragment(self):
-        """Below the fit boundary the column is absent, not hinted at.
-
-        Renamed from ...show_the_marker...: the marker is retired, so this is now
-        a negative assertion.  It is NOT deleted, because the fragment ban it
-        protects is the whole reason the boundary matters.
-        """
+    def test_130_and_131_draw_explicit_previews(self):
 
         import cmux_supervisor_tui as tui
 
@@ -4376,30 +4367,19 @@ class SessionDrawChainWidthTests(unittest.TestCase):
             self.assertNotIn(tui.SESSION_NARROW_MARKER, drawn,
                              f"width {width} must not carry any narrow marker")
             self.assertNotIn(self.SID, drawn, width)
-            # No prefix of the id may survive: a fragment copies cleanly and
-            # resumes the wrong session, which is worse than showing nothing.
-            for cut in range(8, len(self.SID) + 1):
-                self.assertNotIn(self.SID[:cut], drawn,
-                                 f"width {width} leaked a {cut}-char fragment")
+            self.assertTrue(assert_session_preview(self, drawn, self.SID))
 
-    def test_132_and_145_draw_the_complete_uuid(self):
+    def test_medium_widths_keep_identity_and_large_widths_expand_it(self):
         import cmux_supervisor_tui as tui
 
-        for width in (132, 145):
+        for width in (132, 145, 200):
             drawn = self._drawn_row(width, self.SID)
-            self.assertIn(self.SID, drawn, f"width {width} must show the whole id")
+            self.assertTrue(assert_session_preview(self, drawn, self.SID))
             self.assertNotIn(tui.SESSION_NARROW_MARKER, drawn, width)
             self.assertLessEqual(tui.display_width(drawn), width - 1,
                                  "a drawn row may never exceed the clip")
 
-    def test_132_is_the_first_displayable_terminal_width(self):
-        """The boundary itself, swept AND derived -- not a remembered number.
-
-        132 stays asserted because it is the historical, user-visible boundary,
-        but it is now cross-checked against the layout measurement, so a future
-        column change moves both together or fails loudly instead of silently
-        making one of them a lie.
-        """
+    def test_full_and_preview_boundaries_follow_the_rendered_layout(self):
 
         import cmux_supervisor_tui as tui
 
@@ -4408,12 +4388,13 @@ class SessionDrawChainWidthTests(unittest.TestCase):
         self.assertTrue(widths, "the id must be displayable at some width")
         # Derived: the first terminal width whose clip admits the session cell.
         derived = min(w for w in range(2, 400)
-                      if tui.row_layout(max(1, w - 1)).session)
+                      if tui.row_layout(max(1, w - 1)).session_cells == tui.SESSION_COL_WIDTH)
         self.assertEqual(min(widths), derived,
                          "the drawn boundary must equal the measured one")
-        self.assertEqual(derived, 132)
-        # And it stays displayable once it fits.
-        self.assertEqual(widths, list(range(132, 200)))
+        self.assertEqual(widths, list(range(derived, 200)))
+        preview_widths = [w for w in range(30, derived)
+                          if self.SID[:8] in self._drawn_row(w, self.SID)]
+        self.assertTrue(preview_widths, "narrow terminals must retain an explicit preview")
 
     def test_header_and_rows_agree_through_the_same_clip(self):
         """The header may advertise `session` only where a row can carry one."""
@@ -4421,7 +4402,7 @@ class SessionDrawChainWidthTests(unittest.TestCase):
         named = (51, 54, 60, 79, 80, 81, 99, 100, 101, 106, 107, 114, 132, 160)
         for width in sorted(set(named) | set(range(30, 201))):
             header_has = "session" in self._drawn_header(width)
-            row_has = self.SID in self._drawn_row(width, self.SID)
+            row_has = assert_session_preview(self, self._drawn_row(width, self.SID), self.SID)
             self.assertEqual(header_has, row_has,
                              f"width {width}: header={header_has} row={row_has}")
 
@@ -4436,10 +4417,7 @@ class SessionDrawChainWidthTests(unittest.TestCase):
             self.assertNotIn(tui.SESSION_NARROW_MARKER, drawn, f"width {width}")
             self.assertLessEqual(tui.display_width(drawn), max(1, width - 1),
                                  f"width {width} drew past its clip")
-            if self.SID not in drawn:
-                for cut in range(8, len(self.SID) + 1):
-                    self.assertNotIn(self.SID[:cut], drawn,
-                                     f"width {width} leaked {cut} chars")
+            assert_session_preview(self, drawn, self.SID)
 
     def test_an_unmeasured_row_never_shows_a_marker_instead_of_a_reason(self):
         """未测量 is a value, not a width failure; it must render at any width."""
@@ -5227,21 +5205,19 @@ class CollabColumnTests(unittest.TestCase):
 
     # -- layout: width gating and the row/header contract -------------------
 
-    def test_the_column_needs_106_columns_and_the_gate_is_exact(self):
+    def test_collab_gate_preserves_identity_previews_and_matches_the_header(self):
         import cmux_supervisor_tui as tui
 
-        body = sum(width for _, width, _ in ROW_COLUMNS) + len(ROW_COLUMNS) - 1
-        minimum = 5 + body + 1 + tui.COLLAB_COL_WIDTH + 2 + tui.TITLE_COL_WIDTH
-        self.assertEqual(minimum, 106)          # documents the current budget
-        # The gate and this arithmetic must be the SAME measurement, not two
-        # numbers that happen to agree today.
-        self.assertEqual(minimum, tui._head_cells(tui.ROW_COLUMNS, collab=True))
-        self.assertFalse(tui.collab_column_fits(minimum - 1))
-        self.assertTrue(tui.collab_column_fits(minimum))
         self.assertFalse(tui.collab_column_fits(None))
-        # And it is monotone: once the column fits it never un-fits.
         fitting = [w for w in range(30, 401) if tui.collab_column_fits(w)]
+        minimum = min(fitting)
         self.assertEqual(fitting, list(range(minimum, 401)))
+        for width in range(30, 401):
+            plan = tui.row_layout(width, collab_available=True)
+            self.assertEqual(tui.collab_column_fits(width), "协作" in tui.header_text(width, "协作"))
+            if plan.collab:
+                self.assertGreaterEqual(plan.session_cells, tui.SESSION_SHORT_WIDTH)
+                self.assertGreaterEqual(plan.key_cells, tui.API_KEY_SHORT_WIDTH)
 
     def test_the_core_columns_never_shrink_below_their_own_content(self):
         """Removing the literal 80/100/106 thresholds also removed a real bug:
@@ -5299,19 +5275,16 @@ class CollabColumnTests(unittest.TestCase):
         cells = ("监控中", "ws11/p24/s59", "Claude", "正常", "45%", "空闲", "-", "3")
         named = (51, 54, 60, 79, 80, 81, 99, 100, 101, 106, 107, 114, 132, 160)
         for clip in sorted(set(named) | set(range(30, 201)) | {142, 143, 144, 200}):
-            header = tui.header_text(clip, "协作")[:clip]
-            row = _row_text("  *  ", cells, "标题", clip, SID_A, "╭Supervisor")[:clip]
-            self.assertEqual("session" in header, SID_A in row, f"clip {clip}")
+            header = tui.clip_to_width(tui.header_text(clip, "协作"), clip)
+            row = tui.clip_to_width(_row_text("  *  ", cells, "标题", clip, SID_A, "╭Supervisor"), clip)
+            self.assertEqual("session" in header, assert_session_preview(self, row, SID_A), f"clip {clip}")
             self.assertNotIn(tui.SESSION_NARROW_MARKER, row, f"clip {clip}")
-            if SID_A not in row:
-                for length in range(8, len(SID_A)):
-                    self.assertNotIn(SID_A[:length], row,
-                                     f"clip {clip} leaked {length} chars")
+            if SID_A not in row and "session" in header:
+                self.assertIn("session~", header)
         # The measured boundary WITH the collaboration column, derived not typed.
         first = min(c for c in range(2, 400) if tui.row_layout(c, collab_available=True).session)
-        self.assertIn(SID_A, _row_text("  *  ", cells, "标题", first, SID_A, "╭Supervisor"))
-        self.assertNotIn(SID_A,
-                         _row_text("  *  ", cells, "标题", first - 1, SID_A, "╭Supervisor"))
+        self.assertTrue(assert_session_preview(self, _row_text("  *  ", cells, "标题", first, SID_A, "╭Supervisor"), SID_A))
+        self.assertFalse(assert_session_preview(self, _row_text("  *  ", cells, "标题", first - 1, SID_A, "╭Supervisor"), SID_A))
 
     # -- the draw path and the client --------------------------------------
 

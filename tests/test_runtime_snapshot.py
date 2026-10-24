@@ -213,6 +213,7 @@ class HealthSnapshotScopeTests(unittest.TestCase):
         daemon._health_writer = None
 
         with mock.patch.object(daemon, "_check_claude_hook_settings"), \
+             mock.patch.object(daemon, "_native_agent_processes", return_value={}), \
              mock.patch.object(core, "main_surface_records", return_value=list(original["records"].values())), \
              mock.patch.object(core, "classify_surface_processes", side_effect=lambda _: dict(original["labels"])), \
              mock.patch.object(daemon, "_inspect_process_cached", side_effect=original["hook_inspections"].get), \

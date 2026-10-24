@@ -976,7 +976,7 @@ class WatchTests(unittest.TestCase):
 
             daemon.process_once(client)
 
-            self.assertEqual(client.top_calls, ["workspace-uuid"])
+            self.assertEqual(client.top_calls, ["workspace-uuid", "workspace-uuid"])
             self.assertEqual(len(client.sent), 1)
             self.assertNotEqual(daemon.runtime["surface-uuid"].state, "claude_observed")
 
@@ -2882,11 +2882,23 @@ class WatchTests(unittest.TestCase):
                 top=process_fixture(("surface-uuid", "claude")),
             )
             daemon = self._claude_armed_daemon(directory, client)
+            runtime = daemon.runtime.setdefault("surface-uuid", TargetRuntime(
+                claude_process_pid=1234, claude_process_generation="fixture-birth-1234",
+                claude_session_id="session-uuid"))
             event = claude_hook_event("failure-1", "StopFailure", error_kind="claude_503")
+            event.update(agent_pid=1234, process_generation="fixture-birth-1234")
             daemon._handle_claude_event(event, client)
             daemon._handle_claude_event(event, client)
-            self.assertEqual([item[2] for item in client.sent], [CLAUDE_MESSAGE])
+            self.assertEqual(client.sent, [])
             runtime = daemon.runtime["surface-uuid"]
+            target = daemon.config['targets'][0]
+            with mock.patch.object(core.time, 'time',
+                    return_value=runtime.claude_provider_guard['retry_after'] + 1):
+                daemon._maybe_send_deferred_claude_stop(
+                    target, runtime, core.ScreenState('claude_stopped', message_kind='claude'), client)
+                daemon._maybe_send_deferred_claude_stop(
+                    target, runtime, core.ScreenState('claude_stopped', message_kind='claude'), client)
+            self.assertEqual([item[2] for item in client.sent], [CLAUDE_MESSAGE])
             self.assertEqual(runtime.claude_last_event_status, "sent")
             self.assertEqual(runtime.claude_last_resume_event_id, "failure-1")
 
@@ -3794,13 +3806,23 @@ class WatchTests(unittest.TestCase):
                 top=process_fixture(("surface-uuid", "claude")),
             )
             daemon = self._claude_armed_daemon(directory, client)
+            runtime = daemon.runtime.setdefault("surface-uuid", TargetRuntime(
+                claude_process_pid=1234, claude_process_generation="fixture-birth-1234",
+                claude_session_id="session-uuid"))
             daemon.process_once(client)
             self.assertEqual(client.sent, [])
             with mock.patch("cmux_codex_watch.CLAUDE_EVENT_PREFLIGHT_SETTLE_SEC", 0):
-                daemon._handle_claude_event(
-                    claude_hook_event("stream-1", "StopFailure", error_kind="claude_stream"),
-                    client,
-                )
+                event = claude_hook_event("stream-1", "StopFailure", error_kind="claude_stream")
+                event.update(agent_pid=1234, process_generation="fixture-birth-1234")
+                daemon._handle_claude_event(event, client)
+                self.assertEqual(client.sent, [])
+                runtime = daemon.runtime['surface-uuid']
+                with mock.patch.object(core.time, 'time',
+                        return_value=runtime.claude_provider_guard['retry_after'] + 1):
+                    daemon._maybe_send_deferred_claude_stop(
+                        daemon.config['targets'][0], runtime,
+                        core.ScreenState('recoverable_error', error_type='claude_stream',
+                                         message_kind='claude'), client)
             self.assertEqual(len(client.sent), 1)
             self.assertEqual(client.sent[0][2], CLAUDE_MESSAGE)
             self.assertEqual(daemon.runtime["surface-uuid"].error_type, "claude_stream")

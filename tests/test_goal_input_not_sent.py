@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import cmux_codex_watch as core
 from tests import test_input_not_sent as zero_input
-from tests.test_watch import span
+from tests.native_goal_fixture import terminal_frame
 
 
 class GoalInputNotSentTests(unittest.TestCase):
@@ -15,14 +15,25 @@ class GoalInputNotSentTests(unittest.TestCase):
         c.setUp()
         self.addCleanup(c.doCleanups)
         f = c.f
-        grid = f.client.payload['render_grid']
-        grid['row_spans'].append(span(grid['cursor']['row'] + 1, 0, 'Goal stalled (/goal resume)'))
+        # Rate-limit failures now use the authorized ordinary continuation,
+        # including with a blocked Goal. Exercise the separate Goal-resume
+        # route with the separately budgeted HTTP502 failure and exact viewport.
+        blocked_error = 'unexpected status 502 Bad Gateway: Unknown error, url: http://127.0.0.1:18765/v1/responses'
+        f.path.write_text(f.path.read_text().replace(zero_input.ERROR, blocked_error))
+        f.client.payload = terminal_frame(f.sid, blocked_error)
+        c.make_draft = lambda text: terminal_frame(f.sid, blocked_error, draft=text)
         self.empty_frame = deepcopy(f.client.payload)
         f.state = core.classify_grid(core.Grid.from_rpc(f.client.payload, f.sid))
         self.assertTrue(f.state.native_goal_stalled)
         turn = f.daemon.codex_queue_recovery.current_turn(f.target)
         self.process_pid = turn['pid']
         self.goal = [{**turn, 'kind': 'goal_blocked', 'goal_id': 'original-goal'}]
+        # HTTP502 gets a new durable delay from the observation time. Advance
+        # the fixture's clock through that real budget before input assertions.
+        evidence = f.daemon._provider_retry.observe(turn['session_id'], turn['model_provider'],
+            turn['turn_id'], 'http_502', blocked_error, turn['at'])
+        decision = f.daemon._provider_retry.evaluate(evidence)
+        c.now[0] = max(c.now[0], decision.retry_at + .001)
         goal_patch = patch('ccc_codex_goal.blocked_goal', side_effect=lambda *a, **kw: self.goal[0])
         goal_patch.start()
         self.addCleanup(goal_patch.stop)
@@ -53,7 +64,7 @@ class GoalInputNotSentTests(unittest.TestCase):
         self.assertEqual(c.f.runtime.send_attempt_id, attempt)
         self.assertEqual(c.episode()['count'], 1)
         self.assertEqual([r[0] for r in c.pending], ['surface.send_text', 'surface.send_key'])
-        self.assertTrue(all(r[1:] == ('sending', 'text_pending') for r in c.pending))
+        self.assertTrue(all(r[1:] == ('sending', 'goal_native_pending') for r in c.pending))
         c.send()
         self.assertEqual(len(c.pending), 2)
 
@@ -146,7 +157,7 @@ class GoalInputNotSentTests(unittest.TestCase):
         self.assertEqual(failures, ['pending', 'proof'])
         self.assertFalse(c.pending)
         self.assertFalse(c.f.runtime.codex_input_not_sent)
-        self.assertEqual(c.restored().codex_input_phase, 'text_pending')
+        self.assertEqual(c.restored().codex_input_phase, 'goal_native_pending')
         self.restart()
         c.send()
         self.assertFalse(c.pending)
@@ -262,7 +273,7 @@ class GoalInputNotSentTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'goal proof commit failed'):
                 c.send()
         self.assertFalse(c.f.runtime.codex_input_not_sent)
-        self.assertEqual(c.restored().codex_input_phase, 'text_pending')
+        self.assertEqual(c.restored().codex_input_phase, 'goal_native_pending')
         c.deny = False
         c.send()
         self.restart()

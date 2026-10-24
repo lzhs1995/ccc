@@ -117,10 +117,38 @@ class LivenessIdentityTests(unittest.TestCase):
         targets = [{'surface_id': 'a'}, {'surface_id': 'b'}]
         states = {'a': {'observation_timings': {'completed_at': 999}},
                   'b': {'observation_timings': {'completed_at': 800}}}
-        self.assertFalse(live.observations_current(targets, states, now=1000))
+        progress = live.ObservationProgress()
+        # One newly completed worker advances daemon liveness. Re-publishing
+        # the same records never supplies another observation heartbeat.
+        self.assertTrue(progress.advanced(targets, states, now=1000))
+        self.assertFalse(progress.advanced(targets, states, now=1001))
         targets[1]['paused'] = True
-        self.assertTrue(live.observations_current(targets, states, now=1000))
-        self.assertFalse(live.observations_current(targets, {}, now=1000))
+        self.assertFalse(progress.advanced(targets, states, now=1002))
+        states['a']['observation_timings']['completed_at'] = 1002
+        self.assertTrue(progress.advanced(targets, states, now=1003))
+        self.assertFalse(progress.advanced(targets, {}, now=1004))
+
+    def test_pause_and_reenrollment_do_not_reuse_completed_observations(self):
+        progress = live.ObservationProgress()
+        targets = [{'surface_id': 'a'}]
+        states = {'a': {'observation_timings': {'completed_at': 999}}}
+        self.assertTrue(progress.advanced(targets, states, now=1000))
+        targets[0]['paused'] = True
+        self.assertTrue(progress.advanced(targets, states, now=1001))
+        self.assertTrue(progress.advanced([], {}, now=1002))
+        targets[0]['paused'] = False
+        self.assertFalse(progress.advanced(targets, states, now=1003))
+
+    def test_clock_rollback_requires_new_completed_observation(self):
+        progress = live.ObservationProgress()
+        targets = [{'surface_id': 'a'}]
+        states = {'a': {'observation_timings': {'completed_at': 999}}}
+        self.assertTrue(progress.advanced(targets, states, now=1000))
+        states['a']['observation_timings']['completed_at'] = 499
+        self.assertFalse(progress.advanced(targets, states, now=500))
+        self.assertFalse(progress.advanced(targets, states, now=501))
+        states['a']['observation_timings']['completed_at'] = 501
+        self.assertTrue(progress.advanced(targets, states, now=502))
 
     def test_repeated_stall_backoff_is_bounded_and_expires(self):
         with tempfile.TemporaryDirectory() as folder:

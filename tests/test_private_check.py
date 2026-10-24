@@ -316,6 +316,8 @@ class PrivateCheckDeliveryTests(CheckFixture, unittest.TestCase):
         self.runtime = core.TargetRuntime()
         self.daemon.runtime[self.sid] = self.runtime
         self.state = core.classify_grid(core.Grid.from_rpc(frame, self.sid))
+        from tests.native_goal_fixture import install as bind_native_goal
+        bind_native_goal(self, self.read_turn())
 
     def send(self):
         self.daemon._handle_state(self.target, self.runtime, self.state, self.client,
@@ -524,7 +526,7 @@ class PrivateCheckDeliveryTests(CheckFixture, unittest.TestCase):
             lambda: (self.job_path.parent / "access.json").write_text("{}"))
 
     def queue_frame(self, message, *, draft=False):
-        lines = [] if draft else ["Messages to be submitted", "↳ " + message, "⌥↑ edit last queued message"]
+        lines = [] if draft else ["• Messages to be submitted", "↳ " + message, "⌥↑ edit last queued message"]
         frame = grid_payload(lines)
         grid = frame["render_grid"]
         grid["surface_id"] = self.sid

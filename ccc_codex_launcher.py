@@ -21,7 +21,19 @@ def current_workspace(config_path, surface_id):
     return row["workspace_id"]
 
 
-def run(config_path, native, args):
+def run(config_path, native, args, service_factory=None):
+    # Managed sanitizer proxy (explicit opt-in): applied once, before every exec/guarded launch below.
+    from ccc_codex_proxy_launch import default_service_factory, prepare
+    if os.environ.get("CCC_CODEX_MANAGED_PROXY") == "1":
+        # Lazy: the pinned real factory is resolved only when prepare() actually ensures the service,
+        # so read-only --help/--version stay available without proxy pins.
+        factory = service_factory or (lambda **kw: default_service_factory(os.environ)(**kw))
+        args, delta = prepare(args, os.environ, factory)
+        os.environ.update(delta)
+    return _run(config_path, native, args)
+
+
+def _run(config_path, native, args):
     # With automatic pause off, no session needs a guardian backend. In
     # particular an old B workspace must not trigger adoption of live Codex.
     # B bootstrap and the watcher still enforce the operator's input gates.
@@ -57,7 +69,7 @@ def run(config_path, native, args):
             # A moved shell retains its inherited environment. Old placement
             # must not impose B restrictions on the destination workspace.
             os.environ["CMUX_WORKSPACE_ID"] = actual
-            return run(config_path, native, args)
+            return _run(config_path, native, args)
     # Read-only CLI operations do not create sessions or model requests.
     if any(x in args for x in ("--help", "-h", "--version", "-V")) or (args and args[0] in {
             "login", "logout", "completion", "mcp", "features", "update", "help"}):

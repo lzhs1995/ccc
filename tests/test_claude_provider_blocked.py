@@ -36,7 +36,8 @@ class ProviderFailureClassificationTests(unittest.TestCase):
             with self.subTest(error=error, details=details):
                 result = classify_stop_failure(error, details)
                 self.assertEqual(result["error_kind"], expected)
-                self.assertTrue(result["provider_blocked"])
+                # 有界续跑：任何标签都不得制造无限期持有。
+                self.assertFalse(result["provider_blocked"])
 
     def test_real_transient_failures_remain_retryable(self):
         cases = [

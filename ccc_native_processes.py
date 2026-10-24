@@ -234,11 +234,33 @@ def display_process_labels(records, classified, top, *, processes=None, agent_ki
         return output
     for record, target in wanted:
         group = groups.get(target["surface_id"], [])
-        if len(group) != 1:
-            continue
-        row = group[0]
-        # Other agents still count toward ambiguity. Filtering before grouping
-        # would turn a mixed Claude/Codex surface into a false unique identity.
+        if len(group) == 1:
+            row = group[0]
+        else:
+            # An inherited surface can have a background Codex on the same
+            # TTY. Keep mixed-agent, duplicate and foreign-TTY groups ambiguous.
+            # Only a single foreground Codex may supply missing observation;
+            # input authorization still performs its own live identity checks.
+            if (agent_kind not in {None, "codex"} or not group
+                    or any(item.get("agent_kind") != "codex" for item in group)):
+                continue
+            device = _display_tty_device(target)
+            foreground = [item for item in group
+                          if item.get("pgid", 0) > 0
+                          and item.get("pgid") == item.get("tpgid")
+                          and item.get("tdev") == device]
+            if len(foreground) != 1:
+                continue
+            row = foreground[0]
+            if (len({item.get("pid") for item in group}) != len(group)
+                    or any(item.get("tdev") != device
+                           or item.get("tpgid") != row["pgid"]
+                           or (item is not row and item.get("pgid") == row["pgid"])
+                           for item in group)
+                    or any(display_process(item["pid"]) != item
+                           for item in group if item is not row)):
+                continue
+        # Other agent kinds were never filtered out of the group above.
         if agent_kind is not None and row["agent_kind"] != agent_kind:
             continue
         proof = {"process": row, "target": target}

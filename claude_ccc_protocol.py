@@ -120,9 +120,13 @@ def _digest(value: str) -> str:
     return hashlib.sha256((value or "").encode("utf-8", errors="replace")).hexdigest()[:24]
 
 
-CLAUDE_PROVIDER_BLOCKED_KINDS = frozenset({
+CLAUDE_PROVIDER_RETRY_KINDS = frozenset({
     "claude_auth", "claude_billing", "claude_model_unavailable", "claude_request_invalid",
+    "claude_429", "claude_503", "claude_api", "claude_stream",
 })
+# Error labels describe the last failure; they never override the user's
+# noncompletion continuation rule. Keep the old import compatible for callers.
+CLAUDE_PROVIDER_BLOCKED_KINDS = frozenset()
 STOP_FAILURE_ENUMS = frozenset({
     "authentication_failed", "oauth_org_not_allowed", "cloud_credential_error",
     "billing_error", "account_on_hold", "model_not_found", "invalid_request",
@@ -142,9 +146,9 @@ _ERROR_ANSI_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\
 def classify_stop_failure(error: Any, error_details: Any = "") -> dict[str, Any]:
     """Classify native failure evidence without retaining response text.
 
-    Hook enums and response details are independent evidence. A generic enum
-    must not hide a permanent rejection, and a number mentioned inside prose
-    must not turn an invalid request into a retryable provider outage.
+    Hook enums and response details are independent diagnostic evidence.
+    All incomplete failures use bounded continuation; a label must not create
+    an indefinite authentication/billing/model hold.
     """
     def text(value: Any) -> str:
         if isinstance(value, (dict, list)):
@@ -204,7 +208,7 @@ def classify_stop_failure(error: Any, error_details: Any = "") -> dict[str, Any]
         kind, reason = "claude_stream", "transport_interrupted"
     return {
         "error_kind": kind, "stop_failure_error": normalized_enum,
-        "error_reason": reason, "provider_blocked": kind in CLAUDE_PROVIDER_BLOCKED_KINDS,
+        "error_reason": reason, "provider_blocked": False,
         "error_evidence_hash": _digest(raw_error + "\n" + details),
     }
 

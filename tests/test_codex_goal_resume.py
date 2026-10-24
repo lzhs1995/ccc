@@ -15,6 +15,7 @@ import cmux_codex_watch as core
 from ccc_provider_retry import ProviderRetryStore
 from tests.test_codex_status_chrome import status_payload, visible_text, ERRORS
 from tests.test_watch import FakeClient, armed_daemon, span
+from tests.native_goal_fixture import install as install_goal_evidence
 
 
 class NativeGoalEvidenceTests(unittest.TestCase):
@@ -509,30 +510,47 @@ class GoalResumeDeliveryTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
+        # Rate limits use ordinary continuation even with a Goal. The separate
+        # Goal-resume route is exercised with a budgeted HTTP502 failure.
+        self.goal_error = 'unexpected status 502 Bad Gateway: Unknown error, url: http://127.0.0.1:18765/v1/responses'
         self.payload = status_payload("rate_limit")
+        for item in self.payload['render_grid']['row_spans']:
+            if ERRORS['rate_limit'] in item['text']:
+                item['text'] = item['text'].replace(ERRORS['rate_limit'], self.goal_error)
+                item['cell_width'] = len(item['text'])
         row = self.payload["render_grid"]["cursor"]["row"]
         self.payload["render_grid"]["row_spans"].append(span(row + 2, 2, "GPT-6-Astra · Goal stalled (/goal resume)", 1))
         self.client = FakeClient(self.payload, visible_text(self.payload))
         self.client.resume_codex_goal = lambda wid, sid, **kwargs: self.client.send(wid, sid, "/goal resume")
         self.daemon = armed_daemon(self.temp.name, self.client)
         self.addCleanup(self.daemon._process_snapshots.close)
+        self.target = self.daemon.config_store.load()['targets'][0]
+        self.sid = str(uuid.uuid4())
         self.daemon.codex_queue_recovery.current_turn = lambda _: {"kind": "unknown"}
         self.daemon.codex_queue_recovery.process_lookup = lambda _: {"agent_kind": "codex", "agent_pids": [12345]}
-        self.proof = {"session_id": "original", "goal_id": "goal", "turn_id": "failed", "at": 200,
-                      "model_provider": "synthetic-provider", "error": {"message": ERRORS["rate_limit"]}}
-        self.retry_now = 1000.0
+        self.proof = {"session_id": self.sid, "goal_id": "goal", "turn_id": "failed", "at": 200,
+                      "kind": "goal_blocked",
+                      "pid": 12345, "process_start": 1,
+                      "model_provider": "synthetic-provider", "error": {"message": self.goal_error}}
+        # A missing blocked-Goal proof cannot establish that the writer has no
+        # Goal. Ordinary fallback needs the writer's real, authenticated absent
+        # database row; the production reader and its stable rechecks stay live.
+        self.goal_evidence = install_goal_evidence(
+            self, {**self.proof, 'kind': 'task_complete'})
+        self.retry_now = 200.0
         self.daemon._provider_retry = ProviderRetryStore(self.daemon._provider_retry.path,
             clock=lambda: self.retry_now, jitter=lambda: 0)
-        self.daemon._provider_retry.observe('original', 'synthetic-provider', 'failed',
-            'rate_limit', ERRORS['rate_limit'], 200)
-        self.retry_now += 15
+        evidence = self.daemon._provider_retry.observe(self.sid, 'synthetic-provider', 'failed',
+            'http_502', self.goal_error, 200)
+        self.retry_due = self.daemon._provider_retry.evaluate(evidence).retry_at
+        self.retry_now = self.retry_due + .001
 
     def test_goal_waits_for_durable_error_delay_before_one_resume(self):
         self.retry_now = 200.0
         with patch.object(goal, 'blocked_goal', return_value=self.proof):
             self.daemon.process_once(self.client)
             self.assertEqual(self.client.sent, [])
-            self.retry_now = 200.25
+            self.retry_now = self.retry_due
             self.daemon.process_once(self.client)
             self.assertEqual([row[-1] for row in self.client.sent], ['/goal resume'])
 
@@ -547,7 +565,7 @@ class GoalResumeDeliveryTests(unittest.TestCase):
         self.assertEqual(self.client.sent[0][-1], "/goal resume")
 
     def test_goal_resume_measures_latency_from_matching_native_completion(self):
-        self.daemon._native_failed('surface-uuid', 'workspace-uuid', 'original', 'failed', 199.75)
+        self.daemon._native_failed('surface-uuid', 'workspace-uuid', self.sid, 'failed', 199.75)
         with patch.object(goal, 'blocked_goal', return_value=self.proof):
             self.daemon.process_once(self.client)
         runtime = self.daemon.runtime['surface-uuid']
@@ -558,7 +576,7 @@ class GoalResumeDeliveryTests(unittest.TestCase):
                                (runtime.send_io_started_at - 199.75) * 1000, places=2)
 
     def test_goal_resume_cannot_reuse_another_turns_latency(self):
-        self.daemon._native_failed('surface-uuid', 'workspace-uuid', 'original', 'other-turn', 199.75)
+        self.daemon._native_failed('surface-uuid', 'workspace-uuid', self.sid, 'other-turn', 199.75)
         runtime = self.daemon.runtime['surface-uuid']
         runtime.native_complete_to_send_ms = 5000
         runtime.native_send_deadline_missed = True
@@ -661,7 +679,7 @@ class GoalResumeDeliveryTests(unittest.TestCase):
                   'payload': {'type': 'message', 'role': 'user',
                               'content': [{'type': 'input_text', 'text': '后续消息已到达'}]}}
         path.write_text('\n'.join(json.dumps(row) for row in (
-            {'type': 'session_meta', 'payload': {'id': 'original',
+            {'type': 'session_meta', 'payload': {'id': self.sid,
                                                 'model_provider': 'synthetic-provider'}},
             {**completed, 'timestamp': '1970-01-01T00:02:00Z',
              'payload': {**completed['payload'], 'turn_id': 'old-goal-turn'}},
@@ -669,8 +687,9 @@ class GoalResumeDeliveryTests(unittest.TestCase):
         self.payload['render_grid']['row_spans'].append(span(49, 0, '› 后续消息已到达', 0))
         self.client.text = visible_text(self.payload)
         self.daemon.codex_queue_recovery.current_turn = lambda _: {
-            'session_id': 'original', 'pid': 12345, 'process_start': 1,
-            **(task_snapshot(path, 'original') or {'kind': 'unknown'})}
+            'session_id': self.sid, 'pid': 12345, 'process_start': 1,
+            'model_provider': 'synthetic-provider',
+            **(task_snapshot(path, self.sid) or {'kind': 'unknown'})}
         return path, notice
 
     def test_new_native_completion_after_notices_recovers_despite_stale_goal(self):

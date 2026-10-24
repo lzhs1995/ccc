@@ -8,6 +8,7 @@ mutations.
 
 from __future__ import annotations
 
+import calendar
 import contextlib
 import copy
 import curses
@@ -15,6 +16,7 @@ import datetime as dt
 import io
 import json
 import locale
+import math
 import re
 import subprocess
 import sys
@@ -56,6 +58,7 @@ WATCH_LABELS = {
     "starting": "整池／启动中",
     "excluded": "已排除",
     "identity_pending": "待检测",
+    "outside_pool": "未纳入",
 }
 
 # 程序 column vocabulary.  Module level so the README-consistency test can prove
@@ -393,6 +396,7 @@ class Candidate:
     paused_at: Any = None
     pause_age_sec: float | None = None
     pause_time_status: str = "missing"
+    display_state: str = ""
 
     @property
     def session_text(self) -> str:
@@ -476,6 +480,7 @@ def native_display_labels(records, classified, top):
             if target and not target.get("tty") and len(rows) == 1:
                 names = ttys.get(rows[0]["tdev"], [])
                 if len(names) == 1:
+                    # display_process_labels rechecks this exact process and TTY.
                     record = {**record, "native_display_target": {**target, "tty": names[0]}}
             result.append(record)
         return result, native.display_process_labels(result, classified, top, processes=processes)
@@ -531,6 +536,8 @@ def is_idling(candidate: Candidate) -> bool:
         return False
     if candidate.agent_kind == "unknown":
         return False
+    if candidate.agent_kind in {"codex", "claude"}:
+        return False
     if candidate.source == "workspace_non_codex":
         return True
     if candidate.paused or candidate.source == "workspace_excluded":
@@ -555,6 +562,8 @@ def watch_kind(candidate: Candidate) -> str:
         return "excluded"
     if not candidate.enabled:
         return "disabled"
+    if candidate.source == "workspace_non_codex" and candidate.agent_kind in {"codex", "claude"}:
+        return "outside_pool"
     if candidate.source == "workspace_starting":
         return "paused" if candidate.paused else "starting"
     if candidate.paused and candidate.source != "workspace_non_codex":
@@ -580,7 +589,7 @@ def watch_label(candidate: Candidate) -> str:
         return ('N续跑' if phase == 'retryable' else
                 'N完成' if phase in {'complete', 'stopped'} else 'N检查')
     if candidate.source not in {"untracked", "workspace_excluded", "workspace_non_codex"} and candidate.enabled and not candidate.paused:
-        health_labels = {"unknown": "待检测", "delivery_unknown": "投递待验",
+        health_labels = {"unknown": "待检测", "delayed": "检测延迟", "delivery_unknown": "投递待验",
                          "send_failed": "发送失败", "unavailable": "读取异常", "blocked": "服务阻塞"}
         if candidate.continuation_status in health_labels:
             return health_labels[candidate.continuation_status]
@@ -612,7 +621,7 @@ def screen_label(candidate: Candidate) -> str:
         return ACCESS_LABELS.get(candidate.access.get('phase'), ACCESS_LABELS['invalid'])[0]
     if is_idling(candidate) and candidate.state not in DETAIL_FALLBACKS:
         return "—"
-    return state_label(candidate.state)
+    return state_label(candidate.display_state or candidate.state)
 
 
 def _elapsed_since(value: object) -> float:
@@ -714,12 +723,30 @@ def diagnostic_detail(candidate: Candidate) -> str:
     return detail
 
 
+def runtime_viewport_state(runtime: Mapping[str, Any]) -> str:
+    """A fresh raw viewport can describe activity without changing send state."""
+    stamp = runtime.get("viewport_observed_at")
+    if (runtime.get("viewport_readable") is not True or type(stamp) not in (int, float)
+            or not math.isfinite(stamp) or stamp <= 0):
+        return ""
+    cadence = runtime.get("observation_cadence_sec", 1.0)
+    if type(cadence) not in (int, float) or not math.isfinite(cadence):
+        cadence = 1.0
+    if not 0 <= time.time() - stamp <= max(3.0, 2 * min(10.0, max(1.0, cadence))):
+        return ""
+    return str(runtime.get("viewport_state") or "")
+
+
 def runtime_observation(runtime: Mapping[str, Any]) -> tuple[str, str]:
     """Use a matching observation without relabeling an old send episode."""
     error = str(runtime.get("error_type") or "-")
     reason = ""
+    if runtime_viewport_state(runtime):
+        return str(runtime.get("viewport_error_type") or "-"), str(runtime.get("viewport_reason") or "")
     if runtime.get("observed_state") == runtime.get("state") and runtime.get("observed_at"):
-        error = str(runtime.get("observed_error_type") or error)
+        # An explicit empty current error clears the display, not the stored
+        # trigger used by the original continuation episode.
+        error = str(runtime.get("observed_error_type") or "-")
         reason = str(runtime.get("observed_reason") or "")
     return error, reason
 
@@ -873,18 +900,17 @@ def rule(char: str, width: int) -> str:
 # ---------------------------------------------------------------------------
 # Session identity
 #
-# The session column exists so an operator can copy a resume command straight
-# off the row.  That single purpose sets every rule below: a *partial* UUID is
-# not a cosmetic problem, it is wrong data that looks right, so the cell is
-# all-or-nothing.  Everything here is derived from live processes and held in
-# memory only -- no session id is ever written to state, logs or metrics.
+# Narrow rows use an explicit ellipsis; K shows the complete identity and y
+# always copies the validated underlying UUID. Display abbreviations are never
+# used for resume commands. Session identities stay in memory only.
 # ---------------------------------------------------------------------------
 
 TITLE_COL_WIDTH = 12
 SESSION_COL_WIDTH = 36
-# 【已退役，保留只为当"禁止出现的字符串"用】。以前 session 列放不下时画它；现在
-# 放不下就整列省略。留着这个名字，是为了让测试可以按名断言它在任何宽度下都不出
-# 现 —— 删掉名字，那条负向断言就只能写成字面量，改文案时会静默失效。
+SESSION_SHORT_WIDTH = 13
+API_KEY_COL_WIDTH = 72
+API_KEY_SHORT_WIDTH = 16
+# Retired warning marker. Narrow rows now use explicitly abbreviated identities.
 SESSION_NARROW_MARKER = "窗口过窄"
 SESSION_UNMEASURED = "未测量"
 SESSION_GROUP_CELL = "—"
@@ -990,6 +1016,7 @@ class SessionResult:
     api_key_observation_status: str = "unverified"
     foreground_evidence: tuple | None = field(default=None, repr=False)
     foreground_observations: tuple = field(default=(), repr=False)
+    native_identity: dict | None = field(default=None, repr=False)
 
     @property
     def ok(self) -> bool:
@@ -1237,6 +1264,79 @@ def claude_session_from_runtime(
     return session_id.lower(), ""
 
 
+CLAUDE_NATIVE_SESSIONS_DIR = Path.home() / ".claude" / "sessions"
+CLAUDE_NATIVE_RECORD_MAX_BYTES = 64 * 1024
+
+
+def _read_claude_native_record(pid: int, directory: Path) -> tuple[dict | None, str]:
+    """Bounded read of ``<dir>/<pid>.json``: no symlink, regular, ours, small."""
+
+    import os
+    import stat as stat_mod
+
+    try:
+        fd = os.open(str(Path(directory) / f"{int(pid)}.json"),
+                     os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except (OSError, ValueError, TypeError):
+        return None, "原生 session 文件不可读"
+    try:
+        info = os.fstat(fd)
+        if (not stat_mod.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or info.st_size > CLAUDE_NATIVE_RECORD_MAX_BYTES):
+            return None, "原生 session 文件不是本用户的普通小文件"
+        data = os.read(fd, CLAUDE_NATIVE_RECORD_MAX_BYTES + 1)
+    except OSError:
+        return None, "原生 session 文件不可读"
+    finally:
+        os.close(fd)
+    if len(data) > CLAUDE_NATIVE_RECORD_MAX_BYTES:
+        return None, "原生 session 文件不是本用户的普通小文件"
+    try:
+        record = json.loads(data)
+    except (ValueError, UnicodeDecodeError):
+        return None, "原生 session 文件格式无效"
+    if not isinstance(record, dict):
+        return None, "原生 session 文件格式无效"
+    return record, ""
+
+
+def claude_session_from_native(
+    pid: int,
+    ps_table: Mapping[int, Mapping[str, str]],
+    directory: Path | None = None,
+) -> tuple[str | None, str]:
+    """Claude's own per-PID record, admitted only for this exact process birth.
+
+    Used when argv carries no SID (a plain ``claude`` launch).  PID, kind,
+    UUID shape and kernel start time must all agree, so a reused PID or a
+    stale record fails closed exactly like the runtime tier.
+    """
+
+    record, why = _read_claude_native_record(pid, directory or CLAUDE_NATIVE_SESSIONS_DIR)
+    if record is None:
+        return None, why
+    if record.get("pid") != pid:
+        return None, "原生 session 文件 PID 不符"
+    if record.get("kind") != "interactive":
+        return None, "原生 session 不是交互会话"
+    session_id = str(record.get("sessionId") or "")
+    if not is_session_uuid(session_id):
+        return None, "原生 session ID 格式无效"
+    started = str((ps_table.get(pid) or {}).get("started_at") or "")
+    if not started:
+        return None, "无法读取该 PID 的启动时间"
+    try:
+        # procStart is UTC ctime text; parse_ps_table stores local naive ISO.
+        native = calendar.timegm(time.strptime(" ".join(str(record.get("procStart")).split()),
+                                               "%a %b %d %H:%M:%S %Y"))
+        local = int(time.mktime(dt.datetime.fromisoformat(started).timetuple()))
+    except (ValueError, TypeError, OverflowError):
+        return None, "原生 session 出生时间无法解析"
+    if native != local:
+        return None, "原生 session 出生时间与进程不符（PID 复用或记录过期）"
+    return session_id.lower(), ""
+
+
 def resolve_surface_session(
     agent_kind: str,
     agent_pids: list[int],
@@ -1247,6 +1347,7 @@ def resolve_surface_session(
     lsof_runner: Callable[..., Any] = subprocess.run,
     grok_path: Path | None = None,
     grok_loader: Callable[..., Any] | None = None,
+    native_dir: Path | None = None,
 ) -> SessionResult:
     """Resolve one surface, argv tiers first and bounded fallbacks last.
 
@@ -1327,6 +1428,16 @@ def resolve_surface_session(
         if agent_kind == "claude":
             # The Claude tier is keyed on the surface's runtime record, not on
             # an individual PID, so retrying per PID would repeat one answer.
+            # Claude's own per-PID record is checked for every PID and joins
+            # the same ``hits`` set, so runtime/native disagreement is a
+            # conflict rather than a silent pick.
+            for native_pid in live:
+                native_found, native_why = claude_session_from_native(
+                    native_pid, ps_table, native_dir)
+                if native_found:
+                    hits.setdefault(native_found, native_pid)
+                elif native_why and not found:
+                    reasons.append(native_why)
             break
     if len(hits) == 1:
         session_id, pid = next(iter(hits.items()))
@@ -1456,6 +1567,24 @@ class SessionResolver:
             return {}
         return parse_ps_table(getattr(result, "stdout", "") or "")
 
+    def _publish_row(
+        self, token: int, surface_id: str, result: SessionResult,
+    ) -> bool:
+        """Publish one finished row under this pass's own generation token.
+
+        Returns False when a newer pass has started; that is the same discard
+        rule the end-of-pass write already applies, so a late pass can still
+        not resurrect an id for a process that has been replaced.
+        """
+
+        with self._lock:
+            if token != self._generation:
+                return False
+            merged = dict(self._results)
+            merged[surface_id] = result
+            self._results = merged
+            return True
+
     def _resolve_once(
         self,
         surfaces: list[Mapping[str, Any]],
@@ -1469,6 +1598,17 @@ class SessionResolver:
             surface_id = str(item.get("surface_id") or "")
             if not surface_id:
                 continue
+            native_identity = item.get("native_identity")
+            if native_identity is not None:
+                from ccc_native_processes import display_identity_matches
+                if not display_identity_matches(native_identity):
+                    resolved[surface_id] = SessionResult(
+                        reason="原生进程身份已变化，等待重新测量")
+                    # 候选新增：这条早退也要立刻发布，否则上一趟已发布的
+                    # session 与 Key 会留在表上直到本趟结束才被清除。
+                    if not self._publish_row(token, surface_id, resolved[surface_id]):
+                        return
+                    continue
             pids = _coerce_pids(item.get("agent_pids"))
             resolved[surface_id] = resolve_surface_session(
                 str(item.get("agent_kind") or ""), pids, ps_table,
@@ -1477,11 +1617,19 @@ class SessionResolver:
                 grok_path=self._grok_path, grok_loader=self._grok_loader,
             )
             result = resolved[surface_id]
+            result.native_identity = native_identity
             if result.ok and result.agent_kind == "codex":
                 observe_request_api_key(result)
             elif result.ok and result.agent_kind == "claude":
                 from ccc_claude_request_key import observe
                 observe(result)
+            if native_identity is not None and not display_identity_matches(native_identity):
+                resolved[surface_id] = SessionResult(
+                    reason="测量期间原生进程身份已变化，session 与 Key 已清除")
+            # 候选新增：逐行发布。generation 校验照旧，过期趟次直接退出，
+            # 不会把已被替换的进程的 id 复活。
+            if not self._publish_row(token, surface_id, resolved[surface_id]):
+                return
         with self._lock:
             # A pass that started before a newer one is discarded rather than
             # written: late results would otherwise resurrect ids for processes
@@ -2149,6 +2297,22 @@ class RowLayout:
     collab: bool
     session: bool
     head_cells: int      # session 列之前那一段占的显示单元格数
+    session_cells: int = 0
+    key_cells: int = 0
+
+
+def identity_cell_widths(width: int, head_cells: int) -> tuple[int, int]:
+    """Reserve both identities before expanding either display field."""
+    available = width - head_cells
+    if available < 1 + SESSION_SHORT_WIDTH:
+        return 0, 0
+    if available < 2 + SESSION_SHORT_WIDTH + API_KEY_SHORT_WIDTH:
+        return SESSION_SHORT_WIDTH, 0
+    session = (SESSION_COL_WIDTH if available >= 2 + SESSION_COL_WIDTH + API_KEY_SHORT_WIDTH
+               else SESSION_SHORT_WIDTH)
+    key = (API_KEY_COL_WIDTH if available >= 2 + session + API_KEY_COL_WIDTH
+           else API_KEY_SHORT_WIDTH)
+    return session, key
 
 
 def _head_cells(columns: tuple[tuple[str, int, str], ...], *, collab: bool) -> int:
@@ -2166,16 +2330,7 @@ MIN_CORE_WIDTH = _head_cells(
 
 
 def row_layout(width: int | None, *, collab_available: bool = False) -> RowLayout:
-    """按【实测可用宽度】决定列集、协作列、session 列。
-
-    规则（只有这一处）：
-      1. 从信息最全的配置开始往下退，第一个放得下的就是答案 —— 于是更宽的终端
-         永远不会显示得更少（单调）。
-      2. 数据列优先于协作列：协作列是补充说明，数据列回答这一行是谁。
-      3. session 列全有或全无，判据是 36 个显示单元格全部放得下。放不下就整列
-         省略：既不画标记也不画片段，因为 ``9f7aa928-0525`` 看起来就是个合法 id、
-         能干净地复制、却 resume 不了任何东西。完整 id 在焦点行里给。
-    """
+    """Keep location, program and both identity previews before diagnostics."""
     if width is None:
         # 历史形态：没有终端可量的调用方（和老测试）拿到固定九列，不做任何裁剪。
         return RowLayout(ROW_COLUMNS, False, False, _head_cells(ROW_COLUMNS, collab=False))
@@ -2184,12 +2339,15 @@ def row_layout(width: int | None, *, collab_available: bool = False) -> RowLayou
         columns = tuple(col for col in ROW_COLUMNS if col[0] not in removed)
         for collab in ((True, False) if collab_available else (False,)):
             head = _head_cells(columns, collab=collab)
-            if head <= width:
-                return RowLayout(columns, collab,
-                                 head + 1 + SESSION_COL_WIDTH <= width, head)
-    # 比核心行还窄：仍然只给核心三列，剩下的交给按列裁剪，不再有更小的列集可退。
+            session, key = identity_cell_widths(width, head)
+            if key:
+                return RowLayout(columns, collab, bool(session), head, session, key)
+    # Below the two-identity minimum, keep the core columns and any session
+    # preview that fits. The final draw clips terminals narrower than the core.
     columns = tuple(col for col in ROW_COLUMNS if col[0] in CORE_COLUMN_NAMES)
-    return RowLayout(columns, False, False, _head_cells(columns, collab=False))
+    head = _head_cells(columns, collab=False)
+    session, key = identity_cell_widths(width, head)
+    return RowLayout(columns, False, bool(session), head, session, key)
 
 
 def get_visible_columns(width: int) -> tuple[tuple[str, int, str], ...]:
@@ -2217,6 +2375,31 @@ def session_cell(text: str, available: int) -> str | None:
     return pad(text, SESSION_COL_WIDTH)
 
 
+def abbreviated_cell(text: str, width: int) -> str:
+    """Mark shortened display values; copy paths retain the original value."""
+    if display_width(text) <= width:
+        return pad(text, width)
+    # UUID previews retain the first eight and final four characters.
+    left = 8 if is_session_uuid(text) and width == SESSION_SHORT_WIDTH else (width - 1) // 2
+    right = width - left - 1
+    suffix = clip_to_width(text[::-1], right)[::-1]
+    return pad(clip_to_width(text, left) + "…" + suffix, width)
+
+
+def request_key_cell(text: str, width: int) -> str:
+    if width == API_KEY_SHORT_WIDTH:
+        text = {
+            "历史请求（K查看完整值）": "历史请求(K)",
+            "暂无请求记录": "无请求",
+            "仅旧进程记录": "旧进程记录",
+            "未接入采集（K查看）": "未采集(K)",
+        }.get(text, text)
+        if text.startswith("Bearer ") and "; x-api-key " in text:
+            text = "双Key(K详情)"
+        return abbreviated_cell(text, width)
+    return pad(text if display_width(text) <= width else "Key 过长，见详情", width)
+
+
 def _row_text(
     prefix: str,
     cells: tuple[str, ...],
@@ -2233,18 +2416,18 @@ def _row_text(
     nine-column row, which is what callers that have no terminal to measure
     (and the older tests) rely on.
 
-    ``collab`` is the 协作 cell.  ``None`` omits the column entirely -- the
-    historical layout -- while any string (even "") reserves COLLAB_COL_WIDTH
-    columns.  The caller decides once per frame via collab_column_fits(), so
-    the header and every row always agree, and the session cell's own
-    fits-or-marker arithmetic keeps working because it measures the head it is
-    actually appended to.
-
-    ``visible_columns`` allows responsive layout: when provided, only those
-    columns are rendered. The cells tuple must match the original ROW_COLUMNS
-    order; this function extracts the visible subset.
+    Without ``visible_columns``, derive the responsive layout from ROW_COLUMNS.
+    With it, ``cells`` is already the selected subset in the same order and
+    ``collab`` is the frame's shared decision. Identity widths use the rendered
+    head, so headers, member rows and mouse bounds stay aligned.
     """
-    columns = visible_columns if visible_columns is not None else ROW_COLUMNS
+    if visible_columns is None:
+        plan = row_layout(width, collab_available=collab is not None)
+        columns = plan.columns
+        cells = tuple(value for value, column in zip(cells, ROW_COLUMNS) if column in columns)
+        collab = collab if plan.collab else None
+    else:
+        columns = visible_columns
 
     body = " ".join(pad(value, width_, align) for value, (_, width_, align) in zip(cells, columns))
     if collab is not None:
@@ -2252,18 +2435,16 @@ def _row_text(
     head = f"{prefix}{body}  {pad(title, TITLE_COL_WIDTH)}"
     if width is None:
         return f"{prefix}{body}  {title}"
-    cell = session_cell(session, width - display_width(head) - 1)
-    # 全有或全无，且「无」就是【整列省略】：不画标记、不画片段。标记本身也要占
-    # 位（"窗口过窄" 是 8 个显示单元格 + 一个空格），在临界宽度上反而把行顶出窗
-    # 口，于是"放不下 id"变成"连行都画坏"。完整 id 由焦点行给出。
-    if cell is None:
+    session_width, key_width = identity_cell_widths(width, display_width(head))
+    if not session_width:
         return head.rstrip()
+    session_label = "session~" if session == "session" and session_width < SESSION_COL_WIDTH else session
+    cell = abbreviated_cell(session_label, session_width)
     row = f"{head} {cell}"
-    # Keep the full credential (including its configuration-only label) or
-    # omit the entire column. Never present a clipped key as copyable auth.
-    if api_key and display_width(row) + 1 + 72 <= width:
-        value = api_key if display_width(api_key) <= 72 else "Key 过长，见详情"
-        row += " " + pad(value, 72)
+    if api_key and key_width:
+        key_label = ("Key~(最近请求)" if api_key == "api-key(最近请求)" and key_width < API_KEY_COL_WIDTH
+                     else api_key)
+        row += " " + request_key_cell(key_label, key_width)
     return row.rstrip()
 
 
@@ -2303,8 +2484,21 @@ def location_text(record: Mapping[str, Any], workspace_ref: str = "") -> str:
     )
     if len(legacy) <= 14:
         return legacy
+    # '#' explicitly denotes this inventory's display ordinal, never a ref.
     display = str(record.get("display_location") or "")
     return display if display and len(display) <= 14 else "位置待验"
+
+
+def current_session_result(result: SessionResult | None, label: Mapping[str, Any]) -> SessionResult:
+    """A new native generation cannot inherit the previous cache's session/key."""
+    if result is None:
+        return SessionResult(reason="尚未测量")
+    expected = label.get("native_identity")
+    if (expected is not None or result.native_identity is not None) and expected != result.native_identity:
+        # An asynchronous cache mismatch also covers a pending refresh; it
+        # does not by itself prove that the native process changed.
+        return SessionResult(reason="本代 session 与请求记录待重新核验")
+    return result
 
 
 def target_name(record: Mapping[str, Any]) -> str:
@@ -2433,11 +2627,8 @@ def focus_summary(candidate: Candidate | None, workspace_ref: str = "") -> str:
             facts.append(f"连续中断 {candidate.consecutive_resumes} 次，仍在自动恢复")
     else:
         facts.append(candidate.process_summary or agent_label(candidate.agent_kind))
-    # The session detail goes last because it is the longest, and because it is
-    # the one fact the table itself may be too narrow to show.  On a narrow
-    # terminal this line is the only place the complete UUID appears, so the
-    # generated command is built here from the validated ID -- never from the
-    # possibly-clipped cell.
+    # K also wraps the complete UUID on narrow terminals. Resume commands and
+    # clipboard values always come from the validated ID, never its preview.
     facts.append(session_detail(candidate))
     if candidate.agent_kind == "codex":
         note = candidate.session.api_key_observation_note or "尚无可核实的原生请求记录"
@@ -3117,11 +3308,15 @@ class SupervisorModel:
                 try:
                     top = self._inventory.get("top", self.client.top_all, ttl=5)
                 except InventoryUnavailable:
+                    # A missing process-table refresh is not process exit.
                     top = self._inventory.peek("top", max_age=5) or {}
             candidates = core.main_surface_records(tree, allow_ref_only=True)
             process_by_id = core.classify_surface_processes(top)
-            from ccc_native_processes import display_surface_records
+            from ccc_native_processes import display_surface_records, display_process_labels
             candidates = display_surface_records(tree, candidates)
+            # A pending GUI scan must not suppress current native identities.
+            # Bounded cached topology is display-only; the native supplement
+            # still rechecks UUID, TTY, foreground group, birth and argv.
             candidates, process_by_id = native_display_labels(candidates, process_by_id, top)
             # One resolution pass per refresh, on a worker thread.  Started
             # before the rows are built so the ids that land are used by the
@@ -3144,6 +3339,7 @@ class SupervisorModel:
                     "surface_id": str(record["surface_id"]),
                     "agent_kind": str(label.get("agent_kind") or ""),
                     "agent_pids": list(label.get("agent_pids") or []),
+                    "native_identity": label.get("native_identity"),
                 })
             self.sessions.maybe_refresh(
                 session_payload,
@@ -3211,6 +3407,7 @@ class SupervisorModel:
                     source = "workspace_rule"
                     target = {"paused": False}
                 elif rule is not None and agent_kind == "unknown":
+                    # Unknown discovery is not an unused terminal registration.
                     source = "workspace_rule"
                     target = {"paused": False}
                 elif rule is not None:
@@ -3244,6 +3441,7 @@ class SupervisorModel:
                     source=source,
                     state=("untracked" if source in {"untracked", "workspace_non_codex"} else str(runtime.get("state") or "unknown")),
                     error_type=observed_error,
+                    display_state=runtime_viewport_state(runtime),
                     send_count=int(runtime.get("send_count") or 0),
                     paused=bool(target and target.get("paused")),
                     selected_hint=surface_id in {self.suggested_surface, str(self.suggested_surface)},
@@ -3289,7 +3487,7 @@ class SupervisorModel:
                     # Last completed resolution for this surface.  Absent until
                     # the first worker pass lands, which is why the default is
                     # an unmeasured result rather than an empty string.
-                    session=session_by_id.get(surface_id) or SessionResult(),
+                    session=current_session_result(session_by_id.get(surface_id), process_info),
                 ))
             # This is the current cmux inventory, not a registration history.
             # Refs are ephemeral: resurrecting config-only rows both invents
@@ -3348,7 +3546,7 @@ class SupervisorModel:
         trace = getattr(self._action_context, 'ui_trace', None)
         if trace is not None and args[0] == 'batch-workspace':
             args = [*args, '--ui-action-id', trace['action_id']]
-        result = subprocess.run([sys.executable, "-B", str(Path(core.__file__).resolve()),
+        result = subprocess.run([sys.executable, "-I", "-B", str(Path(__file__).with_name("ccc_cli.py").resolve()),
                                  "--config", str(self.config_path), *args],
                                 capture_output=True, text=True, timeout=180 if args[0] in {
                                     "pause-workspace", "resume-workspace", "batch-workspace"} else 30)
@@ -4757,7 +4955,7 @@ def view_row_attr(row: ViewRow) -> int:
     return row_attr(row.candidate) if row.candidate else 0
 
 
-GLOBAL_KEYS_1 = "K API-key详情  ↑↓ jk 移动  Tab 折/展  z/Z 全折/展  [ ] 跳 workspace  / 查找  c 清除  y 复制ID"
+GLOBAL_KEYS_1 = "K 会话/Key详情  ↑↓ jk 移动  Tab 折/展  z/Z 全折/展  [ ] 跳 workspace  / 查找  c 清除  y 复制ID"
 GLOBAL_KEYS_2 = "N 原生50·节费暂缓  b 空目录50  f 筛选 R 刷新 G 存储 v 三件套 e 配置 A 开启发 S 停发 d 观察 q 退出"
 
 
@@ -4803,13 +5001,22 @@ def api_key_detail_lines(candidate: Candidate, width: int) -> list[str]:
                "API-key：暂无请求记录" if candidate.session.api_key_observation_status == "absent" else
                "API-key：本进程未接入请求采集" if candidate.session.api_key_observation_status == "not_instrumented" else
                "API-key：实际请求未核实")
-    values = [heading,
-              candidate.session.api_key_observed or (
-                  "最近请求无可展示 Key" if candidate.session.api_key_observation_note
-                  else "尚无原生请求记录"),
-              candidate.session.api_key_observation_note, candidate.session.session_id,
+    values = ["session ID：", candidate.session.session_id if candidate.session.ok else
+              "未测量" + ("：" + candidate.session.reason if candidate.session.reason else ""),
+              "", heading,
+              candidate.session.api_key_observed or "尚无已核实的请求 Key",
+              candidate.session.api_key_observation_note,
+              "", "表格中 … 表示简写；复制取完整值。",
               "", "本页仅展示该会话实际请求记录，不读取全局配置 Key。",
               "请求记录不保证下一次请求使用同一 Key。"]
+    record = getattr(candidate, "record", {})
+    if record:
+        values.extend(["", "位置 " + location_text(record) + "（# 为当前清单索引）"])
+        for kind, ref_key, id_key in (("window", "window_ref", "window_id"),
+                                     ("workspace", "workspace_ref", "workspace_id"),
+                                     ("pane", "pane_ref", "pane_id"),
+                                     ("surface", "ref", "surface_id")):
+            values.append(f"{kind}: {record.get(ref_key) or '?'}  UUID: {record.get(id_key) or '?'}")
     lines = []
     for value in values:
         line = ""
@@ -4841,7 +5048,7 @@ def _api_key_page(stdscr: Any, candidate: Candidate) -> None:
             _safe_addnstr(stdscr, y, 0, line, clip)
         if height >= 2:
             _safe_addnstr(stdscr, height - 2, 0, message, clip)
-            _safe_addnstr(stdscr, height - 1, 0, "↑↓滚动 y复制当前详情Key q返回", clip)
+            _safe_addnstr(stdscr, height - 1, 0, "↑↓滚动 y复制Key i复制ID q返回", clip)
         stdscr.refresh()
         key = stdscr.getch()
         if key in (27, ord("q"), ord("Q"), ord("K")):
@@ -4850,6 +5057,12 @@ def _api_key_page(stdscr: Any, candidate: Candidate) -> None:
             offset = min(offset + 1, max(0, len(lines) - visible))
         elif key in (curses.KEY_UP, ord("k")):
             offset = max(0, offset - 1)
+        elif key in (ord("i"), ord("I")):
+            try:
+                copy_session_id(candidate)
+                message = "已复制完整 session ID"
+            except (OSError, RuntimeError, subprocess.TimeoutExpired):
+                message = "会话 ID 未核实或复制失败"
         elif key in (ord("y"), ord("Y")):
             copy_key = candidate.session.api_key_observed
             if not copy_key:
@@ -5636,7 +5849,7 @@ def _run(stdscr: Any, model: SupervisorModel) -> None:
                             candidate = rows[clicked].candidate
                             columns = row_layout(width - 1, collab_available=bool(model.collab.snapshot()))
                             if (candidate is not None and columns.session
-                                    and columns.head_cells + 1 <= mx < columns.head_cells + 1 + SESSION_COL_WIDTH):
+                                    and columns.head_cells + 1 <= mx < columns.head_cells + 1 + columns.session_cells):
                                 index, key = clicked, ord("y")
                             else:
                                 continue
@@ -5649,10 +5862,10 @@ def _run(stdscr: Any, model: SupervisorModel) -> None:
             return
         if key == ord("K"):
             candidate = rows[index].candidate if rows else None
-            if candidate is not None and candidate.agent_kind == "codex":
+            if candidate is not None:
                 _api_key_page(stdscr, candidate)
             else:
-                status = "请选择一个 Codex 会话查看配置 Key"
+                status = "请选择一个成员行查看 session / 请求 Key"
             continue
         if key == ord("G"):
             # The storage page owns its own keys while it is open, which is why
@@ -5691,7 +5904,7 @@ def _run(stdscr: Any, model: SupervisorModel) -> None:
         if key in (ord("y"), ord("Y")):
             candidate = rows[index].candidate if rows else None
             if candidate is None or not candidate.session.ok:
-                status = "请选中已显示完整 session ID 的行；未测量或组头无法复制"
+                status = "请选中会话 ID 已核实的行；未测量或组头无法复制"
             else:
                 status = model.start_action(
                     lambda candidate=candidate: copy_session_id(candidate),

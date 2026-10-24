@@ -28,6 +28,8 @@ class RuntimeInstallTests(unittest.TestCase):
         self.source.mkdir(parents=True)
         for name in core.RUNTIME_FILES:
             (self.source / name).write_text("VALUE = 1\n", encoding="utf-8")
+        shutil.copytree(SOURCE / core.RUNTIME_MAC_SOURCE,
+                        self.source / core.RUNTIME_MAC_SOURCE)
         self.app = self.root / "Library" / "Application Support" / core.APP_NAME
         self.runtime = self.app / "runtime"
         self.plist = self.root / "LaunchAgents" / "watcher.plist"

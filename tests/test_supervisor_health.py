@@ -183,7 +183,7 @@ class CurrentHealthTests(unittest.TestCase):
 class SessionClipboardTests(unittest.TestCase):
     def test_full_native_id_goes_to_stdin_even_if_column_is_hidden(self):
         candidate = row()
-        self.assertFalse(tui.row_layout(70).session)
+        self.assertFalse(tui.row_layout(60).session)
         with mock.patch.object(tui.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as run:
             self.assertEqual(tui.copy_session_id(candidate), SESSION_A)
         self.assertEqual(run.call_args.kwargs["input"], SESSION_A)

@@ -43,14 +43,20 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from claude_ccc_protocol import (
     EVENT_JOURNAL_PATH, EVENT_SOCKET_PATH, completion_reported, report_ready_task,
-    classify_stop_failure, CLAUDE_PROVIDER_BLOCKED_KINDS, STOP_FAILURE_METADATA,
+    classify_stop_failure, CLAUDE_PROVIDER_RETRY_KINDS, STOP_FAILURE_METADATA,
 )
 import claude_dispatch_recovery as dispatch_recovery
+import claude_provider_recovery as provider_recovery
+import claude_provider_native_evidence as provider_native
+import claude_provider_legacy_migration as provider_migration
 import ccc_observation as observation_health
 import ccc_claude_closeout as supervisor_closeout
 import ccc_network_client as network_health
 from ccc_codex_queue import NativeCompletionWatcher, QueueRecovery
-from ccc_native_processes import NativeProcessIndex
+from ccc_native_processes import (
+    NativeProcessIndex, display_identity_matches, display_process,
+    display_process_labels, display_surface_records,
+)
 from ccc_scheduling import CoalescingWriter, SnapshotCache, SnapshotClient, SurfaceScheduler, TreeSnapshot
 from ccc_delivery import DeliveryStore
 from ccc_state_snapshot import AtomicJSONSnapshot
@@ -81,6 +87,8 @@ RUNTIME_FILES = ("cmux_codex_watch.py", "ccc_provider_retry.py", "claude_ccc_pro
 RUNTIME_FILES += ("ccc_native_standby.py", "ccc_standby_identity.py", "ccc_standby_transport.py", "ccc_standby_launch.py")
 RUNTIME_FILES += ("ccc_standby_generation.py", "ccc_standby_manager.py")
 RUNTIME_FILES += ("claude_dispatch_recovery.py",)
+RUNTIME_FILES += ("claude_provider_recovery.py", "claude_provider_native_evidence.py",
+                  "claude_provider_legacy_migration.py")
 RUNTIME_FILES += ("ccc_client_thread_observation.py", "ccc_request_key_binding.py",
                   "ccc_request_observation_policy.py", "ccc_shared_codex_turn.py")
 RUNTIME_FILES += ("ccc_standby_sources.py", "ccc_standby_rollouts.py", "ccc_standby_readiness.py",
@@ -93,6 +101,33 @@ RUNTIME_FILES += ("ccc_standby_sources.py", "ccc_standby_rollouts.py", "ccc_stan
 RUNTIME_FILES += ("ccc_claude_closeout.py",)
 RUNTIME_FILES += ("ccc_daemon_liveness.py",)
 RUNTIME_FILES += ("ccc_state_snapshot.py",)
+RUNTIME_FILES += ("ccc_compact_guard.py", "ccc_codex_goal_control.py")
+RUNTIME_FILES += ('ccc_compact_goals.py', 'ccc_compact_handoff.py', 'ccc_compact_inputs.py', 'ccc_compact_intents.py', 'ccc_compact_runtime.py', 'ccc_compact_sensor.py', 'ccc_compact_support.py', 'ccc_compact_trace.py', 'ccc_compact_watchdog.py')
+RUNTIME_MANIFEST_VERSION = 2
+RUNTIME_MAC_SOURCE = "mac/source"
+# Complete, frozen controller; hashes use sorted [relative_path, sha256] rows.
+# These historical file sets remain verifiable for inspection and rollback.
+RUNTIME_LEGACY_FILES = tuple(name for name in RUNTIME_FILES if name not in {
+    "claude_provider_recovery.py", "claude_provider_native_evidence.py",
+    "claude_provider_legacy_migration.py",
+})
+# Installed 06e69b29 shape (73 modules + MAC248) stays verifiable for inspection/rollback.
+RUNTIME_PREVIOUS_FILES = RUNTIME_FILES
+RUNTIME_PREVIOUS_MAC = (248, "7d3da6d624bed3bccf23e778f4ef2be2ac9fd11d6aa9bb279b34a64bdbdc839e")
+# Current bundle: native compact modules plus the managed launch stack, frozen MAC 0.4.59 tree.
+RUNTIME_FILES += ("ccc_compact_backup.py", "ccc_compact_control_health.py", "ccc_compact_endpoint.py",
+                  "ccc_compact_join_accounting.py", "ccc_compact_native_client.py",
+                  "ccc_compact_pin_retirement.py",
+                  "ccc_codex_proxy_launch.py", "ccc_proxy_service.py", "ccc_codex_proxy.py")
+RUNTIME_MAC_FILE_COUNT = 334
+RUNTIME_MAC_SOURCE_SHA256 = "2b03b27c92792a430b06aa5b7e0dba5b55c853b7698317e4b00ec002f7560ce7"
+RUNTIME_CURRENT_MAC = (RUNTIME_MAC_FILE_COUNT, RUNTIME_MAC_SOURCE_SHA256)
+# Exact supported (module set -> MAC pair) shapes; nothing else validates.
+RUNTIME_SUPPORTED_SHAPES = (
+    (frozenset(RUNTIME_FILES), RUNTIME_CURRENT_MAC),
+    (frozenset(RUNTIME_PREVIOUS_FILES), RUNTIME_PREVIOUS_MAC),
+    (frozenset(RUNTIME_LEGACY_FILES), RUNTIME_PREVIOUS_MAC),
+)
 DEFAULT_LOG_DIR = Path.home() / "Library" / "Logs" / APP_NAME
 DEFAULT_CONFIG_PATH = DEFAULT_APP_DIR / "config.json"
 DEFAULT_STATE_PATH = DEFAULT_APP_DIR / "state.json"
@@ -179,10 +214,10 @@ RECONNECT_HEADER_RE = re.compile(
     re.IGNORECASE,
 )
 PROVIDER_RATE_LIMIT_COMPACT_RE = re.compile(
-    r"(?:ratelimitexceeded:){1,2}yourrequeststo[a-z0-9][a-z0-9._:/-]{0,199}"
+    r"(?:errorrunningremotecompacttask:)?(?:ratelimitexceeded:){1,2}yourrequeststo[a-z0-9][a-z0-9._:/-]{0,199}"
     r"for[a-z0-9][a-z0-9._:/-]{0,199}"
     r"in[a-z0-9][a-z0-9._-]{0,79}"
-    r"haveexceeded(?:token)?ratelimit\.$"
+    r"haveexceeded(?:token|request)?ratelimit\.$"
 )
 RECONNECT_COMPACT_PREFIX_RE = re.compile(
     r"^•reconnecting(?:\.\.\.|…)?(?:\d+/\d+)?"
@@ -197,6 +232,10 @@ RECONNECT_COMPACT_PREFIX_RE = re.compile(
 # After a reconnect stall is nudged, the timer in the status line still ticks.
 # Do not send every second; allow one safety retry per minute.
 RECONNECT_STALL_REPEAT_SEC = 60.0
+# 早于本进程启动的 pending 输入属于已死进程，它的 I/O 不会再完成，也不会再落盘。
+PROCESS_STARTED_AT = time.time()
+# 孤儿 paste 须静默这么久（原失败轮未变、composer 空）才视为未写入；排队输入在此之前必改生命周期。
+ORPHANED_PASTE_MIN_AGE_SEC = 600.0
 # Nested provider errors under reconnect are the stall the user asked to
 # rescue at ~1s. The 60s floor stays only for reconnect chrome with no
 # matched provider banner.
@@ -215,6 +254,9 @@ OBSERVE_WORKERS = 32
 SEND_WORKERS = 8
 IMMEDIATE_SCAN_SEC = 0.1
 IMMEDIATE_DISCOVERY_SEC = 0.25
+# 本机进程索引只是 pid 提示，每个消费方都用新的 OS 探针复核 placement/birth/env/rollout。
+# 负载下一次刷新可达十几秒（2026-10-19 实测 4.6–16 s）；5 s 上限使索引恒过期、未登记 Hook 的会话永不认领。
+NATIVE_PROCESS_INDEX_MAX_AGE_SEC = 60.0
 IMMEDIATE_WORKERS = 50
 NATIVE_EVENT_WORKERS = 1024
 MAINTENANCE_WORKERS = 2
@@ -437,6 +479,64 @@ class DeliveryBusyError(DeliveryLeaseError):
     """The shared MAC/CCC delivery lock is held; no input was attempted."""
 
 
+class _ClaudeInputGuardTrace:
+    """Local diagnostics only; never update a runtime, delivery lease or receipt."""
+
+    def __init__(self, logger, surface_id, event_id, phase):
+        self.logger = logger
+        self.surface_id = surface_id
+        self.event_id = event_id
+        self.phase = phase
+        self.started = self.mark = time.perf_counter()
+        self.predicate = "start"
+        self.durations = {}
+        self.result = False
+        self.exception = ""
+        self.detail = {}
+
+    def __enter__(self):
+        return self
+
+    def step(self, predicate):
+        now = time.perf_counter()
+        self.durations[self.predicate] = round((now - self.mark) * 1000.0, 1)
+        self.mark = now
+        self.predicate = predicate
+        return True
+
+    def __exit__(self, kind, value, traceback):
+        # Diagnostics must not turn a refused or successful check into an error.
+        try:
+            now = time.perf_counter()
+            self.durations[self.predicate] = round((now - self.mark) * 1000.0, 1)
+            elapsed_ms = round((now - self.started) * 1000.0, 1)
+            if not self.result or kind is not None or elapsed_ms >= 1000.0:
+                self.logger.info(
+                    "surface=%s Claude input guard phase=%s event=%s thread=%s "
+                    "passed=%s predicate=%s exception=%s elapsed_ms=%.1f "
+                    "stages=%s detail=%s",
+                    self.surface_id[:8], self.phase, self.event_id,
+                    threading.get_ident(), bool(self.result),
+                    json.dumps(self.predicate),
+                    kind.__name__ if kind is not None else self.exception,
+                    elapsed_ms, json.dumps(self.durations, sort_keys=True),
+                    json.dumps(self.detail, sort_keys=True),
+                )
+        except Exception:
+            pass
+        return False
+
+
+def _release_claude_delivery(local):
+    """Close only this thread's acquired lease; keep nesting and fault evidence."""
+    stack = getattr(local, "stack", None)
+    local.stack = None
+    local.binding = None
+    local.pins = ()
+    if stack is not None:
+        stack.close()
+
+
 def _claude_delivery_scope(method):
     """Release a lazily acquired shared delivery lock at the outer call.
 
@@ -455,13 +555,8 @@ def _claude_delivery_scope(method):
         finally:
             local.depth -= 1
             if outer:
-                stack = getattr(local, "stack", None)
-                local.stack = None
-                local.binding = None
-                local.pins = ()
                 local.lease_fault = None
-                if stack is not None:
-                    stack.close()
+                _release_claude_delivery(local)
     return wrapped
 
 
@@ -610,6 +705,16 @@ class ScreenState:
     # Later transcript may only be an in-flight echo. This candidate needs
     # the original blocked goal; an old failed rollout alone cannot send.
     requires_goal_proof: bool = False
+    # An occupied composer may coexist with a failed native Goal. This is
+    # observation eligibility only; it never authorizes terminal input.
+    native_goal_only: bool = False
+
+
+def _is_recovery_candidate(state: ScreenState) -> bool:
+    return state.kind in SEND_ELIGIBLE_STATES or bool(
+        state.kind == "composer_busy" and state.message_kind == "codex"
+        and state.native_goal_only and state.error_type
+        and state.error_type not in PROVIDER_BLOCKED)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -638,6 +743,12 @@ class TargetRuntime:
     viewport_readable: bool | None = None
     viewport_checked_at: float = 0.0
     viewport_source: str = ""
+    # Display-only evidence, before lifecycle/send guards rewrite the state.
+    # A working viewport never clears completion or grants another send.
+    viewport_state: str = ""
+    viewport_error_type: str | None = None
+    viewport_reason: str = ""
+    viewport_observed_at: float = 0.0
     observation_started_at: float = 0.0
     observation_completed_at: float = 0.0
     observation_interval_ms: float = 0.0
@@ -667,6 +778,9 @@ class TargetRuntime:
     codex_sent_turn_key: str = ""
     codex_goal_resume: bool = False
     codex_goal_proof: dict[str, Any] = dataclasses.field(default_factory=dict)
+    # Bounded failure evidence only; never input authority or a retry proof.
+    codex_goal_diagnostics: dict[str, Any] = dataclasses.field(default_factory=dict)
+    codex_compact_guard: dict[str, Any] = dataclasses.field(default_factory=dict)
     codex_input_phase: str = ""
     codex_input_not_sent: dict[str, Any] = dataclasses.field(default_factory=dict)
     codex_private_check: dict[str, Any] = dataclasses.field(default_factory=dict)
@@ -677,6 +791,8 @@ class TargetRuntime:
     network_phase: str = ""
     network_checked_at: float = 0.0
     provider_retry_status: dict[str, Any] = dataclasses.field(default_factory=dict)
+    # Diagnostic only: never a delivery proof or permission to repeat input.
+    codex_retry_status: dict[str, Any] = dataclasses.field(default_factory=dict)
     registration_revalidation: dict[str, Any] = dataclasses.field(default_factory=dict)
     observed_screen_signature: str | None = None
     observed_evidence_row: int | None = None
@@ -742,6 +858,9 @@ class TargetRuntime:
     # CCC lifecycle events.
     claude_hook_health: str = "unverified"
     claude_hook_provenance: str = ""
+    # Diagnostic evidence only. Never consumed by lifecycle or send gates.
+    claude_session_start_observation: dict[str, Any] | None = None
+    claude_session_start_registration: dict[str, Any] | None = None
     claude_last_rejected_hook_status: str | None = None
     claude_last_rejected_hook_reason: str | None = None
     claude_last_rejected_hook_at: float = 0.0
@@ -833,6 +952,7 @@ class TargetRuntime:
     claude_submit_event_id: str | None = None
     claude_submit_message_hash: str | None = None
     claude_submit_fingerprint: str | None = None
+    claude_submit_native_identity: dict[str, Any] | None = None
     claude_submit_since: float = 0.0
     claude_submit_last_attempt_at: float = 0.0
     claude_submit_phase: str = "none"
@@ -1029,18 +1149,47 @@ def _without_reconnect_status(lines: Sequence[str]) -> list[str]:
     return kept
 
 
+def _queue_header_end(lines: Sequence[str], index: int) -> int | None:
+    """Recognize a native bullet header with at most two wrapped rows.
+
+    Queue phrases in tool output or ordinary prose do not prove queued input.
+    Consumers share this boundary so those phrases cannot hide Working or
+    truncate the newest error card during queue recovery.
+    """
+    first = lines[index].strip()
+    if not first.startswith("•"):
+        return None
+    header = first
+    for end in range(index + 1, min(index + 3, len(lines)) + 1):
+        if end > index + 1:
+            tail = lines[end - 1].strip()
+            if not tail or tail.startswith(("•", "●", "└", "↳", "›", "■", "⚠")):
+                return None
+            header += "\n" + tail
+        match = QUEUED_FOLLOWUP_RE.search(header)
+        if match and not header[1:match.start()].strip():
+            return end
+    return None
+
+
 def _without_queue_interrupt_chrome(lines: Sequence[str]) -> list[str]:
     """Drop queue headers whose interrupt hint is not genuine Working."""
 
     kept: list[str] = []
     skipping = False
-    for line in lines:
-        stripped = line.strip()
-        if QUEUED_FOLLOWUP_RE.search(stripped):
+    index = 0
+    while index < len(lines):
+        end = _queue_header_end(lines, index)
+        if end is not None:
             skipping = True
+            index = end
             continue
+        line = lines[index]
+        index += 1
+        stripped = line.strip()
         if skipping:
-            if not stripped or stripped.startswith(("›", "•", "↳", "■", "⚠")):
+            if (not stripped or stripped.startswith(("›", "•", "↳", "■", "⚠"))
+                    or re.match(r"^Working\b", stripped, re.IGNORECASE)):
                 skipping = False
             else:
                 continue
@@ -1087,8 +1236,9 @@ def _queued_followup_present(lines: Sequence[str], composer_row: int) -> bool:
     another send. The header's interrupt hint is not required for this gate.
     """
     head = [line.strip() for line in lines[:max(composer_row, 0)]]
-    if QUEUED_FOLLOWUP_RE.search("\n".join(head)):
-        return True
+    for index in range(len(head)):
+        if _queue_header_end(head, index) is not None:
+            return True
     previous = ""
     for line in head:
         if line.startswith("↳"):
@@ -1130,6 +1280,12 @@ def _provider_rate_limit_banner(compact: str) -> bool:
     return bool(PROVIDER_RATE_LIMIT_COMPACT_RE.match(stripped)) or bool(
         re.fullmatch(r"(?:ratelimitexceeded:){1,2}" + re.escape(peak_load), stripped)
     )
+
+
+# 2026-10-20 user rule: an authenticated blocked Goal whose current failure is an
+# Azure "different resource" error is continued with the ordinary Chinese prompt,
+# not /goal resume. Every Goal/native proof is still required; only the route changes.
+ORDINARY_CONTINUE_GOAL_ERRORS = frozenset({'resource_mismatch', 'upstream_invalid', 'budget_pool_exhausted', 'rate_limit'})
 
 
 def _match_error_block(block_text: str) -> str | None:
@@ -2419,10 +2575,10 @@ def classify_claude_grid(grid: Grid, *, claude_message: str = CLAUDE_MESSAGE) ->
             claude_native_activity=native_activity,
         )
 
-    if provider_failure and provider_failure["provider_blocked"]:
+    if provider_failure:
         kind = str(provider_failure["error_kind"])
         return ScreenState(
-            "claude_model_unavailable" if kind == "claude_model_unavailable" else "claude_provider_blocked",
+            "recoverable_error", fingerprint=content_fp or _short_hash(kind),
             error_type=kind, screen_signature=signature, message_kind="claude",
             reason=str(provider_failure["error_reason"]), content_fingerprint=content_fp,
             claude_context=context, claude_provider_failure=provider_failure,
@@ -2436,10 +2592,13 @@ def classify_claude_grid(grid: Grid, *, claude_message: str = CLAUDE_MESSAGE) ->
         re.sub(r"\s+", " ", last_block),
     ):
         return ScreenState(
-            "claude_model_unavailable", error_type="claude_model_unavailable",
+            "recoverable_error", error_type="claude_model_unavailable",
+            fingerprint=content_fp or _short_hash(last_block),
             screen_signature=signature, message_kind="claude",
-            reason="selected Claude model is unavailable; repeating the prompt cannot repair model access",
+            reason="selected Claude model failed; incomplete turn remains eligible for continuation",
             content_fingerprint=content_fp, claude_context=context,
+            claude_provider_failure={**classify_stop_failure("model_not_found", last_block),
+                                     "screen_fingerprint": _short_hash(last_block)},
         )
     error_type = _claude_live_error_type(grid, prompt_row, claude_message)
     if error_type is not None:
@@ -2644,14 +2803,20 @@ def classify_grid(grid: Grid) -> ScreenState:
         return ScreenState("incompatible", screen_signature=grid.signature(), reason="composer cursor/prompt not verified")
     if not _is_codexish(lines, composer_row):
         return ScreenState("non_codex_or_unknown", screen_signature=grid.signature(), reason="Codex UI fingerprint missing")
-    if composer_kind == "composer_busy":
-        return ScreenState("composer_busy", screen_signature=grid.signature(), reason="composer contains user text")
+    occupied = composer_kind == "composer_busy"
+    busy = ScreenState("composer_busy", screen_signature=grid.signature(), reason="composer contains user text")
+    if occupied and _queued_followup_present(lines, composer_row):
+        return dataclasses.replace(busy, reason="composer contains user text and Codex holds queued input")
     error, chrome_rows, marker_row = _codex_error_scan(grid, composer_row)
     if error is None:
+        if occupied:
+            return busy
         return ScreenState("idle", screen_signature=grid.signature(), reason="empty composer without current recoverable error")
     goal_stalled = any('Goal stalled (/goal resume)' in line
                        for line in lines[composer_row + 1:composer_row + 4])
     goal_candidate = goal_stalled and error.error_type not in PROVIDER_BLOCKED
+    if occupied and (error.error_type in PROVIDER_BLOCKED or (error.superseded and not goal_candidate)):
+        return busy
     if error.superseded and not goal_candidate:
         # Not plain "idle": the error is real, we are choosing not to act on it
         # because Codex printed something after it.  Reporting that choice keeps
@@ -2698,11 +2863,12 @@ def classify_grid(grid: Grid) -> ScreenState:
         "", re.sub(r"\s+", "", error.block.lower()), count=1,
     )
     return ScreenState(
-        "recoverable_error",
+        "composer_busy" if occupied else "recoverable_error",
         error_type=error.error_type,
         fingerprint=fingerprint,
         screen_signature=grid.signature(),
-        reason=f"current {error.error_type} error block",
+        reason=(f"user draft preserved; native Goal proof required for {error.error_type}"
+                if occupied else f"current {error.error_type} error block"),
         message_kind="codex",
         content_fingerprint=_short_hash(evidence_prefix + "\0" + evidence_error),
         ignored_chrome_rows=tuple(sorted(chrome_rows)),
@@ -2711,7 +2877,8 @@ def classify_grid(grid: Grid) -> ScreenState:
             or not _is_reconnect_marker(error.block)
         ),
         native_goal_stalled=goal_stalled,
-        requires_goal_proof=bool(error.superseded),
+        requires_goal_proof=bool(error.superseded) or occupied,
+        native_goal_only=occupied,
     )
 
 
@@ -3491,6 +3658,25 @@ class ClaudeEventLedger:
         } if isinstance(guards, Mapping) else {"*": self._normalise_provider_guard("*", None)}
 
     @staticmethod
+    def ordinary_stop_boundary(event: Any) -> dict[str, Any] | None:
+        """Identity and semantics retained by raw Hooks and deferred ledger rows."""
+        if (not isinstance(event, Mapping) or event.get("event_name") != "Stop"
+                or event.get("completed") is not False or event.get("synthetic_fallback")
+                or not isinstance(event.get("event_id"), str) or not event["event_id"]
+                or event.get("error_kind") not in (None, "", "claude_stopped")
+                or any(event.get(key) for key in STOP_FAILURE_METADATA if key != "error_kind")
+                or any(event.get(key) for key in (*supervisor_closeout.PROTOCOL_FIELDS, "report_ready_task_id"))
+                or type(event.get("created_at")) not in (int, float)
+                or not math.isfinite(event["created_at"]) or event["created_at"] <= 0
+                or type(event.get("agent_pid")) is not int or event["agent_pid"] <= 0
+                or any(not isinstance(event.get(key), str) or not event[key]
+                       for key in ("surface_id", "workspace_id", "session_id", "process_generation"))):
+            return None
+        return {key: event.get(key) for key in (
+            "event_id", "event_name", "completed", "created_at", "surface_id", "workspace_id",
+            "session_id", "agent_pid", "process_generation", "transcript_id", "message_hash")}
+
+    @staticmethod
     def _normalise_provider_guard(surface_id: str, value: Any) -> dict[str, Any]:
         """A damaged hold is never permission to type into a terminal."""
         if isinstance(value, Mapping):
@@ -3499,7 +3685,7 @@ class ClaudeEventLedger:
             stamp = value.get("source_created_at")
             release = value.get("release_created_at", 0)
             valid = (value.get("surface_id") == surface_id
-                     and status in {"blocked", "retry_wait", "released"}
+                     and status in {"blocked", "retry_wait", "released", "completed"}
                      and type(revision) is int and revision > 0
                      and type(stamp) in (int, float) and math.isfinite(stamp) and stamp > 0
                      and type(release) in (int, float) and math.isfinite(release) and release >= 0
@@ -3507,15 +3693,32 @@ class ClaudeEventLedger:
             if status == "retry_wait":
                 deadline = value.get("retry_after")
                 count = value.get("retry_count")
+                episode = value.get("retry_episode_started_at", stamp)
                 valid = (valid and type(deadline) in (int, float) and math.isfinite(deadline)
-                         and deadline > 0 and type(count) is int and count > 0)
+                         and deadline > 0 and type(count) is int and count > 0
+                         and type(episode) in (int, float) and math.isfinite(episode)
+                         and 0 < episode <= stamp)
+            if status == "completed":
+                completion = value.get("completion_event")
+                valid = (valid and isinstance(completion, Mapping)
+                         and completion.get("completed") is True
+                         and completion.get("event_name") in {"Stop", "StopFailure"}
+                         and bool(completion.get("event_id"))
+                         and type(completion.get("created_at")) in (int, float)
+                         and math.isfinite(completion["created_at"])
+                         and completion["created_at"] > 0
+                         and not value.get("retry_event") and not value.get("retry_after")
+                         and all(completion.get(key) and completion.get(key) == value.get(key)
+                                 for key in ("surface_id", "workspace_id", "session_id",
+                                             "agent_pid", "process_generation")))
             if status == "released":
                 boundary = value.get("release_created_at")
                 valid = (valid and bool(value.get("release_event_id"))
                          and type(boundary) in (int, float) and math.isfinite(boundary)
                          and boundary > stamp
                          and value.get("release_reason") in {
-                             "native_human_prompt", "verified_dispatch", "verified_new_session", "verified_new_process"}
+                             "native_human_prompt", "verified_dispatch", "verified_new_session", "verified_new_process",
+                             "verified_noncompletion_stop"}
                          and type(value.get("release_agent_pid")) is int and value["release_agent_pid"] > 0
                          and bool(value.get("release_process_generation"))
                          and (value.get("release_reason") == "verified_new_process"
@@ -3524,6 +3727,17 @@ class ClaudeEventLedger:
                     valid = valid and value.get("release_process_generation") != value.get("process_generation")
                 if value.get("release_reason") == "verified_new_session":
                     valid = valid and value.get("release_session_id") != value.get("session_id")
+            if value.get("release_reason") == "verified_noncompletion_stop" or value.get("release_stop_event"):
+                stopped = ClaudeEventLedger.ordinary_stop_boundary(value.get("release_stop_event"))
+                valid = (valid and value.get("release_reason") == "verified_noncompletion_stop"
+                         and stopped is not None
+                         and stopped == value.get("release_stop_event")
+                         and stopped["event_id"] == value.get("release_event_id")
+                         and stopped["created_at"] == release
+                         and all(stopped.get(key) == value.get(key) for key in supervisor_closeout.IDENTITY_KEYS)
+                         and stopped["agent_pid"] == value.get("release_agent_pid")
+                         and stopped["session_id"] == value.get("release_session_id")
+                         and stopped["process_generation"] == value.get("release_process_generation"))
             if valid:
                 return dict(value)
         return {"surface_id": surface_id, "status": "blocked", "revision": 1,
@@ -3557,7 +3771,15 @@ class ClaudeEventLedger:
     def provider_claim_pending(row: Mapping[str, Any]) -> bool:
         return (row.get("status") == "handling" and row.get("event_name") == "StopFailure"
                 and not row.get("synthetic_fallback")
-                and row.get("error_kind") in CLAUDE_PROVIDER_BLOCKED_KINDS | {"claude_429"})
+                and not row.get("completed")
+                and row.get("error_kind") in CLAUDE_PROVIDER_RETRY_KINDS)
+
+    @staticmethod
+    def completion_claim_pending(row: Mapping[str, Any]) -> bool:
+        """A genuine completion may replay only before its terminal commit."""
+        return (row.get("status") == "handling" and row.get("completed") is True
+                and row.get("event_name") in {"Stop", "StopFailure"}
+                and not row.get("synthetic_fallback"))
 
     def contains(self, event_id: str) -> bool:
         with self._lock:
@@ -3567,7 +3789,10 @@ class ClaudeEventLedger:
         with self._lock:
             # Claim-before-hold is a recoverable crash boundary. Other reserved
             # or unknown writes remain consumed and must never be replayed.
-            return {key for key, row in self.events.items() if not self.provider_claim_pending(row)}
+            covered = set(self._provider_migration_claim_rows().values())
+            return {key for key, row in self.events.items()
+                    if key in covered or not (self.provider_claim_pending(row)
+                                              or self.completion_claim_pending(row))}
 
     @staticmethod
     def _identity(event: Mapping[str, Any]) -> tuple[str, ...]:
@@ -3617,7 +3842,18 @@ class ClaudeEventLedger:
             event_id = str(event["event_id"])
             existing = self.events.get(event_id)
             if existing is not None:
-                if self.provider_claim_pending(existing) and all(existing.get(key) == event.get(key) for key in (
+                if (event_id not in self._provider_migration_claim_rows().values()
+                        and self.completion_claim_pending(existing)):
+                    replay = self._row_from_event(event, status="handling", detail="")
+                    # Compare every persisted semantic field, including completion,
+                    # native hashes and provenance. Inbox bookkeeping is not stored.
+                    audit = {"status", "handled_at", "detail"}
+                    if (self.completion_claim_pending(replay)
+                            and {key: value for key, value in existing.items() if key not in audit}
+                            == {key: value for key, value in replay.items() if key not in audit}):
+                        return CLAUDE_CLAIMED
+                if (event_id not in self._provider_migration_claim_rows().values()
+                        and self.provider_claim_pending(existing)) and all(existing.get(key) == event.get(key) for key in (
                     "event_name", "surface_id", "workspace_id", "session_id", "agent_pid", "created_at",
                     "process_generation", "error_kind", "error_evidence_hash",
                 )):
@@ -3713,7 +3949,8 @@ class ClaudeEventLedger:
             "report_migration_source_event_id", "report_migration_turn_started_at",
             "report_migration_generation_id",
             "dispatch_migration_source_event_id",
-            "transcript_id", "message_hash", *STOP_FAILURE_METADATA,
+            "provider_migration_source_event_id", "provider_migration_turn_started_at",
+            "completed", "transcript_id", "message_hash", "input_not_sent_recovery", *STOP_FAILURE_METADATA,
         ):
             if key in event and event.get(key) not in (None, ""):
                 row[key] = event[key]
@@ -3736,6 +3973,7 @@ class ClaudeEventLedger:
                 if candidate > latest_delivery.get(surface, (0, '')):
                     latest_delivery[surface] = candidate
         unresolved = {item[1] for item in latest_delivery.values()}
+        unresolved.update(self._provider_migration_claim_rows())
         for event_id, row in self.events.items():
             status = str(row.get("status") or "")
             if (self._is_active_status(status) or event_id in unresolved
@@ -3785,6 +4023,44 @@ class ClaudeEventLedger:
             self._prune()
             self._write()
             return True
+
+
+    def _provider_migration_claim_rows(self):
+        """Map durable derived IDs to their exact original handling claim.
+
+        Keep a consumed source consumed even after its guard is replaced by a
+        later failure. All derived outcomes count, including unknown delivery.
+        The migration ID binds the original source, process and turn; no source
+        row is changed. The caller holds the reentrant ledger lock.
+        """
+        covered = {}
+        for retry_id, retry in self.events.items():
+            source_id = retry.get("provider_migration_source_event_id")
+            source = self.events.get(source_id) if isinstance(source_id, str) else None
+            if (not isinstance(source, Mapping) or not self.provider_claim_pending(source)
+                    or retry.get("event_name") != "ProviderRetry" or retry.get("episode_id") != retry_id
+                    or retry.get("completed") is not False or retry.get("provider_blocked") is not False
+                    or retry.get("error_kind") not in provider_recovery.PROVIDER_KINDS
+                    or not isinstance(retry.get("status"), str) or not retry["status"]
+                    or any(retry.get(key) != source.get(key) for key in (
+                        "surface_id", "workspace_id", "session_id", "agent_pid", "created_at", "stop_failure_error"))
+                    or source.get("process_generation") not in (None, "", retry.get("process_generation"))):
+                continue
+            try:
+                identity = provider_recovery._identity(retry)
+                turn = provider_recovery._number(retry.get("provider_migration_turn_started_at"), "migration turn")
+                stamp = provider_recovery._number(source.get("created_at"), "source time")
+                if stamp < turn or not source.get("stop_failure_error"):
+                    continue
+                stable = {**identity, "source_event_id": source_id, "turn_started_at": turn}
+                encoded = json.dumps(stable, sort_keys=True, ensure_ascii=False,
+                                     separators=(",", ":"), allow_nan=False).encode("utf-8")
+                expected = provider_recovery.VERSION + "-" + hashlib.sha256(encoded).hexdigest()
+                if retry_id == expected:
+                    covered[retry_id] = source_id
+            except (TypeError, ValueError, KeyError, OverflowError):
+                continue
+        return covered
 
 
 class ClaudeEventInbox:
@@ -4117,6 +4393,129 @@ def controller_admission(path, deadline, *, capacity=24):
     raise InputNotSentError('controller admission deadline exceeded before request')
 
 
+
+def _goal_composer_diagnostic(grid: Grid) -> dict[str, Any]:
+    """Keep a bounded composer excerpt; never retain an entire conversation."""
+    spans = [s for s in grid.spans if grid.cursor.row <= s.row <= grid.cursor.row + 1]
+    selected = spans[:64]
+    return {
+        'full': grid.raw.get('full') is True,
+        'completeness_known': type(grid.raw.get('full')) is bool,
+        'rows': grid.rows, 'columns': grid.columns,
+        'cursor': dataclasses.asdict(grid.cursor),
+        'matches': _goal_resume_draft_matches(grid),
+        'current_working': _current_working_present(grid.lines),
+        'queue_present': _queued_followup_present(grid.lines, grid.cursor.row),
+        'menu_present': _menu_present(grid.lines),
+        'truncated': len(spans) > len(selected) or any(len(s.text) > 256 for s in selected),
+        'spans': [dict(row=s.row, column=s.column, cell_width=s.cell_width,
+                       text=s.text[:256], faint=bool(grid.style(s.style_id).get('faint')),
+                       invisible=bool(grid.style(s.style_id).get('invisible')))
+                  for s in selected],
+    }
+
+
+def _goal_boundary_signature(grid: Grid, *, draft: bool) -> tuple | None:
+    """Keep input structure fixed across paste, allowing valid footer updates."""
+    frame = _goal_composer_frame(grid, draft=draft)
+    if frame is None:
+        return None
+    rows, width, row, cells, _footer = frame
+    # The physical footer is validated above. Its dynamic text and styling are
+    # still included in the complete draft signatures checked before Enter.
+    return (rows, width, row, cells[0], cells[1][:2], cells[2])
+
+
+def _goal_composer_signature(grid: Grid) -> tuple | None:
+    """Semantic styling and geometry, independent of span splits/style IDs."""
+    return _goal_composer_frame(grid, draft=True)
+
+
+def _goal_resume_draft_matches(grid: Grid) -> bool:
+    """Check this exact command; native Goal/turn authorization is separate."""
+    return _goal_composer_frame(grid, draft=True) is not None
+
+
+def _goal_composer_frame(grid: Grid, *, draft: bool) -> tuple | None:
+    """Validate the measured single-line composer and its physical footer.
+
+    The entire styled input region is required, including both padding rows.
+    A footer-looking line inside input cannot provide the lower boundary. Full
+    frames may omit default-background footer blanks, but not styled input
+    cells. This intentionally refuses unknown layouts without pressing a key.
+    """
+    cursor = grid.cursor
+    row, width = cursor.row, grid.columns
+    expected = '› /goal resume'
+    if (grid.raw.get('full') is not True or grid.raw.get('anchor') != 'screen'
+            or not cursor.visible or width < len(expected) or row < 2
+            or grid.rows - (row + 2) not in (1, 2)
+            or cursor.column != (len(expected) if draft else 2)
+            or _menu_present(grid.lines) or _current_working_present(grid.lines)
+            or _queued_followup_present(grid.lines, row)):
+        return None
+    by_row: dict[int, list[Span]] = {}
+    for item in grid.spans:
+        by_row.setdefault(item.row, []).append(item)
+    # Grid.from_rpc checks bounds, but overlapping spans must not hide input.
+    for items in by_row.values():
+        end = 0
+        for item in sorted(items, key=lambda s: s.column):
+            if item.column < end:
+                return None
+            end = item.column + item.cell_width
+    cells = []
+    background = None
+    for r in range(row - 1, row + 2):
+        line = []
+        for item in sorted(by_row.get(r, ()), key=lambda s: s.column):
+            style = grid.style(item.style_id)
+            bg = style.get('background')
+            if (item.column != len(line) or len(item.text) != item.cell_width
+                    or not isinstance(bg, str) or not bg
+                    or any(style.get(flag, False) for flag in ('invisible', 'inverse', 'blink'))
+                    or any(ch != '›' and not (' ' <= ch <= '~') for ch in item.text)):
+                return None
+            background = bg if background is None else background
+            if bg != background or (r != row and any(ch != ' ' for ch in item.text)):
+                return None
+            semantic = json.dumps({k: v for k, v in style.items() if k != 'id'}, sort_keys=True)
+            if r == row and (draft or item.column < 2) and style.get('faint', False):
+                return None
+            if r == row and not draft and item.column >= 2 and item.text.strip(' ') and not style.get('faint', False):
+                return None
+            line.extend((ch, semantic) for ch in item.text)
+        if len(line) != width:
+            return None
+        cells.append(tuple(line))
+    command = ''.join(ch for ch, _ in cells[1])
+    if (not command.startswith('› ') or (draft and command != expected.ljust(width))
+            or (not draft and _composer_status(grid)[0] != 'empty')):
+        return None
+    # Another styled input row above our padding is a multiline composer, even
+    # when it is separated from the cursor by an entirely blank input row.
+    if any(grid.style(s.style_id).get('background') == background for s in by_row.get(row - 2, ())):
+        return None
+    footer = []
+    for r in range(row + 2, grid.rows):
+        runs = []
+        for item in sorted(by_row.get(r, ()), key=lambda s: s.column):
+            style = grid.style(item.style_id)
+            if (not style.get('background') or style.get('background') == background
+                    or any(style.get(flag, False) for flag in ('invisible', 'inverse', 'blink'))
+                    or any(unicodedata.category(ch).startswith('C') for ch in item.text)):
+                return None
+            semantic = json.dumps({k: v for k, v in style.items() if k != 'id'}, sort_keys=True)
+            if runs and runs[-1][0] + runs[-1][1] == item.column and runs[-1][3] == semantic:
+                start, size, text, _ = runs.pop()
+                runs.append((start, size + item.cell_width, text + item.text, semantic))
+            else:
+                runs.append((item.column, item.cell_width, item.text, semantic))
+        footer.append(tuple(runs))
+    if not re.match(r'^ {0,2}gpt-[\w.-]+\b', grid.lines[row + 2], re.IGNORECASE):
+        return None
+    return (grid.rows, width, row, tuple(cells), tuple(footer))
+
 class CmuxViewportSocket:
     """Read-only v2 viewport transport, discovered by the configured CLI.
 
@@ -4181,7 +4580,7 @@ class CmuxViewportSocket:
             raise ValueError("viewport transport must not request history")
         borrowed = getattr(self._connection_local, 'read_rpc', None)
         if borrowed is not None:
-            return borrowed(method, params)
+            return borrowed(method, params, timeout=timeout)
         path = self.path
         if path is None or time.monotonic() < self.retry_at:
             return None
@@ -4232,6 +4631,19 @@ class CmuxViewportSocket:
 
 class CmuxClient:
     _input_guard_local = threading.local()
+    # A connected input guard runs its full live recheck on the admitted
+    # connection before writing (see _control_rpc_once).  Measured Claude
+    # Text/Enter rechecks take 6-18 s each and Text runs two, so the plain
+    # 8 s request budget expired before any byte was written.  The window
+    # between the last check and the write is unchanged; only the wait
+    # for the check itself is longer.
+    GUARDED_INPUT_TIMEOUT_SEC = 45.0
+    INPUT_TIMEOUT_SEC = 8.0
+
+    def _input_timeout(self) -> float:
+        guards = getattr(self._input_guard_local, 'guards', None) or {}
+        return (self.GUARDED_INPUT_TIMEOUT_SEC if guards.get(id(self)) is not None
+                else self.INPUT_TIMEOUT_SEC)
 
     @contextlib.contextmanager
     def input_guard(self, check):
@@ -4268,7 +4680,7 @@ class CmuxClient:
             return None
         borrowed = getattr(transport._connection_local, 'read_rpc', None)
         if borrowed is not None and method in {'system.tree', 'system.top'}:
-            return borrowed(method, params)
+            return borrowed(method, params, timeout=timeout)
         admitted = False
         try:
             with transport.connection_window(timeout) as remaining:
@@ -4277,7 +4689,7 @@ class CmuxClient:
                     return self._control_rpc_once(method, params, timeout=remaining, write_guard=write_guard)
                 return self._control_rpc_once(method, params, timeout=remaining)
         except (OSError, CmuxError) as exc:
-            if not admitted and method in {'surface.send_text', 'surface.send_key', 'terminal.paste'}:
+            if not admitted and method in {'surface.send_text', 'surface.send_key', 'terminal.paste', 'surface.create'}:
                 raise InputNotSentError(f'controller admission failed before input: {exc}') from exc
             raise
 
@@ -4335,16 +4747,22 @@ class CmuxClient:
                 if is_input or is_create:
                     check = getattr(self._input_guard_local, 'guards', {}).get(id(self))
                     if check is not None or write_guard is not None:
-                        def read_rpc(read_method, read_params):
+                        def read_rpc(read_method, read_params, *, timeout=None):
                             if read_method not in {'system.tree', 'system.top', 'terminal.replay', 'surface.read_text'}:
                                 raise CmuxError('connected guard only permits read RPC')
+                            read_deadline = min(deadline, time.monotonic() + timeout) if timeout is not None else deadline
+                            def read_remaining():
+                                seconds = min(remaining(), read_deadline - time.monotonic())
+                                if seconds <= 0:
+                                    raise TimeoutError('connected guard read deadline exceeded')
+                                return seconds
                             rid = uuid.uuid4().hex
-                            connection.settimeout(remaining())
+                            connection.settimeout(read_remaining())
                             connection.sendall((json.dumps({'id': rid, 'method': read_method,
                                 'params': read_params}) + '\n').encode())
                             response = bytearray()
                             while b'\n' not in response:
-                                connection.settimeout(remaining())
+                                connection.settimeout(read_remaining())
                                 chunk = connection.recv(min(65536, transport.MAX_RESPONSE_BYTES + 1 - len(response)))
                                 if not chunk:
                                     raise CmuxError('connected guard response incomplete')
@@ -4363,6 +4781,7 @@ class CmuxClient:
                                 raise CmuxError('connected guard topology missing')
                             if read_method == 'system.top' and value.get('include_processes') is not True:
                                 raise CmuxError('connected guard process evidence missing')
+                            read_remaining()
                             return value
                         transport._connection_local.read_rpc = read_rpc
                         transport._connection_local.input_remaining = remaining
@@ -4415,7 +4834,7 @@ class CmuxClient:
         except (OSError, ValueError, CmuxError) as exc:
             if (is_input or is_create) and attempted:
                 raise UncertainDeliveryError(f"{method} acknowledgement uncertain: {exc}") from exc
-            if is_input:
+            if is_input or is_create:
                 raise InputNotSentError(f"{method} input not sent: {exc}") from exc
             raise CmuxError(f"{method} control request failed: {exc}") from exc
 
@@ -4490,8 +4909,13 @@ class CmuxClient:
             raise CmuxError("top JSON is not an object")
         return value
 
+    # 全机进程表一次读：进程多时 cmux 要十几秒才返回。8 s 默认时限让 discovery 连续失败、
+    # 新会话进不了监控（2026-10-19 实测 6–16 s）。只放宽这一个只读请求；每个请求独占连接。
+    TOP_ALL_TIMEOUT_SEC = 30.0
+
     def top_all(self) -> Mapping[str, Any]:
-        value = self._control_rpc("system.top", {"all": True, "include_processes": True})
+        value = self._control_rpc("system.top", {"all": True, "include_processes": True},
+                                  timeout=self.TOP_ALL_TIMEOUT_SEC)
         if value is not None:
             return value
         result = self._run(["--json", "--id-format", "both", "top", "--all", "--processes"], timeout=20)
@@ -4675,9 +5099,21 @@ class CmuxClient:
         self.last_viewport_source = "terminal.replay"
         return "\n".join(grid.lines), grid
 
-    def replay(self, workspace_id: str, surface_id: str, *, live: bool | None = None) -> Mapping[str, Any]:
+    def replay(self, workspace_id: str, surface_id: str, *, live: bool | None = None,
+               timeout: float = 12.0) -> Mapping[str, Any]:
         if not workspace_id or not surface_id:
             raise IncompatibleError("terminal.replay requires workspace_id and surface_id")
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("terminal.replay timeout must be positive and finite")
+        # Admission, socket I/O and the read-only CLI fallback share one budget.
+        # Giving the fallback a fresh timeout makes a slow target hold a sampler
+        # worker for up to twice the advertised limit.
+        deadline = time.monotonic() + timeout
+        def remaining():
+            value = deadline - time.monotonic()
+            if value <= 0:
+                raise CmuxError("terminal.replay observation timed out")
+            return value
         params = {"workspace_id": workspace_id, "surface_id": surface_id, "anchor": "viewport"}
         if live is None:
             live = bool(getattr(self.viewport_socket, "live_native_frames", False))
@@ -4685,10 +5121,10 @@ class CmuxClient:
             # Native lanes follow the live terminal, not the user's scrollback
             # viewport. No history rows are needed to prove its current input.
             params.update(anchor="screen", max_scrollback_rows=0)
-        value = (self.viewport_socket.request("terminal.replay", params, timeout=12)
+        value = (self.viewport_socket.request("terminal.replay", params, timeout=remaining())
                  if self.viewport_socket is not None else None)
         if value is None:
-            result = self._run(["--json", "rpc", "terminal.replay", json.dumps(params, ensure_ascii=False)], timeout=12)
+            result = self._run(["--json", "rpc", "terminal.replay", json.dumps(params, ensure_ascii=False)], timeout=remaining())
             try:
                 value = json.loads(result.stdout)
             except json.JSONDecodeError as exc:
@@ -4746,44 +5182,99 @@ class CmuxClient:
         self._reject_unapproved_command(message)
         if self._control_rpc("surface.send_text", {
             "workspace_id": workspace_id, "surface_id": surface_id, "text": message,
-        }) is not None:
+        }, timeout=self._input_timeout()) is not None:
             return
         self._run(["send", "--workspace", workspace_id, "--surface", surface_id, message], timeout=8)
 
-    def resume_codex_goal(self, workspace_id: str, surface_id: str, *, authorize) -> None:
-        """Fixed native operation; caller proves this exact goal is stalled."""
+    def resume_codex_goal(self, workspace_id: str, surface_id: str, *, strategy='terminal', authorize) -> None:
+        """Submit the existing Goal command through the guarded cmux terminal."""
+        if strategy != 'terminal':
+            raise InputNotSentError('goal resume requires the explicit terminal strategy')
         if not workspace_id or not surface_id:
-            raise CmuxError("goal resume requires explicit workspace and surface UUIDs")
+            raise InputNotSentError('goal resume requires explicit workspace and surface UUIDs')
         if (not callable(authorize) or self.viewport_socket is None or not self.viewport_socket.path
                 or not {'surface.send_text', 'surface.send_key'} <= self.viewport_socket.control_methods):
-            raise InputNotSentError('goal resume requires connected input authorization')
-        with self.input_guard(lambda: authorize(None)):
+            raise InputNotSentError('goal resume requires connected terminal input authorization')
+        # The caller has already persisted this exact Goal/turn attempt. A
+        # connected guard rechecks identity and the empty composer after any
+        # admission wait, before the only paste. No Codex app-server is needed.
+        boundary = None
+        def capture_empty(grid):
+            nonlocal boundary
+            boundary = _goal_boundary_signature(grid, draft=False)
+            return boundary is not None
+        def before_paste():
+            return authorize(None, frame_check=capture_empty) and boundary is not None
+        with self.input_guard(before_paste):
             if self._control_rpc('surface.send_text', {
                 'workspace_id': workspace_id, 'surface_id': surface_id, 'text': '/goal resume',
             }) is None:
-                raise InputNotSentError('goal resume socket unavailable; no input fallback')
-        # Slash commands are bracket-pasted as draft text by native Codex.
-        # A newline in that paste is not Enter. Confirm our exact draft before
-        # one explicit submission; never resend an uncertain paste or Enter.
+                raise InputNotSentError('goal terminal input unavailable; input not sent')
+        frames = []
+        reads = 0
+        entered = False
+        started = time.monotonic()
         try:
-            deadline = time.monotonic() + 1
-            while time.monotonic() < deadline:
-                grid = Grid.from_rpc(self.replay(workspace_id, surface_id), surface_id)
-                if WatchDaemon._codex_draft_matches(grid, '/goal resume'):
-                    with self.input_guard(lambda: authorize('/goal resume')):
+            deadline = started + 3.0
+            previous = None
+            while (remaining := deadline - time.monotonic()) > 0:
+                grid = Grid.from_rpc(self.replay(workspace_id, surface_id,
+                                               live=True, timeout=remaining), surface_id)
+                reads += 1
+                # Diagnostics must never change whether a key may be sent.
+                with contextlib.suppress(Exception):
+                    frames.append(_goal_composer_diagnostic(grid))
+                    del frames[:-4]
+                if time.monotonic() >= deadline:
+                    break
+                matched = (_goal_boundary_signature(grid, draft=True) == boundary
+                           and _goal_resume_draft_matches(grid))
+                signature = _goal_composer_signature(grid) if matched else None
+                if matched and signature == previous:
+                    # Draft reads must not consume the connected Enter guard's
+                    # budget. The guard still rechecks the exact frame and live
+                    # authorization on the admitted connection before writing.
+                    enter_deadline = time.monotonic() + 3.0
+                    final_checked = False
+                    def final_frame(grid):
+                        nonlocal final_checked
+                        final_checked = (_goal_composer_signature(grid) == signature
+                                         and _goal_boundary_signature(grid, draft=True) == boundary)
+                        return final_checked
+                    def before_enter():
+                        return (time.monotonic() < enter_deadline
+                                and authorize('/goal resume', frame_check=final_frame)
+                                and final_checked and time.monotonic() < enter_deadline)
+                    with self.input_guard(before_enter):
+                        remaining = enter_deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        entered = True
                         if self._control_rpc('surface.send_key', {
                             'workspace_id': workspace_id, 'surface_id': surface_id, 'key': 'enter',
-                        }) is None:
-                            raise CmuxError('goal Enter socket unavailable; no fallback')
+                        }, timeout=remaining) is None:
+                            raise CmuxError('goal terminal Enter unavailable')
                     return
-                if _composer_status(grid)[0] != 'empty':
+                previous = signature
+                if not matched and _composer_status(grid)[0] != 'empty':
                     break
-                time.sleep(.025)
-            raise CmuxError('native goal resume draft was not confirmed; Enter withheld')
+                time.sleep(min(.025, max(0, deadline - time.monotonic())))
+            raise CmuxError('exact goal resume draft not confirmed; Enter withheld')
         except (OSError, CmuxError, RuntimeError) as exc:
-            # Paste has been acknowledged. A withheld or uncertain Enter must
-            # never permit another paste of this goal operation after restart.
-            raise UncertainDeliveryError('goal draft/Enter retained: ' + str(exc)) from exc
+            # The acknowledged paste remains UNKNOWN and must not be repeated.
+            # A typed pre-write refusal proves only that this Enter was not
+            # written; preserve that separately from invoking the RPC. Lost
+            # acknowledgements and historical error strings prove no such fact.
+            error = UncertainDeliveryError('goal draft/Enter retained: ' + str(exc))
+            error.goal_diagnostics = dict(command='/goal resume', frames=frames,
+                                          frame_reads=reads, enter_rpc_invoked=entered,
+                                          elapsed_ms=round((time.monotonic() - started) * 1000, 3))
+            if entered and isinstance(exc, InputNotSentError):
+                error.goal_diagnostics['enter_not_sent_proof'] = dict(
+                    schema='goal-enter-not-sent-v1', method='surface.send_key',
+                    workspace_id=workspace_id, surface_id=surface_id,
+                    key='enter', write_attempted=False)
+            raise error from exc
 
     def draft_batch_session_name(self, workspace_id: str, surface_id: str, job_id: str, index: int) -> None:
         """Draft a fixed local name; the B worker separately proves and submits it."""
@@ -4811,7 +5302,7 @@ class CmuxClient:
             raise RuntimeError(f"Claude submit only permits Enter, got {key!r}")
         if self._control_rpc("surface.send_key", {
             "workspace_id": workspace_id, "surface_id": surface_id, "key": key,
-        }) is not None:
+        }, timeout=self._input_timeout()) is not None:
             return
         self._run([
             "send-key", "--workspace", workspace_id, "--surface", surface_id, key,
@@ -5148,6 +5639,26 @@ def _is_codex_process(stem: str, basename: str, path: str) -> bool:
     return stem == "codex" and (not path or basename == "codex")
 
 
+_NATIVE_CLAUDE_VERSION = re.compile(r"[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,6}")
+
+
+def _is_native_installer_claude(path: str) -> bool:
+    """Native-installer Claude Code runs as ``~/.local/share/claude/versions/<X.Y.Z>``.
+
+    From 2.1.303 on this machine both the reported name and the path basename
+    are the bare version, so the stem and basename tests above cannot match and
+    such panes were labelled 其他.  Only that exact directory under the current
+    user's home counts; a version-shaped name anywhere else is not identity.
+    This restores the label the ``claude``-named builds already got; send paths
+    keep their own generation and screen checks.
+    """
+    if not path:
+        return False
+    root = os.path.join(os.path.expanduser("~"), ".local", "share", "claude", "versions")
+    parent, name = os.path.split(path)
+    return parent == root and bool(_NATIVE_CLAUDE_VERSION.fullmatch(name))
+
+
 # Ordered most-specific first.  ``path`` is the primary evidence: cmux reports
 # process names through the macOS 15-character comm limit, so "grok-1.0.4-maco"
 # is truncated *and* carries a version, and no exact name test can ever match
@@ -5155,7 +5666,8 @@ def _is_codex_process(stem: str, basename: str, path: str) -> bool:
 AGENT_RULES: tuple[tuple[str, str, Any], ...] = (
     ("codex", "Codex", _is_codex_process),
     ("claude", "Claude", lambda stem, basename, path:
-        stem == "claude" or basename == "claude" or "claude-code/" in path.lower()),
+        stem == "claude" or basename == "claude" or "claude-code/" in path.lower()
+        or _is_native_installer_claude(path)),
     ("grok", "grok", lambda stem, basename, path:
         stem == "grok" or basename.startswith("grok-") or "/.grok/" in path.lower()),
     ("copilot", "Copilot", lambda stem, basename, path:
@@ -5435,10 +5947,13 @@ def batch_start_hold(rule, surface_id):
 class DiscoverySnapshot:
     """One topology/process collection per discovery pass, never an input grant."""
 
-    def __init__(self, client, native_labels=None, *, tree=None, top=None):
+    def __init__(self, client, native_labels=None, *, tree=None, top=None, native_processes=()):
         self.client = client
         self.native_labels = native_labels
-        self.records = {r["surface_id"]: r for r in main_surface_records(client.tree() if tree is None else tree)}
+        self.tree = client.tree() if tree is None else tree
+        self.native_processes = native_processes
+        self.records = {r["surface_id"]: r for r in display_surface_records(
+            self.tree, main_surface_records(self.tree))}
         self.workspaces = {}
         for record in self.records.values():
             if record.get("type") == "terminal":
@@ -5475,7 +5990,9 @@ class DiscoverySnapshot:
         records = self.workspaces.get(workspace_id, [])
         if not records:
             return []
-        _, labels = self._load(workspace_id)
+        top, labels = self._load(workspace_id)
+        labels = display_process_labels(records, labels, top,
+                                        processes=self.native_processes, agent_kind=agent)
         def matches(record):
             label = surface_process_label(labels, record)
             hint = (self.native_labels or {}).get(record["surface_id"], {})
@@ -5526,6 +6043,16 @@ def dynamic_target_authorized(config, target):
             and target.get("follow_agent", "codex") in {"codex", "claude"}
             for t in config.get("targets", []))
     return False
+
+
+def claude_session_start_observation_authorized(config, target):
+    """Observation enrollment stays inside the currently enabled discovery scope."""
+    return bool(isinstance(config, Mapping) and isinstance(target, Mapping)
+                and target.get("surface_id") and target.get("workspace_id")
+                and target.get("source") == "claude_auto"
+                and target.get("enabled", True) and not target.get("paused")
+                and config.get("mode") == "armed" and not config.get("global_paused")
+                and config.get("claude_enabled") and dynamic_target_authorized(config, target))
 
 
 def discover_rule_targets(client: CmuxClient, config: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -5943,7 +6470,8 @@ class WatchDaemon:
         self._guard_root_path = None
         self._guard_stop_paths = {}
         self._process_snapshots = SnapshotCache(workers=MAINTENANCE_WORKERS)
-        self._native_process_index = NativeProcessIndex(interval=IMMEDIATE_DISCOVERY_SEC)
+        self._native_process_index = NativeProcessIndex(
+            interval=IMMEDIATE_DISCOVERY_SEC, max_age=NATIVE_PROCESS_INDEX_MAX_AGE_SEC)
         from ccc_inventory import SharedInventory
         self._shared_inventory = SharedInventory(config_path.parent, owner=True)
         self.codex_queue_recovery.process_lookup = lambda target: self._candidate_process_label(target, self._observation_client())
@@ -5975,6 +6503,8 @@ class WatchDaemon:
         self._observation_rows: dict[str, dict[str, Any]] = {}
         self.observation_health_path = config_path.parent / "monitoring-health.json"
         self._liveness_guard = None
+        from ccc_daemon_liveness import ObservationProgress
+        self._observation_progress = ObservationProgress()
         self._last_workspace_discovery_at = 0.0
         # Set while the on-disk config is invalid, so the rejection is logged
         # once per distinct reason instead of every second.
@@ -6498,7 +7028,8 @@ class WatchDaemon:
         with self._targets_lock:
             dynamic = list(self.dynamic_targets.values())
         targets = effective_targets(config, dynamic)
-        records = {r["surface_id"]: r for r in main_surface_records(client.tree())}
+        tree = client.tree()
+        records = {r["surface_id"]: r for r in display_surface_records(tree, main_surface_records(tree))}
         inventory_complete = True
         if isinstance(client, SnapshotClient):
             # The same per-workspace snapshots feed routing and discovery.
@@ -6520,6 +7051,8 @@ class WatchDaemon:
         inventory_complete = inventory_complete and not any(
             item.get("enumeration_complete") is False for item in _walk_objects(top))
         labels = classify_surface_processes(top)
+        labels = display_process_labels(list(records.values()), labels, top,
+                                        processes=self._native_agent_processes())
         # A positive independent native identity defeats a delayed GUI scan;
         # absence from this advisory index never proves a process has exited.
         targets_by_id = {t["surface_id"]: t for t in targets}
@@ -6625,9 +7158,9 @@ class WatchDaemon:
                     "claude_hook_coverage": hooks, "hook_coverage_at": metadata_at,
                     "scheduler": self._scheduler_metrics()}
         if self._liveness_guard is not None:
-            from ccc_daemon_liveness import observations_current
-            if observations_current([] if config.get("global_paused") else targets, state, now=now,
-                                    cadence=float(config.get("poll_interval_sec", 1))):
+            if self._observation_progress.advanced(
+                    targets, state, now=now, cadence=float(config.get("poll_interval_sec", 1)),
+                    paused=bool(config.get("global_paused"))):
                 self._liveness_guard.progress(b'O')
         atomic_write_json(self.observation_health_path, snapshot)
         if self._liveness_guard is not None:
@@ -6657,6 +7190,168 @@ class WatchDaemon:
         except (OSError, ValueError, TypeError):
             return False
 
+    def _reconcile_session_start_observation(self, surface_id, client, rows):
+        """Store one original Hook fact; do not replay it or restore task authority."""
+        target = self._event_target(surface_id)
+        if (self.stop_requested or not claude_session_start_observation_authorized(self.config, target)
+                or not any(r.get("surface_id") == surface_id and r.get("event_name") == "SessionStart"
+                           and r.get("status") == "unmapped" and r.get("detail") == "surface is not authorized"
+                           for r in rows.values())):
+            return False
+        with self._surface_lock(surface_id):
+            runtime = self.runtime.setdefault(surface_id, TargetRuntime())
+            from ccc_guard_scope import birth
+            pid = runtime.claude_process_pid
+            generation = runtime.claude_process_generation
+            process_birth = birth(pid, codex=False)
+            epoch = [pid, process_birth]
+            previous = runtime.claude_session_start_registration
+            now = time.time()
+            def finite(value):
+                return type(value) in (int, float) and math.isfinite(value)
+            def known(value):
+                return (isinstance(value, list) and len(value) == 2
+                        and type(value[0]) is int and value[0] > 1
+                        and isinstance(value[1], list) and len(value[1]) == 2
+                        and all(type(v) is int for v in value[1])
+                        and value[1][0] > 0 and 0 <= value[1][1] < 1000000)
+            # Unknown -> known adopts the same budget. Only a different
+            # kernel PID/birth pair can open a new one; config and ps timestamps
+            # are not process epochs.
+            new_process = (isinstance(previous, Mapping)
+                           and known(previous.get("epoch")) and known(epoch)
+                           and previous["epoch"] != epoch)
+            if previous is not None and not new_process:
+                if not isinstance(previous, Mapping):
+                    return False
+                count, deadline = previous.get("attempts"), previous.get("deadline_at")
+                started_at, next_at = previous.get("started_at"), previous.get("next_at")
+                if (type(count) is not int or not 0 < count < 3
+                        or not all(finite(v) for v in (started_at, next_at, deadline))
+                        or not 0 <= started_at <= next_at <= deadline <= started_at + 60
+                        or not started_at <= now < deadline
+                        or previous.get("terminal") is not False):
+                    return False
+                if now < next_at:
+                    return True
+                if not known(epoch):
+                    epoch = previous.get("epoch", epoch)
+            else:
+                count, started_at, deadline = 0, now, now + 60
+            next_at = min(deadline, now + (5 if count == 0 else 15))
+            attempt = {"epoch": epoch, "attempts": count + 1, "started_at": started_at,
+                       "deadline_at": deadline, "next_at": next_at, "checked_at": now, "stage": "runtime",
+                       "reason_code": "check_started", "terminal": False,
+                       "execution_authority": False}
+            runtime.claude_session_start_registration = attempt
+        # Charge before cmux/journal I/O. A reload cannot refund an attempt.
+        self.save()
+
+        def finish(stage, reason, *, retry=False):
+            with self._surface_lock(surface_id):
+                if (self.runtime.get(surface_id) is not runtime
+                        or runtime.claude_session_start_registration is not attempt):
+                    return False
+                current = self._event_target(surface_id)
+                retry = bool(retry and not self.stop_requested and current == target
+                             and claude_session_start_observation_authorized(self.config, current)
+                             and (runtime.claude_process_pid, runtime.claude_process_generation)
+                                 == (pid, generation)
+                             and attempt["attempts"] < 3
+                             and attempt["started_at"] <= time.time() < deadline)
+                attempt.update(stage=stage, reason_code=reason, checked_at=time.time(),
+                               terminal=not retry, retry_pending=retry)
+            self.save(wait=False)
+            self._request_health_publish()
+            return retry
+
+        if not pid or not generation:
+            return finish("runtime", "process_observation_pending", retry=True)
+        if not known([pid, process_birth]):
+            return finish("runtime", "process_birth_unavailable", retry=True)
+
+        def inspect_binding():
+            record = find_main_surface(client.tree(), surface_id)
+            if (record.get("surface_id") != surface_id
+                    or record.get("workspace_id") != target["workspace_id"]):
+                return None, "surface_workspace_mismatch", False
+            process = self._live_claude_process_label(target, client)
+            live_pid, members = process.get("agent_pid"), process.get("identity_verified_pids", [])
+            with self._surface_lock(surface_id):
+                attempt["snapshot_at"] = time.time()
+                attempt["snapshot"] = {"agent_kind": str(process.get("agent_kind") or "unknown"),
+                                       "agent_pid": live_pid if type(live_pid) is int else None,
+                                       "verified_pid_count": len([p for p in members if type(p) is int]),
+                                       "identity_conflicts": process.get("identity_conflicts", 0)}
+            if (process.get("agent_kind") != "claude" or type(live_pid) is not int or live_pid <= 0
+                    or live_pid not in [p for p in members if type(p) is int]
+                    or process.get("identity_conflicts", 0)):
+                transient = (process.get("agent_kind") in (None, "unknown", "claude")
+                             and not process.get("identity_conflicts"))
+                return None, "process_snapshot_unverified", transient
+            if live_pid != pid or birth(live_pid, codex=False) != process_birth:
+                return None, "process_epoch_mismatch", False
+            inspected = inspect_claude_process(live_pid)
+            if inspected.get("pid") != live_pid:
+                return None, "process_identity_mismatch", False
+            if not inspected.get("generation") or not inspected.get("started_epoch"):
+                return None, "process_birth_unavailable", True
+            if (inspected["generation"] != generation
+                    or birth(live_pid, codex=False) != process_birth):
+                return None, "process_epoch_mismatch", False
+            return {**inspected, "identity_verified_pids": members}, "binding_verified", False
+
+        stage = "pre_binding"
+        try:
+            before, reason, retry = inspect_binding()
+            if before is None:
+                return finish(stage, reason, retry=retry)
+            stage = "journal"
+            events = self._registration_events()
+            stage = "post_binding"
+            after, reason, _ = inspect_binding()
+            if (after is None or any(before.get(k) != after.get(k)
+                                     for k in ("pid", "generation", "started_epoch"))):
+                return finish(stage, reason if after is None else "process_changed_during_read")
+        except (CmuxError, OSError, subprocess.TimeoutExpired) as exc:
+            return finish(stage, type(exc).__name__, retry=stage == "pre_binding")
+        except (ValueError, TypeError) as exc:
+            return finish(stage, type(exc).__name__)
+        except Exception as exc:
+            # Unknown failures are not evidence of a transient snapshot. Do
+            # not let the outer scheduler turn them into repeated scans.
+            return finish(stage, type(exc).__name__)
+        with self._surface_lock(surface_id):
+            current = self._event_target(surface_id)
+            if (self.stop_requested or current != target
+                    or not claude_session_start_observation_authorized(self.config, current)):
+                return finish("authorization", "authorization_changed")
+            with self.claude_event_ledger._lock:
+                rows = copy.deepcopy(self.claude_event_ledger.events)
+            with self._runtime_lock:
+                if (self.runtime.get(surface_id) is not runtime
+                        or runtime.claude_session_start_registration is not attempt):
+                    return False
+                if ((runtime.claude_process_pid, runtime.claude_process_generation) != (pid, generation)
+                        or birth(pid, codex=False) != process_birth):
+                    return finish("post_binding", "runtime_process_changed")
+                proof, reason = observation_health.session_start_observation_candidate(
+                    events, current, after, runtime.to_dict(), rows, now=time.time())
+                if proof is None:
+                    return finish("candidate", reason)
+                if any(
+                    sid != surface_id and other.claude_session_id == proof["event"]["session_id"]
+                    for sid, other in self.runtime.items()
+                ):
+                    return finish("candidate", "session_owned_elsewhere")
+                previous = runtime.claude_session_start_observation
+                if (isinstance(previous, Mapping)
+                        and {k: v for k, v in previous.items() if k != "observed_at"}
+                        == {k: v for k, v in proof.items() if k != "observed_at"}):
+                    return finish("candidate", "already_observed")
+                runtime.claude_session_start_observation = proof
+        return finish("candidate", "session_start_observed")
+
     def _reconcile_registration(self, surface_id: str, client: CmuxClient) -> bool:
         """Revalidate one original unauthorized Stop, through the normal gates."""
         target = self._event_target(surface_id)
@@ -6672,7 +7367,7 @@ class WatchDaemon:
                             (r.get("status") == "handling" and r.get("registration_revalidated_at")))
                        for r in rows.values())
         if not possible:
-            return False
+            return self._reconcile_session_start_observation(surface_id, client, rows)
         if (target.get("paused") or not target.get("enabled", True) or self.config.get("global_paused")
                 or self.config.get("mode") != "armed" or not self.config.get("claude_enabled")):
             return False
@@ -6680,8 +7375,7 @@ class WatchDaemon:
             record = find_main_surface(client.tree(), surface_id)
             if record["workspace_id"] != target["workspace_id"]:
                 return True
-            labels = classify_surface_processes(client.top(str(target["workspace_id"])))
-            process = surface_process_label(labels, target)
+            process = self._live_claude_process_label(target, client)
             if process.get("agent_kind") != "claude":
                 return True
             events = self._registration_events()
@@ -6724,6 +7418,42 @@ class WatchDaemon:
             self.save()
         return False
 
+    def _native_goal_error_state(self, target, state, grid):
+        """Resolve a superseded provider card only from an authenticated Goal EOF.
+
+        This is candidate selection, not an input grant. The same helper runs
+        at the connected input boundary; original turn, Goal, draft, queue,
+        compact, provider, placement and durable-attempt guards remain intact.
+        """
+        if (state.kind not in {'error_superseded', 'recoverable_error'} or state.error_type not in ORDINARY_CONTINUE_GOAL_ERRORS
+                or _goal_boundary_signature(grid, draft=False) is None
+                or not any('Goal stalled (/goal resume)' in line
+                           for line in grid.lines[grid.cursor.row + 1:grid.cursor.row + 4])):
+            return state
+        goal = self._current_blocked_goal(target)
+        if not isinstance(goal, Mapping):
+            return state
+        evidence = goal.get('native_evidence')
+        snapshot = evidence.get('snapshot') if isinstance(evidence, Mapping) else None
+        error = goal.get('error')
+        if (not isinstance(snapshot, Mapping) or not isinstance(error, Mapping)
+                or not isinstance(error.get('message'), str) or not error['message'].strip()):
+            return state
+        if (goal.get('proof_source') != 'native_failed_eof_v1'
+                or not self._codex_terminal_tail_proven(snapshot)
+                or snapshot.get('turn_id') != goal.get('turn_id')
+                or snapshot.get('error') != goal.get('error')):
+            return state
+        error_type = _match_error_block('■ ' + error['message'])
+        if not error_type or error_type in PROVIDER_BLOCKED:
+            return state
+        fingerprint = _short_hash(_stable_error_block(goal['error']['message']))
+        return ScreenState('recoverable_error', error_type=error_type,
+            fingerprint=fingerprint, content_fingerprint=fingerprint,
+            screen_signature=state.screen_signature, message_kind='codex',
+            reason=f'authenticated native Goal failure reconciles visible {state.error_type} card',
+            native_goal_stalled=True, requires_goal_proof=True)
+
     def _observe_target_viewport(self, target, runtime, client):
         try:
             reader = getattr(client, "read_viewport", None)
@@ -6739,6 +7469,10 @@ class WatchDaemon:
                 text = client.read_screen(str(target["workspace_id"]), str(target["surface_id"]))
                 grid = None
             state = self._classify_target_screen(target, text, client, grid=grid)
+            runtime.viewport_state = state.kind
+            runtime.viewport_error_type = state.error_type
+            runtime.viewport_reason = " ".join(state.reason.split())[:240]
+            runtime.viewport_observed_at = time.time()
             runtime.viewport_readable = state.kind != "incompatible" and not state.kind.startswith("unreadable")
             runtime.viewport_source = str(getattr(client, "last_viewport_source", "read-screen"))
             return state
@@ -6748,6 +7482,98 @@ class WatchDaemon:
             raise
         finally:
             runtime.viewport_checked_at = time.time()
+
+    def _native_agent_processes(self, *, wait=True):
+        """Share advisory fleet reads; input gates below always read anew."""
+        from ccc_guard_scope import scan
+        return self._process_snapshots.get(
+            ("native-interactive-processes",), lambda: scan(reader=display_process),
+            ttl=IMMEDIATE_DISCOVERY_SEC, wait=wait) or []
+
+    def _native_process_hint(self, target, client, labels, top):
+        try:
+            tree = client.tree()
+            records = display_surface_records(tree, main_surface_records(tree))
+            augmented = display_process_labels(
+                records, labels, top or {}, processes=self._native_agent_processes(wait=False))
+            return surface_process_label(augmented, target)
+        except (CmuxError, OSError, ValueError, TypeError, RuntimeError):
+            return surface_process_label(labels, target)
+
+    def _live_claude_process_label(self, target, client, *, pinned=None, allow_unpinned=True):
+        """Fresh topology + process proof; a cache never grants terminal input.
+
+        Empty cmux process arrays are incomplete observations on newer cmux.
+        Fill that gap, or pin a newly authorized same-surface pane move with
+        matching GUI and native process evidence. Preserve every GUI conflict.
+        A pending fallback submit must carry its original microsecond birth and
+        topology proof; no proof is manufactured for an old unknown write.
+        """
+        base = client.client if isinstance(client, SnapshotClient) else client
+        tree = base.tree()
+        record = find_main_surface(tree, str(target["surface_id"]))
+        unknown = {"agent_kind": "unknown", "summary": "live Claude identity unverified"}
+        # Explicit surface targets persist pane_id only for display. cmux may
+        # move that same UUID to a new pane; new input uses the live topology.
+        # Automatic Claude discovery is workspace-scoped; its saved pane is
+        # also display metadata. Pane-follow targets keep their pane boundary.
+        # Pending input must still match its complete original proof below.
+        explicit_surface = (
+            target.get("source") in {None, "", "explicit"}
+            and str(target["surface_id"]) in self._target_policy().target_records
+        )
+        workspace_auto = (
+            target.get("source") == "claude_auto"
+            and dynamic_target_authorized(self.config, target)
+        )
+        # Legacy pending writes have no native topology proof: retain their
+        # old pane check rather than silently adopting a moved target.
+        live_pane = (explicit_surface or workspace_auto) and (allow_unpinned or pinned is not None)
+        if (record.get("workspace_id") != target["workspace_id"]
+                or (not live_pane and target.get("pane_id")
+                    and record.get("pane_id") != target["pane_id"])):
+            return unknown
+        top = base.top(str(target["workspace_id"]))
+        labels = classify_surface_processes(top)
+        live = surface_process_label(labels, target)
+        if live.get("identity_conflicts"):
+            return unknown
+        # A new explicit/workspace-auto transaction may follow this same UUID
+        # into its live pane. Carry a complete native proof through Text and
+        # delayed Enter; a bare GUI label cannot prove the original topology
+        # once allow_unpinned becomes False. Never retrofit a legacy pending
+        # write, or replace a populated/conflicting GUI process with a fallback.
+        moved_surface = (
+            pinned is None and allow_unpinned
+            and (explicit_surface or workspace_auto)
+            and bool(target.get("pane_id"))
+            and record.get("pane_id") != target["pane_id"]
+            and live.get("agent_kind") == "claude"
+        )
+        if pinned is None and live.get("agent_kind") != "unknown" and not moved_surface:
+            return live
+        if pinned is None and not allow_unpinned:
+            return live
+        if pinned is not None:
+            if (not display_identity_matches(pinned)
+                    or live.get("agent_kind") not in {"unknown", "claude"}
+                    or (live.get("agent_kind") == "claude"
+                        and live.get("agent_pid") != pinned["process"]["pid"])):
+                return unknown
+        records = display_surface_records(tree, main_surface_records(tree))
+        # Even after top recovers, retain the pinned native process and unique
+        # surface/TTY join instead of falling back to second-resolution birth.
+        raw_recovered = (pinned is not None or moved_surface) and live.get("agent_kind") == "claude"
+        native = surface_process_label(display_process_labels(
+            records, {} if raw_recovered else labels, {} if raw_recovered else top,
+            agent_kind="claude"), target)
+        proof = native.get("native_identity")
+        if moved_surface and (not proof or native.get("agent_kind") != "claude"
+                              or native.get("agent_pid") != live.get("agent_pid")):
+            return unknown
+        if pinned is not None and (not proof or json.dumps(proof, sort_keys=True) != json.dumps(pinned, sort_keys=True)):
+            return unknown
+        return native
 
     def _candidate_process_label(
         self,
@@ -6769,26 +7595,29 @@ class WatchDaemon:
         guarded = binding(self.config_path, target)
         if guarded:
             return {"agent_kind": "codex", "agent_pids": [guarded["pid"]], "summary": "guarded native backend"}
+        top = None
         try:
             if isinstance(client, SnapshotClient):
                 # Adapter routing is advisory. A cold/slow process lookup must
                 # not hold every surface in this workspace behind the same RPC.
                 labels = client.process_labels(workspace_id, classify_surface_processes, wait=False)
                 if labels is None:
-                    return self._native_process_index.lookup(target) or {
-                        "agent_kind": "unknown", "summary": "process refresh pending"}
+                    labels = {}
+                top = client.cached_top(workspace_id, wait=False)
             else:
-                labels = self._process_snapshots.get(
-                    ("labels", workspace_id),
-                    lambda: classify_surface_processes(client.top(workspace_id)),
+                top = self._process_snapshots.get(
+                    ("candidate-top", workspace_id), lambda: client.top(workspace_id),
                     ttl=CLAUDE_PROCESS_CACHE_SEC,
                 )
+                labels = classify_surface_processes(top)
         except CmuxError:
             return self._native_process_index.lookup(target) or {
                 "agent_kind": "unknown", "summary": "process lookup unavailable"}
         label = surface_process_label(labels, target)
         if label.get("agent_kind") == "unknown":
-            label = self._native_process_index.lookup(target) or label
+            label = self._native_process_hint(target, client, labels, top)
+            if label.get("agent_kind") == "unknown":
+                label = self._native_process_index.lookup(target) or label
         return label
 
     def _inspect_process_cached(self, pid: int) -> dict[str, Any]:
@@ -7257,7 +8086,7 @@ class WatchDaemon:
                 client.replay(str(target["workspace_id"]), str(target["surface_id"])),
                 str(target["surface_id"]),
             )
-            return classify_grid(current_grid)
+            return self._native_goal_error_state(target, classify_grid(current_grid), current_grid)
 
         if prefilter.kind in {"menu", "working"}:
             if claude_on:
@@ -7352,7 +8181,7 @@ class WatchDaemon:
             observe_workers=max(IMMEDIATE_WORKERS, int(self.config.get("observe_workers", OBSERVE_WORKERS))),
             send_workers=max(IMMEDIATE_WORKERS, int(self.config.get("send_workers", SEND_WORKERS))),
             event_workers=NATIVE_EVENT_WORKERS,
-            event_handler=self._scheduled_native, supersede_reads=True,
+            event_handler=self._scheduled_native_event, supersede_reads=True,
             on_dispatch=self._record_dispatch, on_error=self._scheduled_error,
         )
         return self._scheduler
@@ -7393,6 +8222,9 @@ class WatchDaemon:
             for key, value in self._native_dispatch.metrics().items():
                 result[key] = result.get(key, 0) + value
         result["thread_switch_interval_sec"] = sys.getswitchinterval()
+        native_wakeup = getattr(self, "_native_wakeup", None)
+        if native_wakeup is not None:
+            result["native_wakeup"] = native_wakeup.status()
         return result
 
     def _native_failed(self, sid, wid, session, turn, at):
@@ -7425,20 +8257,22 @@ class WatchDaemon:
             # the fresh native, composer and input gates still run afterwards.
             original = self._codex_turn_key_identity(runtime.codex_sent_turn_key)
             hint = self._codex_turn_key_identity(runtime.native_failure_turn_key)
-            return bool(original and hint and original[0] == hint[0]
-                and original[1] != hint[1]
+            return bool(original and hint
+                and original[:2] != hint[:2]
                 and hint[2] == failed_at == runtime.native_failure_at
                 and type(runtime.send_started_at) in (int, float)
                 and math.isfinite(runtime.send_started_at)
                 and original[2] <= runtime.send_started_at < failed_at
                 and runtime.codex_input_phase != 'text_retained'
-                and runtime.observed_state not in {'composer_busy', 'menu', 'queued_followup'})
-        if runtime.observed_at < failed_at:
-            return True
+                and runtime.observed_state not in {'menu', 'queued_followup', 'composer_busy'})
         if (runtime.send_io_started_at >= failed_at
                 and runtime.delivery_status in {"sending", "accepted", "confirmed"}):
             return False
-        return runtime.observed_state not in {"composer_busy", "menu", "queued_followup"}
+        if runtime.observed_at < failed_at:
+            return True
+        # This only wakes observation. A user draft requires authenticated
+        # native Goal recovery at every later admission boundary.
+        return runtime.observed_state not in {"menu", "queued_followup"}
 
     def _record_send_io_started(self, runtime):
         runtime.send_io_started_at = time.time()
@@ -7542,6 +8376,27 @@ class WatchDaemon:
                             runtime.read_duration_ms = round((finished - started) * 1000, 3)
                             runtime.observation_completed_at = now
                             runtime.observation_interval_ms = round(max(0, now - previous) * 1000, 3) if previous else 0
+
+    def _scheduled_native_event(self, target, is_current):
+        """Discard satisfied failure hints before acquiring a cmux connection.
+
+        Hints queued during I/O can outlive the original failure. Recheck under
+        the same per-surface lock as input, including after waiting for an older
+        observation. A new failure still gets the full transaction. Periodic
+        observations deliberately bypass this filter so visible errors before
+        native completion, delivery reconciliation and draft changes stay live.
+        """
+        if self.stop_requested or not is_current():
+            return
+        sid = str(target["surface_id"])
+        with self._surface_lock(sid):
+            if self.stop_requested or not is_current():
+                return
+            with self._runtime_lock:
+                runtime = self.runtime.get(sid)
+                failed_at = runtime.native_failure_at if runtime is not None else 0
+            if self._native_retry_needed(sid, target["workspace_id"], failed_at):
+                return self._scheduled_native(target, is_current)
 
     def _scheduled_native(self, target, is_current):
         """One current observation and input transaction for a native failure.
@@ -7691,7 +8546,7 @@ class WatchDaemon:
                 return
             if self._active_send_target(current, is_current) is None:
                 return
-            if state.message_kind != candidate.message_kind or state.kind not in SEND_ELIGIBLE_STATES:
+            if state.message_kind != candidate.message_kind or not _is_recovery_candidate(state):
                 self._record_state(sid, runtime, state)
                 self._reconcile_codex_delivery(sid, runtime, state)
                 return
@@ -7771,6 +8626,7 @@ class WatchDaemon:
                                                 interval=0.05, retry_interval=0.1,
                                                 retry_needed=self._native_retry_needed,
                                                 on_failure=self._native_failed)
+        self._native_wakeup = native_wakeup
         scheduler.observation_interval = native_wakeup.observation_interval
         self._native_process_index.start()
         native_wakeup.start()
@@ -8092,6 +8948,12 @@ class WatchDaemon:
                     self._apply_claude_context_guard, surface_id, runtime, state)
                 state = measured_reconcile("codex_queue_recovery",
                     self._recover_stranded_codex_queue, target, runtime, state, client, current)
+                # A retained original Goal draft must reach its one-shot guard
+                # before UNKNOWN reconciliation ends this observation.
+                if measured_reconcile("retained_goal_submit",
+                        self._resume_retained_goal_draft, target, runtime, state, client,
+                        is_current=lambda: current(fresh=True)):
+                    return None
                 if measured_reconcile("codex_delivery",
                         self._reconcile_codex_delivery, surface_id, runtime, state):
                     return None
@@ -8101,6 +8963,8 @@ class WatchDaemon:
                 if measured_reconcile("claude_submit",
                         self._reconcile_claude_submit, target, runtime, state, client):
                     return
+                measured_reconcile("restore_unsent_deferred",
+                    self._restore_unsent_claude_deferred, target, runtime, state)
                 measured_reconcile("restore_deferred", self._restore_expired_claude_deferred, runtime)
                 if measured_reconcile("deferred_stop",
                         self._maybe_send_deferred_claude_stop, target, runtime, state, client):
@@ -8110,7 +8974,7 @@ class WatchDaemon:
                     target, runtime, state, observation, client,
                 ):
                     return
-                if state.kind not in SEND_ELIGIBLE_STATES:
+                if not _is_recovery_candidate(state):
                     self._record_state(surface_id, runtime, state)
                     return
         except GlobalIncompatibleError as exc:
@@ -8200,6 +9064,10 @@ class WatchDaemon:
                             self._apply_claude_context_guard, surface_id, runtime, state)
                         state = measured_reconcile("codex_queue_recovery",
                             self._recover_stranded_codex_queue, target, runtime, state, client, current)
+                        if measured_reconcile("retained_goal_submit",
+                                self._resume_retained_goal_draft, target, runtime, state, client,
+                                is_current=lambda: current(fresh=True)):
+                            return None
                         if measured_reconcile("codex_delivery",
                                 self._reconcile_codex_delivery, surface_id, runtime, state):
                             return None
@@ -8209,6 +9077,8 @@ class WatchDaemon:
                         if measured_reconcile("claude_submit",
                                 self._reconcile_claude_submit, target, runtime, state, client):
                             return
+                        measured_reconcile("restore_unsent_deferred",
+                            self._restore_unsent_claude_deferred, target, runtime, state)
                         measured_reconcile("restore_deferred", self._restore_expired_claude_deferred, runtime)
                         if measured_reconcile("deferred_stop",
                                 self._maybe_send_deferred_claude_stop, target, runtime, state, client):
@@ -8218,7 +9088,7 @@ class WatchDaemon:
                             target, runtime, state, observation, client,
                         ):
                             return
-                        if state.kind not in SEND_ELIGIBLE_STATES:
+                        if not _is_recovery_candidate(state):
                             self._record_state(surface_id, runtime, state)
                             return
                 except GlobalIncompatibleError as retry_exc:
@@ -8381,6 +9251,7 @@ class WatchDaemon:
         """One persistent budget for plain, goal and queue error remedies."""
         from ccc_provider_retry import ProviderRetryDecision, ProviderRetryEvidenceError
         runtime.provider_retry_status = {}
+        runtime.codex_retry_status = {}
         if runtime.paused_reason and runtime.paused_reason.startswith('provider retry '):
             runtime.paused_reason = ''
         turn = self.codex_queue_recovery.current_turn(target) or {}
@@ -8504,7 +9375,7 @@ class WatchDaemon:
             grid = Grid.from_rpc(client.replay(target["workspace_id"], target["surface_id"]), target["surface_id"])
             kind, row = _composer_status(grid)
             lines = grid.lines[:row] if row is not None else grid.lines
-            headers = [i for i, text in enumerate(lines) if QUEUED_FOLLOWUP_RE.search(text)]
+            headers = [i for i in range(len(lines)) if _queue_header_end(lines, i) is not None]
             tail = lines[headers[-1]:] if headers else []
             queued = [text.strip()[1:].strip() for text in tail if text.strip().startswith("↳")]
             draft = ""
@@ -8662,6 +9533,7 @@ class WatchDaemon:
                 boundary = float(guard.get("release_created_at") or 0)
                 created, submitted = row.get("created_at"), runtime.claude_submit_since
                 if (guard.get("status") != "released" or boundary <= 0
+                        or guard.get("release_reason") == "verified_noncompletion_stop"
                         or row.get("workspace_id") != guard.get("workspace_id")
                         or any(type(stamp) not in (int, float) or not math.isfinite(stamp)
                                or not 0 < stamp <= boundary for stamp in (created, submitted))):
@@ -8759,6 +9631,53 @@ class WatchDaemon:
         self._claude_provider_guard_reason(target, runtime)
         return True
 
+    def _retire_completed_claude_provider_retry(
+        self, surface_id: str, runtime: TargetRuntime, event: Mapping[str, Any],
+    ) -> None:
+        """Atomically retire a provider retry and retain its genuine completion."""
+        if (event.get("completed") is not True or event.get("synthetic_fallback")
+                or event.get("event_name") not in {"Stop", "StopFailure"}
+                or event.get("surface_id") != surface_id
+                or event.get("session_id") != runtime.claude_session_id
+                or event.get("agent_pid") != runtime.claude_process_pid
+                or not runtime.claude_process_generation):
+            return
+        with self.claude_event_ledger._lock:
+            previous = self.claude_event_ledger.provider_guard(surface_id)
+            if not previous or previous.get("invalid") or previous.get("status") == "completed":
+                return
+            completion = {**event, "process_generation": runtime.claude_process_generation}
+            retry_id = str((previous.get("retry_event") or {}).get("event_id") or "")
+            row = {key: value for key, value in previous.items()
+                   if key not in {"retry_event", "retry_after", "retry_count"}
+                   and not key.startswith("release_")}
+            row.update(
+                status="completed", revision=int(previous.get("revision") or 0) + 1,
+                session_id=runtime.claude_session_id, agent_pid=runtime.claude_process_pid,
+                process_generation=runtime.claude_process_generation,
+                workspace_id=event.get("workspace_id"), completion_event=completion,
+                release_created_at=event["created_at"], release_event_id=event["event_id"],
+                retired_retry_event_id=retry_id,
+            )
+            row = self.claude_event_ledger._normalise_provider_guard(surface_id, row)
+            if row.get("status") != "completed":
+                return
+            events = dict(self.claude_event_ledger.events)
+            retry = events.get(retry_id, {})
+            if (retry.get("status") in {"handling", "provider_retry_wait"}
+                    or self.claude_event_ledger._is_active_status(str(retry.get("status") or ""))
+                    and str(retry.get("status") or "").startswith("deferred_")):
+                events[retry_id] = {**retry, "status": "provider_retry_completed",
+                                    "completed_by": event["event_id"]}
+            events[str(event["event_id"])] = self.claude_event_ledger._row_from_event(
+                completion, status="completed", detail="genuine completion retires provider retry")
+            guards = {**self.claude_event_ledger.provider_guards, surface_id: row}
+            atomic_write_json(self.claude_event_ledger.path, {
+                "version": 2, "events": events, "provider_guards": guards})
+            self.claude_event_ledger.events = events
+            self.claude_event_ledger.provider_guards = guards
+            runtime.claude_provider_guard = dict(row)
+
     def _sync_claude_provider_guard(self, surface_id: str, runtime: TargetRuntime) -> dict[str, Any] | None:
         """The ledger wins over an older state snapshot, including releases."""
         guard = self.claude_event_ledger.provider_guard(surface_id)
@@ -8768,8 +9687,37 @@ class WatchDaemon:
         runtime.claude_provider_guard = guard
         if guard:
             self._retire_claude_provider_submission(surface_id, runtime, guard)
+        if guard and guard.get("status") == "completed":
+            completed = guard["completion_event"]
+            if (completed.get("session_id") == runtime.claude_session_id
+                    and completed.get("agent_pid") == runtime.claude_process_pid
+                    and completed.get("process_generation") == runtime.claude_process_generation
+                    and completed["created_at"] >= runtime.claude_turn_started_at):
+                # The ledger may have committed before the state file. Restore
+                # only this completion's original process and task boundary.
+                runtime.claude_completed_latched = True
+                runtime.claude_completion_event_id = completed["event_id"]
+                runtime.claude_completed_at = completed["created_at"]
+                runtime.claude_completion_fingerprint = completed.get("message_hash") or None
+                runtime.state = "claude_completed"
+                runtime.error_type = None
+                runtime.claude_last_event_id = completed["event_id"]
+                runtime.claude_last_event_status = runtime.claude_hook_status = "completed"
+                runtime.claude_last_hook_at = max(runtime.claude_last_hook_at, completed["created_at"])
+                if ((runtime.claude_deferred_event or {}).get("event_id")
+                        == guard.get("retired_retry_event_id")):
+                    self._clear_claude_deferred(runtime, reason="completion_reported")
+            return guard
         if not guard or guard.get("status") != "retry_wait":
             return guard
+        if runtime.claude_completed_latched and runtime.claude_completion_event_id:
+            completed = self.claude_event_ledger.events.get(runtime.claude_completion_event_id, {})
+            if completed.get("status") == "completed":
+                self._retire_completed_claude_provider_retry(surface_id, runtime, {
+                    **completed, "event_id": runtime.claude_completion_event_id})
+                guard = runtime.claude_provider_guard
+                if guard and guard.get("status") == "completed":
+                    return guard
         event = guard.get("retry_event")
         if (not isinstance(event, Mapping) or runtime.claude_deferred_event
                 or runtime.claude_submit_phase != "none" or runtime.claude_submit_write_unknown
@@ -8793,15 +9741,28 @@ class WatchDaemon:
         self, target: Mapping[str, Any], runtime: TargetRuntime, failure: Mapping[str, Any],
         *, event: Mapping[str, Any] | None = None,
     ) -> dict[str, Any] | None:
-        """Persist a rejection/cooldown before any text, Enter or notification."""
+        """Persist bounded backoff without changing continuation eligibility."""
+        if (event and event.get("completed") is True) or (
+                runtime.claude_completed_latched and not self._legacy_claude_report_latch(runtime)):
+            return runtime.claude_provider_guard
         kind = str(failure.get("error_kind") or "")
-        if kind not in CLAUDE_PROVIDER_BLOCKED_KINDS | {"claude_429"}:
+        if kind not in CLAUDE_PROVIDER_RETRY_KINDS:
             return self._sync_claude_provider_guard(str(target["surface_id"]), runtime)
         surface_id = str(target["surface_id"])
         previous = self._sync_claude_provider_guard(surface_id, runtime) or {}
         now = time.time()
         source_id = str((event or {}).get("event_id") or "")
         stamp = float((event or {}).get("created_at") or now)
+        identity = {"surface_id": surface_id, "workspace_id": str(target.get("workspace_id") or ""),
+                    "session_id": str((event or {}).get("session_id") or runtime.claude_session_id or ""),
+                    "agent_pid": runtime.claude_process_pid,
+                    "process_generation": str(runtime.claude_process_generation or "")}
+        if previous and any(previous.get(key) != value for key, value in identity.items()):
+            # Dedupe watermarks belong to one complete process identity. An
+            # invalid/legacy hold still needs its existing verified migration.
+            if previous.get("invalid") or not all(previous.get(key) for key in identity):
+                return previous
+            previous = {}
         if event and stamp <= float(previous.get("release_created_at") or 0):
             return previous
         screen_fingerprint = str(failure.get("screen_fingerprint") or "")
@@ -8811,56 +9772,115 @@ class WatchDaemon:
             # The same old error is not a second provider rejection. Native
             # work, or a newer StopFailure, ends this narrow screen fence.
             return previous
-        if previous.get("status") == "blocked":
-            if not event and screen_fingerprint and screen_fingerprint != previous.get("screen_fingerprint"):
-                previous = self.claude_event_ledger.put_provider_guard(surface_id, {
-                    **previous, "screen_fingerprint": screen_fingerprint,
-                })
-                runtime.claude_provider_guard = previous
+        if (not event and screen_fingerprint
+                and previous.get("status") in {"blocked", "retry_wait"}
+                and screen_fingerprint != previous.get("screen_fingerprint")):
+            # A Hook-born hold carries no viewport of its own, and the screen
+            # returns below without one. Record the error this hold is actually
+            # showing so its release can fence that exact repaint; an unwritten
+            # fingerprint makes that fence compare equal to nothing.
+            previous = self.claude_event_ledger.put_provider_guard(
+                surface_id, {**previous, "screen_fingerprint": screen_fingerprint})
+            runtime.claude_provider_guard = previous
+        if previous.get("status") == "blocked" and (
+                previous.get("invalid") or not event
+                or stamp <= float(previous.get("source_created_at") or 0)):
+            # Original held events use the atomic native-evidence migration.
+            # A redraw cannot renew or release a historical hold.
             return previous
         if event and source_id == previous.get("source_event_id"):
             return previous
         # A viewport is weaker than a native lifecycle. Rendering jitter, or
         # replaying the same error after restart, must not extend its deadline.
-        if not event and previous.get("status") == "retry_wait" and kind == "claude_429":
+        if not event and previous.get("status") == "retry_wait":
             return previous
-        same_retry = (kind == "claude_429" and previous.get("status") == "retry_wait"
-                      and previous.get("evidence_source") == "screen")
         if (event and previous.get("evidence_source") == "hook"
                 and stamp <= float(previous.get("source_created_at") or 0)):
             return previous
-        blocked = kind in CLAUDE_PROVIDER_BLOCKED_KINDS
-        previous_count = int(previous.get("retry_count") or 0) if previous.get("status") == "retry_wait" else 0
-        retry_count = (previous_count + (0 if same_retry else 1)) if not blocked else 0
+        same_failure = (all(value and previous.get(key) == value for key, value in identity.items())
+                        and previous.get("error_kind") == kind
+                        and previous.get("error_reason") == str(failure.get("error_reason") or kind)
+                        and (previous.get("evidence_source") == "screen" or all(
+                            str(previous.get(key) or default) == str(failure.get(key) or default)
+                            for key, default in (("stop_failure_error", "unknown"),
+                                                 ("error_evidence_hash", "")))))
+        # The current observation and the retry episode have separate clocks:
+        # a later Hook may arrive before the original attempt gets its receipt.
+        # Only durable, identity-bound submissions from this episode consume it.
+        episode_start = float(previous.get("retry_episode_started_at")
+                              or previous.get("source_created_at") or stamp)
+        consumed = False
+        if same_failure:
+            with self.claude_event_ledger._lock:
+                for attempt_id, attempt in self.claude_event_ledger.events.items():
+                    created = attempt.get("created_at")
+                    if (not all(attempt.get(key) == value for key, value in identity.items())
+                            or type(created) not in (int, float) or not math.isfinite(created)
+                            or not episode_start <= created < stamp
+                            or (attempt_id != previous.get("release_event_id") and (
+                                attempt.get("event_name") != "StopFailure"
+                                or any(str(attempt.get(key) or default) != str(previous.get(key) or default)
+                                       for key, default in (("error_kind", ""), ("error_reason", ""),
+                                                            ("stop_failure_error", "unknown"),
+                                                            ("error_evidence_hash", "")))))):
+                        continue
+                    receipt = attempt.get("watchdog_submission")
+                    native = attempt.get("provider_native_receipt")
+                    if isinstance(receipt, Mapping):
+                        submitted = receipt.get("submitted_at")
+                        consumed = (receipt.get("surface_id") == surface_id
+                                    and receipt.get("session_id") == identity["session_id"]
+                                    and receipt.get("agent_pid") == identity["agent_pid"]
+                                    and receipt.get("generation") == identity["process_generation"]
+                                    and bool(receipt.get("message_hash"))
+                                    and type(submitted) in (int, float) and math.isfinite(submitted)
+                                    and created <= submitted < stamp)
+                    if isinstance(native, Mapping):
+                        accepted = native.get("event") if isinstance(native.get("event"), Mapping) else {}
+                        accepted_at = accepted.get("created_at")
+                        consumed = consumed or (native.get("source_event_id") == attempt_id
+                                    and all(accepted.get(key) == value for key, value in identity.items())
+                                    and type(accepted_at) in (int, float) and math.isfinite(accepted_at)
+                                    and created <= accepted_at < stamp)
+                    if consumed:
+                        break
+        same_retry = previous.get("status") == "retry_wait" and same_failure and not consumed
+        previous_count = int(previous.get("retry_count") or 0) if same_failure and (
+            previous.get("status") == "retry_wait"
+            or previous.get("release_reason") == "verified_noncompletion_stop") else 0
+        retry_count = max(1, previous_count + int(consumed))
         row = {
             "surface_id": surface_id, "workspace_id": str(target.get("workspace_id") or ""),
             "session_id": str((event or {}).get("session_id") or runtime.claude_session_id or ""),
             "agent_pid": runtime.claude_process_pid,
             "process_generation": str(runtime.claude_process_generation or ""),
-            "status": "blocked" if blocked else "retry_wait", "source_created_at": stamp,
+            "status": "retry_wait", "source_created_at": stamp,
             "source_event_id": source_id, "evidence_source": "hook" if event else "screen",
             "error_kind": kind, "error_reason": str(failure.get("error_reason") or kind),
             "stop_failure_error": str(failure.get("stop_failure_error") or "unknown"),
             "error_evidence_hash": str(failure.get("error_evidence_hash") or ""),
             "screen_fingerprint": str(failure.get("screen_fingerprint") or ""),
-            "retry_count": retry_count, "notification_planned": blocked,
+            "retry_count": retry_count, "notification_planned": False,
+            "retry_episode_started_at": episode_start if same_retry else stamp,
             "release_created_at": float(previous.get("release_created_at") or 0),
             "release_event_id": str(previous.get("release_event_id") or ""),
         }
-        if not blocked:
-            row["retry_after"] = (float(previous["retry_after"]) if same_retry else now + min(
-                CLAUDE_PROVIDER_RETRY_MAX_SEC, CLAUDE_PROVIDER_RETRY_BASE_SEC * 2 ** min(retry_count - 1, 10)))
-            if event:
-                row["retry_event"] = {key: event[key] for key in (
-                    "event_id", "event_name", "surface_id", "workspace_id", "session_id", "agent_pid",
-                    "created_at", "process_generation", *STOP_FAILURE_METADATA,
-                ) if key in event}
-                row["retry_event"].update(completed=False, process_generation=runtime.claude_process_generation)
+        row["retry_after"] = (float(previous["retry_after"]) if same_retry else now + min(
+            CLAUDE_PROVIDER_RETRY_MAX_SEC, CLAUDE_PROVIDER_RETRY_BASE_SEC * 2 ** min(retry_count - 1, 10)))
+        if previous.get("release_reason") == "verified_noncompletion_stop":
+            # A current screen rejection still backs off. Keep the exact Stop
+            # eligible at its own boundary; a later native event supersedes it.
+            row.update({key: copy.deepcopy(value) for key, value in previous.items()
+                        if key.startswith("release_")})
+        if event:
+            row["retry_event"] = {key: event[key] for key in (
+                "event_id", "event_name", "surface_id", "workspace_id", "session_id", "agent_pid",
+                "created_at", "process_generation", *STOP_FAILURE_METADATA,
+            ) if key in event}
+            row["retry_event"].update(completed=False, provider_blocked=False,
+                                      process_generation=runtime.claude_process_generation)
         guard = self.claude_event_ledger.put_provider_guard(surface_id, row)
         runtime.claude_provider_guard = guard
-        if blocked:
-            self._notify_async("CCC Claude 服务商拒绝", f"surface {surface_id[:8]}: {row['error_reason']}；等待已验证的新任务或进程",
-                               name=f"ccc-provider-{surface_id[:8]}")
         return guard
 
     def _claude_provider_guard_reason(
@@ -8869,8 +9889,18 @@ class WatchDaemon:
     ) -> str:
         if not target:
             return ""
+        if (event and event.get("completed") is True) or (
+                runtime.claude_completed_latched and not self._legacy_claude_report_latch(runtime)):
+            return ""
         surface_id = str(target["surface_id"])
         guard = self._sync_claude_provider_guard(surface_id, runtime)
+        candidate = event if event is not None else runtime.claude_deferred_event
+        if guard and guard.get("status") in {"blocked", "retry_wait"} and candidate:
+            if self._release_claude_provider_on_stop(target, runtime, candidate, guard):
+                guard = self._sync_claude_provider_guard(surface_id, runtime)
+        if guard and guard.get("status") == "blocked":
+            if self._recover_claude_provider_hold(target, runtime):
+                guard = self._sync_claude_provider_guard(surface_id, runtime)
         if (guard and guard.get("status") == "released" and guard.get("released_screen_fingerprint")
                 and state and state.claude_native_activity):
             runtime.claude_provider_guard = self.claude_event_ledger.put_provider_guard(surface_id, {
@@ -8886,9 +9916,11 @@ class WatchDaemon:
                     event = {**self.claude_event_ledger.events.get(submit_id, {}), "event_id": submit_id}
         # Do not race a crash-left, identity-compatible native rejection claim.
         # Journal replay must revalidate it; it is not release authority.
+        migrated_claim_source = self._claude_provider_migrated_claim_source(target, runtime, guard)
         with self.claude_event_ledger._lock:
             pending = any(
-                self.claude_event_ledger.provider_claim_pending(row)
+                claim_id != migrated_claim_source
+                and self.claude_event_ledger.provider_claim_pending(row)
                 and row.get("surface_id") == surface_id
                 and row.get("workspace_id") == target.get("workspace_id")
                 and row.get("session_id") == runtime.claude_session_id
@@ -8899,7 +9931,7 @@ class WatchDaemon:
                 and math.isfinite(row["created_at"])
                 and max(runtime.claude_turn_started_at, runtime.claude_last_hook_at)
                     <= row["created_at"] <= time.time() + 1
-                for row in self.claude_event_ledger.events.values()
+                for claim_id, row in self.claude_event_ledger.events.items()
             )
         if guard and guard.get("status") == "blocked":
             reason = "claude_provider_blocked"
@@ -8911,7 +9943,8 @@ class WatchDaemon:
         elif (event and guard and float(guard.get("release_created_at") or 0) > 0
               and (type(event.get("created_at")) not in (int, float)
                    or not math.isfinite(event["created_at"])
-                   or event["created_at"] <= float(guard["release_created_at"]))):
+                   or (event["created_at"] <= float(guard["release_created_at"])
+                       and not self._is_claude_provider_release_stop(target, runtime, event, guard)))):
             reason = "claude_provider_event_superseded"
         else:
             return ""
@@ -8948,6 +9981,67 @@ class WatchDaemon:
         except (OSError, ValueError, TypeError, RuntimeError):
             return None
         return {**event, "process_generation": generation}
+
+    def _is_claude_provider_release_stop(
+        self, target: Mapping[str, Any], runtime: TargetRuntime,
+        event: Mapping[str, Any], guard: Mapping[str, Any],
+    ) -> bool:
+        if guard.get("release_reason") != "verified_noncompletion_stop":
+            return False
+        validated = self._validated_claude_provider_event(target, runtime, event)
+        return bool(validated
+                    and (guard.get("evidence_source") != "hook"
+                         or guard["source_created_at"] < validated["created_at"])
+                    and self.claude_event_ledger.ordinary_stop_boundary(validated)
+                    == guard.get("release_stop_event"))
+
+    def _release_claude_provider_on_stop(
+        self, target: Mapping[str, Any], runtime: TargetRuntime,
+        event: Mapping[str, Any], guard: Mapping[str, Any],
+    ) -> bool:
+        """A newer ordinary Stop retires only an old provider hold, never input."""
+        if (guard.get("invalid") or guard.get("status") not in {"blocked", "retry_wait"}
+                or runtime.claude_submit_phase != "none" or runtime.claude_submit_write_unknown
+                or runtime.claude_completed_latched or runtime.claude_supervisor_wait
+                or runtime.claude_handshake_wait or runtime.claude_handshake_challenge):
+            return False
+        validated = self._validated_claude_provider_event(target, runtime, event)
+        stopped = self.claude_event_ledger.ordinary_stop_boundary(validated)
+        if (stopped is None
+                or any(stopped.get(key) != guard.get(key) for key in supervisor_closeout.IDENTITY_KEYS)
+                or stopped["created_at"] <= max(float(guard["source_created_at"]),
+                                                float(guard.get("release_created_at") or 0))):
+            return False
+        with self.claude_event_ledger._lock:
+            # A crash-left newer Hook is a barrier, not evidence of recovery.
+            # Do not compare the deferred Stop against its own observation.
+            for event_id, row in self.claude_event_ledger.events.items():
+                stamp = row.get("created_at")
+                same_identity = (all(row.get(key) == stopped[key] for key in (
+                    "surface_id", "workspace_id", "session_id", "agent_pid"))
+                    and (not row.get("process_generation")
+                         or row["process_generation"] == stopped["process_generation"]))
+                if (same_identity and row.get("status") in {"reserved", "unknown", "submit_unknown"}
+                        and not any(isinstance(row.get(key), Mapping) for key in (
+                            "provider_superseded_submission", "provider_native_receipt"))):
+                    # A state snapshot can lose its active slot before a
+                    # crash. The durable unknown input still owns recovery.
+                    return False
+                if (event_id != stopped["event_id"] and not row.get("synthetic_fallback")
+                        and row.get("event_name") in {"Stop", "StopFailure", "UserPromptSubmit", "SessionStart"}
+                        and same_identity
+                        and type(stamp) in (int, float) and math.isfinite(stamp)
+                        and stamp >= stopped["created_at"]):
+                    return False
+            released = self.claude_event_ledger.put_provider_guard(str(target["surface_id"]), {
+                **guard, "status": "released", "release_reason": "verified_noncompletion_stop",
+                "release_event_id": stopped["event_id"], "release_created_at": stopped["created_at"],
+                "release_agent_pid": stopped["agent_pid"], "release_session_id": stopped["session_id"],
+                "release_process_generation": stopped["process_generation"], "release_stop_event": stopped,
+                "retry_event": None, "retry_after": 0,
+            })
+        runtime.claude_provider_guard = released
+        return released.get("status") == "released"
 
     def _release_claude_provider_guard(
         self, surface_id: str, runtime: TargetRuntime, event: Mapping[str, Any], *, reason: str,
@@ -9009,7 +10103,8 @@ class WatchDaemon:
                     or not self._validated_claude_provider_event(target, runtime, verified_event)
                     or self.claude_event_ledger.provider_guard(surface_id) != guard):
                 return False
-        row = {**guard, "status": "released", "release_created_at": stamp,
+        row = {**{key: value for key, value in guard.items() if key != "release_stop_event"},
+               "status": "released", "release_created_at": stamp,
                "release_event_id": str(event.get("event_id") or ""), "release_reason": reason,
                "release_agent_pid": runtime.claude_process_pid,
                "release_process_generation": runtime.claude_process_generation,
@@ -9034,7 +10129,8 @@ class WatchDaemon:
                            float(guard.get("release_created_at") or 0)) < stamp <= time.time() + 1):
             return
         runtime.claude_provider_guard = self.claude_event_ledger.put_provider_guard(surface_id, {
-            **guard, "status": "released", "release_created_at": stamp,
+            **{key: value for key, value in guard.items() if key != "release_stop_event"},
+            "status": "released", "release_created_at": stamp,
             "release_event_id": "process:" + str(generation), "release_reason": "verified_new_process",
             "release_agent_pid": observation["pid"], "release_process_generation": generation,
             "release_session_id": "", "released_screen_fingerprint": str(guard.get("screen_fingerprint") or ""),
@@ -9290,7 +10386,8 @@ class WatchDaemon:
         for key in ("synthetic_fallback", "attempt_number", "evidence_fingerprint", "workspace_id", "agent_pid", "_registration_revalidation",
                     "report_migration_source_event_id", "report_migration_turn_started_at",
                     "report_migration_generation_id", "dispatch_migration_source_event_id",
-                    "transcript_id", "message_hash", *STOP_FAILURE_METADATA):
+                    "provider_migration_source_event_id", "provider_migration_turn_started_at",
+                    "transcript_id", "message_hash", "input_not_sent_recovery", *STOP_FAILURE_METADATA):
             if key in parked_event:
                 runtime.claude_deferred_event[key] = parked_event[key]
         runtime.claude_deferred_reason = reason
@@ -9306,6 +10403,196 @@ class WatchDaemon:
             superseded[:8] or "-",
         )
 
+
+    def _claude_unsent_stop_current(self, event, target, runtime) -> bool:
+        """Prove a zero-input Stop still owns this exact native turn.
+
+        A restored slot is not new send authority. This predicate also runs in
+        the existing preflight, Text and immediate/delayed Enter source gates.
+        """
+        try:
+            target = dict(target)
+            event_id = str(event.get("event_id") or "")
+            marker = event.get("input_not_sent_recovery")
+            if (type(marker) is not int or marker != 1
+                    or runtime.claude_hook_health != "healthy"
+                    or runtime.claude_hook_process_generation != runtime.claude_process_generation
+                    or runtime.claude_last_event_id != event_id
+                    or runtime.claude_completed_latched or runtime.claude_supervisor_wait
+                    or runtime.claude_handshake_wait or runtime.claude_handshake_challenge
+                    or runtime.claude_handshake_provider_conflict):
+                return False
+            fields = ("claude_process_pid", "claude_process_generation", "claude_session_id",
+                      "claude_generation_id", "claude_turn_started_at", "claude_last_hook_at",
+                      "claude_last_event_id", "last_send_at", "claude_last_submit_at",
+                      "claude_last_submit_event_id", "claude_last_submit_session_id",
+                      "claude_last_submit_generation", "claude_last_submit_has_receipt")
+            binding = tuple(getattr(runtime, key) for key in fields)
+            guards = self._claude_report_guard_snapshot(runtime)
+            validated = self._validated_claude_provider_event(target, runtime, event)
+            if self.claude_event_ledger.ordinary_stop_boundary(validated) is None:
+                return False
+            stamp = event["created_at"]
+            if (event.get("session_id") != runtime.claude_session_id
+                    or event.get("process_generation") != runtime.claude_process_generation
+                    or any(event.get(key) for key in ("report_migration_source_event_id",
+                        "dispatch_migration_source_event_id", "provider_migration_source_event_id"))
+                    or self._foreign_claude_session_owner(str(target["surface_id"]), event["session_id"])):
+                return False
+            with self.claude_event_ledger._lock:
+                row = copy.deepcopy(self.claude_event_ledger.events.get(event_id, {}))
+                proof = row.get("input_not_sent")
+                owns_submit = (row.get("status") == "reserved"
+                               and runtime.claude_submit_event_id == event_id
+                               and runtime.claude_submit_phase == "text_written")
+                same = ("event_name", "surface_id", "workspace_id", "session_id", "agent_pid",
+                        "process_generation", "created_at", "completed", "transcript_id", "message_hash")
+                if (any(row.get(key) != event.get(key) for key in same)
+                        or not isinstance(proof, Mapping) or proof.get("phase") != "text"
+                        or "provider_guard" in proof
+                        or not isinstance(proof.get("reason"), str) or not proof["reason"]
+                        or not stamp <= provider_native._number(proof.get("at")) <= time.time()
+                        or any(key in row for key in (
+                            "watchdog_submission", "provider_superseded_submission", "provider_native_receipt"))
+                        or not (owns_submit or (row.get("status") == "deferred_input_not_sent"
+                            and runtime.claude_submit_phase == "none"
+                            and not runtime.claude_submit_event_id
+                            and not runtime.claude_submit_write_unknown))):
+                    return False
+                # Enter stamps its own intent before its connected guard runs.
+                # This permits that same reserved transaction, never restores it.
+                if (any(type(value) not in (int, float) or not math.isfinite(value) or value < 0
+                        for value in (runtime.last_send_at, runtime.claude_last_submit_at))
+                        or runtime.last_send_at >= stamp
+                        or (runtime.claude_last_submit_at >= stamp and not (
+                            owns_submit and runtime.claude_last_submit_event_id == event_id
+                            and runtime.claude_last_submit_session_id == event["session_id"]
+                            and runtime.claude_last_submit_generation == event["process_generation"]
+                            and runtime.claude_last_submit_has_receipt is False))):
+                    return False
+                related = {key: copy.deepcopy(value) for key, value in self.claude_event_ledger.events.items()
+                           if (value.get("surface_id") == event["surface_id"]
+                               or value.get("session_id") == event["session_id"])}
+                for other_id, other in related.items():
+                    if other_id == event_id:
+                        continue
+                    archived = any(isinstance(other.get(key), Mapping) for key in (
+                        "provider_superseded_submission", "provider_native_receipt"))
+                    if other.get("status") in {"reserved", "unknown", "submit_unknown"} and not archived:
+                        return False
+                    other_stamp = other.get("created_at")
+                    if (type(other_stamp) in (int, float) and math.isfinite(other_stamp)
+                            and other_stamp >= stamp):
+                        return False
+
+            journal = self.claude_event_inbox.journal_path
+            raw, hook_boundary = supervisor_closeout.native_tail(journal)
+            hooks = provider_native._records(raw, hook_boundary)
+            matches = [(index, hook) for index, (hook, _, _) in enumerate(hooks)
+                       if hook.get("event_id") == event_id]
+            if len(matches) != 1:
+                return False
+            source_index, original = matches[0]
+            if (any(original.get(key) != event.get(key) for key in same if key != "process_generation")
+                    or original.get("process_generation") not in (None, "", event["process_generation"])
+                    or self.claude_event_ledger.ordinary_stop_boundary(
+                        {**original, "process_generation": event["process_generation"]}) is None
+                    or original.get("stop_hook_active")):
+                return False
+            for index, (hook, _, _) in enumerate(hooks):
+                if (index == source_index
+                        or (hook.get("surface_id") != event["surface_id"]
+                            and hook.get("session_id") != event["session_id"])):
+                    continue
+                if (hook.get("event_name") not in CLAUDE_HOOK_EVENTS
+                        or index > source_index
+                        or provider_native._number(hook.get("created_at")) >= stamp):
+                    return False
+
+            path = dispatch_recovery.native_path(original)
+            raw, native_boundary = supervisor_closeout.native_tail(path)
+            native = provider_native._records(raw, native_boundary)
+            mainline = []
+            for native_row, offset, digest in native:
+                if native_row.get("isSidechain") is True:
+                    continue
+                if native_row.get("type") in {"user", "assistant"}:
+                    if (native_row.get("sessionId") != event["session_id"]
+                            or native_row.get("isSidechain") is not False):
+                        return False
+                    mainline.append((native_row, offset, digest))
+            if not mainline:
+                return False
+            latest, latest_offset, _ = mainline[-1]
+            text = dispatch_recovery._text(latest)
+            native_stamp = provider_native._epoch(latest.get("timestamp"))
+            if (latest.get("type") != "assistant" or not latest.get("uuid") or not text
+                    or latest["message"].get("role") != "assistant"
+                    or dispatch_recovery.digest(text) != original.get("message_hash")
+                    or completion_reported(text)
+                    or not runtime.claude_turn_started_at <= native_stamp <= stamp
+                    or sum(1 for item, _, _ in mainline
+                           if item.get("type") == "assistant"
+                           and dispatch_recovery._text(item) == text) != 1
+                    or provider_native._unresolved_queue(native, event["session_id"])
+                    or any(offset > latest_offset and item.get("type") in {
+                               "queue-operation", "tool", "tool_result"}
+                           for item, offset, _ in native)):
+                return False
+            # Reads and process inspection may yield. Never commit a slot using
+            # a different ledger, task boundary, target or file generation.
+            with self.claude_event_ledger._lock:
+                return bool(self.claude_event_ledger.events.get(event_id) == row
+                            and related == {key: value for key, value in self.claude_event_ledger.events.items()
+                                            if (value.get("surface_id") == event["surface_id"]
+                                                or value.get("session_id") == event["session_id"])}
+                            and dispatch_recovery.fingerprint(journal) == hook_boundary["stat"]
+                            and dispatch_recovery.fingerprint(path) == native_boundary["stat"]
+                            and binding == tuple(getattr(runtime, key) for key in fields)
+                            and self._claude_report_guard_snapshot(runtime) == guards
+                            and target == self._event_target(str(target["surface_id"])))
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, RuntimeError, OverflowError):
+            return False
+
+    def _restore_unsent_claude_deferred(self, target, runtime, state) -> bool:
+        """Rebuild only a lost slot whose durable text attempt sent no input."""
+        if (not self._runtime_is_claude(runtime, state)
+                or runtime.claude_deferred_event or runtime.claude_submit_phase != "none"
+                or runtime.claude_submit_event_id or runtime.claude_submit_write_unknown
+                or state.kind not in {"claude_stopped", "recoverable_error", "claude_hook_waiting"}
+                or state.claude_native_activity
+                or self._claude_supervisor_wait_guard(target, runtime)
+                or self._claude_provider_guard_reason(target, runtime, state)):
+            return False
+        event_id = str(runtime.claude_last_event_id or "")
+        with self.claude_event_ledger._lock:
+            row = copy.deepcopy(self.claude_event_ledger.events.get(event_id, {}))
+        proof = row.get("input_not_sent")
+        if (row.get("status") != "deferred_input_not_sent"
+                or not isinstance(proof, Mapping) or proof.get("phase") != "text"):
+            return False
+        event = {key: value for key, value in row.items()
+                 if key not in {"status", "handled_at", "detail", "input_not_sent"}}
+        event.update(event_id=event_id, input_not_sent_recovery=1)
+        if not self._claude_unsent_stop_current(event, target, runtime):
+            return False
+        # The surface lock surrounds this periodic path; the ledger CAS also
+        # keeps a reservation committed during the evidence read consumed.
+        with self.claude_event_ledger._lock:
+            if self.claude_event_ledger.events.get(event_id) != row:
+                return False
+            runtime.claude_deferred_event = event
+            runtime.claude_deferred_reason = "input_not_sent_recovery"
+            runtime.claude_deferred_since = time.time()
+            runtime.claude_deferred_attempts = 0
+            runtime.claude_deferred_last_attempt_at = 0.0
+            runtime.claude_last_event_status = "deferred_input_not_sent"
+            runtime.claude_hook_status = "deferred_input_not_sent"
+            runtime.state = "claude_deferred_retrying"
+        self.save()
+        self.logger.warning("surface=%s Claude zero-input Stop slot restored event=%s",
+                            str(target["surface_id"])[:8], event_id[:8])
+        return True
     def _restore_expired_claude_deferred(self, runtime: TargetRuntime) -> bool:
         """Rehydrate a deferred Stop that expired before the retry policy existed.
 
@@ -9332,6 +10619,10 @@ class WatchDaemon:
             return False
         with self.claude_event_ledger._lock:
             row = self.claude_event_ledger.events.get(event_id)
+            # Proven-unsent rows must use their native freshness gate.
+            if isinstance(row, Mapping) and (row.get("status") == "deferred_input_not_sent"
+                    or "input_not_sent_recovery" in row):
+                return False
             # Older daemons did not always advance the ledger row when the
             # 900-second slot expired.  In production this left the exact
             # event at ``deferred_active_stop_hook`` even though runtime.json
@@ -9371,6 +10662,9 @@ class WatchDaemon:
                 "episode_id": row_episode or str(runtime.claude_fallback_episode_id or ""),
             }
             for key in ("synthetic_fallback", "attempt_number", "evidence_fingerprint", "workspace_id", "agent_pid",
+                        "report_migration_source_event_id", "report_migration_turn_started_at",
+                        "report_migration_generation_id", "dispatch_migration_source_event_id",
+                        "provider_migration_source_event_id", "provider_migration_turn_started_at",
                         *STOP_FAILURE_METADATA):
                 if key in row:
                     event[key] = row[key]
@@ -9438,11 +10732,16 @@ class WatchDaemon:
             return False
         if runtime.claude_submit_phase != "none":
             return False
-        if deferred.get("error_kind") == "claude_429":
+        if deferred.get("error_kind") in CLAUDE_PROVIDER_RETRY_KINDS:
             status = self.claude_event_ledger.status_of(str(deferred.get("event_id") or ""))
             if status not in {"handling", "provider_retry_wait"} and not (
                     status.startswith("deferred_") and status not in CLAUDE_DEFERRED_TERMINAL_STATUSES):
                 self._clear_claude_deferred(runtime, reason="provider_retry_already_consumed")
+                return False
+        if deferred.get("provider_migration_source_event_id"):
+            if not self._claude_migration_sources_current(deferred, target, runtime):
+                # A transient read failure keeps the same immutable retry;
+                # the next guarded attempt can revalidate it without replay.
                 return False
         if deferred.get("report_migration_source_event_id") or deferred.get("dispatch_migration_source_event_id"):
             status = self.claude_event_ledger.status_of(str(deferred.get("event_id") or ""))
@@ -9771,6 +11070,7 @@ class WatchDaemon:
         runtime.claude_submit_event_id = None
         runtime.claude_submit_message_hash = None
         runtime.claude_submit_fingerprint = None
+        runtime.claude_submit_native_identity = None
         runtime.claude_submit_since = 0.0
         runtime.claude_submit_last_attempt_at = 0.0
         runtime.claude_submit_phase = "none"
@@ -10088,6 +11388,14 @@ class WatchDaemon:
             if stack is not None:
                 stack.close()
 
+    @staticmethod
+    def _claude_submit_owner(runtime: TargetRuntime) -> tuple[Any, ...]:
+        """The stable owner across this transaction's text and Enter writes."""
+        return (runtime.claude_submit_event_id, runtime.claude_submit_message_hash,
+                runtime.claude_submit_since, runtime.claude_session_id,
+                runtime.claude_process_generation,
+                json.dumps(runtime.claude_submit_native_identity, sort_keys=True))
+
     @_claude_delivery_scope
     def _send_claude_enter(
         self,
@@ -10100,11 +11408,22 @@ class WatchDaemon:
     ) -> bool:
         """Submit only the already verified watchdog text with an explicit key."""
 
+        submit_owner = self._claude_submit_owner(runtime)
+        submit_phase = runtime.claude_submit_phase
+
+        def owns_submit():
+            return (self._claude_submit_owner(runtime) == submit_owner
+                    and runtime.claude_submit_phase == submit_phase)
+
+        if runtime.claude_completed_latched:
+            return False
         if not self._acquire_claude_delivery(target, runtime, client):
             return False
         if self._claude_supervisor_wait_guard(target, runtime):
             return False
         if self._claude_provider_guard_reason(target, runtime):
+            return False
+        if not owns_submit():
             return False
 
         surface_id = str(target["surface_id"])
@@ -10115,8 +11434,12 @@ class WatchDaemon:
         previous_attempt = {key: getattr(runtime, key) for key in (
             "claude_submit_write_unknown", "claude_submit_not_sent",
             "claude_submit_last_attempt_at", "claude_submit_last_reason")}
-        submit: dict[str, Any] = {}
+        with self.claude_event_ledger._lock:
+            submit_id = str(submit_owner[0] or "")
+            submit_row = dict(self.claude_event_ledger.events.get(submit_id, {}))
+        submit = {**submit_row, "event_id": submit_id}
         composer_pin = None
+        write_intent = False
         try:
             if runtime.claude_submit_write_unknown or runtime.claude_handshake_wait:
                 return False
@@ -10133,8 +11456,8 @@ class WatchDaemon:
                             or runtime.claude_completed_latched or not expected_pid or not expected_generation):
                         return False
                     record = find_main_surface(base.tree(), surface_id)
-                    live = surface_process_label(
-                        classify_surface_processes(base.top(str(target["workspace_id"]))), target)
+                    live = self._live_claude_process_label(
+                        target, base, pinned=runtime.claude_submit_native_identity, allow_unpinned=False)
                     identity = self._claude_send_process_identity(expected_pid)
                     return (record.get("workspace_id") == target["workspace_id"]
                             and live.get("agent_kind") == "claude" and live.get("agent_pid") == expected_pid
@@ -10144,16 +11467,17 @@ class WatchDaemon:
             identity_check = input_check
 
             def submit_check():
-                nonlocal submit, composer_pin
-                if (not self._acquire_claude_delivery(target, runtime, client)
+                nonlocal composer_pin
+                if (not owns_submit() or runtime.claude_completed_latched
+                        or (runtime.claude_submit_write_unknown and not write_intent)
+                        or not self._acquire_claude_delivery(target, runtime, client)
                         or self._claude_supervisor_wait_guard(target, runtime)
                         or self._claude_provider_guard_reason(target, runtime)
                         or runtime.claude_handshake_wait or not identity_check()):
                     return False
                 with self.claude_event_ledger._lock:
-                    submit_id = str(runtime.claude_submit_event_id or "")
-                    submit = {**self.claude_event_ledger.events.get(submit_id, {}),
-                              "event_id": submit_id}
+                    if self.claude_event_ledger.events.get(submit_id, {}) != submit_row:
+                        return False
                 if not self._claude_migration_sources_current(submit, target, runtime):
                     return False
                 message = str(self.config.get("claude_message") or CLAUDE_MESSAGE)
@@ -10180,7 +11504,9 @@ class WatchDaemon:
                         and self._claude_migration_sources_current(submit, target, runtime)
                         and not self._claude_supervisor_wait_guard(target, runtime)
                         and not self._claude_provider_guard_reason(target, runtime, event=submit)
-                        and str(self.config.get("claude_message") or CLAUDE_MESSAGE) == message)
+                        and str(self.config.get("claude_message") or CLAUDE_MESSAGE) == message
+                        and not runtime.claude_completed_latched
+                        and owns_submit())
 
             # Two complete fresh observations under the same pane+target lease;
             # connected input_guard rechecks the same pin immediately at write.
@@ -10188,6 +11514,8 @@ class WatchDaemon:
                 raise InputNotSentError("Claude live identity or exact composer check rejected Enter")
             guard = (base.input_guard(submit_check) if hasattr(base, "input_guard") else contextlib.nullcontext())
             with guard:
+                if not owns_submit():
+                    raise InputNotSentError("Claude submit owner changed before Enter")
                 runtime.claude_last_submit_event_id = runtime.claude_submit_event_id
                 runtime.claude_last_submit_message_hash = runtime.claude_submit_message_hash
                 runtime.claude_last_submit_session_id = runtime.claude_session_id
@@ -10197,19 +11525,25 @@ class WatchDaemon:
                 # Crash / lost response cannot be interpreted as an unsent key.
                 runtime.claude_submit_not_sent = False
                 runtime.claude_submit_write_unknown = True
+                write_intent = True
                 self.save()
                 # Last local step before the key bytes: the same lock inodes
                 # must still be ours. The connected input_guard repeats it.
                 self._verify_claude_delivery_lease()
                 client.send_key(str(target["workspace_id"]), surface_id, "enter")
         except InputNotSentError as exc:
+            if not owns_submit():
+                return False
             # Typed transport evidence proves the input request never left this
             # process. Preserve the original text/event; retry only Enter after
             # fresh authorization, process and exact-composer checks.
             local = self._claude_delivery_local
             if isinstance(exc, DeliveryLeaseError):
                 local.lease_fault = exc
-            if self._claude_provider_guard_reason(target, runtime, event=submit):
+            provider_reason = self._claude_provider_guard_reason(target, runtime, event=submit)
+            if not owns_submit():
+                return False
+            if provider_reason:
                 # The provider gate consumed no key budget. Keep the original
                 # attempt and any earlier uncertainty exactly as recorded.
                 for key, value in previous_attempt.items():
@@ -10231,12 +11565,16 @@ class WatchDaemon:
             self.logger.info("surface=%s Claude Enter withheld: %s", surface_id[:8], exc)
             return False
         except (CmuxError, RuntimeError, OSError, ValueError, TypeError) as exc:
+            if not owns_submit():
+                return False
             runtime.claude_submit_last_reason = f"enter failed: {exc}"
             self.save()
             self.logger.warning(
                 "surface=%s Claude submit Enter failed phase=%s reason=%s",
                 surface_id[:8], runtime.claude_submit_phase, reason,
             )
+            return False
+        if not owns_submit():
             return False
         now = time.time()
         runtime.claude_submit_write_unknown = False
@@ -10506,13 +11844,28 @@ class WatchDaemon:
         client: CmuxClient,
     ) -> tuple[bool, str]:
 
+        if event.get("completed") or runtime.claude_completed_latched:
+            return False, "Claude task already completed"
+        preflight_owner = self._claude_submit_owner(runtime)
+        submit_owner = None
+
+        def available_for_submit():
+            return (self._claude_submit_owner(runtime) == preflight_owner
+                    and runtime.claude_submit_phase == "none"
+                    and not runtime.claude_submit_write_unknown
+                    and not event.get("completed") and not runtime.claude_completed_latched)
+
+        def owns_submit():
+            return (submit_owner is not None
+                    and self._claude_submit_owner(runtime) == submit_owner)
+
         waiting = self._claude_supervisor_wait_guard(target, runtime)
         if waiting:
             return False, waiting
         provider_reason = self._claude_provider_guard_reason(target, runtime, event=event)
         if provider_reason:
             return False, provider_reason
-        if runtime.claude_submit_phase != "none" or runtime.claude_submit_write_unknown:
+        if not available_for_submit():
             return False, "Claude submit pending: existing transaction owns the input"
         if self.claude_event_ledger.status_of(str(event.get("event_id") or "")) in {"reserved", "sent"}:
             return False, "Claude submit already reserved or sent"
@@ -10567,7 +11920,10 @@ class WatchDaemon:
             post_send_stages[name] = round((current - submit_mark) * 1000.0, 1)
             submit_mark = current
 
-        process = self._candidate_process_label(target, client)
+        try:
+            process = self._live_claude_process_label(target, client)
+        except (OSError, ValueError, TypeError, CmuxError):
+            return False, "process is unverified before preflight"
         _stage("process_ms")
         if process.get("agent_kind") != "claude":
             return False, f"process is {process.get('agent_kind') or 'unknown'}"
@@ -10575,6 +11931,7 @@ class WatchDaemon:
         try:
             pinned_pid = int(process.get("agent_pid") or 0)
             pinned_identity = self._claude_send_process_identity(pinned_pid)
+            pinned_native_identity = copy.deepcopy(process.get("native_identity"))
         except (OSError, ValueError, TypeError, CmuxError):
             return False, "process is unverified before preflight"
         if event.get("_inbox_source") == "deferred":
@@ -10589,37 +11946,71 @@ class WatchDaemon:
                 return False, "process is changed before deferred retry"
 
         def live_input_check():
-            # Do not reuse the discovery cache after viewport or socket I/O.
-            try:
-                record = find_main_surface(base.tree(), surface_id)
-                if record.get("workspace_id") != target["workspace_id"]:
+            with _ClaudeInputGuardTrace(self.logger, surface_id, str(event.get('event_id') or ''), 'live') as _guard_trace:
+                try:
+                    if (
+                        _guard_trace.step('submit_owner')
+                        and (not owns_submit())
+                        or (_guard_trace.step('submit_phase') and runtime.claude_submit_phase != 'text_written')
+                        or (_guard_trace.step('event_completed') and event.get('completed'))
+                        or (_guard_trace.step('completion_latch') and runtime.claude_completed_latched)
+                    ):
+                        return False
+                    _guard_trace.step('tree_lookup')
+                    record = find_main_surface(base.tree(), surface_id)
+                    _guard_trace.detail['expected_workspace'] = target.get('workspace_id')
+                    _guard_trace.detail['observed_workspace'] = record.get('workspace_id')
+                    _guard_trace.detail['configured_pane'] = target.get('pane_id')
+                    _guard_trace.detail['observed_pane'] = record.get('pane_id')
+                    if _guard_trace.step('workspace_changed') and record.get('workspace_id') != target['workspace_id']:
+                        return False
+                    if _guard_trace.step('delivery_lease') and (not self._acquire_claude_delivery(target, runtime, client)):
+                        return False
+                    _guard_trace.step('live_process_label')
+                    live = self._live_claude_process_label(target, base, pinned=pinned_native_identity, allow_unpinned=False)
+                    if (
+                        _guard_trace.step('live_agent_kind')
+                        and live.get('agent_kind') != 'claude'
+                        or (_guard_trace.step('live_pid') and int(live.get('agent_pid') or 0) != pinned_pid)
+                    ):
+                        return False
+                    _guard_trace.step('process_identity')
+                    identity = self._claude_send_process_identity(pinned_pid)
+                    if (
+                        _guard_trace.step('pinned_birth_missing')
+                        and (not pinned_identity.get('started_epoch'))
+                        or (_guard_trace.step('current_birth_missing') and (not identity.get('started_epoch')))
+                        or (_guard_trace.step('pinned_generation_missing') and (not pinned_identity.get('generation')))
+                        or (_guard_trace.step('process_generation_changed') and identity.get('generation') != pinned_identity['generation'])
+                    ):
+                        return False
+                    _guard_trace.step('active_target_lookup')
+                    current = self._active_send_target(target)
+                    _guard_trace.detail['active_target_available'] = current is not None
+                    if isinstance(current, dict):
+                        _guard_trace.detail['target_difference_keys'] = sorted((str(k) for k in set(current) | set(target) if current.get(k) != target.get(k)))
+                    _guard_trace.result = (
+                        (_guard_trace.step('active_target_equal') and current == target)
+                        and (_guard_trace.step('stop_requested') and (not self.stop_requested))
+                        and (_guard_trace.step('mode_armed') and self.config.get('mode') == 'armed')
+                        and (_guard_trace.step('global_paused') and (not self.config.get('global_paused')))
+                        and (_guard_trace.step('claude_enabled') and self.config.get('claude_enabled'))
+                        and (_guard_trace.step('target_paused') and (not current.get('paused')))
+                        and (_guard_trace.step('target_enabled') and current.get('enabled', True))
+                        and (_guard_trace.step('event_completed') and (not event.get('completed')))
+                        and (_guard_trace.step('completion_latch') and (not runtime.claude_completed_latched))
+                        and (_guard_trace.step('handshake_wait') and (not runtime.claude_handshake_wait))
+                        and (_guard_trace.step('supervisor_wait') and (not self._claude_supervisor_wait_guard(target, runtime)))
+                        and (_guard_trace.step('registration_revalidation') and (not event.get('_registration_revalidation')) or (_guard_trace.step('registration_stop_latest') and self._registration_stop_is_latest(event)))
+                        and (_guard_trace.step('migration_sources_current') and self._claude_migration_sources_current(event, target, runtime))
+                        and (_guard_trace.step('provider_guard_final') and (not self._claude_provider_guard_reason(target, runtime, event=event)))
+                        and (_guard_trace.step('submit_owner_final') and owns_submit())
+                        and (_guard_trace.step('submit_phase_final') and runtime.claude_submit_phase == 'text_written')
+                    )
+                    return _guard_trace.result
+                except (OSError, ValueError, TypeError, CmuxError) as _guard_exc:
+                    _guard_trace.exception = type(_guard_exc).__name__
                     return False
-                if not self._acquire_claude_delivery(target, runtime, client):
-                    return False
-                labels = classify_surface_processes(base.top(str(target["workspace_id"])))
-                live = surface_process_label(labels, target)
-                if live.get("agent_kind") != "claude" or int(live.get("agent_pid") or 0) != pinned_pid:
-                    return False
-                identity = self._claude_send_process_identity(pinned_pid)
-                if (not pinned_identity.get("started_epoch") or not identity.get("started_epoch")
-                        or not pinned_identity.get("generation")
-                        or identity.get("generation") != pinned_identity["generation"]):
-                    return False
-                current = self._active_send_target(target)
-                return (current == target and not self.stop_requested
-                        and self.config.get("mode") == "armed"
-                        and not self.config.get("global_paused")
-                        and self.config.get("claude_enabled")
-                        and not current.get("paused") and current.get("enabled", True)
-                        and not runtime.claude_completed_latched
-                        and not runtime.claude_handshake_wait
-                        and not self._claude_supervisor_wait_guard(target, runtime)
-                        and (not event.get("_registration_revalidation")
-                             or self._registration_stop_is_latest(event))
-                        and self._claude_migration_sources_current(event, target, runtime)
-                        and not self._claude_provider_guard_reason(target, runtime, event=event))
-            except (OSError, ValueError, TypeError, CmuxError):
-                return False
         try:
             _, focused_before, first, first_signature = self._claude_event_snapshot(target, client)
             _stage("frame1_ms")
@@ -10656,6 +12047,9 @@ class WatchDaemon:
         if provider_reason:
             return False, provider_reason
         _stage("verify_ms")
+        if (not available_for_submit()
+                or self.claude_event_ledger.status_of(str(event.get("event_id") or "")) in {"reserved", "sent"}):
+            return False, "Claude submit owner changed during preflight"
         # Freeze preflight cost here, at the last preflight stage.  Everything
         # after this line is the submit transaction and is timed on its own.
         preflight_duration = max(0.0, time.perf_counter() - perf_started)
@@ -10674,25 +12068,34 @@ class WatchDaemon:
         _submit_stage("ledger_reserve_ms")
         self.save()
         _submit_stage("persist_reserve_ms")
+        if not available_for_submit():
+            return False, "Claude submit owner changed before transaction initialization"
         message = str(self.config.get("claude_message") or CLAUDE_MESSAGE)
         def text_input_check():
-            if not live_input_check():
-                return False
-            frame = Grid.from_rpc(base.replay(str(target["workspace_id"]), surface_id), surface_id)
-            current_state = classify_claude_grid(frame, claude_message=message)
-            if self._claude_provider_guard_reason(target, runtime, current_state, event=event):
-                return False
-            return (current_state.kind in {"claude_stopped", "recoverable_error"}
-                    and not current_state.claude_native_activity
-                    and current_state.content_fingerprint == final.content_fingerprint
-                    and str(self.config.get("claude_message") or CLAUDE_MESSAGE) == message
-                    and live_input_check()
-                    and not self._claude_provider_guard_reason(target, runtime, event=event))
+            with _ClaudeInputGuardTrace(self.logger, surface_id, str(event.get('event_id') or ''), 'text') as _guard_trace:
+                if _guard_trace.step('live_initial') and (not live_input_check()):
+                    return False
+                _guard_trace.step('replay')
+                frame = Grid.from_rpc(base.replay(str(target['workspace_id']), surface_id), surface_id)
+                _guard_trace.step('classify')
+                current_state = classify_claude_grid(frame, claude_message=message)
+                if _guard_trace.step('provider_guard_screen') and self._claude_provider_guard_reason(target, runtime, current_state, event=event):
+                    return False
+                _guard_trace.result = (
+                    (_guard_trace.step('composer_kind') and current_state.kind in {'claude_stopped', 'recoverable_error'})
+                    and (_guard_trace.step('native_activity') and (not current_state.claude_native_activity))
+                    and (_guard_trace.step('assistant_fingerprint') and current_state.content_fingerprint == final.content_fingerprint)
+                    and (_guard_trace.step('continuation_message_changed') and str(self.config.get('claude_message') or CLAUDE_MESSAGE) == message)
+                    and (_guard_trace.step('live_final') and live_input_check())
+                    and (_guard_trace.step('provider_guard_final') and (not self._claude_provider_guard_reason(target, runtime, event=event)))
+                )
+                return _guard_trace.result
 
         previous_orphan = (runtime.claude_orphan_enter_count, runtime.claude_orphan_enter_at)
         runtime.claude_submit_event_id = str(event["event_id"])
         runtime.claude_submit_message_hash = _short_hash(message)
         runtime.claude_submit_fingerprint = final.content_fingerprint or final_signature or first_signature
+        runtime.claude_submit_native_identity = pinned_native_identity
         runtime.claude_submit_since = time.time()
         runtime.claude_submit_last_attempt_at = 0.0
         runtime.claude_submit_phase = "text_written"
@@ -10702,6 +12105,7 @@ class WatchDaemon:
         # F2 重置点之二：新事务重新拥有 composer，上一个孤儿事件的预算作废。
         runtime.claude_orphan_enter_count = 0
         runtime.claude_orphan_enter_at = 0.0
+        submit_owner = self._claude_submit_owner(runtime)
         _submit_stage("transaction_init_ms")
         self.save()
         text_attempted = False
@@ -10711,22 +12115,44 @@ class WatchDaemon:
             guard = (base.input_guard(text_input_check) if hasattr(base, "input_guard")
                      else contextlib.nullcontext())
             with guard:
+                if not owns_submit():
+                    raise InputNotSentError("Claude submit owner changed before text")
                 text_attempted = True
                 runtime.claude_submit_write_unknown = True
                 self.save()
                 client.send_text(str(target["workspace_id"]), surface_id, message)
+            if not owns_submit():
+                return False, "Claude submit owner changed after text"
             runtime.claude_submit_write_unknown = False
             self.save()
-        except InputNotSentError as exc:
+        except (CmuxError, RuntimeError) as exc:
+            if (not isinstance(exc, InputNotSentError)
+                    and (text_attempted or runtime.claude_submit_write_unknown)):
+                if not owns_submit():
+                    return False, "Claude submit owner changed during text transport"
+                self.save()
+                return False, f"cmux send text failed after reservation: {exc}"
+            if not owns_submit():
+                return False, "Claude submit owner changed before text"
+            # This branch has proved zero Text input and cannot proceed to
+            # Enter. Release our outer lease before slow provider/ledger/state
+            # bookkeeping. A nested caller retains its own outer scope; the
+            # durable reservation is not cleared until unsent proof is saved.
+            if getattr(self._claude_delivery_local, "depth", 0) == 1:
+                _release_claude_delivery(self._claude_delivery_local)
             provider_reason = self._claude_provider_guard_reason(target, runtime, event=event)
+            if not owns_submit():
+                return False, "Claude submit owner changed while withholding text"
             status = "reserved" if provider_reason else "deferred_input_not_sent"
             if not provider_reason:
                 if event.get("dispatch_migration_source_event_id"):
                     status = "deferred_dispatch_migration"
                 elif event.get("report_migration_source_event_id"):
                     status = "deferred_report_migration"
-            # InputNotSentError is the transport's proof that no text I/O
-            # started. Commit that proof and the retry status together before
+            # InputNotSentError proves no text I/O started. A local check or
+            # guard setup failure before our untouched write intent does too.
+            # After intent/attempt, only transport proof permits this cleanup.
+            # Commit that proof and the retry status together before
             # clearing the transaction. In particular, an ordinary deferred
             # Stop must not remain reserved and lose its slot on the next poll.
             # Unknown writes and crash-left reservations never enter this path.
@@ -10746,6 +12172,8 @@ class WatchDaemon:
                 # fails. The original reservation/unknown state stays closed.
                 self.claude_event_ledger._write(events)
                 self.claude_event_ledger.events = events
+            if not owns_submit():
+                return False, "Claude submit owner changed while recording unsent text"
             self._clear_claude_submit(runtime, reason=f"text not sent: {exc}")
             runtime.claude_orphan_enter_count, runtime.claude_orphan_enter_at = previous_orphan
             runtime.claude_last_event_status = status
@@ -10759,11 +12187,6 @@ class WatchDaemon:
                 return False, provider_reason
             self.save()
             return False, f"Claude input not sent: {exc}"
-        except (CmuxError, RuntimeError) as exc:
-            if not text_attempted:
-                self._clear_claude_submit(runtime, reason=f"text failed: {exc}")
-            self.save()
-            return False, f"cmux send text failed after reservation: {exc}"
         _submit_stage("text_ms")
         # Close the race with a human typing between the double-frame
         # preflight and the write.  Only press Enter after the exact watchdog
@@ -10776,24 +12199,34 @@ class WatchDaemon:
             verification_state = classify_claude_grid(
                 verification_grid, claude_message=message,
             )
+            if not owns_submit():
+                return False, "Claude submit owner changed during text readback"
             provider_reason = self._claude_provider_guard_reason(target, runtime, verification_state, event=event)
             if provider_reason:
                 return False, provider_reason
+            if not owns_submit():
+                return False, "Claude submit owner changed before Enter"
             if not verification_state.watchdog_echo:
                 runtime.claude_submit_last_reason = "composer changed before Enter"
                 return False, "Claude submit composer changed before Enter"
         except (CmuxError, RuntimeError) as exc:
+            if not owns_submit():
+                return False, "Claude submit owner changed during text readback"
             runtime.claude_submit_last_reason = f"submit readback failed: {exc}"
             return False, f"Claude submit readback failed; waiting for confirmation: {exc}"
         _submit_stage("readback_ms")
         self.save()
         _submit_stage("persist_pre_enter_ms")
+        if not owns_submit():
+            return False, "Claude submit owner changed before Enter"
         # Immediate and delayed Enter share the durable submit path.
         entered = self._send_claude_enter(target, runtime, client, reason="initial_submit",
                                          input_check=live_input_check)
         _submit_stage("enter_ms")
         if not entered:
             return False, "Claude submit pending: Enter withheld or unconfirmed"
+        if not owns_submit():
+            return False, "Claude submit owner changed after Enter"
         now = time.time()
         runtime.error_type = str(event.get("error_kind") or "claude_stopped")
         _post_stage("finalize_bookkeeping_ms")
@@ -11315,13 +12748,15 @@ class WatchDaemon:
             self.logger.debug("surface=%s dispatch append revalidation withheld: %s", str(target["surface_id"])[:8], exc)
             return False
 
-    def _claude_migration_sources_current(
-        self, event: Mapping[str, Any], target: Mapping[str, Any], runtime: TargetRuntime,
-    ) -> bool:
+    def _claude_migration_sources_current(self, event, target, runtime):
         return bool((not event.get("report_migration_source_event_id")
                      or self._claude_report_source_current(event, target, runtime))
                     and (not event.get("dispatch_migration_source_event_id")
-                         or self._claude_dispatch_source_current(event, target, runtime)))
+                         or self._claude_dispatch_source_current(event, target, runtime))
+                    and (not event.get("provider_migration_source_event_id")
+                         or self._claude_provider_source_current(event, target, runtime))
+                    and ("input_not_sent_recovery" not in event
+                         or self._claude_unsent_stop_current(event, target, runtime)))
 
     def _recover_claude_dispatch_wait(self, surface_id: str, runtime: TargetRuntime, state: ScreenState) -> bool:
         """Release an incorrectly suppressed native dispatch, once, in place.
@@ -11620,6 +13055,57 @@ class WatchDaemon:
             self.save()
             return True
 
+    def _refresh_paused_claude_hook_process(self, target, runtime, event, client) -> bool:
+        """Observe a resumed root without rearming or rewriting delivery ownership.
+
+        Paused targets skip periodic process observations.  Only a fresh socket
+        Hook for the already-bound session can repair their process tuple;
+        replayed events and an unverified/recycled PID cannot adopt a root.
+        """
+        from ccc_guard_scope import birth
+        pid, stamp = event.get("agent_pid"), event.get("created_at")
+        if (event.get("synthetic_fallback") or event.get("_inbox_source") != "socket"
+                or type(pid) is not int or pid <= 0
+                or type(stamp) not in (int, float) or not math.isfinite(stamp)
+                or not 0 < stamp <= time.time() + 1
+                or stamp < max(runtime.claude_last_hook_at, runtime.claude_turn_started_at)
+                or not runtime.claude_session_id
+                or event.get("session_id") != runtime.claude_session_id
+                or any(not target.get(k) or event.get(k) != target[k]
+                       for k in ("surface_id", "workspace_id"))):
+            return False
+        try:
+            before = birth(pid)
+            if not before or before != event.get("_inbox_process_birth"):
+                return False
+            live = self._live_claude_process_label(target, client)
+            if (live.get("agent_kind") != "claude" or live.get("agent_pid") != pid
+                    or live.get("identity_conflicts")):
+                return False
+            observed = self._claude_send_process_identity(pid)
+            started, generation = observed.get("started_epoch"), observed.get("generation")
+            started_at = observed.get("started_at")
+            if (observed.get("pid") != pid or not isinstance(generation, str) or not generation
+                    or not isinstance(started_at, str) or not started_at
+                    or type(started) not in (int, float) or not math.isfinite(started)
+                    or not 0 < started <= stamp
+                    or (event.get("process_generation") and event["process_generation"] != generation)
+                    or before != birth(pid)):
+                return False
+        except (CmuxError, OSError, ValueError, TypeError, OverflowError, RuntimeError):
+            return False
+        old = (runtime.claude_process_pid, runtime.claude_process_started_at,
+               runtime.claude_process_generation)
+        current = (pid, started_at, generation)
+        if old != current:
+            runtime.__dict__.pop("_live_claude_hook_identity", None)
+            (runtime.claude_process_pid, runtime.claude_process_started_at,
+             runtime.claude_process_generation) = current
+        # Do not clear pause, task bindings, completion, pending/unknown writes,
+        # deferred events, or receipts. Existing protocol and send guards decide
+        # what this native Hook may do after the read-only identity refresh.
+        return True
+
     def _handle_claude_event_locked(
         self,
         event: Mapping[str, Any],
@@ -11728,6 +13214,12 @@ class WatchDaemon:
                 surface_id[:8], event_id[:8], foreign_surface[:8],
             )
             return
+        if (target.get("paused") and not synthetic_fallback
+                and runtime.claude_session_id == session_id):
+            if not self._refresh_paused_claude_hook_process(target, runtime, event, client):
+                self.claude_event_ledger.mark(event, "paused_process_identity_unverified",
+                                              detail="paused identity refresh requires current native root and birth")
+                return
         event_name = str(event["event_name"])
         handshake_session_start = event_name == "SessionStart" and bool(
             runtime.claude_handshake_challenge or runtime.claude_handshake_wait)
@@ -11803,8 +13295,7 @@ class WatchDaemon:
         event_pid_is_surface_claude = False
         if event_pid > 0 and expected_pid != event_pid:
             try:
-                labels = classify_surface_processes(client.top(str(target.get("workspace_id") or "")))
-                process = surface_process_label(labels, target)
+                process = self._live_claude_process_label(target, client)
             except CmuxError:
                 process = {"agent_kind": "unknown", "agent_pid": 0, "agent_pids": []}
             process_kind = str(process.get("agent_kind") or "unknown")
@@ -11890,12 +13381,13 @@ class WatchDaemon:
             return
 
         provider_failure_event = (not synthetic_fallback and event_name == "StopFailure"
-                                  and event.get("error_kind") in CLAUDE_PROVIDER_BLOCKED_KINDS | {"claude_429"})
+                                  and not bool(event.get("completed"))
+                                  and event.get("error_kind") in CLAUDE_PROVIDER_RETRY_KINDS)
         # Validate against the already accepted runtime before any root/session
         # rebind. A rejected provider event cannot adopt a different process.
         provider_boundary_event = (provider_failure_event or (
             not synthetic_fallback and runtime.claude_provider_guard
-            and event_name in {"SessionStart", "UserPromptSubmit"}))
+            and event_name in {"SessionStart", "UserPromptSubmit", "Stop"}))
         if provider_boundary_event:
             validated = self._validated_claude_provider_event(
                 target, runtime, event, allow_new_session=event_name == "SessionStart")
@@ -11959,6 +13451,12 @@ class WatchDaemon:
                     event_id[:8],
                 )
                 return
+        if (provider_failure_event and runtime.claude_completed_latched
+                and not self._legacy_claude_report_latch(runtime)):
+            self.claude_event_ledger.mark(event, "suppressed_completed",
+                                          detail="genuine completion owns the current task")
+            self._sync_claude_provider_guard(surface_id, runtime)
+            return
         if provider_failure_event:
             # This must precede pending-submit de-duplication: a rejection is
             # neither a consumption receipt nor permission to retry old Enter.
@@ -12069,6 +13567,7 @@ class WatchDaemon:
             runtime.error_type = None
             self._reset_claude_repeat_warning(runtime)
             runtime.state = "claude_completed"
+            self._retire_completed_claude_provider_retry(surface_id, runtime, event)
             self._mark_claude_event(event, runtime, "completed")
             self.logger.info("surface=%s state=claude_completed source=hook", surface_id[:8])
             return
@@ -12198,7 +13697,8 @@ class WatchDaemon:
         self._last_workspace_discovery_at = now
         config = copy.deepcopy(self.config)
         try:
-            inventory = DiscoverySnapshot(client, self._native_process_index.snapshot())
+            inventory = DiscoverySnapshot(client, self._native_process_index.snapshot(),
+                                          native_processes=self._native_agent_processes())
             discovered = discover_all_targets(inventory, config)
         except RuntimeError as exc:
             # Keep the last known set, but do not add or rebind anything from a
@@ -12577,6 +14077,13 @@ class WatchDaemon:
 
         if state.message_kind == "codex" or not self._runtime_is_claude(runtime, state):
             return state
+        if runtime.claude_completed_latched and not self._legacy_claude_report_latch(runtime):
+            return dataclasses.replace(
+                state, kind="claude_completed", error_type=None,
+                fingerprint=runtime.claude_completion_event_id,
+                reason="Claude completion remains latched until a real user prompt or verified later Stop-hook continuation",
+                message_kind="claude",
+            )
         provider_reason = self._claude_provider_guard_reason(self._event_target(surface_id), runtime, state)
         if provider_reason:
             return dataclasses.replace(
@@ -12625,8 +14132,6 @@ class WatchDaemon:
                 reason="Legacy report recovery awaits a current verified Stop and no pending submission; task completion is unproven",
                 message_kind="claude",
             )
-        if state.kind == "claude_model_unavailable":
-            return state
         if runtime.claude_hook_health == "legacy_override":
             return dataclasses.replace(
                 state, kind="claude_hook_legacy", error_type=None, fingerprint=None,
@@ -13056,12 +14561,15 @@ class WatchDaemon:
         if proof:
             return (self._private_check_ready(proof, target, runtime, state, client, is_current, draft=draft)
                     and self._provider_retry_gate(target, runtime, state, attempt=runtime.send_attempt_id))
+        # Keep the turn from before admission. Taking a new snapshot after
+        # the reserved check could silently adopt a user turn started there.
+        turn = self.codex_queue_recovery.current_turn(target)
         if (self._active_send_target(target, is_current) is None
                 or self.config.get('mode') != 'armed' or self.config.get('global_paused')
-                or not self._codex_turn_ready(target, runtime, state, reserved=True)):
+                or not self._codex_turn_ready(target, runtime, state, reserved=True)
+                or self.codex_queue_recovery.current_turn(target) != turn):
             return False
         generation = self._config_mtime_ns
-        turn = self.codex_queue_recovery.current_turn(target)
         tree = (client.workspace_tree(target['workspace_id']) if isinstance(client, CmuxClient)
                 else client.fresh_tree() if isinstance(client, SnapshotClient) else client.tree())
         sid, wid = target['surface_id'], target['workspace_id']
@@ -13074,20 +14582,32 @@ class WatchDaemon:
                 and self._provider_retry_gate(target, runtime, state, attempt=runtime.send_attempt_id)
                 and self._active_send_target(target, is_current) is not None
                 and generation == self._config_mtime_ns and self.config.get('mode') == 'armed'
-                and not self.config.get('global_paused'))
+                and not self.config.get('global_paused')
+                and self._codex_turn_ready(target, runtime, state, reserved=True)
+                and self.codex_queue_recovery.current_turn(target) == turn)
 
-    def _goal_input_ready(self, target, runtime, state, client, is_current, draft, *, input_identity=None):
-        """Recheck the pinned goal and live input after each socket admission."""
+    def _goal_input_ready(self, target, runtime, state, client, is_current, draft=None, *,
+                          input_identity=None, frame_check=None):
+        """Pin the original blocked Goal and recheck the live terminal draft."""
+        from ccc_compact_guard import inspect as inspect_compact, status as compact_input_status
         def same_identity():
-            return (not input_identity or self._current_codex_input_identity(target, runtime) == input_identity)
-        if not same_identity():
-            return False
-        if not self._provider_retry_gate(target, runtime, state, attempt=runtime.send_attempt_id):
-            return False
-        if (not runtime.codex_goal_resume
+            return bool(input_identity and self._current_codex_input_identity(target, runtime) == input_identity)
+        def compact_allowed():
+            terminal_turn = self.codex_queue_recovery.current_turn(target)
+            inspection = inspect_compact(self.config_path, target, terminal_turn=terminal_turn)
+            runtime.codex_compact_guard = inspection
+            return (not compact_input_status(self.config_path, target, inspection=inspection)
+                    and self.codex_queue_recovery.current_turn(target) == terminal_turn)
+        if (not runtime.codex_goal_resume or not same_identity()
+                or not self._connected_native_input(client)
+                or not self._provider_retry_gate(target, runtime, state, attempt=runtime.send_attempt_id)
                 or self._active_send_target(target, is_current) is None
                 or self.config.get('mode') != 'armed' or self.config.get('global_paused')
                 or not self._codex_turn_ready(target, runtime, state, reserved=True)):
+            return False
+        # A terminal command must not borrow the old status-only native RPC
+        # permission when another input attempt remains unresolved.
+        if not compact_allowed():
             return False
         generation = self._config_mtime_ns
         base = client.client if isinstance(client, SnapshotClient) else client
@@ -13095,16 +14615,19 @@ class WatchDaemon:
         sid, wid = target['surface_id'], target['workspace_id']
         if find_main_surface(tree, sid).get('workspace_id') != wid or is_dock_surface(tree, sid):
             return False
-        grid = Grid.from_rpc(base.replay(wid, sid), sid)
-        fresh = classify_grid(grid) if draft is None else None
-        ready = (self._codex_draft_matches(grid, draft) if draft is not None else
-                 _composer_status(grid)[0] == 'empty' and fresh.kind == 'recoverable_error'
-                 and fresh.native_goal_stalled and fresh.error_type == state.error_type)
+        grid = Grid.from_rpc(base.replay(wid, sid, live=True, timeout=1.0), sid)
+        fresh = (self._native_goal_error_state(target, classify_grid(grid), grid)
+                 if draft is None else None)
+        ready = (draft == '/goal resume' and _goal_resume_draft_matches(grid) if draft is not None else
+                 _goal_boundary_signature(grid, draft=False) is not None and fresh.kind == 'recoverable_error'
+                 and fresh.message_kind == 'codex' and fresh.error_type == state.error_type)
         return (ready and self._codex_turn_ready(target, runtime, state, reserved=True)
+                and compact_allowed()
                 and self._provider_retry_gate(target, runtime, state, attempt=runtime.send_attempt_id)
                 and self._active_send_target(target, is_current) is not None
                 and generation == self._config_mtime_ns and self.config.get('mode') == 'armed'
-                and not self.config.get('global_paused') and same_identity())
+                and not self.config.get('global_paused') and same_identity()
+                and (frame_check is None or frame_check(grid)))
 
     def _submit_native_draft(self, target, runtime, state, client, message, proof, is_current,
                              *, persisted_input_phase=None, retry_identity=None):
@@ -13132,8 +14655,10 @@ class WatchDaemon:
             if persisted_input_phase != 'paste_submit_pending':
                 self._save_delivery(sid, runtime, True)
             with base.input_guard(authorized):
+                # 与 send_text/send_key 同一预算：连接内 guard 复核在写入前完成，负载下 6–18 s；
+                # 默认 8 s 让续跑在写入前就超时（2026-10-19 实测 668 次零写入失败）。复核到写入的窗口不变。
                 result = base._control_rpc('terminal.paste', {'workspace_id': wid, 'surface_id': sid,
-                    'text': message, 'submit_key': 'enter'})
+                    'text': message, 'submit_key': 'enter'}, timeout=base._input_timeout())
                 if result is None:
                     raise CmuxError('paste capability unavailable; no fallback attempted')
             runtime.codex_input_phase = 'paste_submit_acknowledged'
@@ -13324,6 +14849,119 @@ class WatchDaemon:
         runtime.claude_candidate_focused = False
         return final_state, fresh_tree
 
+    def _resume_retained_goal_draft(self, target, runtime, state, client, *, is_current=None):
+        """Consume one Enter for an authenticated original, never-submitted Goal draft.
+
+        The paste remains UNKNOWN. Original diagnostics must prove no Enter
+        invocation or a typed, bound pre-write refusal. Historical UNKNOWN
+        records are not upgraded; recovery intent is never removed or reset.
+        """
+        diagnostic = runtime.codex_goal_diagnostics
+        if (state.message_kind != 'codex' or runtime.delivery_status != 'unknown'
+                or runtime.codex_input_phase != 'goal_native_pending'
+                or not runtime.codex_goal_resume
+                or not isinstance(diagnostic, dict) or 'retained_submit' in diagnostic):
+            return False
+        observation = diagnostic.get('observation')
+        sid, wid = str(target['surface_id']), str(target['workspace_id'])
+        enter_proof = (observation.get('enter_not_sent_proof')
+                       if isinstance(observation, dict) else None)
+        enter_not_sent = (isinstance(observation, dict)
+                         and (observation.get('enter_rpc_invoked') is False
+                              or (observation.get('enter_rpc_invoked') is True
+                                  and isinstance(enter_proof, dict)
+                                  and enter_proof.get('write_attempted') is False
+                                  and enter_proof == dict(
+                                      schema='goal-enter-not-sent-v1', method='surface.send_key',
+                                      workspace_id=wid, surface_id=sid,
+                                      key='enter', write_attempted=False))))
+        if (not isinstance(observation, dict)
+                or observation.get('command') != '/goal resume'
+                or not enter_not_sent
+                or not runtime.send_attempt_id
+                or diagnostic.get('attempt_id') != runtime.send_attempt_id
+                or diagnostic.get('turn_key') != runtime.codex_sent_turn_key
+                or runtime.codex_sent_turn_key != runtime.codex_observed_turn_key
+                or not self._connected_native_input(client)):
+            return False
+        identity = copy.deepcopy(diagnostic.get('identity'))
+        if (not identity or self._current_codex_input_identity(target, runtime) != identity
+                or not self._codex_input_matches_key(identity, runtime.codex_sent_turn_key)):
+            return False
+        base = client.client if isinstance(client, SnapshotClient) else client
+        original = copy.deepcopy(diagnostic)
+        def bound():
+            return (runtime.send_attempt_id == original['attempt_id']
+                    and runtime.codex_sent_turn_key == original['turn_key']
+                    and runtime.codex_observed_turn_key == original['turn_key']
+                    and runtime.delivery_status == 'unknown'
+                    and runtime.codex_input_phase == 'goal_native_pending'
+                    and self._current_codex_input_identity(target, runtime) == identity)
+        with workspace_input_lock(self.config_path, wid, shared=False):
+            if not bound() or runtime.codex_goal_diagnostics != original:
+                return False
+            signatures = []
+            retained_admission = (runtime.codex_goal_resume,
+                                  copy.deepcopy(runtime.codex_goal_proof),
+                                  runtime.codex_observed_turn_key)
+            admitted = False
+            try:
+                for _ in range(2):
+                    def capture(grid):
+                        signature = _goal_composer_signature(grid)
+                        if not _goal_resume_draft_matches(grid) or signature is None:
+                            return False
+                        signatures.append(signature)
+                        return True
+                    if not self._goal_input_ready(target, runtime, state, base, is_current,
+                            draft='/goal resume', input_identity=identity, frame_check=capture):
+                        return False
+                if len(signatures) != 2 or signatures[0] != signatures[1] or not bound():
+                    return False
+                admitted = True
+            finally:
+                # Readiness probes may clear their candidate Goal fields.
+                # A pre-intent refusal must leave this original UNKNOWN
+                # attempt eligible for a fresh check on the next poll.
+                # Never restore delivery state, diagnostics or an Enter budget.
+                if (not admitted and runtime.send_attempt_id == original['attempt_id']
+                        and runtime.codex_sent_turn_key == original['turn_key']
+                        and runtime.delivery_status == 'unknown'
+                        and runtime.codex_input_phase == 'goal_native_pending'
+                        and isinstance(runtime.codex_goal_diagnostics, dict)
+                        and 'retained_submit' not in runtime.codex_goal_diagnostics):
+                    (runtime.codex_goal_resume, runtime.codex_goal_proof,
+                     runtime.codex_observed_turn_key) = retained_admission
+            signature = signatures[-1]
+            recovery = dict(version=1, status='enter_intent', intent_at=time.time(),
+                            attempt_id=original['attempt_id'], turn_key=original['turn_key'],
+                            identity=copy.deepcopy(identity),
+                            frame_sha256=hashlib.sha256(repr(signature).encode()).hexdigest())
+            runtime.codex_goal_diagnostics = {**original, 'retained_submit': recovery}
+            # DeliveryStore's original-row revision CAS must succeed before any
+            # connected write. A crash/lost ACK can never reopen this budget.
+            self._save_delivery(sid, runtime, True)
+            def before_enter():
+                return (bound() and runtime.codex_goal_diagnostics.get('retained_submit') == recovery
+                        and self._goal_input_ready(target, runtime, state, base, is_current,
+                            draft='/goal resume', input_identity=identity,
+                            frame_check=lambda grid: _goal_composer_signature(grid) == signature)
+                        and bound())
+            try:
+                with base.input_guard(before_enter):
+                    if base._control_rpc('surface.send_key', dict(
+                            workspace_id=wid, surface_id=sid, key='enter'), timeout=3.0) is None:
+                        raise UncertainDeliveryError('retained Goal Enter response unavailable')
+                recovery.update(status='enter_acknowledged', completed_at=time.time())
+                runtime.codex_input_phase = 'goal_native_acknowledged'
+            except (OSError, CmuxError, RuntimeError) as exc:
+                recovery.update(status='outcome_unknown', completed_at=time.time(), error=str(exc))
+            # An Enter ACK is transport evidence only, not native recovery.
+            runtime.delivery_status = 'unknown'
+            runtime.state = 'delivery_unknown'
+            self._save_delivery(sid, runtime, True)
+            return True
+
     def _reconcile_codex_delivery(self, surface_id, runtime, state) -> bool:
         if runtime.delivery_status not in {"sending", "unknown"}:
             return False
@@ -13345,7 +14983,7 @@ class WatchDaemon:
                 turn = self.codex_queue_recovery.current_turn(target) if target else None
                 original = self._codex_turn_key_identity(runtime.codex_sent_turn_key)
                 goal = (self._current_blocked_goal(target)
-                        if target and state.native_goal_stalled else None)
+                        if target and (state.native_goal_stalled or runtime.codex_goal_resume) else None)
                 def later_failure(proof, *, authenticated):
                     at = proof.get('at') if isinstance(proof, Mapping) else None
                     error = proof.get('error') if isinstance(proof, Mapping) else None
@@ -13363,10 +15001,14 @@ class WatchDaemon:
                         and state.kind == 'recoverable_error' and state.error_type
                         and (later_failure(goal, authenticated=bool(goal))
                             or later_failure(turn, authenticated=bool(turn
-                                and turn.get('kind') == 'task_complete' and turn.get('signature'))))):
+                                and turn.get('kind') == 'task_complete' and turn.get('signature')))
+                            or self._new_codex_session_failure(target, runtime, turn, state.error_type))):
                     # A different authenticated turn lets _codex_turn_ready
                     # evaluate a new failure. It does not prove this older
                     # input arrived, so keep its outcome and error unchanged.
+                    return False
+                if self._recover_orphaned_codex_paste(surface_id, runtime, state, target, turn):
+                    # 已转成 input_not_sent+retryable，交给 _unwritten_codex_attempt 原路复核。
                     return False
                 # An empty composer cannot disprove input still queued in the
                 # controller/native process after a lost ACK. Only subsequent
@@ -13413,6 +15055,144 @@ class WatchDaemon:
             runtime.state = "delivery_unknown"
             return True
         return False
+
+    def _recover_orphaned_codex_paste(self, surface_id, runtime, state, target, turn) -> bool:
+        """已死进程遗留的 paste_submit_pending：在全部证据成立时写零写证明。
+
+        证据（缺一不可）：attempt 早于本进程启动且从未完成；当前原生轮仍是 sent_turn_key
+        那一轮失败、发生在 attempt 之前，带 EOF 栅栏时栅栏成立；composer 空、可恢复错误仍在；静默满
+        ORPHANED_PASTE_MIN_AGE_SEC；同一探针连续两次观测。只写 input_not_sent，不新增发送路径，
+        之后仍由 _unwritten_codex_attempt / pre_input 按原身份复核。
+        """
+        if (runtime.codex_input_phase != 'paste_submit_pending'
+                or runtime.codex_goal_resume
+                or runtime.codex_input_not_sent
+                or state.kind != 'recoverable_error' or not state.error_type
+                or not target or not isinstance(turn, Mapping)):
+            return False
+        started = runtime.send_started_at
+        now = time.time()
+        if (type(started) not in (int, float) or not math.isfinite(started)
+                or not 0 < started < PROCESS_STARTED_AT
+                or runtime.send_io_started_at != 0 or runtime.send_completed_at != 0
+                or now - started < ORPHANED_PASTE_MIN_AGE_SEC):
+            return False
+        key = f"{turn.get('session_id')}:{turn.get('turn_id')}:{turn.get('at')}"
+        error = turn.get('error')
+        if (turn.get('kind') != 'task_complete' or not turn.get('signature')
+                or not isinstance(error, Mapping)
+                or _match_error_block('■ ' + str(error.get('message') or '')) != state.error_type
+                or type(turn.get('at')) not in (int, float) or not 0 < turn['at'] < started
+                or key != runtime.codex_sent_turn_key or key != runtime.codex_observed_turn_key):
+            return False
+        if turn.get('terminal_tail') is not None and not self._codex_terminal_tail_proven(turn):
+            # 有 EOF 栅栏就必须成立：失败的 task_complete 正好在稳定 EOF，之后没有任何追加。
+            return False
+        identity = self._codex_input_identity(target, turn)
+        if not identity or not self._codex_input_matches_key(identity, runtime.codex_sent_turn_key):
+            return False
+        probe = _short_hash(str(('orphan', runtime.send_attempt_id, key, turn['signature'],
+                                 state.content_fingerprint)))
+        if runtime.codex_absent_probe != probe:
+            runtime.codex_absent_probe, runtime.codex_absent_since = probe, now
+            return False
+        if now - runtime.codex_absent_since < 1:
+            return False
+        before = (runtime.codex_input_phase, runtime.delivery_status, runtime.last_send_error)
+        runtime.codex_input_not_sent = self._codex_zero_input_proof(runtime, identity)
+        runtime.codex_input_phase = 'input_not_sent'
+        runtime.delivery_status = 'retryable'
+        runtime.last_send_error = ''
+        runtime.awaiting = False
+        try:
+            self._save_delivery(surface_id, runtime, True)
+            self._finish_private_zero_input(runtime)
+        except (OSError, RuntimeError) as exc:
+            # 证明没落盘就不授权：退回原 pending，下一轮重新取证。
+            runtime.codex_input_not_sent = {}
+            runtime.codex_input_phase, runtime.delivery_status, runtime.last_send_error = before
+            runtime.codex_absent_probe, runtime.codex_absent_since = '', 0.0
+            self.logger.warning('surface=%s orphaned paste proof not persisted: %s', surface_id[:8], exc)
+            return False
+        self.logger.info('surface=%s attempt=%s orphaned paste absent: started %.0fs before process start, '
+                         'original failed turn unchanged, empty composer', surface_id[:8],
+                         runtime.send_attempt_id, PROCESS_STARTED_AT - started)
+        return True
+
+    def _new_codex_session_failure(self, target, runtime, turn, error_type):
+        """Observe a fresh process/session without settling its predecessor.
+
+        An uncertain Goal input belongs to the original process and session,
+        not forever to the cmux surface. A new process born after that attempt
+        may fail independently. Only an authenticated terminal EOF in a new
+        session, with the old process generation demonstrably gone, can leave
+        reconciliation. Ordinary Goal, draft, queue and final-input gates must
+        still authorize any new attempt. DeliveryStore archives the unchanged
+        old record before committing the new attempt; this is never a replay.
+        """
+        from ccc_guard_scope import birth
+        from ccc_shared_codex_turn import binding_for_turn, valid
+
+        old = runtime.codex_goal_proof
+        if (not target or runtime.delivery_status != 'unknown'
+                or runtime.codex_input_phase != 'goal_native_pending'
+                or not isinstance(old, Mapping) or old.get('kind') != 'goal_blocked'
+                or not self._codex_terminal_tail_proven(turn)):
+            return False
+        original = self._codex_turn_key_identity(runtime.codex_sent_turn_key)
+        def finite(value):
+            return type(value) in (int, float) and math.isfinite(value) and value > 0
+        def generation(value):
+            return (isinstance(value, (list, tuple)) and len(value) == 2
+                    and type(value[0]) is int and value[0] > 0
+                    and type(value[1]) is int and 0 <= value[1] < 1000000)
+        old_birth, new_birth = old.get('birth'), turn.get('birth')
+        # A crashed predecessor can retain UNKNOWN without a completion clock.
+        # Its write-ahead start still bounds that attempt. The old generation
+        # must be gone and the new session must prove its own failed EOF below.
+        # This leaves reconciliation without settling or replaying old input.
+        completed = runtime.send_completed_at
+        if (type(completed) not in (int, float)
+                or not math.isfinite(completed) or completed < 0):
+            return False
+        last_attempt_at = completed or runtime.send_started_at
+        if (not original or not old.get('goal_id')
+                or original != (old.get('session_id'), old.get('turn_id'), old.get('at'))
+                or self._goal_turn_key(old) != runtime.codex_sent_turn_key
+                or not generation(old_birth) or not generation(new_birth)
+                or type(old.get('pid')) is not int or old['pid'] <= 1
+                or type(turn.get('pid')) is not int or turn['pid'] <= 1
+                or old.get('process_start') != old_birth[0]
+                or turn.get('process_start') != new_birth[0]
+                or not turn.get('session_id') or turn['session_id'] == original[0]
+                or not turn.get('turn_id')
+                or not all(finite(v) for v in (runtime.send_started_at,
+                    last_attempt_at, turn.get('at')))
+                or not (old_birth[0] + old_birth[1] / 1e6 <= original[2]
+                    <= runtime.send_started_at <= last_attempt_at
+                    < new_birth[0] + new_birth[1] / 1e6 <= turn['at'])
+                or not isinstance(turn.get('error'), Mapping)
+                or _match_error_block('■ ' + str(turn['error'].get('message') or '')) != error_type):
+            return False
+        try:
+            current = birth(old['pid'])
+            if current is None:
+                # Missing libproc data can be a permission/read failure.
+                # Signal 0 only queries existence; ESRCH alone proves absence.
+                try:
+                    os.kill(old['pid'], 0)
+                except ProcessLookupError:
+                    pass
+                else:
+                    return False
+            elif not generation(current) or list(current) == list(old_birth):
+                return False
+            proof = binding_for_turn(target, turn)
+            return bool(proof and proof['process']['birth'] == list(new_birth)
+                        and self.codex_queue_recovery.current_turn(target) == turn
+                        and valid(target, proof))
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+            return False
 
     @staticmethod
     def _codex_turn_key_identity(key):
@@ -13480,7 +15260,7 @@ class WatchDaemon:
                 or runtime.codex_sent_turn_key != runtime.codex_observed_turn_key):
             return None
         if goal is not None:
-            if not state.native_goal_stalled or goal != runtime.codex_goal_proof:
+            if goal != runtime.codex_goal_proof:
                 return None
             identity = self._codex_input_identity(target, goal, goal=True)
         else:
@@ -13528,7 +15308,7 @@ class WatchDaemon:
         initial_phase = runtime.codex_input_phase
         runtime.delivery_status = 'cancelled'
         runtime.last_send_error = 'input not sent: ' + reason
-        if (input_identity and initial_phase in {'text_pending', 'paste_submit_pending'}
+        if (input_identity and initial_phase in {'text_pending', 'paste_submit_pending', 'goal_native_pending'}
                 and self._codex_input_matches_key(input_identity, runtime.codex_sent_turn_key)):
             # Preserve the original attempt/reservation, even if a live gate
             # has changed. Reuse still requires the same authenticated process,
@@ -13545,6 +15325,7 @@ class WatchDaemon:
             runtime.codex_input_not_sent = {}
             runtime.codex_input_phase = initial_phase
             runtime.delivery_status = 'cancelled'
+            self._codex_retry_blocked(runtime, 'zero_input_proof_persistence_failed')
             raise
         self.logger.info('surface=%s attempt=%s cancelled before input: %s',
                          surface_id[:8], runtime.send_attempt_id, reason)
@@ -13561,13 +15342,52 @@ class WatchDaemon:
         send_guard_error: str = "",
         is_current: Callable[[], bool] | None = None,
     ) -> None:
+        # Goal admission evaluates a candidate in these fields. A temporary
+        # refusal before allocating a new attempt must not attach that new
+        # proof to the predecessor's UNKNOWN key: subsequent observation
+        # still needs the original process/session proof to isolate it.
+        retained = None
+        if (runtime.delivery_status == 'unknown'
+                and runtime.codex_input_phase == 'goal_native_pending'):
+            retained = (runtime.send_attempt_id, runtime.codex_goal_resume,
+                        copy.deepcopy(runtime.codex_goal_proof), runtime.codex_observed_turn_key)
+        try:
+            self._handle_observed_state(target, runtime, state, client,
+                send_guard_tree=send_guard_tree, send_guard_error=send_guard_error,
+                is_current=is_current)
+        finally:
+            if retained is not None and runtime.send_attempt_id == retained[0]:
+                runtime.codex_goal_resume = retained[1]
+                runtime.codex_goal_proof = retained[2]
+                runtime.codex_observed_turn_key = retained[3]
+
+    def _handle_observed_state(
+        self,
+        target: Mapping[str, Any],
+        runtime: TargetRuntime,
+        state: ScreenState,
+        client: CmuxClient,
+        *,
+        send_guard_tree: Mapping[str, Any] | None,
+        send_guard_error: str = "",
+        is_current: Callable[[], bool] | None = None,
+    ) -> None:
         surface_id = str(target["surface_id"])
+        if state.message_kind == 'codex':
+            # A previous provider check is not today's refusal. Early native,
+            # identity and transport gates may prevent reaching it at all.
+            runtime.codex_retry_status = {}
+            runtime.provider_retry_status = {}
+            if str(runtime.paused_reason or '').startswith('provider retry '):
+                runtime.paused_reason = ''
+        if self._resume_retained_goal_draft(target, runtime, state, client, is_current=is_current):
+            return
         if self._reconcile_codex_delivery(surface_id, runtime, state):
             return
         if not self._runtime_is_claude(runtime, state):
             self._provider_retry_success(target)
         previous_state = runtime.state
-        if state.kind not in SEND_ELIGIBLE_STATES:
+        if not _is_recovery_candidate(state):
             self._record_state(surface_id, runtime, state)
             return
         if state.message_kind == "codex" and not self._codex_turn_ready(target, runtime, state):
@@ -13579,6 +15399,8 @@ class WatchDaemon:
                  or runtime.codex_sent_turn_key == runtime.codex_observed_turn_key))
         if recovering_unwritten and (not retry_attempt or not self._connected_native_input(client)):
             runtime.paused_reason = 'zero-write recovery identity or transport changed; session preserved'
+            self._codex_retry_blocked(runtime, 'zero_input_identity_or_proof_changed'
+                                     if not retry_attempt else 'zero_input_transport_unavailable')
             return
         retry_identity = dict(runtime.codex_input_not_sent['identity']) if retry_attempt else None
         if state.message_kind == 'codex' and not self._provider_retry_gate(
@@ -13737,28 +15559,32 @@ class WatchDaemon:
             return
         if not self._codex_turn_ready(target, runtime, state):
             return
-        private_check = (self.private_checks.select(target, lambda: self.codex_queue_recovery.current_turn(target))
+        # A proven zero-input retry belongs to the original route and proof.
+        # A newly available optional private check must not replace that route
+        # or permanently block a generic attempt. The original proof/identity
+        # is revalidated by _unwritten_codex_attempt below and at the input gate.
+        private_check = ((runtime.codex_private_check or None) if retry_attempt else
+                         self.private_checks.select(target, lambda: self.codex_queue_recovery.current_turn(target))
                          if state.message_kind == "codex" and not state.native_goal_stalled
                          and not runtime.codex_goal_resume else None)
-        if retry_attempt and (private_check or {}) != runtime.codex_private_check:
-            runtime.paused_reason = 'zero-write private source changed; session preserved'
-            return
         outgoing_message = private_check["message"] if private_check else None
         runtime.codex_private_check = private_check or {}
         checked_attempt = self._unwritten_codex_attempt(target, runtime, state)
         input_identity = (self._current_codex_input_identity(target, runtime)
                           if state.message_kind == 'codex'
-                          and self._connected_native_input(client) else {})
+                          and (runtime.codex_goal_resume or self._connected_native_input(client)) else {})
         if (state.message_kind == 'codex'
-                and self._connected_native_input(client) and not input_identity):
+                and (runtime.codex_goal_resume or self._connected_native_input(client)) and not input_identity):
             # Missing evidence is an observation gap, not an attempted send.
             # Never create an unbound pending row that cannot later prove a
             # zero-write refusal. Existing attempts remain untouched.
             runtime.paused_reason = 'native input identity unavailable; awaiting fresh observation; session preserved'
+            self._codex_retry_blocked(runtime, 'native_input_identity_unavailable')
             return
         if (checked_attempt != retry_attempt
                 or (retry_attempt and input_identity != retry_identity)):
             runtime.paused_reason = 'zero-write recovery changed before persistence; session preserved'
+            self._codex_retry_blocked(runtime, 'zero_input_identity_or_proof_changed')
             return
         # Persist the attempt before I/O. A restart during a send must reconcile
         # the viewport rather than blindly treating the attempt as never made.
@@ -13776,7 +15602,8 @@ class WatchDaemon:
         # Invalidate the zero-write proof durably before any new I/O. A crash
         # or lost ACK after this point must retain the normal pending guard.
         runtime.codex_input_not_sent = {}
-        runtime.codex_input_phase = "text_pending" if state.message_kind == "codex" else ""
+        runtime.codex_goal_diagnostics = {}
+        runtime.codex_input_phase = ("goal_native_pending" if runtime.codex_goal_resume else "text_pending") if state.message_kind == "codex" else ""
         base = client.client if isinstance(client, SnapshotClient) else client
         if (state.message_kind == 'codex' and not runtime.codex_goal_resume
                 and self._connected_native_input(client)
@@ -13816,6 +15643,8 @@ class WatchDaemon:
             runtime.delivery_status = "failed"
             runtime.state = "send_failed"
             runtime.last_send_error = f"attempt persistence failed; input not sent: {exc}"
+            if state.message_kind == 'codex':
+                self._codex_retry_blocked(runtime, 'zero_input_proof_persistence_failed')
             self.logger.error("surface=%s %s", surface_id[:8], runtime.last_send_error)
             return
         runtime.send_persist_duration_ms = round((time.monotonic() - persisted_at) * 1000, 3)
@@ -13832,6 +15661,7 @@ class WatchDaemon:
             return
         send_started = time.monotonic()
         input_attempted = False
+        goal_send_context = None
         try:
             with contextlib.ExitStack() as input_scope:
                 try:
@@ -13850,7 +15680,7 @@ class WatchDaemon:
                     self._cancel_before_input(surface_id, runtime, state, input_identity,
                                               'native turn changed while acquiring workspace lock')
                     return
-                if retry_identity and (not self._connected_native_input(client)
+                if retry_identity and ((not runtime.codex_goal_resume and not self._connected_native_input(client))
                         or self._current_codex_input_identity(target, runtime)
                         != retry_identity):
                     raise InputNotSentError('original zero-write identity or transport changed; input not sent')
@@ -13868,9 +15698,18 @@ class WatchDaemon:
                         raise CmuxError("原 b 检查来源、任务或输入授权已变化；本次未发送")
                 self._record_send_io_started(runtime)
                 if runtime.codex_goal_resume:
-                    client.resume_codex_goal(str(target["workspace_id"]), surface_id,
-                        authorize=lambda draft: self._goal_input_ready(
-                            target, runtime, state, client, is_current, draft, input_identity=input_identity))
+                    # Readiness is mutable: the connected Enter check may
+                    # clear its Goal flag while refusing the write. Bind the
+                    # result to the route actually invoked, not that flag.
+                    goal_send_context = (
+                        runtime.send_attempt_id, runtime.codex_sent_turn_key,
+                        runtime.codex_observed_turn_key,
+                        copy.deepcopy(runtime.codex_goal_proof))
+                    client.resume_codex_goal(str(target["workspace_id"]), surface_id, strategy='terminal',
+                        authorize=lambda draft, **checks: self._goal_input_ready(
+                            target, runtime, state, client, is_current, draft,
+                            input_identity=input_identity, **checks))
+                    runtime.codex_input_phase = 'goal_native_acknowledged'
                 else:
                     input_attempted = True
                     message = outgoing_message if private_check else self._outgoing_message(state)
@@ -13885,9 +15724,26 @@ class WatchDaemon:
             runtime.send_completed_at = time.time()
             runtime.send_duration_ms = round((time.monotonic() - send_started) * 1000, 3)
             runtime.last_send_error = str(exc)[-500:]
+            if (goal_send_context is not None
+                    and runtime.send_attempt_id == goal_send_context[0]
+                    and runtime.codex_sent_turn_key == goal_send_context[1]
+                    and isinstance(getattr(exc, 'goal_diagnostics', None), dict)):
+                runtime.codex_goal_diagnostics = dict(
+                    attempt_id=goal_send_context[0], turn_key=goal_send_context[1],
+                    identity=copy.deepcopy(input_identity),
+                    observation=copy.deepcopy(exc.goal_diagnostics))
+            if (goal_send_context is not None
+                    and initial_input_phase == runtime.codex_input_phase == 'goal_native_pending'
+                    and goal_send_context == (
+                        runtime.send_attempt_id, runtime.codex_sent_turn_key,
+                        runtime.codex_observed_turn_key, runtime.codex_goal_proof)):
+                # Preserve the original route for a later fresh admission.
+                # Never replace a newer observation, proof, attempt or phase;
+                # diagnostics alone do not authorize another paste or Enter.
+                runtime.codex_goal_resume = True
             uncertain = isinstance(exc, UncertainDeliveryError) or isinstance(exc.__cause__, subprocess.TimeoutExpired)
             zero_input = (isinstance(exc, InputNotSentError) and not uncertain and input_identity
-                    and runtime.codex_input_phase in {'text_pending', 'paste_submit_pending'}
+                    and runtime.codex_input_phase in {'text_pending', 'paste_submit_pending', 'goal_native_pending'}
                     and self._codex_input_matches_key(input_identity, runtime.codex_sent_turn_key))
             if private_reserved and not zero_input:
                 with contextlib.suppress(OSError, RuntimeError):
@@ -13913,6 +15769,8 @@ class WatchDaemon:
                 runtime.codex_input_not_sent = {}
                 runtime.codex_input_phase = initial_input_phase
                 runtime.delivery_status = 'unknown' if uncertain else 'failed'
+                if zero_input:
+                    self._codex_retry_blocked(runtime, 'zero_input_proof_persistence_failed')
                 raise
             return
         if private_reserved:
@@ -13990,21 +15848,31 @@ class WatchDaemon:
                     and isinstance(proof.get('sha256'), str)
                     and re.fullmatch(r'[0-9a-f]{64}', proof['sha256']))
 
-    def _current_blocked_goal(self, target):
+    def _current_blocked_goal(self, target, *, diagnostics=None):
         from ccc_codex_goal import blocked_goal
         label = self.codex_queue_recovery.process_lookup(target) if self.codex_queue_recovery.process_lookup else {}
         pids = label.get('agent_pids', [])
         turn = self.codex_queue_recovery.current_turn(target)
+        # Only the bare legacy "unknown" has no native lifecycle evidence.
+        # A bound reader's explicit failure (including a torn EOF) is a veto,
+        # not permission to discard that failure and reuse an older log row.
+        if (turn and turn.get('kind') != 'task_complete'
+                and turn != {'kind': 'unknown'}):
+            if diagnostics is not None:
+                diagnostics['reason'] = turn.get('reason') or 'native_lifecycle_not_complete'
+            return None
         binding = turn if turn and turn.get('kind') == 'task_complete' else None
         # Inventory is a locator. A freshly authenticated shared foreground
         # turn can still identify its original client during a refresh gap;
         # blocked_goal independently revalidates the entire writer binding.
         pid = binding.get('pid') if binding and binding.get('shared_writer') else (
             pids[0] if label.get('agent_kind') == 'codex' and len(pids) == 1 else None)
-        goal = blocked_goal(target, pid, current_turn=binding) if pid is not None else None
+        goal = blocked_goal(target, pid, current_turn=binding, diagnostics=diagnostics) if pid is not None else None
         if not goal:
             return None
         if self.codex_queue_recovery.current_turn(target) != turn:
+            if diagnostics is not None:
+                diagnostics['reason'] = 'current_turn_changed'
             return None
         if turn and turn.get('kind') != 'unknown':
             if turn.get('session_id') != goal['session_id'] or type(turn.get('at')) not in (int, float):
@@ -14022,12 +15890,51 @@ class WatchDaemon:
         if state.message_kind != "codex":
             runtime.codex_goal_resume = False
             return True
+        from ccc_compact_guard import inspect as inspect_compact, status as compact_input_status
+        terminal_turn = self.codex_queue_recovery.current_turn(target)
+        runtime.codex_compact_guard = inspect_compact(
+            self.config_path, target, terminal_turn=terminal_turn)
+        def compact_allowed():
+            compact_gate = compact_input_status(self.config_path, target,
+                inspection=runtime.codex_compact_guard)
+            if compact_gate:
+                runtime.codex_goal_resume = False
+                self._record_state(str(target['surface_id']), runtime,
+                                   dataclasses.replace(state, **compact_gate))
+                return False
+            if self.codex_queue_recovery.current_turn(target) != terminal_turn:
+                runtime.codex_goal_resume = False
+                self._record_state(str(target['surface_id']), runtime, dataclasses.replace(
+                    state, kind='awaiting_transition', reason='native turn changed during terminal input check'))
+                return False
+            return True
         original = self._codex_turn_key_identity(runtime.codex_sent_turn_key)
         def already_sent(proof):
             return bool(original and original[:2] == (proof.get('session_id'), proof.get('turn_id')))
-        if state.native_goal_stalled:
-            goal = self._current_blocked_goal(target)
-            if goal and _match_error_block("■ " + goal["error"]["message"]) == state.error_type:
+        if terminal_turn and terminal_turn.get('kind') in {'task_started', 'user_message'}:
+            # Native input or a new running turn supersedes a stale error/Goal
+            # footer. There is no failed-turn admission to evaluate here; the
+            # Goal reader deliberately returns unknown for unfinished turns.
+            # Keep the original attempt and require the same live observation.
+            runtime.codex_goal_resume = False
+            if not compact_allowed():
+                return False
+            self._record_state(str(target['surface_id']), runtime, ScreenState(
+                'working', message_kind='codex', error_type=state.error_type,
+                reason='native Codex input or running turn supersedes the visible failure',
+            ))
+            return False
+        if state.native_goal_only or state.native_goal_stalled or (state.kind == 'recoverable_error' and state.error_type):
+            diagnostics = {}
+            goal = self._current_blocked_goal(target, diagnostics=diagnostics)
+            goal_error = _match_error_block("■ " + goal["error"]["message"]) if goal else None
+            ordinary_goal = bool(goal and goal_error == state.error_type
+                                 and goal_error in ORDINARY_CONTINUE_GOAL_ERRORS)
+            if goal and goal_error == state.error_type and not ordinary_goal:
+                # /goal resume is terminal input. It must pass exactly the
+                # same current-input permission as an ordinary continuation.
+                if not compact_allowed():
+                    return False
                 key = self._goal_turn_key(goal)
                 if self.codex_queue_recovery.blocks_turn(target, goal):
                     return False
@@ -14042,18 +15949,65 @@ class WatchDaemon:
                     runtime.codex_goal_proof = dict(goal)
                     runtime.codex_observed_turn_key = key
                     return True
-                # This stalled goal is already resumed. Do not also send 任务请继续.
+                # An old attempt is not proof that this goal was resumed, or
+                # that no input occurred. Keep its exact attempt and verdict.
                 runtime.codex_goal_resume = False
-                return False
+                return self._codex_duplicate_blocked(runtime)
             if reserved and runtime.codex_goal_resume:
                 # The proof disappeared while the resume was being persisted.
                 runtime.codex_goal_resume = False
                 return False
-            # The footer is visible but the sqlite proof is missing. That must
-            # not freeze a still-visible high-demand failure; continue below.
+            # A blocked Goal can become visible before its error log, or a
+            # concurrent append can invalidate a proof. Never lose the Goal
+            # route by sending ordinary text during that evidence gap.
             runtime.codex_goal_resume = False
+            if state.native_goal_only:
+                self._record_state(str(target['surface_id']), runtime, dataclasses.replace(
+                    state, reason='user draft preserved; authenticated blocked Goal unavailable ('
+                    + str(diagnostics.get('reason') or 'no_matching_goal') + ')'))
+                return False
+            goal_turn = self.codex_queue_recovery.current_turn(target)
+            # Goal state can change without a matching footer update. Every
+            # authenticated native client must read it, including paused and
+            # limited Goals for which blocked_goal intentionally has no proof.
+            if (state.native_goal_stalled or 'goal_status' in diagnostics
+                    or (goal_turn and goal_turn.get('pid'))):
+                from ccc_codex_goal import goal_state_for_turn
+                observed_goal = goal_state_for_turn(target, goal_turn)
+                status = observed_goal.get('status', 'unknown')
+                # An active Goal does not make a completed failed turn busy.
+                # A stale Goal footer must not suppress a new ordinary retry.
+                # Limited/unknown Goals remain held. A paused Goal stays
+                # paused, but independent ordinary user work can be retried.
+                active_failed = bool(status == 'active'
+                    and goal_turn == terminal_turn
+                    and self._codex_terminal_tail_proven(goal_turn)
+                    and _match_error_block('■ ' + str((goal_turn.get('error') or {}).get('message') or ''))
+                        == state.error_type)
+                # The ordinary resource route keeps every other status veto:
+                # only the same authenticated blocked failed turn may proceed.
+                ordinary_failed = bool(ordinary_goal and status == 'blocked'
+                    and goal_turn == terminal_turn
+                    and self._codex_terminal_tail_proven(goal_turn))
+                paused_ordinary_failed = False
+                if (status == 'paused' and goal_turn == terminal_turn
+                        and self._codex_terminal_tail_proven(goal_turn)
+                        and _match_error_block('■ ' + str((goal_turn.get('error') or {}).get('message') or ''))
+                            == state.error_type):
+                    from ccc_codex_goal import ordinary_turn_after_pause
+                    paused_ordinary_failed = bool(ordinary_turn_after_pause(
+                        target, goal_turn, observed_goal))
+                if (status not in {'absent', 'complete'} and not active_failed
+                        and not ordinary_failed and not paused_ordinary_failed):
+                    reason = diagnostics.get('reason') or observed_goal.get('reason') or 'resume_proof_unavailable'
+                    self._record_state(str(target['surface_id']), runtime, dataclasses.replace(
+                        state, kind='awaiting_transition',
+                        reason=f'native Goal {status}; waiting for authenticated Goal recovery evidence ({reason})'))
+                    return False
+        if not compact_allowed():
+            return False
         runtime.codex_goal_resume = False
-        turn = self.codex_queue_recovery.current_turn(target)
+        turn = terminal_turn
         if state.requires_goal_proof and not self._codex_terminal_tail_proven(turn):
             self._record_state(str(target['surface_id']), runtime, dataclasses.replace(
                 state, kind='error_superseded',
@@ -14089,12 +16043,259 @@ class WatchDaemon:
                     not reserved and (not already_sent(turn) or retryable)):
                 runtime.codex_observed_turn_key = key
                 return True
+            if not reserved and already_sent(turn):
+                self._record_state(str(target['surface_id']), runtime, dataclasses.replace(
+                    state, kind='awaiting_transition', reason='original input attempt has no reusable zero-input proof'))
+                return self._codex_duplicate_blocked(runtime)
         phase = "working" if turn.get("kind") in {"task_started", "user_message"} else "awaiting_transition"
         self._record_state(str(target["surface_id"]), runtime, ScreenState(
             phase, message_kind="codex", error_type=state.error_type,
             reason=turn.get("reason") or "waiting for native Codex failed-turn completion before submitting continuation",
         ))
         return False
+
+    def _codex_duplicate_blocked(self, runtime):
+        reason = ('zero_input_identity_or_proof_changed'
+                  if runtime.codex_input_phase == 'input_not_sent'
+                  else 'already_sent_turn' if runtime.delivery_status == 'accepted'
+                  else 'already_sent_unproven_zero_input')
+        return self._codex_retry_blocked(runtime, reason)
+
+
+    @staticmethod
+    def _codex_retry_blocked(runtime, reason):
+        """Publish the gate actually reached, without changing the send ledger."""
+        runtime.provider_retry_status = {}
+        if str(runtime.paused_reason or '').startswith('provider retry '):
+            runtime.paused_reason = ''
+        runtime.codex_retry_status = dict(
+            reason_code=reason, checked_at=time.time(),
+            observed_turn_key=runtime.codex_observed_turn_key,
+            sent_turn_key=runtime.codex_sent_turn_key,
+            attempt_id=runtime.send_attempt_id, input_phase=runtime.codex_input_phase,
+            delivery_status=runtime.delivery_status,
+        )
+        return False
+
+
+    def _claude_provider_migration_admission(self, target, runtime):
+        """Read-only authorization; reject protected memory before any I/O."""
+        if (not target or self.stop_requested or self.config.get("mode") != "armed"
+                or self.config.get("global_paused") or not self.config.get("claude_enabled")
+                or self._config_rejected_reason or target.get("paused")
+                or not target.get("enabled", True)
+                or runtime.claude_submit_phase != "none" or runtime.claude_submit_write_unknown
+                or runtime.claude_prompt_pending or runtime.claude_deferred_event
+                or runtime.claude_completed_latched or runtime.claude_handshake_wait
+                or runtime.claude_handshake_provider_conflict or runtime.claude_supervisor_wait
+                or runtime.claude_hook_health != "healthy"):
+            return False
+        sid, wid = str(target["surface_id"]), str(target["workspace_id"])
+        if (sid in self._local_paused_surface_ids
+                or sid == str(self.config.get("manager_surface_id") or "")
+                or self.runtime.get(sid) is not runtime
+                or (self._native_dispatch is not None and self._native_dispatch.owns(sid))
+                or self._delivery_store.blocked(sid)):
+            return False
+        # Build a local policy instead of publishing/reloading daemon caches.
+        policy = ObservationPolicy(self.config)
+        with self._targets_lock:
+            current = copy.deepcopy(policy.target_records.get(sid, self.dynamic_targets.get(sid)))
+        rules = policy.rule_records.get(wid, ())
+        if (current is None or current != target or current.get("paused")
+                or not current.get("enabled", True)
+                or any(r.get("paused") or batch_start_hold(r, sid) for r in rules)
+                or sid in self.config.get("discovery_excluded_surface_ids", [])
+                or any(sid in r.get("excluded_surface_ids", []) for r in rules)):
+            return False
+        if sid not in policy.target_records or current.get("source") in {"workspace_rule", "pane_follow", "claude_auto"}:
+            if current.get("source") == "workspace_rule":
+                granted = any(r.get("enabled", True)
+                              and str(r.get("workspace_id")) == str(current.get("source_workspace_id"))
+                              and sid not in r.get("excluded_surface_ids", [])
+                              for r in policy.rule_records.get(str(current.get("source_workspace_id")), ()))
+            elif current.get("source") == "pane_follow":
+                granted = ((current.get("workspace_id"), current.get("pane_id"), current.get("follow_agent", "codex"))
+                           in policy.pane_agents and dynamic_target_authorized(self.config, current))
+            elif current.get("source") == "claude_auto":
+                granted = dynamic_target_authorized(self.config, current)
+            else:
+                granted = False
+            if not granted:
+                return False
+        # These primitives read only. In particular, do not use the config
+        # reloader, supervisor-wait guard, event snapshot, or provider guard.
+        from ccc_access_service import continuation_allowed
+        from ccc_batch_guard import blocked
+        return bool(self._config_mtime() == self._config_mtime_ns
+                    and not blocked(self.config_path, wid)
+                    and continuation_allowed(self.config_path, {"workspace_rules": rules}, current))
+
+    def _claude_provider_migration_binding(self, target, runtime):
+        """Fresh PID birth plus identity/turn, without sender ownership facts."""
+        pid = runtime.claude_process_pid
+        if (type(pid) is not int or pid <= 0 or not runtime.claude_session_id
+                or not runtime.claude_process_generation or runtime.claude_hook_health != "healthy"
+                or runtime.claude_hook_process_generation not in (None, "", runtime.claude_process_generation)):
+            raise ValueError("provider identity is unverified")
+        inspected = self._claude_send_process_identity(pid)
+        birth = inspected.get("started_epoch")
+        if (inspected.get("pid") != pid or inspected.get("generation") != runtime.claude_process_generation
+                or type(birth) not in (int, float) or not math.isfinite(birth) or birth <= 0):
+            raise ValueError("provider process birth changed")
+        return {"surface_id": str(target["surface_id"]), "workspace_id": str(target["workspace_id"]),
+                "session_id": runtime.claude_session_id, "agent_pid": pid,
+                "process_generation": runtime.claude_process_generation,
+                "turn_started_at": runtime.claude_turn_started_at, "started_epoch": birth}
+
+    def _claude_provider_source_current(self, event, target, runtime):
+        """Native freshness only; the frozen sender owns its pending intent."""
+        try:
+            guard = copy.deepcopy(self.claude_event_ledger.provider_guard(str(target["surface_id"])))
+            if not guard or guard.get("status") != "retry_wait" or guard.get("invalid"):
+                return False
+            proof = guard.get("provider_migration")
+            if not isinstance(proof, Mapping) or proof.get("version") != provider_recovery.VERSION:
+                return False
+            source, retry = proof["source_event"], proof["resume_event"]
+            if (guard.get("retry_event") != retry or event.get("event_id") != proof["resume_event_id"]
+                    or any(event.get(k) != v for k, v in retry.items())
+                    or event.get("provider_migration_source_event_id") != source["event_id"]
+                    or guard.get("source_event_id") != source["event_id"]
+                    or guard.get("source_created_at") != source["created_at"]
+                    or guard.get("revision") != proof["guard"]["revision"] + 1
+                    or guard.get("provider_blocked") is not False
+                    or any(guard.get(k) != v for k, v in proof["identity"].items())):
+                return False
+            binding = self._claude_provider_migration_binding(target, runtime)
+            marker = (runtime.claude_last_hook_at, runtime.claude_last_event_id, runtime.claude_generation_id)
+            if (source["created_at"] < runtime.claude_last_hook_at
+                    or self._foreign_claude_session_owner(str(target["surface_id"]), binding["session_id"])):
+                return False
+            raw, boundary = supervisor_closeout.native_tail(self.claude_event_inbox.journal_path)
+            events = [row for row, _, _ in provider_native._records(raw, boundary)]
+            native = provider_native.read_evidence(source_event=source,
+                hook_journal_path=self.claude_event_inbox.journal_path, binding=binding, failure=proof["failure"])
+            return bool(provider_recovery.current(proof, events, binding, native)
+                        and self._claude_provider_migration_binding(target, runtime) == binding
+                        and marker == (runtime.claude_last_hook_at, runtime.claude_last_event_id, runtime.claude_generation_id)
+                        and self.claude_event_ledger.provider_guard(str(target["surface_id"])) == guard)
+        except (OSError, ValueError, TypeError, KeyError, RuntimeError, OverflowError):
+            return False
+
+    def _recover_claude_provider_hold(self, target, runtime):
+        """Atomically schedule a current legacy failure; never send or replay."""
+        sid = str(target.get("surface_id") or "") if target else ""
+        try:
+            with self._surface_lock(sid):
+                if not self._claude_provider_migration_admission(target, runtime):
+                    return False
+                guard = copy.deepcopy(self.claude_event_ledger.provider_guard(sid))
+                if (not guard or guard.get("status") != "blocked" or guard.get("invalid")
+                        or guard.get("error_kind") not in provider_recovery.PROVIDER_KINDS):
+                    return False
+                config, publication = self.config, self._config_mtime_ns
+                config_snapshot = copy.deepcopy(config)
+                protected = self._claude_report_guard_snapshot(runtime)
+                marker = (runtime.claude_last_hook_at, runtime.claude_last_event_id,
+                          runtime.claude_generation_id, runtime.claude_prompt_pending)
+                binding = self._claude_provider_migration_binding(target, runtime)
+                if self._foreign_claude_session_owner(sid, binding["session_id"]):
+                    return False
+
+                def unchanged():
+                    return (self.config is config and self.config == config_snapshot
+                            and self._config_mtime_ns == publication
+                            and self._claude_report_guard_snapshot(runtime) == protected
+                            and marker == (runtime.claude_last_hook_at, runtime.claude_last_event_id,
+                                           runtime.claude_generation_id, runtime.claude_prompt_pending))
+
+                def diagnostic():
+                    client = self._observation_client()
+                    if isinstance(client, SnapshotClient):
+                        client = client.client
+                    tree = client.tree()
+                    if is_dock_surface(tree, sid):
+                        raise ValueError("provider source is a dock surface")
+                    client.read_screen(target["workspace_id"], sid)
+                    grid = Grid.from_rpc(client.replay(target["workspace_id"], sid), sid)
+                    composer, _ = _claude_composer_state(grid)
+                    state = classify_claude_grid(grid, claude_message=str(config.get("claude_message") or CLAUDE_MESSAGE))
+                    if (composer != "empty" or state.claude_native_activity
+                            or state.kind not in {"claude_stopped", "recoverable_error"}
+                            or not state.claude_provider_failure):
+                        raise ValueError("provider diagnostic is not current on an empty stopped composer")
+                    return provider_recovery._failure(state.claude_provider_failure)
+
+                failure = diagnostic()
+                raw, boundary = supervisor_closeout.native_tail(self.claude_event_inbox.journal_path)
+                events = [row for row, _, _ in provider_native._records(raw, boundary)]
+                originals = [row for row in events if row.get("surface_id") == sid and not provider_native._synthetic(row)]
+                if not originals:
+                    return False
+                source = originals[-1]  # Keep the raw Hook byte-equivalent; never enrich generation.
+                if source.get("created_at", 0) < runtime.claude_last_hook_at:
+                    return False
+                with self.claude_event_ledger._lock:
+                    original_row = copy.deepcopy(self.claude_event_ledger.events.get(source.get("event_id")))
+                if (not original_row or original_row.get("status") not in {"handling", "provider_blocked"}
+                        or original_row.get("completed") is True):
+                    return False
+                native = provider_native.read_evidence(source_event=source,
+                    hook_journal_path=self.claude_event_inbox.journal_path, binding=binding, failure=failure)
+                proof = provider_recovery.propose(guard=guard, source_event=source, latest_events=events,
+                    target=target, binding=binding, failure=failure, native_proof=native, observed_at=time.time())
+
+                def revalidate(saved):
+                    if (not unchanged() or not self._claude_provider_migration_admission(target, runtime)
+                            or self._claude_provider_migration_binding(target, runtime) != binding
+                            or self._foreign_claude_session_owner(sid, binding["session_id"])
+                            or self.claude_event_ledger.events.get(source["event_id"]) != original_row
+                            or diagnostic() != failure):
+                        return False
+                    fresh_raw, fresh_boundary = supervisor_closeout.native_tail(self.claude_event_inbox.journal_path)
+                    fresh_events = [row for row, _, _ in provider_native._records(fresh_raw, fresh_boundary)]
+                    fresh_native = provider_native.read_evidence(source_event=source,
+                        hook_journal_path=self.claude_event_inbox.journal_path, binding=binding, failure=failure)
+                    return bool(provider_recovery.current(saved, fresh_events, binding, fresh_native)
+                                and self._claude_provider_migration_binding(target, runtime) == binding
+                                and self._claude_provider_migration_admission(target, runtime) and unchanged()
+                                and self.claude_event_ledger.events.get(source["event_id"]) == original_row)
+
+                provider_migration.commit(proof, ledger=self.claude_event_ledger, revalidate=revalidate,
+                    atomic_write_json=atomic_write_json,
+                    retry_after=proof["observed_at"] + min(CLAUDE_PROVIDER_RETRY_BASE_SEC, CLAUDE_PROVIDER_RETRY_MAX_SEC))
+                # The caller synchronizes/restores from the durable ledger.
+                return True
+        except (OSError, ValueError, TypeError, KeyError, RuntimeError, OverflowError, CmuxError, IncompatibleError) as exc:
+            self.logger.debug("surface=%s legacy provider migration withheld: %s", sid[:8], exc)
+            return False
+
+    def _claude_provider_migrated_claim_source(self, target, runtime, guard):
+        """Exclude one covered handling claim without changing its old row."""
+        if not guard or guard.get("status") != "retry_wait":
+            return ""
+        proof, retry = guard.get("provider_migration"), guard.get("retry_event")
+        if not isinstance(proof, Mapping) or not isinstance(retry, Mapping):
+            return ""
+        source = proof.get("source_event")
+        if not isinstance(source, Mapping) or not source.get("event_id"):
+            return ""
+        source_id = source["event_id"]
+        with self.claude_event_ledger._lock:
+            row = copy.deepcopy(self.claude_event_ledger.events.get(source_id, {}))
+        if (not self.claude_event_ledger.provider_claim_pending(row)
+                or any(row.get(k) != source.get(k) for k in (
+                    "event_name", "surface_id", "workspace_id", "session_id", "agent_pid", "created_at",
+                    "error_kind", "stop_failure_error", "error_evidence_hash", "completed"))
+                or row.get("process_generation") not in (None, "", proof.get("identity", {}).get("process_generation"))):
+            return ""
+        if not self._claude_provider_source_current(retry, target, runtime):
+            return ""
+        with self.claude_event_ledger._lock:
+            return source_id if (self.claude_event_ledger.events.get(source_id) == row
+                                 and self.claude_event_ledger.provider_guard(str(target["surface_id"])) == guard) else ""
+
 
 
 def configure_logging() -> None:
@@ -14119,16 +16320,56 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
             os.unlink(temporary)
 
 
+def _runtime_bundle_payloads(root: Path) -> dict[str, bytes]:
+    """Read a self-contained tree without accepting links or special files."""
+    if root.is_symlink() or not root.is_dir():
+        raise RuntimeError(f"runtime release is incomplete or changed: {root}")
+    payloads = {}
+    for path in sorted(root.rglob("*")):
+        mode = path.lstat().st_mode
+        if stat.S_ISDIR(mode):
+            continue
+        if not stat.S_ISREG(mode):
+            raise RuntimeError(f"runtime release is incomplete or changed: {path}")
+        payloads[path.relative_to(root).as_posix()] = path.read_bytes()
+    return payloads
+
+
+def _runtime_mac_manifest(hashes: Mapping[str, str], expected: tuple[int, str] = RUNTIME_CURRENT_MAC) -> dict[str, Any]:
+    prefix = RUNTIME_MAC_SOURCE + "/"
+    rows = sorted([name[len(prefix):], digest] for name, digest in hashes.items()
+                  if name.startswith(prefix))
+    digest = hashlib.sha256(json.dumps(rows, separators=(",", ":")).encode()).hexdigest()
+    if (len(rows), digest) != tuple(expected):
+        raise RuntimeError("runtime release is incomplete or changed: frozen MAC source differs")
+    return {"source": RUNTIME_MAC_SOURCE, "files": len(rows), "sha256": digest}
+
+
 def validate_runtime_release(release: Path) -> None:
     manifest = load_json(release / "manifest.json", {})
-    actual = {name: file_sha256(release / name) for name in RUNTIME_FILES}
+    if not isinstance(manifest, Mapping):
+        raise RuntimeError(f"runtime release is incomplete or changed: {release}")
+    if manifest.get("version") == 1:
+        # Historical bundles contain only these 70 modules. Their address and
+        # manifest format must stay compatible with rollback/inspection.
+        actual = {name: file_sha256(release / name) for name in RUNTIME_LEGACY_FILES}
+    elif manifest.get("version") == RUNTIME_MANIFEST_VERSION:
+        payloads = _runtime_bundle_payloads(release)
+        payloads.pop("manifest.json", None)
+        actual = {name: hashlib.sha256(payload).hexdigest()
+                  for name, payload in payloads.items()}
+        runtime_names = {name for name in actual
+                         if not name.startswith(RUNTIME_MAC_SOURCE + "/")}
+        expected = next((mac for names, mac in RUNTIME_SUPPORTED_SHAPES if runtime_names == names), None)
+        if expected is None or manifest.get("mac") != _runtime_mac_manifest(actual, expected):
+            raise RuntimeError(f"runtime release is incomplete or changed: {release}")
+    else:
+        raise RuntimeError(f"runtime release is incomplete or changed: {release}")
     release_id = hashlib.sha256(json.dumps(
         actual, sort_keys=True, separators=(",", ":"),
     ).encode()).hexdigest()
     if (
-        not isinstance(manifest, Mapping)
-        or manifest.get("version") != 1
-        or manifest.get("files") != actual
+        manifest.get("files") != actual
         or not all(actual.values())
         or release.name != release_id
     ):
@@ -14142,17 +16383,29 @@ def stage_runtime_release(
     """Copy a complete daemon bundle without executing or activating it.
 
     launchd must never load this service from Documents: the terminal's access
-    permission is not inherited by the background Python process. There are
-    only the declared runtime modules; no import or working-directory link may lead
-    back to the checkout. The current pointer is changed separately.
+    permission is not inherited by the background Python process. The declared
+    runtime modules and complete pinned MAC source travel together; no import
+    or working-directory link may lead back to the checkout. The current
+    pointer is changed separately.
     """
 
     source_dir = source_dir if source_dir is not None else PROJECT_DIR
     runtime_root = runtime_root if runtime_root is not None else DEFAULT_RUNTIME_ROOT
-    payloads = {name: (source_dir / name).read_bytes() for name in RUNTIME_FILES}
+    payloads = {}
+    for name in RUNTIME_FILES:
+        path = source_dir / name
+        if not stat.S_ISREG(path.lstat().st_mode):
+            raise RuntimeError(f"runtime release is incomplete or changed: {path}")
+        payloads[name] = path.read_bytes()
     for name, payload in payloads.items():
         compile(payload, str(source_dir / name), "exec")
+    if (source_dir / "mac").is_symlink():
+        raise RuntimeError(f"runtime release is incomplete or changed: {source_dir / 'mac'}")
+    mac_payloads = _runtime_bundle_payloads(source_dir / RUNTIME_MAC_SOURCE)
+    payloads.update({RUNTIME_MAC_SOURCE + "/" + name: payload
+                     for name, payload in mac_payloads.items()})
     hashes = {name: hashlib.sha256(payload).hexdigest() for name, payload in payloads.items()}
+    mac_manifest = _runtime_mac_manifest(hashes)
     release_id = hashlib.sha256(json.dumps(
         hashes, sort_keys=True, separators=(",", ":"),
     ).encode()).hexdigest()
@@ -14167,7 +16420,9 @@ def stage_runtime_release(
     try:
         for name, payload in payloads.items():
             _atomic_write_bytes(temporary / name, payload)
-        atomic_write_json(temporary / "manifest.json", {"version": 1, "files": hashes})
+        atomic_write_json(temporary / "manifest.json", {
+            "version": RUNTIME_MANIFEST_VERSION, "files": hashes, "mac": mac_manifest,
+        })
         os.replace(temporary, release)
     finally:
         if temporary.exists():
@@ -14653,6 +16908,7 @@ def registration_readiness(
         elif row.get("status") == "readable":
             kind = row.get("agent_kind")
             hook_verified = (hook_rows.get(sid, {}).get("hook_verified") is True
+                             and not hook_rows.get(sid, {}).get("hook_observation_only", False)
                              and row.get("agent_pid") == runtime.get("claude_process_pid"))
             if kind == "codex" or (kind == "claude" and hook_verified):
                 status = "ready"
@@ -14733,6 +16989,20 @@ def claude_hook_coverage_from_inventory(state, records, labels, targets, inspect
             # File-based reports cannot reconstruct a daemon's private live
             # receipt. Keep their verdict conservative under clock rollback.
             health = "unverified"
+        observation_only = bool(
+            not verified and record.get("workspace_id") == target.get("workspace_id")
+            and claude_session_start_observation_authorized(config, target)
+            and observation_health.session_start_observation_matches(
+                runtime.get("claude_session_start_observation"), target,
+                {**inspection, "identity_verified_pids": process.get("identity_verified_pids", [])},
+                runtime, now=time.time()))
+        if observation_only:
+            proof_session = runtime["claude_session_start_observation"]["event"]["session_id"]
+            observation_only = not any(other_sid != sid and isinstance(other, Mapping)
+                                       and other.get("claude_session_id") == proof_session
+                                       for other_sid, other in state.items())
+        if observation_only:
+            verified, health = True, "observed_session_start"
         disposition = (
             "paused" if target.get("paused") or not target.get("enabled", True) else
             runtime["claude_supervisor_wait"]["status"].lower()
@@ -14742,6 +17012,7 @@ def claude_hook_coverage_from_inventory(state, records, labels, targets, inspect
             "verified" if verified else "needs_verification")
         rows.append({"surface_id": sid, "surface_ref": record["ref"],
                      "hook_health": health, "hook_verified": verified,
+                     "hook_observation_only": observation_only,
                      "report_task_id": runtime.get("claude_report_ready_task_id") if same_process else None,
                      "disposition": disposition})
     missing = [row["surface_ref"] for row in rows if row["disposition"] == "needs_verification"]

@@ -320,9 +320,31 @@ class SharedTurnTests(unittest.TestCase):
         self.assertEqual((proof['pid'], proof['birth'], proof['session_id']),
                          (41, self.process['birth'], self.sid))
 
-    def test_shared_goal_rejects_log_from_frontend_or_different_writer(self):
+    def test_shared_goal_uses_native_eof_and_checks_legacy_log_writer(self):
         turn = self.make_goal(writer=41)
-        self.assertIsNone(goal.blocked_goal(self.target, 41, current_turn=turn))
+        # A current authenticated failed EOF independently proves the failure;
+        # unrelated legacy logs do not invalidate it or supply its authority.
+        proof = goal.blocked_goal(self.target, 41, current_turn=turn)
+        self.assertEqual(proof['proof_source'], 'native_failed_eof_v1')
+        self.assertEqual(proof['writer']['pid'], 81)
+
+        # Model the older wire shape that lacks native EOF fields but has an
+        # independently authenticated shared-writer binding. Exercise the real
+        # legacy SQLite reader, including a matching-writer positive control.
+        binding = shared.binding_for_turn(self.target, turn)
+        self.assertIsNotNone(binding)
+        legacy_turn = {key: value for key, value in turn.items()
+                       if key not in {'transcript_path', 'terminal_tail'}}
+        logs = self.root / 'logs_2.sqlite'
+        with patch.object(shared, 'binding_for_turn', return_value=binding):
+            for writer in (41, 82):
+                with self.subTest(legacy_writer=writer), closing(sqlite3.connect(logs)) as db, db:
+                    db.execute('UPDATE logs SET process_uuid=?', (f'pid:{writer}:generation',))
+                    db.commit()
+                    self.assertIsNone(goal.blocked_goal(self.target, 41, current_turn=legacy_turn))
+            with closing(sqlite3.connect(logs)) as db, db:
+                db.execute('UPDATE logs SET process_uuid=?', ('pid:81:generation',))
+            self.assertEqual(goal.blocked_goal(self.target, 41, current_turn=legacy_turn)['log_id'], 1)
 
     def test_shared_goal_rejects_new_foreground_and_native_reconnect(self):
         turn = self.make_goal()

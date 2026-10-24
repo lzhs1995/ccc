@@ -34,13 +34,20 @@ class NativeRetryHintTests(unittest.TestCase):
                 self.assertEqual(self.runtime.last_send_error, 'lost ACK')
                 self.assertEqual(self.runtime.delivery_confirmed_at, 0)
 
-    def test_retimestamped_same_turn_or_different_session_is_not_new_failure(self):
-        for key in ('original:old-turn:300.0', 'replacement:new-turn:300.0'):
+    def test_retimestamped_same_turn_is_not_new_failure(self):
+        for key in ('original:old-turn:300.0',):
             for observed_at in (201, 301):
                 with self.subTest(key=key, observed_at=observed_at):
                     self.runtime.native_failure_turn_key = key
                     self.runtime.observed_at = observed_at
                     self.assertFalse(self.ready())
+
+    def test_different_session_hint_wakes_observation_without_settling_old_input(self):
+        self.runtime.native_failure_turn_key = 'replacement:new-turn:300.0'
+        self.assertTrue(self.ready())
+        self.assertEqual(self.runtime.delivery_status, 'unknown')
+        self.assertEqual(self.runtime.send_attempt_id, 'uncertain-original')
+        self.assertEqual(self.runtime.delivery_confirmed_at, 0)
 
     def test_hint_must_match_current_failure_and_follow_original_send(self):
         for key, at, requested in (

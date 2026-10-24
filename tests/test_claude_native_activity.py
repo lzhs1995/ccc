@@ -274,7 +274,15 @@ class NativeActivityTests(unittest.TestCase):
             restarted = w.WatchDaemon(d.config_path,d.state_path,client=c)
             recovered = restarted.runtime[t['surface_id']]
             with mock.patch.object(c,'send_text',side_effect=AssertionError('duplicate text')):
-                self.assertTrue(restarted._send_claude_enter(t,recovered,c,reason='terminal',input_check=lambda:True))
+                # Ending the client's retry exposes a new terminal provider
+                # error. It keeps the original text and Enter budget, while
+                # the persisted provider cooldown still vetoes immediate input.
+                self.assertFalse(restarted._send_claude_enter(t,recovered,c,reason='terminal',input_check=lambda:True))
+                self.assertEqual(c.sent_keys, [])
+                self.assertEqual(recovered.claude_provider_guard['status'], 'retry_wait')
+                with mock.patch.object(w.time, 'time',
+                        return_value=recovered.claude_provider_guard['retry_after'] + 1):
+                    self.assertTrue(restarted._send_claude_enter(t,recovered,c,reason='terminal',input_check=lambda:True))
             self.assertEqual(len(c.sent_text),1)
             self.assertEqual(len(c.sent_keys),1)
             self.assertEqual(recovered.send_count,1)

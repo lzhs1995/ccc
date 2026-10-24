@@ -40,6 +40,10 @@ class ProcessSessionTests(unittest.TestCase):
                      side_effect=lambda pid, **kw: list(process_birth) if pid == 123 else None)
         born.start()
         self.addCleanup(born.stop)
+        # pid123 is synthetic; no real native owner exists for this OS query.
+        owner = patch('ccc_guard_scope.process', return_value=None)
+        owner.start()
+        self.addCleanup(owner.stop)
         self.paths = "f44\nau\nn" + str(self.path) + "\n"
 
     def run_command(self, args, **kwargs):
@@ -83,6 +87,7 @@ class ProcessSessionTests(unittest.TestCase):
     def test_missing_sessions_directory_cannot_allow_viewport_only_resume(self):
         import cmux_codex_watch as core
         daemon = core.WatchDaemon.__new__(core.WatchDaemon)
+        daemon.config_path = self.root / 'config.json'
         daemon.codex_queue_recovery = self.queue
         daemon._network_turn_ready = lambda *_: True
         daemon._record_state = lambda *_: None
