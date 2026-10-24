@@ -1,4 +1,5 @@
 """A distinct authenticated failure must not inherit a dead session's input."""
+from contextlib import ExitStack
 import copy
 import dataclasses
 import json
@@ -20,6 +21,8 @@ ERROR = ('rate limit exceeded: Your requests to gpt-6.1-sol for gpt-6.1-sol '
 
 class NewSessionUnknownTests(unittest.TestCase):
     def setUp(self):
+        self.contexts = ExitStack()
+        self.addCleanup(self.contexts.close)
         self.target = dict(surface_id='surface', workspace_id='workspace')
         self.old = dict(kind='goal_blocked', session_id='old-session',
                         turn_id='old-turn', goal_id='old-goal', at=200.0,
@@ -51,11 +54,11 @@ class NewSessionUnknownTests(unittest.TestCase):
         self.daemon._current_blocked_goal = Mock(return_value=None)
         self.daemon._record_observation = Mock()
         self.daemon.logger = logging.getLogger(__name__)
-        self.birth = self.enterContext(patch('ccc_guard_scope.birth', return_value=None))
-        self.kill = self.enterContext(patch.object(core.os, 'kill', side_effect=ProcessLookupError()))
-        self.binding = self.enterContext(patch('ccc_shared_codex_turn.binding_for_turn',
+        self.birth = self.contexts.enter_context(patch('ccc_guard_scope.birth', return_value=None))
+        self.kill = self.contexts.enter_context(patch.object(core.os, 'kill', side_effect=ProcessLookupError()))
+        self.binding = self.contexts.enter_context(patch('ccc_shared_codex_turn.binding_for_turn',
             return_value={'process': {'birth': list(self.turn['birth'])}}))
-        self.valid = self.enterContext(patch('ccc_shared_codex_turn.valid', return_value=True))
+        self.valid = self.contexts.enter_context(patch('ccc_shared_codex_turn.valid', return_value=True))
 
     def reconcile(self, kind='recoverable_error', error='rate_limit'):
         state = core.ScreenState(kind, message_kind='codex', error_type=error)

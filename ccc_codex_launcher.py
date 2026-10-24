@@ -23,8 +23,8 @@ def current_workspace(config_path, surface_id):
 
 def run(config_path, native, args, service_factory=None):
     # Managed sanitizer proxy (explicit opt-in): applied once, before every exec/guarded launch below.
-    from ccc_codex_proxy_launch import default_service_factory, prepare
     if os.environ.get("CCC_CODEX_MANAGED_PROXY") == "1":
+        from ccc_codex_proxy_launch import default_service_factory, prepare
         # Lazy: the pinned real factory is resolved only when prepare() actually ensures the service,
         # so read-only --help/--version stay available without proxy pins.
         factory = service_factory or (lambda **kw: default_service_factory(os.environ)(**kw))
