@@ -45,7 +45,7 @@ class IdentityRetryTests(unittest.TestCase):
             d._defer_claude_event(t['surface_id'],r,e,'working')
             original = dict(r.claude_deferred_event)
             since = r.claude_deferred_since
-            with mock.patch.object(d,'_candidate_process_label',return_value={'agent_kind':'unknown'}):
+            with mock.patch.object(d,'_live_claude_process_label',return_value={'agent_kind':'unknown'}):
                 for _ in range(3):
                     self.retry(d,t,r,c)
             self.assertEqual(r.claude_deferred_event,original)
@@ -93,7 +93,7 @@ class IdentityRetryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             d,t,r,e,c = self.setup_case(root)
             d._defer_claude_event(t['surface_id'],r,e,'working')
-            with mock.patch.object(d,'_candidate_process_label',return_value={'agent_kind':'codex'}):
+            with mock.patch.object(d,'_live_claude_process_label',return_value={'agent_kind':'codex'}):
                 self.retry(d,t,r,c)
             self.assertIsNone(r.claude_deferred_event)
             self.assertEqual(d.claude_event_ledger.status_of(e['event_id']),'deferred_dropped')

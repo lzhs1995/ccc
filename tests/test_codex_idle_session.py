@@ -38,6 +38,8 @@ class IdleSessionTests(unittest.TestCase):
             patch("ccc_client_thread_observation.read_foreground", return_value=('absent', None, None)),
             patch("ccc_shared_codex_turn.read_foreground", return_value=('absent', None, None)),
             patch("ccc_codex_queue.process_placement_start", return_value=100),
+            patch("ccc_guard_scope.birth", side_effect=lambda pid, **kw: list(self.process['birth'])),
+            patch("ccc_codex_queue.codex_process_starts", side_effect=lambda pids: {123: self.process['process_start']}),
             patch("ccc_guard_scope.process", side_effect=lambda _: dict(self.process)),
             patch("ccc_guard_scope.arguments", return_value=(["/native/codex"], {})),
             patch("ccc_codex_queue.process_writable_files", side_effect=self.open_files),
@@ -66,6 +68,7 @@ class IdleSessionTests(unittest.TestCase):
         self.assertEqual(turn.get("birth"), [100, 100])
         sources = self.queue.wakeup_sources([self.target])
         self.assertEqual([str(s["path"]) for s in sources], [str(self.path)])
+        self.assertEqual(sources[0]['birth'], turn['birth'])
 
     def test_different_surface_or_workspace_cannot_supply_a_turn(self):
         for field in ("surface_id", "environment_workspace_id"):
@@ -133,6 +136,36 @@ class IdleSessionTests(unittest.TestCase):
         replacement.write_bytes(self.path.read_bytes())
         replacement.replace(self.path)
         self.assertEqual(self.queue.current_turn(self.target), {"kind": "unknown"})
+
+    def test_open_rollout_rejects_same_second_birth_change_during_read(self):
+        self.files[self.path] = self.identity(self.path)
+        snapshot = native.task_snapshot
+        def changed(*args):
+            result = snapshot(*args)
+            self.process['birth'] = [100, 101]
+            return result
+        with patch.object(native, 'task_snapshot', side_effect=changed):
+            self.assertEqual(self.queue.current_turn(self.target), {'kind': 'unknown'})
+
+    def test_darwin_missing_birth_never_downgrades_to_legacy_reader(self):
+        for rollout_open in (False, True):
+            for pidinfo in (None, object()):
+                with self.subTest(rollout_open=rollout_open, native_inspector=pidinfo is not None):
+                    self.files = {self.lock: self.identity(self.lock)}
+                    if rollout_open:
+                        self.files[self.path] = self.identity(self.path)
+                    with patch.object(native.sys, 'platform', 'darwin'), \
+                            patch.object(native, '_proc_pidinfo', pidinfo), \
+                            patch('ccc_guard_scope.birth', return_value=None), \
+                            patch.object(native, 'process_writable_files', wraps=self.open_files) as opened:
+                        self.assertEqual(self.queue.current_turn(self.target), {'kind': 'unknown'})
+                        opened.assert_not_called()
+
+    def test_darwin_birth_read_error_remains_unknown(self):
+        self.files[self.path] = self.identity(self.path)
+        with patch.object(native.sys, 'platform', 'darwin'), \
+                patch('ccc_guard_scope.birth', side_effect=OSError('native process read failed')):
+            self.assertEqual(self.queue.current_turn(self.target), {'kind': 'unknown'})
 
 
 if __name__ == "__main__":

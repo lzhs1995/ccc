@@ -1,0 +1,8 @@
+{
+  "version": "0.1.0",
+  "verdict": "PASS",
+  "tests": 284,
+  "scope": "offline mocks, sandbox installer and benign hook subprocesses; no live agents dispatched",
+  "stdoutSha256": "196ea955743ff9757756bdd09fb9d2da69c4cf919e8703d19a6cf585fda798f1",
+  "stderrSha256": "e9ad2c48b6b8613b196fac9fc76084e058d04a354a397ff24d1f1630122eb3dd"
+}

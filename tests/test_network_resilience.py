@@ -7,7 +7,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ccc_mihomo import ControllerError, ProbeResult, effective_service_route
 from ccc_network_guard import Director, Engine
-from test_network_guard import fixtures, Publisher
+from tests.test_network_guard import fixtures, Publisher
 from tools.network_profile import build_profile, manual_name, MANUAL_GROUP
 
 

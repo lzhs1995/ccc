@@ -88,6 +88,31 @@ class CurrentTopologyTests(unittest.TestCase):
         historical.record["workspace_ref"] = "workspace:19"
         self.assertEqual(tui.group_identity([historical, row()]), ("workspace:28", "Live thesis"))
 
+    def test_refresh_keeps_original_pause_metadata_and_distinguishes_disabled(self):
+        config = json.loads(self.path.read_text())
+        target = config["targets"][-1]
+        target.update(paused=True, paused_reason="maintenance hold", pause_origin="user", paused_at=99)
+        self.path.write_text(json.dumps(config))
+        before = self.path.read_bytes()
+        with mock.patch.object(tui.time, "time", return_value=100):
+            self.model.refresh(force=True)
+        candidate = self.model.candidates[0]
+        self.assertEqual((candidate.pause_origin, candidate.paused_reason, candidate.paused_at,
+                          candidate.pause_age_sec), ("user", "maintenance hold", 99, 1))
+        summary = tui.focus_summary(candidate)
+        for text in ("已暂停", "maintenance hold", "来源 user", "操作者未记录", "paused_at=99"):
+            self.assertIn(text, summary)
+        self.assertEqual(self.path.read_bytes(), before)
+        target.update(enabled=False, paused=False)
+        self.path.write_text(json.dumps(config))
+        with mock.patch.object(tui.time, "time", return_value=101):
+            self.model.refresh(force=True)
+        candidate = self.model.candidates[0]
+        self.assertEqual(tui.watch_label(candidate), "已停用")
+        self.assertEqual(candidate.paused_reason, "maintenance hold")
+        counts = self.model.counts()
+        self.assertEqual((counts["disabled"], counts["paused"], counts["watching"]), (1, 0, 0))
+
 
 class CurrentHealthTests(unittest.TestCase):
     def setUp(self):
@@ -158,7 +183,7 @@ class CurrentHealthTests(unittest.TestCase):
 class SessionClipboardTests(unittest.TestCase):
     def test_full_native_id_goes_to_stdin_even_if_column_is_hidden(self):
         candidate = row()
-        self.assertFalse(tui.row_layout(70).session)
+        self.assertFalse(tui.row_layout(60).session)
         with mock.patch.object(tui.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as run:
             self.assertEqual(tui.copy_session_id(candidate), SESSION_A)
         self.assertEqual(run.call_args.kwargs["input"], SESSION_A)

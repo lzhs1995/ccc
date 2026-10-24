@@ -176,7 +176,7 @@ class ClaudeHookProtocolTests(unittest.TestCase):
         self.assertEqual(prompt_kind("请实现下一项任务", DEFAULT_CLAUDE_MESSAGE), "human")
 
     def test_stop_event_contains_hashes_not_raw_assistant_text(self):
-        secret_text = "内部正文，完成，建议检查 usage: /context"
+        secret_text = "内部正文。\n完成，建议检查 usage: /context"
         event = build_event({
             "hook_event_name": "Stop",
             "session_id": "session-a",

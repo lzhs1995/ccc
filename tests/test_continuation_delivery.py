@@ -60,7 +60,9 @@ class DeliveryTests(unittest.TestCase):
             runtime = core.TargetRuntime()
             daemon.runtime["surface-uuid"] = runtime
             state = core.classify_grid(core.Grid.from_rpc(error_frame(), "surface-uuid"))
-            with mock.patch.object(daemon, "save", side_effect=OSError("disk unavailable")):
+            # The per-surface journal is the input barrier; the fleet snapshot
+            # is only an observer publication and can fail after this commits.
+            with mock.patch.object(daemon._delivery_store, "persist", side_effect=OSError("disk unavailable")):
                 daemon._handle_state(target, runtime, state, client, send_guard_tree=client.tree())
             self.assertEqual(client.sent, [])
             self.assertEqual(runtime.delivery_status, "failed")
@@ -101,7 +103,7 @@ class DeliveryTests(unittest.TestCase):
                 self.assertEqual(persisted["mode"], "armed")
                 daemon._process_snapshots.close()
 
-    def test_timeout_after_delivery_is_confirmed_by_working_without_duplicate(self):
+    def test_timeout_followed_by_working_keeps_unknown_delivery_without_duplicate(self):
         with tempfile.TemporaryDirectory() as directory:
             client = TimeoutClient(delivered=True)
             daemon = armed_daemon(directory, client)
@@ -110,7 +112,9 @@ class DeliveryTests(unittest.TestCase):
             self.assertEqual(runtime.delivery_status, "unknown")
             self.assertEqual(runtime.send_count, 0)
             daemon.process_once(client)
-            self.assertEqual(runtime.delivery_status, "confirmed")
+            self.assertEqual(runtime.delivery_status, "unknown")
+            self.assertEqual(runtime.delivery_confirmed_at, 0)
+            self.assertTrue(runtime.last_send_error)
             self.assertEqual(runtime.state, "working")
             self.assertEqual(client.attempts, 1)
 
@@ -273,7 +277,7 @@ class ContinuationHealthTests(unittest.TestCase):
     def test_supervisor_keeps_monitoring_label_and_shows_unconfirmed_delivery(self):
         import cmux_supervisor_tui as tui
         target = {"surface_id": "s", "workspace_id": "w"}
-        for runtime, expected in (({"viewport_checked_at": 100}, "监控中"),
+        for runtime, expected in (({"viewport_checked_at": 100}, "检测延迟"),
                                   ({"viewport_checked_at": 110, "delivery_status": "unknown"}, "投递待验")):
             with mock.patch.object(tui.time, "time", return_value=110):
                 fields = tui.continuation_fields(target, runtime)

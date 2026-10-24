@@ -1,0 +1,11 @@
+─────────────────────────────────────────────────────────────────────────────────
+❯ 
+─────────────────────────────────────────────────────────────────────────────────
+  [Opus 5]
+  tasks/07_Paper-workbench git:(ops/loc...
+  ⏱️  2104h 25m
+  上下文 █░░░ 22%
+  1 CLAUDE.md | 9 MCPs | 7 钩子
+  ✓ Bash ×19 | ✓ Read ×1
+  ▸ Relaunch and complete standard sta...
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents

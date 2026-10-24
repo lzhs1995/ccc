@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local/multi-agent-collaboration/active-marker.schema.json",
+  "title": "Active collaboration marker v2 (published read-only contract)",
+  "description": "One file per collaboration at /tmp/multi-agent-collaboration/_active/<WORKSPACE_UUID>/<COLLABORATION_ID>.json, written by arm_task when identity-gate passes and removed by disarm_task. Concurrent collaborations in one workspace therefore no longer overwrite each other. External read-only consumers — currently the CCC Supervisor TUI's 协作 column — join on surface_uuid, never on surface_ref: refs are renumbered whenever surfaces open or close (the CCC 2026-08-20 ref-join incident). A v2 consumer must treat the marker as active only while now < armed_at + ttl_seconds AND last_activity_at is present, parseable and >= armed_at; a missing or malformed last_activity_at hides the whole marker (no fallback to armed_at). Artifact existence alone is history, not liveness.",
+  "type": "object",
+  "required": [
+    "marker_version",
+    "collaboration_id",
+    "task_id",
+    "artifact_root",
+    "workspace_id",
+    "participants",
+    "armed_at",
+    "last_activity_at",
+    "ttl_seconds"
+  ],
+  "properties": {
+    "marker_version": {
+      "const": 2,
+      "description": "Contract version. Consumers must ignore markers with a version they do not understand rather than guess."
+    },
+    "collaboration_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "UUID of this collaboration; also the marker filename stem. disarm_task removes exactly this file, never the workspace directory."
+    },
+    "task_id": {"type": "string", "minLength": 1},
+    "artifact_root": {
+      "type": "string",
+      "pattern": "^/",
+      "description": "Absolute artifact directory for this task; heartbeat scope and the reverse-lookup key that routes an artifact write to its owning marker."
+    },
+    "workspace_id": {
+      "type": "string",
+      "description": "CMUX_WORKSPACE_ID of the arming process (workspace UUID, also the parent directory name)."
+    },
+    "workspace_uuid": {
+      "type": "string",
+      "description": "Workspace UUID resolved at arm time; equals workspace_id when armed inside cmux."
+    },
+    "participants": {
+      "type": "array",
+      "minItems": 2,
+      "items": {
+        "type": "object",
+        "required": ["role", "ordinal", "surface_ref", "surface_uuid", "provider"],
+        "properties": {
+          "role": {
+            "type": "string",
+            "enum": ["supervisor", "executor"],
+            "description": "Numbered role enums (executor2/executor3) are retired; executor identity order lives in ordinal."
+          },
+          "ordinal": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Supervisor is exactly ordinal 0; executors are 1..n. Display labels derive from this (single executor: Executor; several: Executor1/Executor2/…), never from array position."
+          },
+          "surface_ref": {"type": "string", "description": "Ref at arm time; display/debug only — do not join on it."},
+          "surface_uuid": {"type": "string", "description": "Stable surface UUID. Empty string means the UUID could not be resolved at arm time; consumers must then show nothing rather than fall back to the ref."},
+          "provider": {"type": "string", "description": "codex / claude / grok / … as detected at arm time."}
+        }
+      }
+    },
+    "armed_at": {"type": "string", "description": "ISO-8601; identity-gate PASS instant."},
+    "last_activity_at": {"type": "string", "description": "ISO-8601; bumped by every artifact write under artifact_root (heartbeat). Mandatory: consumers hide the marker when it is missing, malformed or earlier than armed_at."},
+    "ttl_seconds": {"type": "integer", "minimum": 1, "description": "Hard expiry relative to armed_at so a stale marker cannot wedge sessions."}
+  },
+  "$comment": "v2 introduced 2026-09-01: per-collaboration files under a workspace directory, role+ordinal participants, exactly one supervisor (ordinal 0) and >=1 executor per marker, no duplicate surface_uuid, mandatory strict last_activity_at. v1 (2026-08-31, single _active/<ws>.json, numbered role enums) remains read-only compatible in consumers; nothing writes it anymore. Markers without marker_version/participants are pre-contract; consumers must ignore them."
+}

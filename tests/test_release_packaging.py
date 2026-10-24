@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import plistlib
+import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -85,6 +86,8 @@ class LaunchAgentRenderingTests(unittest.TestCase):
             source.mkdir(parents=True)
             for name in core.RUNTIME_FILES:
                 (source / name).write_text("VALUE = 1\n")
+            shutil.copytree(Path(core.__file__).parent / core.RUNTIME_MAC_SOURCE,
+                            source / core.RUNTIME_MAC_SOURCE)
             runtime = root / "runtime"
             release = core.stage_runtime_release(source, runtime).resolve()
             core._set_runtime_pointer(runtime, release)

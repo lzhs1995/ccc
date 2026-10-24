@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "title": "Shared resource lease v1",
+  "required": [
+    "id",
+    "task_id",
+    "workspace_uuid",
+    "surface_uuid",
+    "resource",
+    "status",
+    "requested"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "task_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "workspace_uuid": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "surface_uuid": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "resource": {
+      "type": "string",
+      "minLength": 1
+    },
+    "status": {
+      "enum": [
+        "WAITING",
+        "ACTIVE",
+        "RELEASED",
+        "WITHDRAWN"
+      ]
+    },
+    "requested": {
+      "type": "number"
+    },
+    "token": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "expires": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "pgid": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "invocations": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "release_proof": {
+      "type": [
+        "object",
+        "string",
+        "null"
+      ]
+    }
+  }
+}

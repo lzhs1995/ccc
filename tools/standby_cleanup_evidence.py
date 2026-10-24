@@ -40,6 +40,46 @@ def tree_records(tree):
     return scope.records(tree)
 
 
+def _detached_backend(record):
+    """Observe an orphaned, non-terminal app-server without claiming a surface."""
+    if (sys.platform != 'darwin' or scope.native._proc_pidinfo is None
+            or not scope.matches(record)):
+        return None
+    info = scope.native._BsdInfo()
+    if (scope.native._proc_pidinfo(record['pid'], 3, 0, ctypes.byref(info),
+            ctypes.sizeof(info)) != ctypes.sizeof(info)
+            or info.pid != record['pid'] or info.ppid != 1
+            or info.ids[0] != os.geteuid() or info.misc[3] != 0xffffffff
+            or [info.start_sec, info.start_usec] != record['birth']):
+        return None
+    argv, _ = scope.arguments(record['pid'])
+    if (len(argv) != 4 or Path(argv[0]).name != 'codex'
+            or argv[1:3] != ['app-server', '--listen']
+            or not argv[3].startswith('unix:///') or not scope.matches(record)):
+        return None
+    return {'original': record, 'parent_pid': 1, 'terminal_device': 0xffffffff,
+            'argv': argv}
+
+
+def _baseline_backends(baseline, membership):
+    backends = baseline.get('detached_backends', {})
+    missing = {str(row['pid']): row for row in baseline['processes']
+               if row['surface_id'] not in membership}
+    if not isinstance(backends, dict) or backends.keys() != missing.keys():
+        raise ValueError('complete detached backend identity coverage required')
+    for pid, proof in backends.items():
+        if not isinstance(proof, dict):
+            raise ValueError('invalid detached backend evidence')
+        argv = proof.get('argv', [])
+        if (proof.get('original') != missing[pid] or proof.get('parent_pid') != 1
+                or proof.get('terminal_device') != 0xffffffff
+                or len(argv) != 4 or not all(isinstance(a, str) for a in argv)
+                or Path(argv[0]).name != 'codex' or argv[1:3] != ['app-server', '--listen']
+                or not argv[3].startswith('unix:///')):
+            raise ValueError('invalid detached backend evidence')
+    return backends
+
+
 def capture_baseline(directory, *, client, clock=stamp, seconds=30.0,
                      monotonic=time.monotonic):
     """Call before creating experimental sessions, not retrospectively.
@@ -69,10 +109,16 @@ def capture_baseline(directory, *, client, clock=stamp, seconds=30.0,
     processes = scope.scan()
     if len({row['pid'] for row in processes}) != len(processes):
         raise ValueError('duplicate baseline process')
+    backends = {}
     for row in processes:
         budget.check()
-        if row['surface_id'] not in membership or not scope.matches(row):
+        if not scope.matches(row):
             raise ValueError('baseline process identity or membership unavailable')
+        if row['surface_id'] not in membership:
+            proof = _detached_backend(row)
+            if proof is None:
+                raise ValueError('baseline process identity or membership unavailable')
+            backends[str(row['pid'])] = proof
     after_tree = client.tree()
     if tree_records(after_tree) != membership:
         raise ValueError('baseline window membership changed')
@@ -80,6 +126,8 @@ def capture_baseline(directory, *, client, clock=stamp, seconds=30.0,
         budget.check()
         if not scope.matches(row):
             raise ValueError('baseline process changed during final observation')
+        if str(row['pid']) in backends and _detached_backend(row) != backends[str(row['pid'])]:
+            raise ValueError('detached backend changed during final observation')
     finished = clock()
     _elapsed(started, finished, started['boot_id'])
     current = directory.lstat()
@@ -89,7 +137,8 @@ def capture_baseline(directory, *, client, clock=stamp, seconds=30.0,
     result = {'version': 1, 'kind': 'standby_cleanup_baseline',
               'started': started, 'finished': finished,
               'tree_before': before_tree, 'tree_after': after_tree,
-              'processes': processes, 'job_terminal': False, 'run_terminal': False,
+              'processes': processes, 'detached_backends': backends,
+              'job_terminal': False, 'run_terminal': False,
               'scope': 'recognized native identities before creation; non-atomic; no cleanup claim'}
     budget.check()
     write_once(target, result)
@@ -137,6 +186,7 @@ def capture_cleanup(config_path, job_id, baseline_path, directory, *, client,
             or _sha(ui_raw) != saved['activation_ui_sha256']):
         raise ValueError('original baseline or activation binding invalid')
     original_membership = tree_records(baseline['tree_after'])
+    backends = _baseline_backends(baseline, original_membership)
     originals = ui['originals']
     if (len(originals) != COUNT or len({r['pid'] for r in originals}) != COUNT
             or len({r['surface_id'] for r in originals}) != COUNT
@@ -175,7 +225,9 @@ def capture_cleanup(config_path, job_id, baseline_path, directory, *, client,
             budget.check()
             preserved.append({'original': row, 'matches': scope.matches(row),
                 'membership_matches': membership.get(row['surface_id']) ==
-                                      original_membership.get(row['surface_id'])})
+                                      original_membership.get(row['surface_id']),
+                'detached_backend_matches': str(row['pid']) not in backends or
+                    _detached_backend(row) == backends[str(row['pid'])]})
         passes.append({'tree': tree, 'recognized_processes': recognized, 'pids': pids,
                        'experiment': experiment, 'preserved': preserved})
     if (_read(baseline_path)[1] != baseline_raw or _read(ui_path)[1] != ui_raw
@@ -193,7 +245,8 @@ def capture_cleanup(config_path, job_id, baseline_path, directory, *, client,
                          for r in p['recognized_processes']) and
                  all(r['state'] in ('absent', 'pid_reused') and r['surface_absent']
                          for r in p['experiment']) and
-                 all(r['matches'] and r['membership_matches'] for r in p['preserved'])
+                 all(r['matches'] and r['membership_matches'] and r['detached_backend_matches']
+                     for r in p['preserved'])
                  for p in passes)
     result = {'version': 1, 'kind': 'standby_cleanup_observation', 'job_id': job_id,
               'action_id': saved['action_id'], 'settlement_sha256': settlement_sha,
@@ -227,6 +280,7 @@ def verify_cleanup(config_path, job_id, observation_path):
             or baseline.get('kind') != 'standby_cleanup_baseline' or baseline.get('version') != 1):
         raise ValueError('cleanup original binding invalid')
     membership = tree_records(baseline['tree_after'])
+    backends = _baseline_backends(baseline, membership)
     if tree_records(baseline['tree_before']) != membership:
         raise ValueError('baseline membership inconsistent')
     originals = ui['originals']
@@ -275,8 +329,9 @@ def verify_cleanup(config_path, job_id, observation_path):
         for original, observed in zip(baseline_rows, sample['preserved']):
             if (observed['original'] != original or observed['matches'] is not True
                     or observed['membership_matches'] is not True
-                    or original['surface_id'] not in membership
-                    or current_membership.get(original['surface_id']) != membership[original['surface_id']]):
+                    or (original['surface_id'] not in membership and str(original['pid']) not in backends)
+                    or (str(original['pid']) in backends and observed.get('detached_backend_matches') is not True)
+                    or current_membership.get(original['surface_id']) != membership.get(original['surface_id'])):
                 raise ValueError('original process preservation not established')
         if any(r['surface_id'] in {o['surface_id'] for o in originals}
                for r in sample['recognized_processes']):

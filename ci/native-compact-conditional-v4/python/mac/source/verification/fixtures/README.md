@@ -1,0 +1,9 @@
+Fixtures preserve measured footer shapes. Task payloads, paths and unrelated transcript content are replaced with synthetic examples; these are regression fixtures, not live delivery proof.
+
+`codex-compacting-behind-queued-followups-20261009.txt` and `codex-stranded-below-queued-followups-20261009.txt` are the PASTE_INTENT and POST_ENTER screens of one measured attempt (2026-10-09 01:15 +0800): Codex was compacting while an earlier ask sat in "• Queued follow-up inputs", and the next payload stayed in the composer. Rows from "• Compacting context" down are kept verbatim except the caller UUID, task id and path; the transcript above them is synthetic.
+
+The five Claude fixtures added for 2026-10-09 are minimal synthetic reconstructions. They retain the tested border/footer fields, folded-draft shape, active spinner and historical status lookalikes; raw private transcripts and machine paths are excluded. Their names identify regression origins, not live proof or current session identities.
+
+The 2026-10-12 ASCII control/state fixtures retain the measured composer and footer rows only. Private transcript rows are omitted; project/branch labels are synthetic. Both Unicode and ASCII clipping must occur at physical row ends.
+
+The 2026-10-13 reference-body JSON and 2026-10-14 formal/Goal JSON use synthetic task names, paths, hashes and project labels with the measured display widths. The latter includes 100 extracted frames across five layouts, including the B0018 27-space and B0019 49-space PACK continuation rows. Private source hashes preserve provenance without publishing the original transcripts. Tests require two stable, complete composer reads and reject changed payloads, padding, borders and footers. These fixtures authorize no recovery of a live attempt and prove no native receipt or hook adoption.

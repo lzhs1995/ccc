@@ -8,6 +8,43 @@ from tests.test_watch import FakeClient, armed_daemon, grid_payload
 
 
 class AnchorObservationRecoveryTests(unittest.TestCase):
+    def missing_grid_error(self):
+        client = core.CmuxClient('unused')
+        client.viewport_socket = mock.Mock(live_native_frames=False)
+        client.viewport_socket.request.return_value = {
+            'workspace_id': 'workspace-uuid', 'surface_id': 'surface-uuid'}
+        with self.assertRaises(core.ViewportUnavailableError) as caught:
+            core.Grid.from_rpc(client.replay('workspace-uuid', 'surface-uuid'), 'surface-uuid')
+        return caught.exception
+
+    def test_missing_grid_recovers_after_both_reads_without_persisted_exclusion(self):
+        for retry in (False, True):
+            for dynamic in (False, True):
+                with self.subTest(retry=retry, dynamic=dynamic), tempfile.TemporaryDirectory() as directory:
+                    client = FakeClient(grid_payload([]), '')
+                    daemon = armed_daemon(directory, client)
+                    target = daemon.config['targets'][0]
+                    if dynamic:
+                        target = dict(target, source='workspace_rule', source_workspace_id='workspace-uuid')
+                        daemon._mutate_config(lambda config: config.update(workspace_rules=[{
+                            'workspace_id': 'workspace-uuid', 'enabled': True,
+                            'excluded_surface_ids': [], 'excluded_surface_reasons': {}}]))
+                    before = daemon.config_path.read_bytes()
+                    failures = ([core.CmuxError('workspace moved')] if retry else []) + [self.missing_grid_error()]
+                    with mock.patch.object(daemon, '_observe_target_viewport', side_effect=failures), \
+                         mock.patch.object(daemon, '_refresh_workspace', return_value=True):
+                        daemon._process_one_target(target, client, None, '')
+                    self.assertEqual(client.sent, [])
+                    self.assertFalse(target.get('paused'))
+                    self.assertEqual(daemon.config_path.read_bytes(), before)
+                    self.assertEqual(daemon.runtime['surface-uuid'].state, 'cmux_unavailable')
+                    with mock.patch.object(daemon, '_observe_target_viewport', return_value=core.ScreenState('working')) as observe:
+                        daemon._process_one_target(target, client, None, '')
+                    observe.assert_called_once()
+                    self.assertEqual(daemon.runtime['surface-uuid'].state, 'working')
+                    self.assertEqual(daemon.config_path.read_bytes(), before)
+                    self.assertEqual(client.sent, [])
+
     def anchor_error(self):
         client = core.CmuxClient('unused')
         client.viewport_socket = mock.Mock(live_native_frames=True)
@@ -77,6 +114,11 @@ class AnchorObservationRecoveryTests(unittest.TestCase):
                 with self.assertRaises(core.IncompatibleError) as caught:
                     client.replay('workspace-uuid', 'surface-uuid')
                 self.assertNotIsInstance(caught.exception, core.UnanchoredFrameError)
+                self.assertNotIsInstance(caught.exception, core.ViewportUnavailableError)
+                response.pop('render_grid')
+                with self.assertRaises(core.IncompatibleError) as missing:
+                    client.replay('workspace-uuid', 'surface-uuid')
+                self.assertNotIsInstance(missing.exception, core.ViewportUnavailableError)
 
 
 if __name__ == '__main__':

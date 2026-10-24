@@ -108,7 +108,7 @@ def process(pid, *, launch=False):
         return None
 
 
-def scan():
+def scan(*, reader=None):
     """One bounded local snapshot; never invoke slow ps/top on the stop path."""
     if native._proc_listpids is None or sys.platform != "darwin":
         raise RuntimeError("B realtime process coverage requires Darwin libproc")
@@ -122,7 +122,7 @@ def scan():
         raise RuntimeError("native process inventory incomplete")
     records = []
     for pid in values[:count // 4]:
-        row = process(pid)
+        row = (reader or process)(pid)
         if row:
             records.append(row)
     return records

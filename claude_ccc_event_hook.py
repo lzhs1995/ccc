@@ -6,6 +6,10 @@ from __future__ import annotations
 import json
 import sys
 
+# Existing Claude processes may retain a hook command without Python -B.
+# Protect the immutable runtime before importing any adjacent module.
+sys.dont_write_bytecode = True
+
 from claude_ccc_protocol import append_event, build_event, notify_daemon
 
 

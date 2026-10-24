@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Multi-agent pane naming proof",
+  "type": "object",
+  "required": ["task_id", "status", "session", "entries", "blocking_reasons", "updated_at"],
+  "properties": {
+    "task_id": {"type": "string", "minLength": 1},
+    "status": {"type": "string", "enum": ["PASS", "FAIL"]},
+    "session": {"type": "string"},
+    "entries": {
+      "type": "array",
+      "minItems": 2,
+      "items": {"$ref": "#/$defs/entry"}
+    },
+    "blocking_reasons": {"type": "array", "items": {"type": "string"}},
+    "updated_at": {"type": "string", "minLength": 1}
+  },
+  "$defs": {
+    "entry": {
+      "type": "object",
+      "required": [
+        "identity",
+        "pane_id",
+        "role",
+        "expected_role",
+        "actual_role",
+        "expected_visible_name",
+        "actual_visible_name",
+        "expected_title",
+        "actual_title",
+        "border_status",
+        "border_format",
+        "role_match",
+        "visible_name_match",
+        "pane_title_match",
+        "border_visible",
+        "status"
+      ],
+      "properties": {
+        "identity": {"type": "string"},
+        "pane_id": {"type": "string"},
+        "role": {"type": "string"},
+        "expected_role": {"type": "string"},
+        "actual_role": {"type": "string"},
+        "expected_visible_name": {"type": "string"},
+        "actual_visible_name": {"type": "string"},
+        "expected_title": {"type": "string"},
+        "actual_title": {"type": "string"},
+        "border_status": {"type": "string"},
+        "border_format": {"type": "string"},
+        "role_match": {"type": "boolean"},
+        "visible_name_match": {"type": "boolean"},
+        "pane_title_match": {"type": "boolean"},
+        "pane_title_advisory": {"type": "boolean"},
+        "border_visible": {"type": "boolean"},
+        "name_evidence_pass": {"type": "boolean"},
+        "status": {"type": "string", "enum": ["PASS", "FAIL"]}
+      }
+    }
+  }
+}

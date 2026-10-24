@@ -6,7 +6,7 @@ import tempfile
 import unittest
 
 from ccc_access_gateway import Gateway, ProtocolFault, Upstream, read_head, read_response
-from test_access_gateway import UpstreamFixture, native_request, new_channel
+from tests.test_access_gateway import UpstreamFixture, native_request, new_channel
 
 
 COOKIES = b'Set-Cookie: first=server-private; Path=/\r\nSet-Cookie: second=server-private; Path=/\r\n'
