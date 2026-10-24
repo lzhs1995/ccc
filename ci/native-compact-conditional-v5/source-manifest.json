@@ -1,11 +1,11 @@
 {
-  "schema": "ccc-native-conditional-source-v19",
+  "schema": "ccc-native-conditional-source-v20",
   "status": "INTEGRATED_VERIFICATION_CANDIDATE_NOT_DEPLOYABLE",
   "baseline_prepare_sha256": "beae02abdd924b103f489ce54fdd9fb666ebff89ccb8592d43cfc18cdff81a12",
   "baseline_source_tree_sha256": "6a0540b9d82e9c947192a3bf675467af87562c35b047ce54c0767c2d4aec3d35",
-  "source_tree_sha256": "d3e37ce9facffa5e4d66892d87505d452feddd85f03cecba0130ea6b4a245309",
+  "source_tree_sha256": "2dfe43955fb77426c5eade230041ce0830a58e0fab72a85d07e6c62e3103c82a",
   "source_file_count": 8891,
-  "archive_sha256": "66ef92fe5a997cc35e6e7d98cbeb12bc36171feb4a89c6f9776a25b48f6ded54",
+  "archive_sha256": "d6cf20af492ccc8cc21eeff5b783e9a25c9d9da23ba9f981b9b8d1587b5d0500",
   "evidence": {
     "authority_manifest": "544e569f9323faa03e4a3277188fc3a4db54aa4559de4b774cc646e86a1f6dd2",
     "reservation_manifest": "7ff594c3a3a70e71508effed4a9dd7d305c70f3f60ea1d562a4b534b973329d2",
@@ -83,11 +83,14 @@
     "guardian_review": "solo_self_review; independent peer review pending before full acceptance",
     "previous_full_run": 39960514415,
     "previous_full_result": "21149 executed, seven failed, 47 skipped; not accepted",
-    "v19_realtime_format": "Official prebuilt Rust1.95 formatter only; tokens except optional trailing commas, all string literals and file prefix/suffix outside the fixture preserved. Preformat v5 commit80622a9921c7e3a0157b441be3e5baa34a1f8255 and exact local archive preserved."
+    "v19_realtime_format": "Official prebuilt Rust1.95 formatter only; tokens except optional trailing commas, all string literals and file prefix/suffix outside the fixture preserved. Preformat v5 commit80622a9921c7e3a0157b441be3e5baa34a1f8255 and exact local archive preserved.",
+    "v20_delta": "Exactly three equivalent Clippy edits from run40037560783: is_empty and two unnecessary clones. No assertions, timeouts, dependency, protocol or skip changes.",
+    "v20_prior_full_result": "40037560783 workspace tests and Clippy passed; exact-source gate rejected three lint edits and macOS was skipped. No binary adopted.",
+    "v20_review": "Root solo_self_review of exact byte substitutions; original Claude independent review pending before adoption."
   },
   "limitations": [
-    "Exact v17 conditional/full/Clippy/macOS gates pending.",
-    "Current Root compact capability and original-session live acceptance pending."
+    "Exact v20 conditional/full/Clippy/macOS gates pending.",
+    "Original Root compact capability and same-session live acceptance remain separately required."
   ],
   "changes": [
     {
@@ -250,8 +253,8 @@
       "before": null,
       "after": {
         "kind": "file",
-        "sha256": "3313c5761cdd319cd3a07b2226f01e09109a2236ca84557dc755fc2966845dda",
-        "bytes": 33961,
+        "sha256": "6a636229f153e97475d9da0930a2165d1bd46ff723c3d53c7fc1275671c00e2a",
+        "bytes": 33953,
         "git_mode": "100644"
       }
     },
@@ -341,6 +344,21 @@
       }
     },
     {
+      "path": "codex-rs/codex-api/src/credential_observation_tests.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "67eaf6adacad05e77f1ac24a67c25b7b5c1146d0df992f4d72b92e0244567ef2",
+        "bytes": 8013,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "5e51e6d6f280de022c794d4e155a594570ac378ae863eab9cb140bb3ee2ec1d6",
+        "bytes": 8005,
+        "git_mode": "100644"
+      }
+    },
+    {
       "path": "codex-rs/core/src/compact_remote_v2.rs",
       "before": {
         "kind": "file",
@@ -360,8 +378,8 @@
       "before": null,
       "after": {
         "kind": "file",
-        "sha256": "043e2d581dc582ec9909d1e5095a233ecaabbb0dd6887f0d27729788405a2461",
-        "bytes": 7939,
+        "sha256": "485038860ae0d3a88269eeca15a97ba21ee2a2735ac04370b4936f3a19fedd55",
+        "bytes": 7940,
         "git_mode": "100644"
       }
     },

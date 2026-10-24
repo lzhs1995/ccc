@@ -8,9 +8,9 @@ import re
 import urllib.request
 
 WORKFLOW_PATH = ".github/workflows/native-compact-conditional-v5.yml"
-EXPECTED_MANIFEST = "1dda9146d37e512aa23c89dfcbd579330c7b8735c8d4a4ca0c66a967b8d4c013"
+EXPECTED_MANIFEST = "c21b1870721d2f35ceefe0848efd782e387c01b5df04737f2107991b80f2a4e8"
 EXPECTED_PYTHON = "cfed1c51af737077de6e2d328a75cae718949bbc7e980b99504dc709ca128289"
-EXPECTED_TREE = "d3e37ce9facffa5e4d66892d87505d452feddd85f03cecba0130ea6b4a245309"
+EXPECTED_TREE = "2dfe43955fb77426c5eade230041ce0830a58e0fab72a85d07e6c62e3103c82a"
 
 def main():
     repository = os.environ["GITHUB_REPOSITORY"]
