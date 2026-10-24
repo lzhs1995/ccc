@@ -7538,6 +7538,14 @@ class WatchDaemon:
         live = surface_process_label(labels, target)
         if live.get("identity_conflicts"):
             return unknown
+        records = display_surface_records(tree, main_surface_records(tree))
+        gui_claude = live.get("agent_kind") == "claude"
+        native_target_available = any(
+            item.get("surface_id") == str(target["surface_id"])
+            and isinstance(item.get("native_display_target"), Mapping)
+            and item["native_display_target"].get("tty")
+            for item in records
+        )
         # A new explicit/workspace-auto transaction may follow this same UUID
         # into its live pane. Carry a complete native proof through Text and
         # delayed Enter; a bare GUI label cannot prove the original topology
@@ -7550,7 +7558,13 @@ class WatchDaemon:
             and record.get("pane_id") != target["pane_id"]
             and live.get("agent_kind") == "claude"
         )
-        if pinned is None and live.get("agent_kind") != "unknown" and not moved_surface:
+        # Pin a new transaction while the GUI observation is still populated.
+        # New cmux may omit that same process on the next read. Without the
+        # original native proof, allow_unpinned=False must then refuse Text or
+        # Enter forever. Legacy topology without a native TTY retains its
+        # original GUI route; it cannot acquire a fabricated pending proof.
+        if (pinned is None and live.get("agent_kind") != "unknown" and not moved_surface
+                and (not gui_claude or not native_target_available)):
             return live
         if pinned is None and not allow_unpinned:
             return live
@@ -7560,16 +7574,15 @@ class WatchDaemon:
                     or (live.get("agent_kind") == "claude"
                         and live.get("agent_pid") != pinned["process"]["pid"])):
                 return unknown
-        records = display_surface_records(tree, main_surface_records(tree))
         # Even after top recovers, retain the pinned native process and unique
         # surface/TTY join instead of falling back to second-resolution birth.
-        raw_recovered = (pinned is not None or moved_surface) and live.get("agent_kind") == "claude"
+        raw_recovered = gui_claude
         native = surface_process_label(display_process_labels(
             records, {} if raw_recovered else labels, {} if raw_recovered else top,
             agent_kind="claude"), target)
         proof = native.get("native_identity")
-        if moved_surface and (not proof or native.get("agent_kind") != "claude"
-                              or native.get("agent_pid") != live.get("agent_pid")):
+        if gui_claude and (not proof or native.get("agent_kind") != "claude"
+                          or native.get("agent_pid") != live.get("agent_pid")):
             return unknown
         if pinned is not None and (not proof or json.dumps(proof, sort_keys=True) != json.dumps(pinned, sort_keys=True)):
             return unknown
