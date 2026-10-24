@@ -1,0 +1,86 @@
+name: Native dev fd exit diagnostic v1
+
+on:
+  push:
+    paths:
+      - .github/workflows/native-dev-fd-diagnostic-v1.yml
+      - ci/native-dev-fd-diagnostic-v1/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-dev-fd-diagnostic-v1-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      RUST_MIN_STACK: "8388608"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - name: Reconstruct frozen v5 and verify the single diagnostic delta
+        run: |
+          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/native-dev-fd-target" >> "$GITHUB_ENV"
+          python3 -I -B ci/native-dev-fd-diagnostic-v1/prepare.py \
+            --output "$RUNNER_TEMP/native-dev-fd/source" \
+            --report "$GITHUB_WORKSPACE/dev-fd-evidence/reconstruction.json"
+      - name: Require capacity and Linux sandbox prerequisites
+        timeout-minutes: 8
+        run: |
+          python3 -I -B -c 'import os,shutil; free=shutil.disk_usage(os.environ["RUNNER_TEMP"]).free; print(f"Free GiB: {free/2**30:.1f}"); assert free>=25*2**30'
+          sudo timeout --kill-after=10s 180s apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update -y
+          sudo timeout --kill-after=10s 180s apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y --no-install-recommends build-essential pkg-config libcap-dev libasound2-dev bubblewrap
+          sudo sysctl -w kernel.unprivileged_userns_clone=1
+          if sudo sysctl -a 2>/dev/null | grep -q '^kernel.apparmor_restrict_unprivileged_userns'; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582
+        with:
+          toolchain: 1.95.0
+          components: rustfmt
+      - uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532
+        with:
+          tool: just@1.51.0,nextest@0.9.103
+      - name: Check preserved Rust formatting
+        working-directory: ${{ runner.temp }}/native-dev-fd/source/codex-rs
+        run: |
+          set -o pipefail
+          cargo fmt --all -- --config imports_granularity=Item --check \
+            2>&1 | tee "$GITHUB_WORKSPACE/dev-fd-evidence/rustfmt.log"
+      - name: Run the unchanged device and denial controls with exit diagnostics
+        working-directory: ${{ runner.temp }}/native-dev-fd/source/codex-rs
+        run: |
+          set -o pipefail
+          cargo build --locked -p codex-linux-sandbox --bin codex-linux-sandbox \
+            2>&1 | tee "$GITHUB_WORKSPACE/dev-fd-evidence/sandbox-helper.log"
+          export CARGO_BIN_EXE_codex_linux_sandbox="$CARGO_TARGET_DIR/debug/codex-linux-sandbox"
+          export TMPDIR="$RUNNER_TEMP/nativefulltesttmp"
+          mkdir -m 700 "$TMPDIR"
+          env -u CODEX_CA_CERTIFICATE -u SSL_CERT_FILE -u SSH_CLIENT -u SSH2_CLIENT \
+            just test --locked -p codex-linux-sandbox --lib \
+            -E 'test(denied_dev_) | test(denied_non_dev_directory_does_not_create_a_mount_target)' \
+            --success-output immediate --retries 0 \
+            2>&1 | tee "$GITHUB_WORKSPACE/dev-fd-evidence/device-tests.log"
+      - name: Upload exact diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: native-dev-fd-diagnostic-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            dev-fd-evidence/
+            ${{ runner.temp }}/native-dev-fd-target/nextest/local/junit.xml
+          if-no-files-found: warn
+          retention-days: 14
