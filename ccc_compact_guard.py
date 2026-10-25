@@ -309,6 +309,47 @@ def _generation(record):
     return record['pid'], tuple(record['birth'])
 
 
+def _historical_start_second(pid):
+    """Read a stable kernel start second when libproc cannot inspect a reused PID.
+
+    Coarse equality cannot retire a generation: the microsecond birth remains
+    required for it. Unavailable, malformed or changing observations stay unknown.
+    """
+    import calendar
+    import re
+    import subprocess
+
+    pattern = (r"\s*([0-9]+)\s+(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+"
+               r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+"
+               r"([0-9]{1,2})\s+([0-9]{2}):([0-9]{2}):([0-9]{2})\s+([0-9]{4})\s*")
+    months = dict(zip(('Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                       'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'), range(1, 13)))
+    observations = []
+    for _ in range(2):
+        try:
+            result = subprocess.run(
+                ['/bin/ps', '-p', str(pid), '-o', 'pid=,lstart='],
+                capture_output=True, text=True, timeout=1,
+                env={'LC_ALL': 'C', 'LANG': 'C', 'TZ': 'UTC'})
+            match = re.fullmatch(pattern, result.stdout)
+            if result.returncode != 0 or result.stderr.strip() or match is None:
+                return None
+            actual_pid, month, day, hour, minute, second, year = match.groups()
+            if int(actual_pid) != pid:
+                return None
+            # datetime validates all fields; UTC avoids DST/local-time ambiguity.
+            from datetime import datetime, timezone
+            value = datetime(int(year), months[month], int(day), int(hour),
+                             int(minute), int(second), tzinfo=timezone.utc)
+            epoch = calendar.timegm(value.utctimetuple())
+            if epoch <= 0 or epoch > time.time():
+                return None
+            observations.append(epoch)
+        except (OSError, ValueError, OverflowError, subprocess.SubprocessError):
+            return None
+    return observations[0] if observations[0] == observations[1] else None
+
+
 def _retired_generations(records):
     """A failed process query is not evidence that an old process has exited."""
     import ctypes
@@ -333,6 +374,10 @@ def _retired_generations(records):
                 continue
             first, second = birth(pid), birth(pid)
             if first is None or first != second:
+                if first is None and second is None:
+                    coarse = _historical_start_second(pid)
+                    if coarse is not None and coarse > previous[0]:
+                        continue
                 raise ValueError('historical process query uncertain')
             if tuple(first) == previous:
                 raise ValueError('historical process generation still live')
