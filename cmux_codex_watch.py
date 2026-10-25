@@ -7433,6 +7433,12 @@ class WatchDaemon:
         goal = self._current_blocked_goal(target)
         if not isinstance(goal, Mapping):
             return state
+        # A predecessor's Goal cannot relabel a current-session error card.
+        # An unknown native turn supplies no current-session agreement.
+        turn = self.codex_queue_recovery.current_turn(target)
+        if (not isinstance(turn, Mapping) or not isinstance(turn.get('session_id'), str)
+                or turn.get('session_id') != goal.get('session_id')):
+            return state
         evidence = goal.get('native_evidence')
         snapshot = evidence.get('snapshot') if isinstance(evidence, Mapping) else None
         error = goal.get('error')
@@ -15148,7 +15154,7 @@ class WatchDaemon:
 
         old = runtime.codex_goal_proof
         if (not target or runtime.delivery_status != 'unknown'
-                or runtime.codex_input_phase != 'goal_native_pending'
+                or runtime.codex_input_phase not in {'goal_native_pending', 'goal_native_acknowledged'}
                 or not isinstance(old, Mapping) or old.get('kind') != 'goal_blocked'
                 or not self._codex_terminal_tail_proven(turn)):
             return False

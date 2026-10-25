@@ -8,6 +8,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import threading
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
@@ -221,6 +222,52 @@ class NewSessionUnknownTests(unittest.TestCase):
                     self.assertEqual(record['send_attempt_id'], 'old-unknown-attempt')
                 finally:
                     store.close()
+
+
+class AcknowledgedNewSessionUnknownTests(NewSessionUnknownTests):
+    """An old Enter acknowledgement retains the same proof and preservation gates."""
+
+    def setUp(self):
+        super().setUp()
+        self.runtime.codex_input_phase = 'goal_native_acknowledged'
+
+
+class NativeGoalSessionAgreementTests(unittest.TestCase):
+    """A valid predecessor Goal cannot relabel another session's error."""
+
+    def setUp(self):
+        error = dict(message='We’re currently experiencing high demand, which may cause temporary errors.',
+                     codex_error_info='internal_server_error')
+        snapshot = dict(kind='task_complete', turn_id='goal-turn', error=error,
+                        signature=[10, 800, 11],
+                        terminal_tail=dict(offset=600, end=800, sha256='a' * 64))
+        goal = dict(session_id='goal-session', turn_id='goal-turn', error=error,
+                    proof_source='native_failed_eof_v1', native_evidence=dict(snapshot=snapshot))
+        self.daemon = object.__new__(core.WatchDaemon)
+        self.daemon._current_blocked_goal = Mock(return_value=goal)
+        self.daemon.codex_queue_recovery = Mock()
+        self.target = dict(surface_id='surface', workspace_id='workspace')
+        self.state = core.ScreenState('recoverable_error', error_type='rate_limit', message_kind='codex')
+        self.grid = SimpleNamespace(cursor=SimpleNamespace(row=0),
+                                    lines=['', 'Goal stalled (/goal resume)', '', ''])
+
+    def select(self, turn):
+        self.daemon.codex_queue_recovery.current_turn.return_value = turn
+        with patch.object(core, '_goal_boundary_signature', return_value=('valid-frame',)):
+            return self.daemon._native_goal_error_state(self.target, self.state, self.grid)
+
+    def test_unknown_turn_does_not_borrow_predecessor_session(self):
+        self.assertIs(self.select(dict(kind='unknown')), self.state)
+
+    def test_current_session_error_keeps_its_visible_classification(self):
+        self.assertIs(self.select(dict(session_id='current-session')), self.state)
+
+    def test_matching_session_preserves_valid_native_goal_classification(self):
+        selected = self.select(dict(session_id='goal-session'))
+        self.assertEqual(selected.kind, 'recoverable_error')
+        self.assertEqual(selected.error_type, 'high_demand')
+        self.assertTrue(selected.native_goal_stalled)
+        self.assertTrue(selected.requires_goal_proof)
 
 
 if __name__ == '__main__':
