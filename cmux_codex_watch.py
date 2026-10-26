@@ -5208,7 +5208,7 @@ class CmuxClient:
         with self.input_guard(before_paste):
             if self._control_rpc('surface.send_text', {
                 'workspace_id': workspace_id, 'surface_id': surface_id, 'text': '/goal resume',
-            }) is None:
+            }, timeout=self._input_timeout()) is None:
                 raise InputNotSentError('goal terminal input unavailable; input not sent')
         frames = []
         reads = 0
@@ -5234,7 +5234,7 @@ class CmuxClient:
                     # Draft reads must not consume the connected Enter guard's
                     # budget. The guard still rechecks the exact frame and live
                     # authorization on the admitted connection before writing.
-                    enter_deadline = time.monotonic() + 3.0
+                    enter_deadline = time.monotonic() + self.GUARDED_INPUT_TIMEOUT_SEC
                     final_checked = False
                     def final_frame(grid):
                         nonlocal final_checked
@@ -14969,7 +14969,7 @@ class WatchDaemon:
             try:
                 with base.input_guard(before_enter):
                     if base._control_rpc('surface.send_key', dict(
-                            workspace_id=wid, surface_id=sid, key='enter'), timeout=3.0) is None:
+                            workspace_id=wid, surface_id=sid, key='enter'), timeout=base._input_timeout()) is None:
                         raise UncertainDeliveryError('retained Goal Enter response unavailable')
                 recovery.update(status='enter_acknowledged', completed_at=time.time())
                 runtime.codex_input_phase = 'goal_native_acknowledged'
