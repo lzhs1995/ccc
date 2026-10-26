@@ -431,3 +431,11 @@ class ProviderRetryStore:
             self._save(connection, key, dict(count=0, failure_at=record['failure_at'], success_at=at, seen={}))
             # A successful session cannot cancel another session's cooldown.
             return True
+
+
+def effective_error_type(message, *, classifier=None, gates=None, client='', model=''):
+    """Local code first; only a gated UNKNOWN may use a cached JEV retry code."""
+    local = structured_error_type(message)
+    if local is not None or classifier is None or gates is None:
+        return local
+    return classifier.resolve(local, gates, client, model, message)
