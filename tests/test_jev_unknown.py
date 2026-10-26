@@ -4,7 +4,7 @@ import ccc_jev_unknown as jev
 from ccc_provider_retry import effective_error_type, ProviderRetryStore, RETRYABLE
 
 OK = jev.Gates(current_native_error=True, identity_bound=True, composer_empty=True)
-ANSWER = lambda choice, conf=0.95: {'answers': {'diagnosis': {'choice': choice, 'confidence': conf}}}
+ANSWER = lambda choice, conf=0.95: {'model': jev.MODEL, 'answers': {'diagnosis': {'type': 'choice', 'choice': choice, 'confidence': conf}}}
 
 
 class Fake:
@@ -19,14 +19,14 @@ class Fake:
 
 class JevUnknownTests(unittest.TestCase):
     def classify(self, text, reply, gates=OK):
-        c = jev.JevUnknownClassifier(Fake(reply), start=False)
+        c = jev.JevUnknownClassifier(Fake(reply), start=False, is_enabled=lambda: True)
         first = effective_error_type(text, classifier=c, gates=gates, client='codex', model='m')
         if not c.queue.empty():
             c.run_once()
         return first, effective_error_type(text, classifier=c, gates=gates, client='codex', model='m'), c
 
     def test_two_natural_language_unknowns_reach_retry_ledger(self):
-        for text, choice in (('the upstream model service is temporarily overloaded, try later', 'UPSTREAM_UNAVAILABLE'),
+        for text, choice in (('the upstream model service is temporarily overloaded, try later', 'UPSTREAM'),
                              ('you are sending requests too quickly; slow down please', 'RATE_LIMIT')):
             first, code, c = self.classify(text, ANSWER(choice))
             self.assertIsNone(first)
@@ -53,7 +53,7 @@ class JevUnknownTests(unittest.TestCase):
             self.assertEqual((first, code, c.calls), (None, None, 1))
 
     def test_cache_and_dedup(self):
-        c = jev.JevUnknownClassifier(Fake(ANSWER('RATE_LIMIT')), start=False)
+        c = jev.JevUnknownClassifier(Fake(ANSWER('RATE_LIMIT')), start=False, is_enabled=lambda: True)
         for _ in range(5):
             c.resolve(None, OK, 'codex', 'm', 'weird')
         self.assertEqual(c.queue.qsize(), 1)

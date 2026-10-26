@@ -60,6 +60,7 @@ from ccc_native_processes import (
 from ccc_scheduling import CoalescingWriter, SnapshotCache, SnapshotClient, SurfaceScheduler, TreeSnapshot
 from ccc_delivery import DeliveryStore
 from ccc_state_snapshot import AtomicJSONSnapshot
+import ccc_jev_unknown as _jev
 from ccc_provider_retry import (
     ProviderRetryStore, RETRYABLE as PROVIDER_RETRYABLE,
     BLOCKED as PROVIDER_BLOCKED, BLOCKED_REASONS as PROVIDER_BLOCKED_REASONS,
@@ -6435,6 +6436,7 @@ class WatchDaemon:
         self.codex_queue_recovery.guard_config_path = config_path
         from ccc_private_check import PrivateChecks
         self.private_checks = PrivateChecks(config_path, self.codex_queue_recovery.sessions_root)
+        self.jev_classifier = _jev.JevUnknownClassifier() if _jev.enabled() else None
         self.network = network_health.NetworkClient()
         if hook_settings_manager is not None:
             self.claude_hook_settings = hook_settings_manager
@@ -7418,6 +7420,21 @@ class WatchDaemon:
             self.save()
         return False
 
+    def _jev_unknown_code(self, goal, message):
+        """Cached JEV retry reason for an authenticated current native failure.
+
+        Only reached after _native_goal_error_state proved native_failed_eof_v1,
+        the terminal tail, same session/turn and a strict empty composer. The key
+        includes provider and turn, so a late answer for another turn is ignored.
+        The first poll only enqueues and returns None; this is never input authority.
+        """
+        classifier = getattr(self, 'jev_classifier', None)
+        if classifier is None:
+            return None
+        gates = _jev.Gates(current_native_error=True, identity_bound=True, composer_empty=True)
+        provider = '%s|%s' % (goal.get('model_provider') or '', goal.get('turn_id') or '')
+        return classifier.resolve(None, gates, 'codex', '', message, provider=provider)
+
     def _native_goal_error_state(self, target, state, grid):
         """Resolve a superseded provider card only from an authenticated Goal EOF.
 
@@ -7450,7 +7467,8 @@ class WatchDaemon:
                 or snapshot.get('turn_id') != goal.get('turn_id')
                 or snapshot.get('error') != goal.get('error')):
             return state
-        error_type = _match_error_block('■ ' + error['message'])
+        # Local rules stay final; only their UNKNOWN may read a gated, turn-keyed JEV cache.
+        error_type = _match_error_block('■ ' + error['message']) or self._jev_unknown_code(goal, error['message'])
         if not error_type or error_type in PROVIDER_BLOCKED:
             return state
         fingerprint = _short_hash(_stable_error_block(goal['error']['message']))
