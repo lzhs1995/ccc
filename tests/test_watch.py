@@ -158,9 +158,11 @@ def claude_grid_payload(
         {"id": 1, "foreground": "#FFFFFF", "background": "#1E1E1E", "faint": True},
     ]
     rows = max(16, len(lines) + 8)
-    composer_row = rows - 4
+    composer_row = rows - 5
     row_spans = [span(row, 0, text, 0) for row, text in enumerate(lines)]
+    row_spans.append(span(composer_row - 1, 0, "─" * columns, 0))
     row_spans.append(span(composer_row, 0, "❯", 0))
+    row_spans.append(span(composer_row + 1, 0, "─" * columns, 0))
     if composer == "busy":
         row_spans.append(span(composer_row, 2, "typed input", 0))
     elif composer == "placeholder":
@@ -180,8 +182,8 @@ def claude_grid_payload(
     if question:
         row_spans.append(span(chrome_row, 0, "Would you like to run this command?", 0))
     if ask_footer:
-        row_spans.append(span(composer_row + 1, 0, "✓ AskUserQuestion ×2", 0))
-    row_spans.append(span(rows - 2, 0, "  [Opus 5 (1M context)] │ ~/repo", 0))
+        row_spans.append(span(rows - 2, 0, "✓ AskUserQuestion ×2", 0))
+    row_spans.append(span(rows - 3, 0, "  [Opus 5 (1M context)] │ ~/repo", 0))
     row_spans.append(span(rows - 1, 0, "  ⏵⏵ bypass permissions on", 0))
     return {
         "render_grid": {
@@ -249,9 +251,11 @@ def claude_wrapped_composer_payload(
     the right edge.  Getting this wrong is not a cosmetic fixture detail: at
     ``columns=30`` a character-based split produced spans 60 cells wide.
 
-    ``rule_before_cursor`` draws Claude's ``────`` box rule between the prompt
-    and the cursor, i.e. a cursor that genuinely IS somewhere else.  That is the
-    negative half of the pair: it must stay ``unverified``.
+    Like the live UI, the composer is framed by identical full-width ``────``
+    borders directly above the ``❯`` row and directly below the last draft row.
+    ``rule_before_cursor`` parks the cursor below that bottom border, i.e. a
+    cursor that genuinely IS somewhere else.  That is the negative half of the
+    pair: it must stay ``unverified``.
     """
 
     body = list(lines or ["previous output"])
@@ -263,14 +267,16 @@ def claude_wrapped_composer_payload(
         {"id": 1, "foreground": "#FFFFFF", "background": "#1E1E1E", "faint": True},
     ]
     prompt_row = len(body) + 1
+    border = "─" * columns
     row_spans = [span(row, 0, item, 0, display_width(item)) for row, item in enumerate(body)]
+    row_spans.append(span(prompt_row - 1, 0, border, 0, columns))
     row_spans.append(span(prompt_row, 0, "❯", 0, 1))
     for offset, chunk in enumerate(chunks):
         row_spans.append(span(prompt_row + offset, 2, chunk, 0, display_width(chunk)))
     last_row = prompt_row + len(chunks) - 1
     cursor_row = last_row
+    row_spans.append(span(last_row + 1, 0, border, 0, columns))
     if rule_before_cursor:
-        row_spans.append(span(last_row + 1, 0, "─" * columns, 0, columns))
         cursor_row = last_row + 2
     rows = cursor_row + 4
     footer = "  [Opus 5 (1M context)] │ ~/repo"
@@ -970,7 +976,7 @@ class WatchTests(unittest.TestCase):
 
             daemon.process_once(client)
 
-            self.assertEqual(client.top_calls, ["workspace-uuid"])
+            self.assertEqual(client.top_calls, ["workspace-uuid", "workspace-uuid"])
             self.assertEqual(len(client.sent), 1)
             self.assertNotEqual(daemon.runtime["surface-uuid"].state, "claude_observed")
 
@@ -2567,11 +2573,17 @@ class WatchTests(unittest.TestCase):
             daemon.process_once(client)
             self.assertEqual(set(daemon.dynamic_targets), {"codex-a"})
             self.assertEqual(client.sent, [("workspace-uuid", "codex-a", "任务请继续")])
+            runtime = daemon.runtime["codex-a"]
+            delivery_revision = runtime.delivery_revision
+            send_attempt_id = runtime.send_attempt_id
 
             client.top_data = {"windows": []}
             daemon.process_once(client)
             self.assertEqual(daemon.dynamic_targets, {})
-            self.assertNotIn("codex-a", daemon.runtime)
+            self.assertIs(daemon.runtime["codex-a"], runtime)
+            self.assertEqual(runtime.delivery_revision, delivery_revision)
+            self.assertEqual(runtime.send_attempt_id, send_attempt_id)
+            self.assertEqual(client.sent, [("workspace-uuid", "codex-a", "任务请继续")])
 
     def test_failed_workspace_discovery_keeps_last_known_targets(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2870,11 +2882,23 @@ class WatchTests(unittest.TestCase):
                 top=process_fixture(("surface-uuid", "claude")),
             )
             daemon = self._claude_armed_daemon(directory, client)
+            runtime = daemon.runtime.setdefault("surface-uuid", TargetRuntime(
+                claude_process_pid=1234, claude_process_generation="fixture-birth-1234",
+                claude_session_id="session-uuid"))
             event = claude_hook_event("failure-1", "StopFailure", error_kind="claude_503")
+            event.update(agent_pid=1234, process_generation="fixture-birth-1234")
             daemon._handle_claude_event(event, client)
             daemon._handle_claude_event(event, client)
-            self.assertEqual([item[2] for item in client.sent], [CLAUDE_MESSAGE])
+            self.assertEqual(client.sent, [])
             runtime = daemon.runtime["surface-uuid"]
+            target = daemon.config['targets'][0]
+            with mock.patch.object(core.time, 'time',
+                    return_value=runtime.claude_provider_guard['retry_after'] + 1):
+                daemon._maybe_send_deferred_claude_stop(
+                    target, runtime, core.ScreenState('claude_stopped', message_kind='claude'), client)
+                daemon._maybe_send_deferred_claude_stop(
+                    target, runtime, core.ScreenState('claude_stopped', message_kind='claude'), client)
+            self.assertEqual([item[2] for item in client.sent], [CLAUDE_MESSAGE])
             self.assertEqual(runtime.claude_last_event_status, "sent")
             self.assertEqual(runtime.claude_last_resume_event_id, "failure-1")
 
@@ -3019,8 +3043,8 @@ class WatchTests(unittest.TestCase):
             ))
             self.assertEqual(client.sent, [])
 
-    def test_hook_gap_fallback_retries_same_fingerprint_after_unconfirmed_send(self):
-        """A timeout must not permanently suppress the unchanged stopped frame."""
+    def test_hook_gap_fallback_preserves_legacy_unconfirmed_send(self):
+        """A legacy timeout is not proof the original prompt was never queued."""
         with tempfile.TemporaryDirectory() as directory, mock.patch(
             "cmux_codex_watch.CLAUDE_EVENT_PREFLIGHT_SETTLE_SEC", 0
         ):
@@ -3050,13 +3074,16 @@ class WatchTests(unittest.TestCase):
             self.assertFalse(daemon._maybe_send_claude_hook_gap_fallback(
                 daemon.config["targets"][0], runtime, state, observation, client,
             ))
-            self.assertTrue(daemon._maybe_send_claude_hook_gap_fallback(
+            self.assertFalse(daemon._maybe_send_claude_hook_gap_fallback(
                 daemon.config["targets"][0], runtime, state, observation, client,
             ))
-            self.assertEqual(len(client.sent), 1)
+            self.assertEqual(client.sent, [])
+            self.assertTrue(runtime.claude_fallback_episode_id)
+            self.assertEqual(runtime.claude_fallback_episode_generation, "generation-a")
+            self.assertEqual(runtime.claude_fallback_episode_session_id, "session-uuid")
 
-    def test_hook_gap_fallback_uses_unique_bounded_retries_and_then_stops(self):
-        """An unconfirmed synthetic rescue cannot become an infinite prompt loop."""
+    def test_hook_gap_fallback_never_repastes_unconfirmed_send_after_restart(self):
+        """Elapsed time and restart cannot turn missing consumption into a retry."""
         with tempfile.TemporaryDirectory() as directory, mock.patch(
             "cmux_codex_watch.CLAUDE_EVENT_PREFLIGHT_SETTLE_SEC", 0
         ):
@@ -3080,40 +3107,39 @@ class WatchTests(unittest.TestCase):
                 content_fingerprint="content-a", screen_signature="screen-a",
             )
 
-            # Initial rescue plus exactly three confirmation-timeout retries.
+            # One rescue; repeated timeouts keep exactly that original event.
             self.assertFalse(daemon._maybe_send_claude_hook_gap_fallback(
                 daemon.config["targets"][0], runtime, state, observation, client,
             ))
             self.assertTrue(daemon._maybe_send_claude_hook_gap_fallback(
                 daemon.config["targets"][0], runtime, state, observation, client,
             ))
-            for expected_retry in range(1, 4):
+            original_event = runtime.claude_fallback_last_event_id
+            original_episode = runtime.claude_fallback_episode_id
+            for elapsed in (121.0, 1000.0, 86400.0):
                 daemon._clear_claude_submit(runtime, reason="confirmation_timeout")
-                runtime.claude_fallback_sent_at = time.time() - 121.0
-                self.assertFalse(daemon._maybe_send_claude_hook_gap_fallback(
-                    daemon.config["targets"][0], runtime, state, observation, client,
-                ))
-                self.assertTrue(daemon._maybe_send_claude_hook_gap_fallback(
-                    daemon.config["targets"][0], runtime, state, observation, client,
-                ))
-                self.assertEqual(runtime.claude_fallback_retry_count, expected_retry)
+                runtime.claude_fallback_sent_at = time.time() - elapsed
+                daemon.save()
+                daemon = WatchDaemon(daemon.config_path, daemon.state_path, client=client)
+                daemon._check_claude_hook_settings(force=True)
+                runtime = daemon.runtime["surface-uuid"]
+                for _ in range(3):
+                    self.assertFalse(daemon._maybe_send_claude_hook_gap_fallback(
+                        daemon.config["targets"][0], runtime, state, observation, client,
+                    ))
+                self.assertEqual(runtime.claude_fallback_last_event_id, original_event)
+                self.assertEqual(runtime.claude_fallback_episode_id, original_episode)
+                self.assertEqual(runtime.claude_fallback_retry_count, 0)
 
-            daemon._clear_claude_submit(runtime, reason="confirmation_timeout")
-            runtime.claude_fallback_sent_at = time.time() - 121.0
-            self.assertTrue(daemon._maybe_send_claude_hook_gap_fallback(
-                daemon.config["targets"][0], runtime, state, observation, client,
-            ))
-            self.assertTrue(runtime.claude_fallback_retry_exhausted)
-            self.assertEqual(runtime.state, "claude_hook_gap_exhausted")
-            self.assertEqual(len(client.sent), 4)
+            self.assertEqual(len(client.sent), 1)
             sent_rows = [
                 row for row in daemon.claude_event_ledger.events.values()
                 if row.get("surface_id") == "surface-uuid" and row.get("status") == "sent"
             ]
-            self.assertEqual(len(sent_rows), 4)
+            self.assertEqual(len(sent_rows), 1)
 
-    def test_hook_gap_retry_budget_survives_upstream_fingerprint_change(self):
-        """Retry chrome changes are not a new lifecycle episode."""
+    def test_hook_gap_unconfirmed_send_survives_upstream_fingerprint_change(self):
+        """Retry chrome changes cannot authorize a second prompt."""
         with tempfile.TemporaryDirectory() as directory, mock.patch(
             "cmux_codex_watch.CLAUDE_EVENT_PREFLIGHT_SETTLE_SEC", 0
         ):
@@ -3151,11 +3177,11 @@ class WatchTests(unittest.TestCase):
             self.assertFalse(daemon._maybe_send_claude_hook_gap_fallback(
                 daemon.config["targets"][0], runtime, changed_state, observation, client,
             ))
-            self.assertTrue(daemon._maybe_send_claude_hook_gap_fallback(
+            self.assertFalse(daemon._maybe_send_claude_hook_gap_fallback(
                 daemon.config["targets"][0], runtime, changed_state, observation, client,
             ))
-            self.assertEqual(runtime.claude_fallback_retry_count, 1)
-            self.assertEqual(len(client.sent), 2)
+            self.assertEqual(runtime.claude_fallback_retry_count, 0)
+            self.assertEqual(len(client.sent), 1)
             self.assertNotEqual(
                 daemon.claude_event_ledger.status_of(runtime.claude_fallback_last_event_id),
                 "",
@@ -3403,7 +3429,7 @@ class WatchTests(unittest.TestCase):
         payload = claude_grid_payload(lines=["let me confirm nothing actually changed."], completed=True)
         composer_row = payload["render_grid"]["cursor"]["row"]
         payload["render_grid"]["row_spans"].append(span(
-            composer_row + 1,
+            composer_row + 3,
             0,
             "✓ general-purpose [opus-5]: Trace RUC design artifacts and protot... (21m 45s)",
             0,
@@ -3605,11 +3631,6 @@ class WatchTests(unittest.TestCase):
             ],
             completed="✻ Cogitated for 2m 37s",
         )
-        composer_row = payload["render_grid"]["cursor"]["row"]
-        payload["render_grid"]["row_spans"].extend([
-            span(composer_row - 1, 0, "─" * 40, 0),
-            span(composer_row + 1, 0, "─" * 40, 0),
-        ])
         state = classify_claude_grid(Grid.from_rpc(payload, "s"))
         self.assertEqual(state.kind, "claude_completed")
         with tempfile.TemporaryDirectory() as directory:
@@ -3785,13 +3806,23 @@ class WatchTests(unittest.TestCase):
                 top=process_fixture(("surface-uuid", "claude")),
             )
             daemon = self._claude_armed_daemon(directory, client)
+            runtime = daemon.runtime.setdefault("surface-uuid", TargetRuntime(
+                claude_process_pid=1234, claude_process_generation="fixture-birth-1234",
+                claude_session_id="session-uuid"))
             daemon.process_once(client)
             self.assertEqual(client.sent, [])
             with mock.patch("cmux_codex_watch.CLAUDE_EVENT_PREFLIGHT_SETTLE_SEC", 0):
-                daemon._handle_claude_event(
-                    claude_hook_event("stream-1", "StopFailure", error_kind="claude_stream"),
-                    client,
-                )
+                event = claude_hook_event("stream-1", "StopFailure", error_kind="claude_stream")
+                event.update(agent_pid=1234, process_generation="fixture-birth-1234")
+                daemon._handle_claude_event(event, client)
+                self.assertEqual(client.sent, [])
+                runtime = daemon.runtime['surface-uuid']
+                with mock.patch.object(core.time, 'time',
+                        return_value=runtime.claude_provider_guard['retry_after'] + 1):
+                    daemon._maybe_send_deferred_claude_stop(
+                        daemon.config['targets'][0], runtime,
+                        core.ScreenState('recoverable_error', error_type='claude_stream',
+                                         message_kind='claude'), client)
             self.assertEqual(len(client.sent), 1)
             self.assertEqual(client.sent[0][2], CLAUDE_MESSAGE)
             self.assertEqual(daemon.runtime["surface-uuid"].error_type, "claude_stream")
@@ -4042,13 +4073,7 @@ class WatchTests(unittest.TestCase):
             state = daemon._apply_claude_runtime_guards(
                 "surface-uuid",
                 runtime,
-                type("State", (), {
-                    "message_kind": None,
-                    "error_type": None,
-                    "kind": "incompatible",
-                    "screen_signature": None,
-                    "content_fingerprint": None,
-                })(),
+                ScreenState("incompatible"),
             )
             self.assertEqual(state.kind, "claude_hook_legacy")
             self.assertFalse(daemon.config["targets"][0].get("paused", False))
@@ -6164,10 +6189,13 @@ class ClaudeEpisodeLedgerInvariantTests(unittest.TestCase):
             ))
             first_event = runtime.claude_fallback_last_event_id
             first_episode = runtime.claude_fallback_episode_id
-            daemon._clear_claude_submit(runtime, reason="hook_confirmed")
-            daemon._clear_claude_fallback_episode(runtime)
-            runtime.claude_last_event_status = "human_prompt"
-            runtime.claude_last_hook_at = time.time()
+            daemon._handle_claude_event(claude_hook_event(
+                "new-user-task", "UserPromptSubmit", prompt_kind="human",
+            ), client)
+            self.assertEqual(runtime.claude_last_event_status, "human_prompt")
+            self.assertEqual(runtime.claude_submit_phase, "none")
+            self.assertIsNone(runtime.claude_fallback_episode_id)
+            self.assertEqual(daemon.claude_event_ledger.status_of(first_event), "sent")
             self.assertFalse(daemon._maybe_send_claude_hook_gap_fallback(
                 daemon.config["targets"][0], runtime, stopped, observation, client,
             ))
@@ -7071,7 +7099,10 @@ class WrappedComposerClassificationTests(unittest.TestCase):
             row_spans.append(
                 span(prompt_row + offset, 2, chunk, 0, display_width(chunk)),
             )
-        # Row 66 carries no span at all: blank padding inside the composer box.
+        # Row 66 carries no span at all: blank padding inside the composer box,
+        # whose live borders sit directly above the ❯ row and below the pad.
+        row_spans.append(span(prompt_row - 1, 0, "─" * columns, 0, columns))
+        row_spans.append(span(67, 0, "─" * columns, 0, columns))
         row_spans.append(span(rows - 2, 0, "  [Opus 5 (1M context)] │ ~/repo", 0))
         row_spans.append(span(rows - 1, 0, "  ⏵⏵ bypass permissions on", 0))
         payload = {
@@ -7176,6 +7207,9 @@ class BlankFirstRowComposerTests(unittest.TestCase):
             span(row, 0, item, 0, display_width(item))
             for row, item in enumerate(body)
         ]
+        # Live borders: one directly above ❯, the identical one below the
+        # draft (or directly below ❯ when the text is outside the box).
+        row_spans.append(span(prompt_row - 1, 0, "─" * columns, 0, columns))
         row_spans.append(span(prompt_row, 0, "❯", 0, 1))
         next_row = prompt_row + 1
         if rule_after_prompt:
@@ -7186,6 +7220,8 @@ class BlankFirstRowComposerTests(unittest.TestCase):
                 span(next_row + offset, 2, chunk, style_id, display_width(chunk)),
             )
         last_text_row = next_row + len(text_rows) - 1 if text_rows else prompt_row
+        if not rule_after_prompt:
+            row_spans.append(span(last_text_row + 1, 0, "─" * columns, 0, columns))
         cursor_row = prompt_row if cursor_on_prompt else last_text_row
         rows = max(cursor_row, last_text_row) + 4
         styles = [
@@ -7249,12 +7285,12 @@ class BlankFirstRowComposerTests(unittest.TestCase):
         ))
         self.assertEqual(kind, "unverified")
 
-    def test_cursor_on_prompt_row_scans_no_continuation(self):
-        # 光标停在 ❯ 行时续行区间为空：空 composer 的历史行为逐字节不变。
+    def test_cursor_on_prompt_row_still_protects_text_below_cursor(self):
+        # 光标可以移到正文前；完整输入区内光标以下的真实文字仍是草稿。
         grid, kind, _ = self._state(self._payload(
-            ["光标行以下的文字不参与判定"], cursor_on_prompt=True,
+            ["光标行以下的文字仍须保护"], cursor_on_prompt=True,
         ))
-        self.assertEqual(kind, "empty")
+        self.assertEqual(kind, "busy")
 
     def test_the_new_busy_shape_never_becomes_send_eligible(self):
         self.assertNotIn("composer_busy", core.SEND_ELIGIBLE_STATES)

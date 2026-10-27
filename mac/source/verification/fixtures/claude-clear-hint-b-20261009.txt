@@ -1,0 +1,16 @@
+● Synthetic report: old status examples below are historical.
+  • Compacting context
+  • Reconnecting...
+
+✻ Baked for 14m 1s
+
+※ recap: Synthetic completed report; no live delivery claim.
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  [claude-model[1M]] │ example/project git:(main) │ ⏱️  99h 44m       new task? /clear to save 170.9k tokens
+  上下文 ██░░░░░░░░ 17%
+  1 CLAUDE.md | 9 MCPs | 7 钩子
+  ✓ Bash ×13 | ✓ Edit ×5 | ✓ Write ×2
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents

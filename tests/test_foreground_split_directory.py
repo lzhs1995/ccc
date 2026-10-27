@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import ccc_client_thread_observation as binding
 import cmux_supervisor_tui as tui
-import test_client_thread_observation as fixtures
+from tests import test_client_thread_observation as fixtures
 
 
 class SplitDirectoryTests(unittest.TestCase):

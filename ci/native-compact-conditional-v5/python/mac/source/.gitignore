@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.backup*
+*.bak*
+.DS_Store
+.venv/
+handoff/
+dist/
+*.log
+.env*
+local-policy.json

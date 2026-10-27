@@ -74,8 +74,26 @@ def private_wrapper(source, destination, plan_path):
     # Save the freshly generated cmux base before user settings are merged.
     # The final handoff reconstructs the expected merge from these bytes and
     # the original inputs, rather than trusting the resulting argv alone.
-    anchor = '    CMUX_SETTINGS_PATH="$CMUX_SETTINGS_BASE_PATH"\n'
-    if text.count(anchor) != 1:
+    # cmux 0.65.2 has two base assignments: the merge path (user settings
+    # present, 8-space body of the inner if) and a durable fallback (no merge
+    # input, 4-space elif body). Only the merge path's base is later merged,
+    # so only it needs the snapshot; the fallback is already final and the
+    # handoff compares it against the original inputs instead.
+    # Match whole lines: the 4-space form is a substring of the 8-space one,
+    # so a substring count cannot tell the two branches apart.
+    assignment = 'CMUX_SETTINGS_PATH="$CMUX_SETTINGS_BASE_PATH"'
+    merge_anchor = '        ' + assignment + '\n'
+    final_anchor = '    ' + assignment + '\n'
+    lines = [row + '\n' for row in text.split('\n')[:-1]] + [text.split('\n')[-1]]
+    merge_rows = [row for row in lines if row == merge_anchor]
+    final_rows = [row for row in lines if row == final_anchor]
+    if len(merge_rows) == 1 and len(final_rows) <= 1:
+        anchor = merge_anchor
+    elif not merge_rows and len(final_rows) == 1 and managed_mcp_contract(source) == 'json_token':
+        # The pinned legacy wrapper has only the four-space merge branch.
+        anchor = final_anchor
+    else:
+        # Ambiguous or missing anchors are rejected, never relaxed.
         raise ValueError('unrecognized cmux settings base boundary')
     snapshot = ' '.join(shlex.quote(str(x)) for x in
         (sys.executable, '-B', Path(__file__).resolve(), '_capture_base', '--plan', plan_path))
@@ -108,6 +126,30 @@ def binary_pin(path):
         raise ValueError('executable pathname changed during read')
     return dict(path=str(path), resolved=str(resolved), path_identity=link,
                 identity=capture_tool.file_identity(info), sha256=digest.hexdigest())
+
+
+def managed_mcp_contract(wrapper):
+    text = Path(wrapper).read_text()
+    if text.count('    export CMUX_CUA_SOCKET_AUTH_TOKEN="$auth_token"\n') == 1:
+        if '"CMUX_CUA_SOCKET_AUTH_TOKEN":' in text:
+            raise ValueError('ambiguous cmux MCP credential contract')
+        return 'environment_token'
+    if '"CMUX_CUA_SOCKET_AUTH_TOKEN":' in text:
+        return 'json_token'
+    raise ValueError('unrecognized cmux MCP credential contract')
+
+
+def managed_mcp_client(wrapper, env, contract):
+    if contract == 'json_token':
+        return Path(wrapper).parent.parent / 'bin/cmux-cua'
+    selected = env.get('CMUX_CUA_CLIENT_PATH')
+    if not selected:
+        scope = env.get('CMUX_CUA_RUNTIME_SCOPE') or env.get('CMUX_TAG') or 'default'
+        selected = (env['HOME'] + '/Library/Application Support/cmux/cmux-cua/helper/'
+                    + scope + '/cmux Computer Use.app/Contents/MacOS/cmux-cua')
+    if not Path(selected).is_absolute():
+        raise ValueError('cmux MCP client path must be absolute')
+    return Path(selected)
 
 
 def verify_capture(record):
@@ -230,14 +272,24 @@ def prepare(record, directory, wrapper, observer, observations):
     claim_identity = hashlib.sha256(json.dumps(record['expected'], sort_keys=True).encode()).hexdigest()
     dependencies = [binary_pin(p) for p in (Path(__file__).resolve(),
         capture_tool.__file__, ROOT / 'ccc_claude_launcher.py', sys.executable)]
-    bundled = Path(wrapper).absolute().parent.parent.parent / 'Resources' / 'bin'
+    bundled = Path(wrapper).absolute().parent
     for name in ('cmux', 'cmux-cua'):
         if (bundled / name).exists():
             dependencies.append(binary_pin(bundled / name))
+    contract = managed_mcp_contract(wrapper_pin['path'])
+    if contract == 'environment_token':
+        policy = bundled.parent / 'cmux-cua/client-policy.sh'
+        client = managed_mcp_client(wrapper_pin['path'], env, contract)
+        for path in (policy, client):
+            if path.exists():
+                dependencies.append(binary_pin(path))
+            elif record['inputs']['process_bound_mcp']:
+                raise ValueError('original managed MCP dependency unavailable')
     plan = dict(version=1, state='prepared_not_launched', expected=record['expected'],
         original_process=record['original_process'], original_inputs=record['inputs'],
         cwd=record['original_process']['cwd'], argv=[adapted['path'], *args],
         environment=env, pins=[executable, wrapper_pin, observer_pin, adapted, *dependencies], generated_inputs=files,
+        managed_mcp_contract=contract,
         session=session, plan_path=str(directory / 'resume.json'),
         claim_path=str(claim_root / (claim_identity + '.json')),
         removed_wrapper_keys=sorted(removed), observed_api_key=None,
@@ -436,14 +488,30 @@ def ordinary_arguments(argv):
     return output
 
 
-def expected_managed_mcp(plan, snapshots):
+def expected_managed_mcp(plan, snapshots, launch_env):
     """Rebuild the pinned wrapper's exact managed server from launch inputs."""
     env = plan['environment']
-    client = Path(plan['pins'][1]['path']).parent.parent.parent / 'Resources/bin/cmux-cua'
+    contract = plan.get('managed_mcp_contract', 'json_token')
+    client = managed_mcp_client(plan['pins'][1]['path'], env, contract)
     pin = binary_pin(client)
     if pin not in plan['pins'] or not os.access(client, os.X_OK):
         raise ValueError('cmux MCP executable is not the pinned bundled client')
     snapshots.append(pin)
+    if contract == 'environment_token':
+        policy = Path(plan['pins'][1]['path']).parent.parent / 'cmux-cua/client-policy.sh'
+        policy_pin = binary_pin(policy)
+        if policy_pin not in plan['pins']:
+            raise ValueError('cmux MCP client policy is not pinned')
+        snapshots.append(policy_pin)
+        # Match the bundled policy's trust check after canonicalization.
+        for parent in Path(pin['resolved']).parents:
+            info = parent.stat()
+            if info.st_uid not in (0, os.getuid()) or info.st_mode & 0o022:
+                raise ValueError('unsafe cmux MCP client ancestor')
+        keys = ('CMUX_CUA_CLIENT_PATH', 'CMUX_CUA_AUTH_TOKEN_FILE',
+                'CMUX_CUA_RUNTIME_SCOPE', 'CMUX_TAG', 'CMUX_CUA_SOCKET_PATH', 'CMUX_CUA_STATE_DIR')
+        if any(launch_env.get(key) != env.get(key) for key in keys):
+            raise ValueError('wrapper changed original cmux MCP environment')
     token = ''
     token_path = env.get('CMUX_CUA_AUTH_TOKEN_FILE', '')
     if token_path and Path(token_path).is_absolute():
@@ -457,12 +525,15 @@ def expected_managed_mcp(plan, snapshots):
     token = token or env.get('CMUX_CUA_SOCKET_AUTH_TOKEN', '')
     if not token:
         raise ValueError('cmux MCP credential unavailable')
+    if contract == 'environment_token' and launch_env.get('CMUX_CUA_SOCKET_AUTH_TOKEN') != token:
+        raise ValueError('cmux MCP inherited credential changed')
     scope = env.get('CMUX_CUA_RUNTIME_SCOPE') or env.get('CMUX_TAG') or 'default'
     scope = re.sub(rb'[^A-Za-z0-9_.-]', b'-', scope.encode()).decode().strip('.-')[:64] or 'default'
     state_dir = env.get('CMUX_CUA_STATE_DIR') or (
         env['HOME'] + '/Library/Application Support/cmux/cmux-cua/runtime/' + scope + '/state')
     socket_path = env.get('CMUX_CUA_SOCKET_PATH') or f'/tmp/cmux-cua-{os.getuid()}/{scope}/cmux-cua.sock'
-    return dict(command=str(client), args=['mcp', '--socket', socket_path], env={
+    server = dict(command=pin['resolved'] if contract == 'environment_token' else str(client),
+        args=['mcp', '--socket', socket_path], env={
         'CMUX_CUA_MCP_FORCE_PROXY': '1', 'CMUX_CUA_EXTERNAL_PERMISSION_FLOW': '1',
         'CMUX_CUA_SOCKET_AUTH_TOKEN': token,
         'CMUX_CUA_DEFAULT_SESSION': 'cmux-' + env['CMUX_SURFACE_ID'],
@@ -472,6 +543,9 @@ def expected_managed_mcp(plan, snapshots):
         'CMUX_CUA_CURSOR_BLOOM': '#2d8cff', 'CMUX_CUA_CURSOR_LABEL': 'cmux',
         'CMUX_CUA_STATE_DIR': state_dir, 'NODE_OPTIONS': '', 'BUN_OPTIONS': '',
     })
+    if contract == 'environment_token':
+        del server['env']['CMUX_CUA_SOCKET_AUTH_TOKEN']
+    return server
 
 
 def validate_final_inputs(plan, argv, env):
@@ -509,7 +583,7 @@ def validate_final_inputs(plan, argv, env):
         if set(added) != {'mcpServers'} or set(added['mcpServers']) != {'cmux-cua'}:
             raise ValueError('wrapper added an unrecognized MCP server')
         server = added['mcpServers']['cmux-cua']
-        if not json_equal(server, expected_managed_mcp(plan, snapshots)):
+        if not json_equal(server, expected_managed_mcp(plan, snapshots, env)):
             raise ValueError('new cmux MCP changed its command, route, credential or process binding')
     elif plan['original_inputs']['process_bound_mcp']:
         raise ValueError('wrapper lost the original managed MCP')

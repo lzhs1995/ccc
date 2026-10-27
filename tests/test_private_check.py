@@ -73,6 +73,7 @@ class CheckFixture:
 
     def read_turn(self, target=None):
         return {"session_id": self.session, "pid": 123, "process_start": self.first_start - 1,
+                "model_provider": "test-provider",
                 **(native.task_snapshot(self.path, self.session) or {"kind": "unknown"})}
 
     def select(self):
@@ -288,12 +289,16 @@ class PrivateCheckProofTests(CheckFixture, unittest.TestCase):
         self.append_turn("next", self.first_start + 5)
         self.assertIsNone(self.select())
 
-    def test_proven_unsent_attempt_can_be_retried_but_both_receipts_remain(self):
+    def test_proven_unsent_attempt_requires_explicit_same_attempt_retry(self):
         proof = self.select()
         self.checks.reserve(proof, "deferred")
         self.checks.finish(proof, "deferred", "not_sent")
-        self.checks.reserve(proof, "retry")
-        self.assertEqual(set(self.checks._ledger(self.target)), {"deferred", "retry"})
+        with self.assertRaises(RuntimeError):
+            self.checks.reserve(proof, "retry")
+        with self.assertRaises(RuntimeError):
+            self.checks.reserve(proof, "deferred")
+        self.checks.reserve(proof, "deferred", reuse=True)
+        self.assertEqual(set(self.checks._ledger(self.target)), {"deferred"})
 
 
 class PrivateCheckDeliveryTests(CheckFixture, unittest.TestCase):
@@ -311,6 +316,8 @@ class PrivateCheckDeliveryTests(CheckFixture, unittest.TestCase):
         self.runtime = core.TargetRuntime()
         self.daemon.runtime[self.sid] = self.runtime
         self.state = core.classify_grid(core.Grid.from_rpc(frame, self.sid))
+        from tests.native_goal_fixture import install as bind_native_goal
+        bind_native_goal(self, self.read_turn())
 
     def send(self):
         self.daemon._handle_state(self.target, self.runtime, self.state, self.client,
@@ -519,7 +526,7 @@ class PrivateCheckDeliveryTests(CheckFixture, unittest.TestCase):
             lambda: (self.job_path.parent / "access.json").write_text("{}"))
 
     def queue_frame(self, message, *, draft=False):
-        lines = [] if draft else ["Messages to be submitted", "↳ " + message, "⌥↑ edit last queued message"]
+        lines = [] if draft else ["• Messages to be submitted", "↳ " + message, "⌥↑ edit last queued message"]
         frame = grid_payload(lines)
         grid = frame["render_grid"]
         grid["surface_id"] = self.sid

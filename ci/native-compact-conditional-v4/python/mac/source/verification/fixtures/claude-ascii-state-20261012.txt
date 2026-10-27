@@ -1,0 +1,11 @@
+─────────────────────────────────────────────────────────────────────────────────
+❯ 
+─────────────────────────────────────────────────────────────────────────────────
+  [Opus 5]
+  tasks/07_Paper-workbench git:(ops/local-paper-route-c-20260813*...
+  ⏱️  186h 13m
+  上下文 ██░░░░ 26%
+  1 CLAUDE.md | 9 MCPs | 7 钩子
+  ✓ Bash ×20
+  ✓ Explore: Find callback reconcile path (3m 16s)
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents

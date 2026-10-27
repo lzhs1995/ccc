@@ -1,0 +1,234 @@
+name: Native compact macOS arm64 candidate
+
+on:
+  push:
+    branches:
+      - fix/ccc-live-recovery-20261011-6054
+    paths:
+      - .github/workflows/native-compact-macos-candidate.yml
+      - ci/native-compact-v2/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
+      CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: "off"
+      PYTHONDONTWRITEBYTECODE: "1"
+      RUST_MIN_STACK: "8388608"
+      STABLE_GIT_COMMIT: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - name: Require a standard hosted arm64 macOS runner
+        run: |
+          python3 -I -B - <<'PY'
+          import json, os, platform, shutil, subprocess
+          from pathlib import Path
+          evidence = Path("compact-macos-evidence")
+          evidence.mkdir()
+          runner = {
+              "runner_label": "macos-15",
+              "runner_arch": os.environ.get("RUNNER_ARCH"),
+              "machine": platform.machine(),
+              "system": platform.system(),
+              "os_version": platform.mac_ver()[0],
+              "logical_cpus": os.cpu_count(),
+              "memory_bytes": int(subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True)),
+              "free_disk_bytes": shutil.disk_usage(os.environ["RUNNER_TEMP"]).free,
+              "image_version": os.environ.get("ImageVersion"),
+          }
+          (evidence / "runner.json").write_text(json.dumps(runner, indent=2) + "\n")
+          print(json.dumps(runner, indent=2))
+          assert runner["system"] == "Darwin" and runner["machine"] == "arm64"
+          assert runner["runner_arch"] == "ARM64"
+          assert runner["free_disk_bytes"] >= 20 * 2**30
+          with open(os.environ["GITHUB_ENV"], "a") as output:
+              output.write(f'CARGO_TARGET_DIR={os.environ["RUNNER_TEMP"]}/native-compact-macos-target\n')
+          PY
+
+      - name: Reconstruct and verify the exact formatted candidate
+        run: |
+          python3 -I -B ci/native-compact-v2/prepare.py \
+            --output "$RUNNER_TEMP/native-compact-macos/source" \
+            --report "$GITHUB_WORKSPACE/compact-macos-evidence/reconstruction.json"
+          python3 -I -B - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          report = json.loads(Path("compact-macos-evidence/reconstruction.json").read_text())
+          assert report["candidate_tree_sha256"] == "6a0540b9d82e9c947192a3bf675467af87562c35b047ce54c0767c2d4aec3d35"
+          assert report["pinned_files"]["compact-native-timeout.patch"] == "adc40c21d4326cd8ff0067e609cfcfa7f1f342c6d514b92719a4095eca80f03a"
+          toolchain = Path(os.environ["RUNNER_TEMP"]) / "native-compact-macos/source/codex-rs/rust-toolchain.toml"
+          assert hashlib.sha256(toolchain.read_bytes()).hexdigest() == "570656042681cfd8795403a455baf9a33035331a07db0645e866bbcea89a3d64"
+          PY
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582
+        with:
+          toolchain: 1.95.0
+          targets: aarch64-apple-darwin
+
+      - name: Record the actual compiler and Cargo hashes
+        working-directory: ${{ runner.temp }}/native-compact-macos/source/codex-rs
+        run: |
+          python3 -I -B - <<'PY'
+          import hashlib, json, os, subprocess
+          from pathlib import Path
+          evidence = Path(os.environ["GITHUB_WORKSPACE"]) / "compact-macos-evidence"
+          versions = {}
+          for name in ("rustc", "cargo"):
+              actual = Path(subprocess.check_output(["rustup", "which", "--toolchain", "1.95.0", name], text=True).strip())
+              verbose = subprocess.check_output([str(actual), "--version", "--verbose"], text=True)
+              versions[name] = {"path": str(actual), "sha256": hashlib.sha256(actual.read_bytes()).hexdigest(), "version_verbose": verbose}
+              print(verbose)
+          assert "release: 1.95.0\n" in versions["rustc"]["version_verbose"]
+          assert "host: aarch64-apple-darwin\n" in versions["rustc"]["version_verbose"]
+          versions["rust_toolchain_toml_sha256"] = hashlib.sha256(Path("rust-toolchain.toml").read_bytes()).hexdigest()
+          (evidence / "toolchain.json").write_text(json.dumps(versions, indent=2) + "\n")
+          PY
+
+      - name: Verify the upstream pinned prebuilt V8 inputs
+        run: |
+          python3 -I -B - <<'PY'
+          import hashlib, json, os, subprocess, urllib.request
+          from pathlib import Path
+          source = Path(os.environ["RUNNER_TEMP"]) / "native-compact-macos/source"
+          version = subprocess.check_output(["python3", str(source / ".github/scripts/rusty_v8_bazel.py"), "resolved-v8-crate-version"], text=True).strip()
+          profile = "ptrcomp_sandbox_release"
+          target = "aarch64-apple-darwin"
+          checksum_name = f"rusty_v8_{profile}_{target}.sha256"
+          trusted = source / f"third_party/v8/rusty_v8_{version.replace('.', '_')}_release_manifests.sha256"
+          manifest_checksums = {line.split()[1]: line.split()[0] for line in trusted.read_text().splitlines() if line.strip()}
+          destination = Path(os.environ["RUNNER_TEMP"]) / "native-compact-macos-v8"
+          destination.mkdir()
+          base = f"https://github.com/openai/codex/releases/download/rusty-v8-v{version}"
+          def download(name, expected):
+              with urllib.request.urlopen(f"{base}/{name}", timeout=120) as response:
+                  data = response.read()
+              actual = hashlib.sha256(data).hexdigest()
+              assert actual == expected, (name, expected, actual)
+              path = destination / name
+              path.write_bytes(data)
+              return path
+          checksum_path = download(checksum_name, manifest_checksums[checksum_name])
+          checksums = {line.split()[1]: line.split()[0] for line in checksum_path.read_text().splitlines() if line.strip()}
+          archive = f"librusty_v8_{profile}_{target}.a.gz"
+          binding = f"src_binding_{profile}_{target}.rs"
+          assert set(checksums) == {archive, binding}
+          archive_path = download(archive, checksums[archive])
+          binding_path = download(binding, checksums[binding])
+          with open(os.environ["GITHUB_ENV"], "a") as output:
+              output.write(f"RUSTY_V8_ARCHIVE={archive_path}\nRUSTY_V8_SRC_BINDING_PATH={binding_path}\n")
+          evidence = Path(os.environ["GITHUB_WORKSPACE"]) / "compact-macos-evidence"
+          (evidence / "v8-inputs.json").write_text(json.dumps({"version": version, "manifest_sha256": manifest_checksums[checksum_name], "inputs": checksums}, indent=2) + "\n")
+          PY
+
+      - name: Build the immutable native CLI candidate
+        working-directory: ${{ runner.temp }}/native-compact-macos/source/codex-rs
+        run: |
+          set -o pipefail
+          cargo build --locked --target aarch64-apple-darwin --release \
+            -p codex-cli --bin codex --timings 2>&1 | tee "$GITHUB_WORKSPACE/compact-macos-evidence/cargo-build.log"
+
+      - name: Inspect, smoke and package the candidate
+        run: |
+          python3 -I -B - <<'PY'
+          import hashlib, json, os, shutil, subprocess, tarfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+          workspace = Path(os.environ["GITHUB_WORKSPACE"])
+          evidence = workspace / "compact-macos-evidence"
+          binary = Path(os.environ["CARGO_TARGET_DIR"]) / "aarch64-apple-darwin/release/codex"
+          def run(*args):
+              return subprocess.check_output(args, text=True, stderr=subprocess.STDOUT, timeout=30).strip()
+          assert run("lipo", "-archs", str(binary)) == "arm64"
+          version = run(str(binary), "--version")
+          assert "0.160.0" in version, version
+          smoke = {"version": version, "file": run("file", str(binary)), "linked_libraries": run("otool", "-L", str(binary)), "codesign": run("codesign", "--verify", "--verbose=2", str(binary))}
+          (evidence / "smoke.json").write_text(json.dumps(smoke, indent=2) + "\n")
+          stage = Path(os.environ["RUNNER_TEMP"]) / "native-compact-macos-package"
+          (stage / "bin").mkdir(parents=True)
+          shutil.copy2(binary, stage / "bin/codex")
+          bundle = workspace / "ci/native-compact-v2"
+          manifest = {
+              "created_at": datetime.now(timezone.utc).isoformat(),
+              "status": "BUILT_RUNNER_SMOKE_PASSED_NOT_ADOPTED",
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "head_sha": os.environ["GITHUB_SHA"],
+              "run_id": os.environ["GITHUB_RUN_ID"],
+              "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "target": "aarch64-apple-darwin",
+              "version": version,
+              "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+              "binary_bytes": binary.stat().st_size,
+              "patch_sha256": hashlib.sha256((bundle / "compact-native-timeout.patch").read_bytes()).hexdigest(),
+              "source_manifest_sha256": hashlib.sha256((bundle / "source-manifest.json").read_bytes()).hexdigest(),
+              "workflow_sha256": hashlib.sha256((workspace / ".github/workflows/native-compact-macos-candidate.yml").read_bytes()).hexdigest(),
+              "reconstruction": json.loads((evidence / "reconstruction.json").read_text()),
+              "toolchain": json.loads((evidence / "toolchain.json").read_text()),
+              "runner": json.loads((evidence / "runner.json").read_text()),
+              "build_command": "cargo build --locked --target aarch64-apple-darwin --release -p codex-cli --bin codex --timings",
+              "build_environment": {key: os.environ[key] for key in ("CARGO_INCREMENTAL", "CARGO_BUILD_JOBS", "CARGO_PROFILE_RELEASE_DEBUG", "CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO", "STABLE_GIT_COMMIT")},
+              "integration_validation": "NOT_RUN",
+              "live_client_adoption": "NOT_PERFORMED",
+          }
+          (stage / "build-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+          (evidence / "build-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+          for name in ("reconstruction.json", "toolchain.json", "runner.json", "v8-inputs.json", "smoke.json"):
+              shutil.copy2(evidence / name, stage / name)
+          for name in ("source-manifest.json", "compact-native-timeout.patch"):
+              shutil.copy2(bundle / name, stage / name)
+          artifacts = workspace / "compact-macos-artifact"
+          artifacts.mkdir()
+          archive = artifacts / f'codex-aarch64-apple-darwin-{os.environ["GITHUB_SHA"]}.tar.gz'
+          with tarfile.open(archive, "w:gz") as output:
+              for path in sorted(stage.rglob("*")):
+                  output.add(path, arcname=str(path.relative_to(stage)), recursive=False)
+          checksum = hashlib.sha256(archive.read_bytes()).hexdigest()
+          (artifacts / "SHA256SUMS").write_text(f"{checksum}  {archive.name}\n")
+          print(json.dumps({"archive": archive.name, "archive_sha256": checksum, "binary_sha256": manifest["binary_sha256"], "version": version}, indent=2))
+          PY
+
+      - name: Upload the immutable candidate binary
+        id: candidate
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: native-compact-macos-arm64-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: compact-macos-artifact/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Record the immutable artifact identity
+        env:
+          ARTIFACT_ID: ${{ steps.candidate.outputs.artifact-id }}
+          ARTIFACT_URL: ${{ steps.candidate.outputs.artifact-url }}
+          ARTIFACT_DIGEST: ${{ steps.candidate.outputs.artifact-digest }}
+        run: |
+          python3 -I -B - <<'PY'
+          import json, os
+          from pathlib import Path
+          record = {key: os.environ[key] for key in ("ARTIFACT_ID", "ARTIFACT_URL", "ARTIFACT_DIGEST")}
+          Path("compact-macos-evidence/artifact.json").write_text(json.dumps(record, indent=2) + "\n")
+          print(json.dumps(record, indent=2))
+          PY
+
+      - name: Upload the build and verification evidence
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: native-compact-macos-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            compact-macos-evidence/
+            ${{ runner.temp }}/native-compact-macos-target/cargo-timings/
+          if-no-files-found: warn
+          retention-days: 14

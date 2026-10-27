@@ -1,0 +1,14 @@
+⏺ Read the current task artifact.
+
+✽ Compacting conversation… (2h 13m 14s · ↓ 27.1k tokens)
+  ██████████████████████████████████████░░ 95%
+  ⎿  Tip: Use /clear to start fresh when switching topics and free up context
+                                                0% until auto-compact · ◎ /goal active (5h)
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  [Opus 5] │ tasks/example git:(fix/example* ↑13) │ ⏱️  219h 30m
+  上下文 █████████░ 93% (输入: 78k, 缓存: 854k)
+  2 CLAUDE.md | 1 规则 | 10 MCPs | 7 钩子
+  ✓ Bash ×12 | ✓ Edit ×6 | ✓ Write ×2
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents

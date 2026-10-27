@@ -1,0 +1,1147 @@
+{
+  "schema": "ccc-native-conditional-source-v20",
+  "status": "INTEGRATED_VERIFICATION_CANDIDATE_NOT_DEPLOYABLE",
+  "baseline_prepare_sha256": "beae02abdd924b103f489ce54fdd9fb666ebff89ccb8592d43cfc18cdff81a12",
+  "baseline_source_tree_sha256": "6a0540b9d82e9c947192a3bf675467af87562c35b047ce54c0767c2d4aec3d35",
+  "source_tree_sha256": "2dfe43955fb77426c5eade230041ce0830a58e0fab72a85d07e6c62e3103c82a",
+  "source_file_count": 8891,
+  "archive_sha256": "d6cf20af492ccc8cc21eeff5b783e9a25c9d9da23ba9f981b9b8d1587b5d0500",
+  "evidence": {
+    "authority_manifest": "544e569f9323faa03e4a3277188fc3a4db54aa4559de4b774cc646e86a1f6dd2",
+    "reservation_manifest": "7ff594c3a3a70e71508effed4a9dd7d305c70f3f60ea1d562a4b534b973329d2",
+    "goal_runtime_gates_manifest": "fb1812f2678739a185fa99d0827a0f8d05142dae40c184b7177a5fdac7808b6e",
+    "native_receipt_gate_manifest": "d63491fd27af0a9efc4668de6538a42bfd073739affff5158b85d56464539101",
+    "real_goal_assertions_manifest": "d49c1890f0e658c3a3117f135fe94468420f98a2322d6c785e6f7538c8b2944c",
+    "mail_lineage_manifest": "1cd813458687dd1d9cfa3cd519b74011c8d61cf0b9b56402f8e0569d22cbbdf6",
+    "native_crossreview_manifest": "4bb21e198f1ffa7ed081a70146a4202ca81d51fe531747bd1d7fc7e73f2511c4",
+    "previous_validation": "GHA39515754036 focused355/355, protocol+Goal libraries683/683, backend35/35, state23/23 PASS; real Session test failed premature interrupt assertion",
+    "compiler_fix": "GHA39506212443 E0308: retain Arc<GoalRuntimeHandle>",
+    "python_producer_manifest": "b2d25fc2d40b14ebf2bb51b6fa90fddb58428defcfef4a351206e5909b9fa437",
+    "real_goal_300s_manifest": "0de4d1387424cafaf2f20719e8b7b74dd96335f0a8b5514f09dcc02a4005665e",
+    "python_ledger_audit_manifest": "4244fe6c767287b5e6095bec2fdc942a921505f89db1578b28902d0ce88af36b",
+    "terminal_pin_retirement_manifest": "fb92b9a4c6c5114143617e610fd23ee23443630ada54e0479f83bc5a10f52e68",
+    "backup_independent_review_manifest": "bcce49e138847bd7aa7d144baffc7940a7bd725f1af809b78fa849b358f3378d",
+    "python_health_lock_gates_manifest": "d4f59993136827aebb0655b309ee210c74b5fcbd339c2ac2b6b71d99704cb352",
+    "backup_kernel_review_manifest": "21c36fad1e0972285069e3cc92770d6d8306d67b86313929087c00a97604997d",
+    "experimental_exports_run": 39499309200,
+    "experimental_exports_sha256": "38a72e7b8d517165cc87502568595996c2dba1bcc88d5d57f225ca1a0e8a3159",
+    "full_regression_before_v9": "GHA39573056772: 21136 executed, 21117 passed, 19 failed, 47 skipped; not accepted",
+    "shell_final_manifest": "56eddabee1d1f95454b352522d75051de31f3d95d89b5af02b8fcc88f506c98f",
+    "host_tls_review_manifest": "f479b70659525af92608a20e2c68131e18415c53539be0a5f4dd23184467779e",
+    "v8_tls_review_manifest": "c30fe7d8826e6b4a38fe9e620aa7da08696092de4c43f1defac6cfc0e63a8750",
+    "real_goal_300s_validation": "GHA39532221465 PASS, real native_compact_goal_f1 301.600 seconds",
+    "v9_fixes": "Record rejected compact output usage; preserve skill cache after defaults; deterministic daemon/composer fixtures; Bash replay --norc; absent project marker unique to test; V8 sandbox default with refreshed Bazel lock; cloud error log outside exact source; voice runtime test path in dependency preparation; notify pending exec approval before interrupt on cancellation",
+    "tls_resolution": "No speculative native-tls feature change; record runner environment and reqwest feature tree; isolate inherited CA variables only for tests",
+    "zsh_completion_review_manifest": "1e6ca18365d483087b1b1b3c38ea27ca38f3003c03aa36ca9d1cdbe4bf6c1fb0",
+    "v9_conditional_success": "GHA39609056442 commit424898b1c424a1f025df8bbbcab1bb24327ecd6a: real Goal301.648s and Zsh cancel PASS",
+    "v9_full_compile_failure": "GHA39617818876 ext/skills/src/host_roots_tests.rs421 E0308: toml macro Table needs Into<Value>; no runtime product defect",
+    "v10_delta": "Only .into() in existing skills test fixture; include codex-skills-extension tests in conditional gate",
+    "v10_conditional_success": "GHA39626334301: conditional gates passed",
+    "v10_full_failure": "GHA39633214432: 21112 passed, 24 failed, 47 skipped; Clippy/Mac skipped",
+    "v11_delta": "12 files: isolated fixtures, Abort parent completion, typed io get_ref descent, TLS and exec-server diagnostics",
+    "v11_a35": "Frozen candidate read; callback acceptance remains pending at packaging",
+    "v11_b35": "Typed descent and two additive units independently accepted, original callback verified/disarmed",
+    "v11_b36": "Original callback verified/disarmed; diagnostic bounded and corrected by Root; no TLS policy/feature pin",
+    "v11_validation_failure": "GHA39673342942 and GHA39679814682: core/Goal/Zsh passed; five TLS tests, runner uid-map and formatting failed.",
+    "v12_delta": "Two exact cloud-rustfmt formatting corrections. No native assertion, timeout, skip, TLS policy or feature changes.",
+    "v12_validation_failure": "GHA39709412921: compiled/Goal301/Zsh passed; historical57 passed50, five TLS plus descriptor/fixture failed.",
+    "v13_delta": "B40 exact typed rustls ProtocolVersion + io.get_ref traversal, four discrimination units; Landlock alias parent placed in existing writable cwd. No backend/features/timeouts/retry counts or weakened assertions.",
+    "v13_descriptor": "B41 diagnosis-only: preserve failing condition, display stderr/status/closed before panic. Root verified exact one-string change; root cause still UNKNOWN.",
+    "v13_validation_failure": "GHA39726711416: previous failures57 tests56PASS1FAIL; bwrap cannot mount tmpfs on absent /newroot/dev/fd. Compile/Goal301s/TLS corrected regressions otherwise passed.",
+    "v14_delta": "Only linux-sandbox/bwrap.rs: create denied directory under fresh /dev before --perms/--tmpfs; three additive argv regressions. Root removed new environmental skip and inlined one-use predicate. Original assertions, Deny modes and writable-symlink refusals unchanged.",
+    "v14_a43_manifest": "21f0856612a15d2cf1234828ff4aff4059358e1824a433f8df3117eaea0b7537",
+    "v14_a43_root_review": "3ad41a38a69ce8449031bc00cdc20b6df2f7d931c2d1bfac5cfb1df4dc17d281",
+    "v14_format": "Official prebuilt rustfmt1.95.0 sha c54af79a + driver149e85a2, candidate9e8ef0c9 unchanged, exit0; no local Rust compilation.",
+    "v14_failure": "GHA39751989534: corrected regressions60 tests59PASS1FAIL; blocked_descriptor_path exec-server SIGPIPE, then WebSocket reset/recovery timeout. Prior /newroot/dev/fd mount failure resolved.",
+    "v15_delta": "Test-only ctor SIGPIPE initialization to match Rust main runtime plus closed-stdin server-survival regression. Product signal policy, original60 regressions, all assertions and timeouts preserved.",
+    "v15_review": "solo_self_review: exact ExecProcess API and bounded pipe writer confirmed. First draft stale read fields and EPIPE-close assumption corrected before packaging. Official prebuilt rustfmt1.95 passed; no local compilation.",
+    "v15_actual_result": "GHA39768230336: 61 selected tests, 60 PASS, blocked_descriptor_path FAIL with unresolved absolute /dev/fd symlink mount. SIGPIPE survival regression and real 301s Goal gate passed.",
+    "v16_cause": "GHA39798392659 Linux syscall measurements refute proc-order and physical-proc-mask repairs. Absolute /dev/fd symlink resolves outside newroot; masking /proc/self/fd covers the setup process only.",
+    "v16_delta": "One product module, exact /dev/fd deny policy only: symlink-free minimal dev tree, private devpts with standard /dev/pts alias, original immutable directory mask. Actual bwrap child regression checks denial, standard nodes and PTY reopen; all prior assertions and timeouts retained.",
+    "v16_direct_validation": "GHA39805811418: filtered logical deny PASS and PRIVATE_PTY_STANDARD_PATH_OK. GHA39805050042 showed the simpler no-PTY skeleton breaks PTYs and was rejected.",
+    "v16_review": "Root solo_self_review implementation; original B50 independent syscall review received separately. Exact candidate peer review and native compilation still pending.",
+    "v16_actual_result": "GHA39810200942: 355 focused, 841 libraries, 35 backend, 23 state, 2 real Goal/Zsh PASS. Corrected regressions 63 run, 62 PASS including blocked_descriptor_path and actual deny/private PTY; only obsolete --dev /dev test expectation FAIL. Final gate correctly refused.",
+    "v17_delta": "Test-only update to denied_dev_descendant_creates_mount_target_before_mask: require symlink-free --tmpfs /dev root, reject --dev /dev, keep target-before-mask order, 000 permissions and read-only remount assertions. All product code and other tests byte-identical to v16.",
+    "v19_delta": "Only realtime startup-server isolation and explicit guardian NotIdle admission handling; preserve event/ciphertext/history assertions and original completion timeout.",
+    "v19_peer_reviews": [
+      {
+        "path": "/Users/lzhs/Documents/cnm/tasks/06_Mintransition/verification/ccc-successor-01a12b57-20261020-53bc-v1/discovery-foreground-20261023-v1/chain-increment-1/A62-ROOT-REVIEW.json",
+        "bytes": 1783,
+        "sha256": "dc0fff365bf6a2b0c2859e268fd02889899087adb547e89d78ca28798422d535"
+      },
+      {
+        "path": "/Users/lzhs/Documents/cnm/tasks/06_Mintransition/verification/ccc-successor-01a12b57-20261020-53bc-v1/discovery-foreground-20261023-v1/chain-increment-1/B76-ROOT-REVIEW.json",
+        "bytes": 6958,
+        "sha256": "ad8cd824172354f618fe0c3816f24d7f93da60088c37df3257895971b7ef587d"
+      },
+      {
+        "path": "/Users/lzhs/Documents/cnm/tasks/06_Mintransition/verification/ccc-successor-01a12b57-20261020-53bc-v1/discovery-foreground-20261023-v1/chain-increment-1/guardian-idle-fixture-v19/REVIEW.formatted-v1.json",
+        "bytes": 2747,
+        "sha256": "91b129bf5d14e917d0d1f19012a7f8656ea4ad27c5439a68e02a2ae37f02a48a"
+      }
+    ],
+    "guardian_review": "solo_self_review; independent peer review pending before full acceptance",
+    "previous_full_run": 39960514415,
+    "previous_full_result": "21149 executed, seven failed, 47 skipped; not accepted",
+    "v19_realtime_format": "Official prebuilt Rust1.95 formatter only; tokens except optional trailing commas, all string literals and file prefix/suffix outside the fixture preserved. Preformat v5 commit80622a9921c7e3a0157b441be3e5baa34a1f8255 and exact local archive preserved.",
+    "v20_delta": "Exactly three equivalent Clippy edits from run40037560783: is_empty and two unnecessary clones. No assertions, timeouts, dependency, protocol or skip changes.",
+    "v20_prior_full_result": "40037560783 workspace tests and Clippy passed; exact-source gate rejected three lint edits and macOS was skipped. No binary adopted.",
+    "v20_review": "Root solo_self_review of exact byte substitutions; original Claude independent review pending before adoption."
+  },
+  "limitations": [
+    "Exact v20 conditional/full/Clippy/macOS gates pending.",
+    "Original Root compact capability and same-session live acceptance remain separately required."
+  ],
+  "changes": [
+    {
+      "path": "MODULE.bazel.lock",
+      "before": {
+        "kind": "file",
+        "sha256": "6facd536f5e486f0cc9cf549168cdff30e135c485efade83d4ac78d306c860e3",
+        "bytes": 1634382,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "140cfe913ac571dae9e9f64f55217ded3d7691600350310316a56af0c32020af",
+        "bytes": 1634278,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/.config/nextest.toml",
+      "before": {
+        "kind": "file",
+        "sha256": "277f6bba1e104c103c658073f91ef50057d0b0ca70f87e58493215536495553b",
+        "bytes": 4622,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "63f1263674ac9f324b061fdf94ac03f6f0aa04b2a24eb8b1618af7764eb8b409",
+        "bytes": 5489,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/Cargo.lock",
+      "before": {
+        "kind": "file",
+        "sha256": "6504fcc0486dd8182bb502369be99a9ad231518d53329cb0214b290df875647d",
+        "bytes": 406732,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "520f9afa8c1a0c2b7e287ba1857e64a89e4aa266676170cca1902a3a9ea30670",
+        "bytes": 406741,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/app-server-protocol/schema/precomputed/app-server-exports-experimental.json.zst",
+      "before": {
+        "kind": "file",
+        "sha256": "63028565f715c584c2dad98163de85dcb03801f9a7c096f5ef07d4769a900984",
+        "bytes": 160029,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "38a72e7b8d517165cc87502568595996c2dba1bcc88d5d57f225ca1a0e8a3159",
+        "bytes": 160615,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/app-server-protocol/src/protocol/common.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "d0cca691d21ffe282d3ca3d8ca9eaee8afe9aab058b04a3d4ef579f72a6918c7",
+        "bytes": 173534,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "9b9e0a5a82af9c2ca865da1b5b58377966b42d6fc6232b0bee7e3b7ade50f9b1",
+        "bytes": 173804,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/app-server-protocol/src/protocol/v2/thread.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "d5e626a8f3bade6865a6274642a607124bea49cf3ebdbc202f70e8d2a976dafb",
+        "bytes": 78367,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "31c738f45c6ba7ea56a3f81fedb72b666d78dc81c03c40ad5341081104c7a19c",
+        "bytes": 79320,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/app-server/Cargo.toml",
+      "before": {
+        "kind": "file",
+        "sha256": "c597a827682bd7d5c9a0f7ffc48ce0ab05bc699c4a47767833eb723031a89c94",
+        "bytes": 5232,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "268bd6570e7c17cd46713d2070305775134f823b31c383fdb7261adc4b3995d2",
+        "bytes": 5260,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/app-server/src/bespoke_event_handling.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "32dc66a8a6d77412be5d6a9dc7db6d3383b7d0d8d54949de02503cade1774982",
+        "bytes": 155200,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "510f3d8b2837cd17839bf7c488a8f8cfcb8d2a1ee324da7d1874ae08d2dce6e3",
+        "bytes": 155352,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/app-server/src/message_processor.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "ad3be8c4bbb5f783d724fd150ef0102f0038e0f2b8e76511b3d1313b5777fe6e",
+        "bytes": 80918,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "9c01f1c03902d0254359550fbb51f7c9cbeb6141b278cedbcd4d5ebc963f6ada",
+        "bytes": 81138,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/app-server/src/request_processors/compact_interrupt.rs",
+      "before": null,
+      "after": {
+        "kind": "file",
+        "sha256": "328de0dbdcfa25f26e12552ebda133646dce05f4ec2b150ba5d3540e8a0ba3e9",
+        "bytes": 10064,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/app-server/src/request_processors/compact_original_intent.rs",
+      "before": null,
+      "after": {
+        "kind": "file",
+        "sha256": "f295eb9495c08bc8a395e2bb994e964fa8601b440214428ad48bb3a3fa67abf1",
+        "bytes": 31416,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/app-server/src/request_processors/compact_original_intent_tests.rs",
+      "before": null,
+      "after": {
+        "kind": "file",
+        "sha256": "6a636229f153e97475d9da0930a2165d1bd46ff723c3d53c7fc1275671c00e2a",
+        "bytes": 33953,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/app-server/src/request_processors/thread_processor.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "67d4baacea1f6b1e4fb217a1f28d7ca43c3479f35af8c90f58acc3a741c9beba",
+        "bytes": 252891,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "9198be8195ed76144330fdf10c10302e28b05b208fccfe1ac53d07fe9f573a7c",
+        "bytes": 252948,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/app-server/tests/suite/mod.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "db3509153cc574d2a11191ea6308e6a433b8ec59f3860a83e00b154ebaaae799",
+        "bytes": 99,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "d4088e1a4579bfc8c3053a9253a06aca5b7be9d562a4a38fff6233edf5fc0e5d",
+        "bytes": 127,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/app-server/tests/suite/native_compact_goal_f1.rs",
+      "before": null,
+      "after": {
+        "kind": "file",
+        "sha256": "7c76141b9eebc0ac92dd4f6f151f1c1546afcc4cf9a14a22fdb97acaf351bfdd",
+        "bytes": 18001,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/app-server/tests/suite/v2/skills_list.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "277a1ddbed179ed3b9f44b6892e2ab85460cf127bc754235d6a5e9b79d75db0f",
+        "bytes": 48450,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "b18aa3391578987ba3e8be374540fa79c8576756f70fc7258c20da896682ba84",
+        "bytes": 48591,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/cli/tests/app_server_daemon.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "53d73b2c4488577bb3bd3b320c9eb6d97abe01980451026e78140307fcb5c51d",
+        "bytes": 25811,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "f6eb800bbf392543eb6b0964106b7034e4c1f87a2d2bca0a9cd1576cd76253a0",
+        "bytes": 25640,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/cloud-tasks/src/util.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "a7c98f71b4a4547afcb8c9398d22c8ebdbf1449cd6e3ba6de96a4d23c3e703af",
+        "bytes": 6876,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "124743df7d235541b1348322643e2230bc939a891507faf1ac6f21d6ddcb907d",
+        "bytes": 7038,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/codex-api/src/credential_observation_tests.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "67eaf6adacad05e77f1ac24a67c25b7b5c1146d0df992f4d72b92e0244567ef2",
+        "bytes": 8013,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "5e51e6d6f280de022c794d4e155a594570ac378ae863eab9cb140bb3ee2ec1d6",
+        "bytes": 8005,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/core/src/compact_remote_v2.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "7eb9519122200741de3077f27ddb7ec79a28ec1ee736c6240b6aa4235452961d",
+        "bytes": 49323,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "db43adfce59177e9ba349274f3287690693af364741a61f2b5e395b859207e48",
+        "bytes": 49970,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/core/src/session/compact_recovery.rs",
+      "before": null,
+      "after": {
+        "kind": "file",
+        "sha256": "485038860ae0d3a88269eeca15a97ba21ee2a2735ac04370b4936f3a19fedd55",
+        "bytes": 7940,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/core/src/session/compact_recovery_tests.rs",
+      "before": null,
+      "after": {
+        "kind": "file",
+        "sha256": "7bac8a31c8aa2066190bc3ebf0bcce69933aa0221011a94520dcfc93ae574b4a",
+        "bytes": 57161,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/core/src/session/extension_interruption.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "10a3fe224624ace9e73f5d2a8d87245c104503f76b6c1f2ce6b565eecf44e425",
+        "bytes": 4620,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "384aa375a7981b8db8b08d76d5e1814de67f344f5171cffdd253418b835b2fa4",
+        "bytes": 8131,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/core/src/session/extension_interruption_tests.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "c409e20bed4e5d744a4b2af1fdfb07e452be9dc0ba5e94f411cbe50ed21c9e31",
+        "bytes": 3396,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "9068abe5732dd26f2273c2a0f43fbcd90f02505f1f611d8363a02442d28a8e9a",
+        "bytes": 5952,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/core/src/session/handlers.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "bb14e953f223cbfeb518fd3c241e5c3b0aa8cded6df271d5dc33d321bcb62b54",
+        "bytes": 26171,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "296d62533a508961591118138987ebdf1c653ed91302e8dd9b725ce10ad59047",
+        "bytes": 27375,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/core/src/session/input_queue.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "dca4d5c8a03f032a6283673b4011f3f4043750769b08a30f40d47146c165b4f4",
+        "bytes": 26968,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "5f873ec3abd4e6850cf495ba6906e70ef0d3d17d7f7758c971f92224d9b86ed8",
+        "bytes": 29350,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/core/src/session/mod.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "d05728bce8f6f3163d20ec4286bf964d7dfda27a39d4669b755e7a2e51849ecf",
+        "bytes": 210605,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "bafcb5e4d56c3e040808e4ef9e51adf466a9c11d0150160c10d9084bb3fec102",
+        "bytes": 210885,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/core/src/session/turn_input.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "7cdbd62e1f1dc92322e61b03e69debd46fb757f5d27177752b1fdeb976f01211",
+        "bytes": 28943,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "5df4f36719ecc27af9c3704ae6bc97cc646a51525265ba8b60cb9d7e45e49a01",
+        "bytes": 31678,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/core/src/state/mod.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "ad49ef8395a1b5c609a3d19f48bcbc40451ed4d20df30b809072f057c45212cd",
+        "bytes": 777,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "81e24369b1a008b45fbc6cb6318c7259c92e7aed79dab8e9b188c3e2b75590f0",
+        "bytes": 925,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/core/src/state/turn.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "fe469e8a2440419bc73c7ff4d055b5d9ddb80e544ae2f7191c2af10ded490743",
+        "bytes": 8973,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "e3c8c997c7a006e689385a1c1df11778903c9385f35c2fd0f8ebc36733e14a12",
+        "bytes": 13533,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/core/src/tasks/mod.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "400b02b66b2fd829ee876d5094c0ae3ab5fb52536ce2d220f8b257e6ee6c41c5",
+        "bytes": 38534,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "56354d007ee0acc8182207ff4b1070be6aec6d9f23775eaec16d971563f2030b",
+        "bytes": 55746,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/core/src/turn_timing.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "7b20a4976c59624656210a21032be5c37f4122ca1921496efc4f039d4b0c6fed",
+        "bytes": 15177,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "016081f275a99123cae48e89f386d6aa752a886d619cbdf651ba011b02eb1fc9",
+        "bytes": 16717,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/core/src/turn_timing_tests.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "29515ed95062f05112e6ae83d06bdd5a38fcdbb268be237016eaf5a70f64e952",
+        "bytes": 9297,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "2250faa8dd7d8a94b2e65708fc045b2b6a9e7cd6fcc55ba82afeb298ae89ca69",
+        "bytes": 13578,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/core/tests/suite/hooks.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "615345d43c48a1111c058733fd4c12c1fa46293d557e0a95009cd2a46cc208f7",
+        "bytes": 201741,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "272e2992d933475b05f0e6a09ab8b7f173d834d45cb600d8919666d9c82f9616",
+        "bytes": 201857,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/core/tests/suite/realtime_conversation.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "4669742d64027f60ebbad82bf02dfe526c2445f6475835fb6ca7d947732857cd",
+        "bytes": 223035,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "8943fd7799f1172d4ef1e5f99767733e0cc4fa3dbc8be1707c52d0fb69973df6",
+        "bytes": 223530,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/core/tests/suite/scenarios_guardian_agent_messages_tests.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "1436aeaf3376d53ae3c90b776710d7dbd991a7bed79576545ed0b25cb649d115",
+        "bytes": 5725,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "3da370a80d590b107f560e71c3b027c346157888317d518db1ee6e59ae8daa13",
+        "bytes": 6947,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/exec-server/src/shell_snapshot.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "70d6a89371392c6c5fd42fc8610e853ca1c99c6ed16e6af0a8039689c2dede00",
+        "bytes": 18622,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "b6e08e54dc6088130d3f5d97f19e6900ae2240f03503035bb6f496f2ec2381f0",
+        "bytes": 19014,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/exec-server/src/shell_snapshot_tests.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "2dada2bd29d700a5da6b2fc56f079f719a2a2023ad27e8ad6298e933011adae2",
+        "bytes": 12858,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "f2ef379a28c13ac6be7ab9e1df78b322eeb227cd79597b13a261821a314d8826",
+        "bytes": 12895,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/exec-server/tests/common/exec_server.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "2b06f9ae2f8315067a97954b61ad49a18a0302dc1ad46a997bb36e7c8a3c7ec2",
+        "bytes": 13638,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "639fbbfaa9fda84c976105b1bd0d78491bff780c63ecd072272f86abecdd1ec8",
+        "bytes": 13785,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/exec-server/tests/common/mod.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "ace2afccb1b79f993ae69cb99d84b45df6f69c04815e965b9345f610e3c4efb9",
+        "bytes": 10519,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "90ef58f915f2af0c9576374343e83e6c93dbf50849420c3ee53cc92098bbe58b",
+        "bytes": 11302,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/exec-server/tests/exec_process/shell_snapshot.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "46b258a730e7a381369d5efc42df764536db96e991df372a50ad95fe822aed1f",
+        "bytes": 8439,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "7c1cae541208b28cea6d4398ff97135da444f7e5be3591ffe3ac71842a4dbbc5",
+        "bytes": 10972,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/ext/goal/src/extension.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "47fe789555dc082a7b9f1b9d67e2f084bde9fcce34aad1d61257a71c03a67055",
+        "bytes": 22951,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "4dc74f5db0d9170ef941a7070c6cd7228dd815b93df9bab888adc561e298c06f",
+        "bytes": 22825,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/ext/goal/src/join_fence_tests.rs",
+      "before": null,
+      "after": {
+        "kind": "file",
+        "sha256": "195b1f44a804838c30ead5c031c31a08bfba049567d3a4f5032127534a68ee2a",
+        "bytes": 5238,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/ext/goal/src/lib.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "fa0a7632863b05c565318f88dd2ef985a08518c833c57e51e70bf4e976e6562f",
+        "bytes": 690,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "09b36c208744af55ae7c9828fc9c851245c7c86b6afaefc01e4faec6350aeb80",
+        "bytes": 763,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/ext/goal/src/runtime.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "59a8c65a5b0d65bea5fab63d2eb3c4c17431d1c8eaf91891563e95657267f04c",
+        "bytes": 24248,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "b2851505d8b752a74d95a0f5ca352ef3edadeca993ff4958ef910c1ca8f1b997",
+        "bytes": 35475,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/ext/goal/tests/goal_extension_backend.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "47517cb92b6d57da0573bd53ec2e34f2769f85b238f38275e00ef0985bd1a12c",
+        "bytes": 67949,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "14797c4608b9decbfb7d59f74587c0316cd7762a312f73dbfd6274f94c9e785d",
+        "bytes": 81656,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/ext/skills/src/host_roots_tests.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "054070e3f7935d2945b99987e08eff5cbf96c27870d25c466bc31b54b174f00b",
+        "bytes": 22485,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "f1d3b27c63441b9a65bce7c678be11e614d1136363e1535d50acf9a273742037",
+        "bytes": 23015,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/ext/skills/src/host_service.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "1df09d62e1fa8df5aa67ecc10b5642d0abe57098282c64d99f3db8bef20a8adc",
+        "bytes": 16318,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "e19c355e3d453f8243be23532cd1d89019b7a1c29b51c5bfdce22f358c8e7214",
+        "bytes": 15970,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/http-client/src/route_aware_client_pool.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "1c53cd22d10342ca74bc4424e3eb7e5a924bd1eb5bb84a36090b2bce67ca6866",
+        "bytes": 20883,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "0561b27f9c1f4f7fc96126d925bf94a7e90f9209a10f7c617118459ebeb0f1b0",
+        "bytes": 21149,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/http-client/src/route_aware_client_pool_tests.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "22a9c088ba0656c57a7b2b71267220c6c569c995d87d5eff70d7781cd2415b8f",
+        "bytes": 42719,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "97bc1bdf8be4c49034d8f68a19a92a150391d9821dfffc45ddf6487cbc6819fd",
+        "bytes": 44229,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/http-client/src/route_aware_tls_fallback_tests.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "b0058d1ad0736222f6a19cab10708935e1911e233d219e85662e2a785b1011da",
+        "bytes": 19972,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "58c2c4322c39e934cafe90d4634cea7c1999292ee7c1e1dacfbf3e6b0b1c920c",
+        "bytes": 23073,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/http-client/src/tls_backend_fallback.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "bfad1ec0d0dadce462a88e4d5a5d48dd1824312bea97acb013aa61a7bd005462",
+        "bytes": 5113,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "66b1f0f5577a8d744b1c540158289bf0465fa4965a70b58331681c2cb571e0c9",
+        "bytes": 5955,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/http-client/src/tls_backend_fallback_tests.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "c3e87ee3e170a92dd2587bcda09ac43734f78c9e9e77b830cf62cbbdd67ed656",
+        "bytes": 7531,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "1b772be5a42d16d1e95c14383eac1c9f2fea10f9d3984ca3f1c115dfe8f67266",
+        "bytes": 9896,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/linux-sandbox/src/bwrap.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "1d3dfe853f9b5f1cafd7283cf760e38ff739eb7c1ac54650ae2ed510b92b870a",
+        "bytes": 118552,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "0ace0dddb89bae7ebae2f4d552ce091474ed768f15638b7215035c250c4b1cbb",
+        "bytes": 131546,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/linux-sandbox/tests/suite/landlock.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "7baaa8f0448645f25bd08ff6c9cfcfdb6396707cdd2e6aa0ae3a85f94513d0bb",
+        "bytes": 53437,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "e9849a1317a6951a1ce6f305be8e1463346153b8faa02ad46cac2949134e5ad6",
+        "bytes": 53507,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/protocol/src/protocol.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "d3d3d384da91b2824c10091de4331a2bc26ec5474887ed0aef1e3f3c4ae110f4",
+        "bytes": 234299,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "2700b55469b5e76c84406221690a58f16d15c1b8ac07d4d85691319874bf87db",
+        "bytes": 234991,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/rollout/src/policy.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "9963db1dad94a26dbddcfd9792624ff975615c795bb212c12d0f9441db1ad395",
+        "bytes": 8423,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "13ad961f279156194131bd9b1475f4eb684098a0d77b99074b8c13fc7801fe24",
+        "bytes": 8643,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/state/src/runtime/goals.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "11640e2a48cbd3d109f22d31695dba2ddb11f9aff9543d774d34f261fd1f48f4",
+        "bytes": 55533,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "a16c24816d49ad5840f2a33a37b9db81882bbd83599c89ac7bf53c4d26b91992",
+        "bytes": 57475,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/state/src/runtime/goals_cas_tests.rs",
+      "before": null,
+      "after": {
+        "kind": "file",
+        "sha256": "9704a81a06891aa5fe90029ec37cebdf326eacd1456663d16758dbd1ca56178b",
+        "bytes": 4616,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/tui/src/app.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "1dcf76e4b334993093dcd33902bc930f0d89b6dd9d47c6ef67da087604ce0f5d",
+        "bytes": 51524,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "3cac0688c7bd4d2fba4d16d698eb6cdae03f79e264948ee43b1564ad8290c494",
+        "bytes": 51577,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/tui/src/app/client_thread_observation.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "44ea7f4044cb75af4795b2ed077cb76045e4870f1f3afe63cf48059538f047cb",
+        "bytes": 5741,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "27d25ab536d6a8d4bff9b729b1c0771f9620ede80fe74b7f2af420fb625a6d9f",
+        "bytes": 8312,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/tui/src/app/client_thread_observation_tests.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "a40da135eebd265696b7bee7fd3c96f8775a21ae829610e2f545f5e83db4dffa",
+        "bytes": 3354,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "be0ad26061acf1bf72443adf0af7583696cbbf38c4fa073af3f32c9620417d2b",
+        "bytes": 5109,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/tui/src/app/tests/startup_defaults_tests.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "2bed44a2f52b2f1c88066443253658f87581d701a363471a21aade37066adf96",
+        "bytes": 21480,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "beaefbcfcb6723726ff03b2b0d6bce62d950995fe42cbaf6e612649251ebb487",
+        "bytes": 21608,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/tui/src/app/thread_routing.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "ba8fbf6c3934ee6dbd108414b0ce44998653ac9421634d31ae92d6bd27acca04",
+        "bytes": 98010,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "84924731eaa15a74854c7bdac9ad9f76dda56a8371e8858c53f038297589b94c",
+        "bytes": 98412,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/tui/src/app_command.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "005e5be4dc13f0ebe1f73a51a671aabff6ddc3eeec774cd71f797f6b4ff9bcba",
+        "bytes": 10737,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "c32f987c115b51d13cc822457a3eef023f3cf170ea6fdc3458bf27280f8fc7f4",
+        "bytes": 10819,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/tui/src/app_server_session.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "ebc9a185e5070cb13b922948d0637fbbf25db5907823e2adb775c41d26d3d1ad",
+        "bytes": 165372,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "2e0beac075da0152294da65cfb5452f3351486e0d3776f9f4d74c4deb7f7a067",
+        "bytes": 165854,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/tui/src/bottom_pane/chat_composer.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "3f9847e8188f57c0ad665b682f626c8ae9b9f1c5d1c03bf231b0d762f6645ef2",
+        "bytes": 511928,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "7c438eda4117d822f7e4d0e0041ebb18acb7421c9b39ff05791fa8f8b05f8262",
+        "bytes": 511579,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/tui/src/chatwidget.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "6b3ace72b6b4e2a24941b27a69ef95c35a7a5e599a730b6ead4233dde6df73d7",
+        "bytes": 86608,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "6be1aab28cb13b2e912069d565f0591f1ba58b6a5aa74e51b2ecaab1bf436fd1",
+        "bytes": 86728,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/tui/src/chatwidget/compact_interrupt.rs",
+      "before": null,
+      "after": {
+        "kind": "file",
+        "sha256": "e2dcc95d825537b2a3421db81cbfa580380e232bb768da941c344772dc5f641d",
+        "bytes": 1933,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/tui/src/chatwidget/slash_dispatch.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "26312475a26b671416ec336d41db0978f430969221b217b06db36a8b1ad0acaf",
+        "bytes": 54829,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "ee6f8cc22113eb90db546d6239a1e119f04a21e0e3ae8fb39f5b8589ed20121e",
+        "bytes": 55041,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/tui/src/chatwidget/tests/slash_commands.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "c3ab5d66dc6424bd60fe1dba3f50db6adb7239926070a40da62a4ab2ec991573",
+        "bytes": 138563,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "24be46420500b9ecda6bf3938469d9d529c3b6101856902d0c3e32638efe04ae",
+        "bytes": 140792,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/tui/src/slash_command.rs",
+      "before": {
+        "kind": "file",
+        "sha256": "6da344165206be25ba2751dd611121e478fe00d262ad0861d3e05a89ee97818b",
+        "bytes": 13710,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "320baeec2dd2357bf651e7bd25f69a0f29f184041f4862f10e457f035dc0f13e",
+        "bytes": 13774,
+        "git_mode": "100644"
+      }
+    },
+    {
+      "path": "codex-rs/v8-poc/Cargo.toml",
+      "before": {
+        "kind": "file",
+        "sha256": "e98d307ee1683087debb02cf5fba46cc1a23177a25cd6b03f74f1539239312c9",
+        "bytes": 348,
+        "git_mode": "100644"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "49726d65cadc6da97b5b8f4e599601c4124715afaa3c65768a3729f76a13de08",
+        "bytes": 460,
+        "git_mode": "100644"
+      }
+    }
+  ]
+}

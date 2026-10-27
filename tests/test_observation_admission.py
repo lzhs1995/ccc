@@ -41,7 +41,8 @@ class AdmissionObservationTests(unittest.TestCase):
         for error in ERRORS:
             for enabled, origin in ((True, 'user'), (False, 'automatic_observation_error')):
                 target = dict(paused=True, enabled=enabled, paused_reason=error, pause_origin=origin)
-                self.assertEqual(health.pause_health(target), ('paused', 'explicitly_paused_or_disabled'))
+                expected = ('paused', 'monitoring_paused') if enabled else ('disabled', 'monitoring_disabled')
+                self.assertEqual(health.pause_health(target), expected)
                 self.assertTrue(target['paused'])
 
     def test_observation_classification_does_not_retry_input(self):

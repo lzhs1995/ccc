@@ -53,6 +53,15 @@ class SustainedConnectRecoveryTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(.005)
         self.assertEqual(self.budget.snapshot()['in_flight'], 0)
 
+    async def wait_for_cohort(self, count):
+        # Admission includes durable reservation I/O. Start failure timing
+        # only after the intended cohort actually exists, not before fifty
+        # serial journal writes on a possibly busy disk.
+        async def ready():
+            while len(self.channel.waiting) != count:
+                await asyncio.sleep(.005)
+        await asyncio.wait_for(ready(), 5)
+
     def decision(self, slot):
         value = {**self.channel.snapshot(), 'authorized': True, 'updated_at': time.time()}
         return continuation_decision({'job_id': self.policy.job_id, 'index': slot},
@@ -144,9 +153,10 @@ class SustainedConnectRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.fixture.requests, [])
 
     async def test_upstream_fin_before_cohort_is_not_counted_as_a_forwarded_request(self):
-        closed = asyncio.Event()
+        close_first, closed = asyncio.Event(), asyncio.Event()
         async def upstream(reader, writer):
             if not closed.is_set():
+                await close_first.wait()
                 writer.close()
                 await writer.wait_closed()
                 closed.set()
@@ -157,12 +167,19 @@ class SustainedConnectRecoveryTests(unittest.IsolatedAsyncioTestCase):
                            f'http://127.0.0.1:{server.sockets[0].getsockname()[1]}/0/v1')
         try:
             first = self.request(0)
+            await self.wait_for_cohort(1)
+            upstream_reader = self.channel.waiting[0][-2]
+            close_first.set()
             await asyncio.wait_for(closed.wait(), 2)
-            await asyncio.sleep(.05)
-            others = [self.request(i) for i in range(1, 50)]
+            self.assertEqual(await asyncio.wait_for(upstream_reader.read(1), 2), b'')
+            self.assertTrue(upstream_reader.at_eof())
+            # One new connection is sufficient to retire the failed ticket;
+            # do not race the assertion against another 49 disk commits.
+            second = self.request(1)
             self.assertEqual((await asyncio.wait_for(first, 2))[0], 503)
             self.assertEqual(len(self.fixture.requests), 0)
             self.assertEqual(self.channel.snapshot()['forwarded'], 0)
+            others = [second, *[self.request(i) for i in range(2, 50)]]
             replacement = self.request(0)
             results = await asyncio.wait_for(asyncio.gather(*others, replacement), 5)
             self.assertEqual([code for code, _ in results], [200] * 50)
@@ -170,6 +187,7 @@ class SustainedConnectRecoveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.channel.snapshot()['forwarded'], 50)
             self.assertEqual(self.budget.snapshot()['attempts'], 51)
         finally:
+            close_first.set()
             server.close()
             await server.wait_closed()
 
@@ -216,12 +234,15 @@ class SustainedConnectRecoveryTests(unittest.IsolatedAsyncioTestCase):
             number = connecting
             reader, writer = await connect()
             if number == 50:
-                await asyncio.sleep(.05)
+                self.assertEqual(await asyncio.wait_for(reader.read(1), 2), b'')
                 self.assertTrue(reader.at_eof())
             return reader, writer
         object.__setattr__(self.channel.upstream, 'connect', delayed_last)
         try:
-            requests = [self.request(i) for i in range(50)]
+            requests = [self.request(i) for i in range(49)]
+            await self.wait_for_cohort(49)
+            self.assertFalse(any(request.done() for request in requests))
+            requests.append(self.request(49))
             done, _ = await asyncio.wait(requests, timeout=2, return_when=asyncio.FIRST_COMPLETED)
             self.assertEqual(len(done), 1)
             first = next(iter(done))

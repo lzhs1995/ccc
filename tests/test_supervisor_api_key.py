@@ -141,7 +141,7 @@ class CredentialDisplayTests(unittest.TestCase):
         for width in range(80, 400):
             row = tui._row_text("     ", cells, "标题", width, SID, api_key=key)
             header = tui.header_text(width)
-            self.assertEqual(key in row, "api-key" in header)
+            self.assertEqual(key in row, "api-key" in header or "Key~" in header)
             self.assertLessEqual(tui.display_width(row), max(width, tui.row_layout(None).head_cells))
             if key not in row:
                 self.assertNotIn("sk-test", row)

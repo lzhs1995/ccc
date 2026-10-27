@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Multi-agent role map",
+  "type": "object",
+  "required": ["task_id", "session", "supervisor", "executors", "panes", "updated_at"],
+  "properties": {
+    "task_id": {"type": "string", "minLength": 1},
+    "session": {"type": "string", "minLength": 1},
+    "supervisor": {"$ref": "#/$defs/role_entry"},
+    "executors": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/role_entry"}
+    },
+    "panes": {
+      "type": "array",
+      "minItems": 2,
+      "items": {"$ref": "#/$defs/role_entry"}
+    },
+    "updated_at": {"type": "string", "minLength": 1}
+  },
+  "$defs": {
+    "role_entry": {
+      "type": "object",
+      "required": [
+        "identity",
+        "pane_id",
+        "session",
+        "role",
+        "agent",
+        "requested_agent",
+        "detected_agent",
+        "agent_match",
+        "binding_confidence",
+        "binding_evidence",
+        "path",
+        "title"
+      ],
+      "properties": {
+        "identity": {"type": "string"},
+        "pane_id": {"type": "string"},
+        "session": {"type": "string"},
+        "role": {"type": "string"},
+        "agent": {"type": "string"},
+        "requested_agent": {"type": "string"},
+        "detected_agent": {"type": "string"},
+        "agent_match": {"type": "boolean"},
+        "binding_confidence": {
+          "type": "string",
+          "enum": ["authoritative", "fallback", "explicit", "unknown"]
+        },
+        "binding_evidence": {"type": "string"},
+        "path": {"type": "string"},
+        "title": {"type": "string"}
+      }
+    }
+  }
+}

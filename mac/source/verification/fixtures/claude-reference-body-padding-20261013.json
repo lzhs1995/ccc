@@ -1,0 +1,38 @@
+[
+  {
+    "marker": "example0",
+    "body_bytes": 1660,
+    "rows": [
+      "───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
+      "❯ STATUS: MESSAGE_REFERENCE_V2 example0",
+      "  BODY=\"/Users/test/.local/state/multi-agent-collaboration/message-bodies-v1/a51084430511f701ebad95da64e6982207612947f1b1f9a9e1eef041a51e6c33.txt\"                ",
+      "  SHA256=a51084430511f701ebad95da64e6982207612947f1b1f9a9e1eef041a51e6c33 BYTES=1660 Verify and read the exact UTF-8 body; follow its reply contract within existing authority.",
+      "  Native receipt proves this notice only; body reading and acceptance are separate.",
+      "───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
+      "  [Opus 5] │ example-task/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx git:(review/xxxxxxxxxxxxxxxxxxxxxxxxx* ↑13) │ ⏱️  210h 50m",
+      "  上下文 ██░░░░░░░░ 24%",
+      "  1 CLAUDE.md | 9 MCPs | 7 钩子",
+      "  ✓ Bash ×14 | ✓ Edit ×2 | ✓ Write ×2 | ✓ ScheduleWakeup ×1 | +1 more",
+      "  ⏵⏵ bypass permissions on (shift+tab to cycle)"
+    ]
+  },
+  {
+    "marker": "example1xxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "body_bytes": 975,
+    "rows": [
+      "───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
+      "❯ STATUS: MESSAGE_REFERENCE_V2 example1xxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "  BODY=\"/Users/test/.local/state/multi-agent-collaboration/message-bodies-v1/3211bd203109ac53469323c2a3292216899909d2badd3c374aefe1832b7d8c60.txt\"                ",
+      "  SHA256=3211bd203109ac53469323c2a3292216899909d2badd3c374aefe1832b7d8c60 BYTES=975 Verify and read the exact UTF-8 body; follow its reply contract within existing authority. Native",
+      "  receipt proves this notice only; body reading and acceptance are separate.",
+      "───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
+      "  [Opus 5] │ work/example-xxxxxxxxx git:(review/xxxxxxxxxxxxxxxxxxxxxxxxx* ↑13) │ ⏱️  1310h 11m",
+      "  上下文 ██░░░░░░░░ 24%",
+      "  2 CLAUDE.md | 9 MCPs | 7 钩子",
+      "  ✓ Bash ×11 | ✓ Write ×4 | ✓ Edit ×4 | ✓ ScheduleWakeup ×1",
+      "  ✓ general-purpose [opus-5]: Audit live production state (<1s)",
+      "  ✓ general-purpose [opus-5]: Audit release and install path (<1s)",
+      "  ⏵⏵ bypass permissions on (shift+tab to cycle)"
+    ]
+  }
+]

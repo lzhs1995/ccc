@@ -150,8 +150,8 @@ class PausedTransportHealthTests(unittest.TestCase):
                 target = dict(surface_id="s", workspace_id="w", enabled=enabled,
                               paused=True, paused_reason=detail)
                 row = health.continuation_row(target, {}, now=100)
-                self.assertEqual(row["status"], "paused")
-                self.assertEqual(row["reason_code"], "explicitly_paused_or_disabled")
+                self.assertEqual(row["status"], "paused" if enabled else "disabled")
+                self.assertEqual(row["reason_code"], "monitoring_paused" if enabled else "monitoring_disabled")
 
 
 if __name__ == "__main__":

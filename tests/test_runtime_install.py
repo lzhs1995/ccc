@@ -3,6 +3,7 @@
 import json
 import os
 import plistlib
+import shlex
 import shutil
 import subprocess
 import sys
@@ -27,6 +28,8 @@ class RuntimeInstallTests(unittest.TestCase):
         self.source.mkdir(parents=True)
         for name in core.RUNTIME_FILES:
             (self.source / name).write_text("VALUE = 1\n", encoding="utf-8")
+        shutil.copytree(SOURCE / core.RUNTIME_MAC_SOURCE,
+                        self.source / core.RUNTIME_MAC_SOURCE)
         self.app = self.root / "Library" / "Application Support" / core.APP_NAME
         self.runtime = self.app / "runtime"
         self.plist = self.root / "LaunchAgents" / "watcher.plist"
@@ -88,6 +91,21 @@ class RuntimeInstallTests(unittest.TestCase):
             input="{}", cwd=self.root, capture_output=True, text=True, timeout=15,
         )
         self.assertEqual(hook.returncode, 0, hook.stderr)
+
+    def test_pre_jev_release_remains_valid_for_inspection_and_rollback(self):
+        historical_files = tuple(name for name in core.RUNTIME_FILES
+                                 if name != "ccc_jev_unknown.py")
+        with mock.patch.object(core, "RUNTIME_FILES", historical_files):
+            release = core.stage_runtime_release()
+        core.validate_runtime_release(release)
+        manifest = json.loads((release / "manifest.json").read_text())
+        self.assertNotIn("ccc_jev_unknown.py", manifest["files"])
+        core._set_runtime_pointer(self.runtime, release)
+        self.assertEqual((self.runtime / "current").resolve(), release)
+        # A missing manifest member remains corruption, not another old shape.
+        (release / "ccc_provider_retry.py").unlink()
+        with self.assertRaises(RuntimeError):
+            core.validate_runtime_release(release)
 
     def test_staged_daemon_constructs_without_checkout_or_external_io(self):
         for name in core.RUNTIME_FILES:
@@ -162,6 +180,25 @@ print('staged daemon constructed without running watch loop')
         self.assertNotIn(str(self.source), self.plist.read_text())
         self.assertIn("&amp;", self.plist.read_text())
 
+    def test_launchd_environment_does_not_add_bytecode_to_release(self):
+        release = core.stage_runtime_release()
+        core.write_plist(runtime_dir=release)
+        document = plistlib.loads(self.plist.read_bytes())
+        before = {str(p.relative_to(release)): p.read_bytes()
+                  for p in release.rglob("*") if p.is_file()}
+        # Deliberately omit -B: launchd must enforce this for the daemon itself.
+        result = subprocess.run(
+            [core.DEFAULT_PYTHON, "-s", "-c",
+             "import cmux_codex_watch, sys; assert sys.dont_write_bytecode"],
+            cwd=document["WorkingDirectory"], env=document["EnvironmentVariables"],
+            capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(before, {str(p.relative_to(release)): p.read_bytes()
+                                 for p in release.rglob("*") if p.is_file()})
+        self.assertFalse(list(release.rglob("__pycache__")))
+        self.launch.assert_not_called()
+
     def test_bootstrap_failure_restores_old_runtime_plist_and_data(self):
         old, old_plist = self.old_install()
         protected = {}
@@ -230,7 +267,10 @@ print('staged daemon constructed without running watch loop')
             return subprocess.CompletedProcess(args, 0, "", "")
 
         self.launch.side_effect = launch
-        with mock.patch.object(core.time, "sleep") as sleep:
+        with mock.patch.object(core, "time", wraps=core.time) as clock:
+            # Do not replace time.sleep process-wide: unrelated background
+            # workers otherwise spin and contaminate this installer's count.
+            sleep = clock.sleep = mock.Mock()
             core.launchctl("install")
         self.assertEqual(len(attempts), 3)
         self.assertEqual(sleep.call_count, 2)
@@ -250,7 +290,8 @@ print('staged daemon constructed without running watch loop')
             return subprocess.CompletedProcess(args, 0, "", "")
 
         self.launch.side_effect = launch
-        with mock.patch.object(core.time, "sleep") as sleep:
+        with mock.patch.object(core, "time", wraps=core.time) as clock:
+            sleep = clock.sleep = mock.Mock()
             with self.assertRaisesRegex(RuntimeError, "previous runtime pointer and plist restored"):
                 core.launchctl("install")
             sleep.assert_not_called()
@@ -260,7 +301,8 @@ print('staged daemon constructed without running watch loop')
 
     def test_bootstrap_busy_retry_has_a_deadline(self):
         self.launch.return_value = subprocess.CompletedProcess([], 5, "", "Bootstrap failed: 5: Input/output error")
-        with mock.patch.object(core.time, "sleep") as sleep:
+        with mock.patch.object(core, "time", wraps=core.time) as clock:
+            sleep = clock.sleep = mock.Mock()
             with self.assertRaisesRegex(RuntimeError, "Input/output error"):
                 core._bootstrap_runtime_service("gui/test", self.plist, timeout_sec=0)
             sleep.assert_not_called()
@@ -310,6 +352,7 @@ print('staged daemon constructed without running watch loop')
             self.assertEqual(result.returncode, 0, result.stderr)
             commands.append(result.stdout.strip())
         self.assertEqual(commands[0], commands[1])
+        self.assertEqual(shlex.split(commands[0])[1], "-B")
         self.assertIn("/runtime/current/claude_ccc_event_hook.py", commands[0])
         self.assertNotIn("Documents", commands[0])
 

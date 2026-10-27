@@ -1,0 +1,12 @@
+· Flowing… (22m 47s · ↓ 8.3k tokens)
+                                                                                                                 ◎ /goal active (3h)
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯  
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  [Opus 5.5 (1M context)] │ controller-5e477175c864/scripts git:(detached:5e47717) │ ⏱️  242h 23m
+  上下文 ██░░░░░░░░ 22%
+  1 CLAUDE.md | 9 MCPs | 7 钩子
+  ✓ Bash ×19 | ✓ Write ×1
+  ✓ general-purpose: R3 sub-review B identity consume (23m 30s)
+  ✓ general-purpose: R3 sub-review C markers busy installer (22m 47s)
+  ⏵⏵ bypass permissions on (shift+tab to cycle)

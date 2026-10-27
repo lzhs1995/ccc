@@ -433,7 +433,7 @@ class PersistenceTests(unittest.TestCase):
             entered[index].set()
             if not release[index].wait(4):
                 raise TimeoutError("test write was not released")
-        writer = CoalescingWriter(write, delay=0)
+        writer = CoalescingWriter(write, delay=0, background_interval=60)
         try:
             writer.request(wait=False)
             self.assertTrue(entered[0].wait(2))
@@ -463,12 +463,63 @@ class PersistenceTests(unittest.TestCase):
             writes.append(1)
             if len(writes) == 1:
                 raise OSError("disk unavailable")
-        writer = CoalescingWriter(write, delay=0)
+        writer = CoalescingWriter(write, delay=0, background_interval=60)
         try:
             with self.assertRaisesRegex(OSError, "disk unavailable"):
                 writer.request()
             writer.request()
             self.assertEqual(len(writes), 2)
+        finally:
+            writer.close()
+
+    def test_background_requests_coalesce_until_due_without_another_request(self):
+        writes = []
+        first, second = threading.Event(), threading.Event()
+
+        def write():
+            writes.append(time.monotonic())
+            (first if len(writes) == 1 else second).set()
+
+        writer = CoalescingWriter(write, delay=0, background_interval=0.15)
+        try:
+            writer.request(wait=False)
+            self.assertTrue(first.wait(2))
+            for _ in range(100):
+                writer.request(wait=False)
+            self.assertFalse(second.wait(0.02))
+            self.assertTrue(second.wait(2), "pending background snapshot was dropped")
+            self.assertEqual(len(writes), 2)
+            self.assertGreaterEqual(writes[1] - writes[0], 0.14)
+        finally:
+            writer.close()
+
+    def test_sync_barrier_bypasses_background_deadline_and_close_flushes_pending(self):
+        writes = []
+        first, second = threading.Event(), threading.Event()
+
+        def write():
+            writes.append(len(writes))
+            (first if len(writes) == 1 else second).set()
+
+        writer = CoalescingWriter(write, delay=0, background_interval=60)
+        try:
+            writer.request(wait=False)
+            self.assertTrue(first.wait(2))
+            writer.request(wait=False)
+            self.assertFalse(second.wait(0.02))
+            # Use a bounded future so a regression cannot hang the test for
+            # the whole interval. close in finally wakes a throttled writer.
+            pool = ThreadPoolExecutor(1)
+            try:
+                pool.submit(writer.request).result(2)
+                self.assertEqual(writes, [0, 1])
+                writer.request(wait=False)
+            finally:
+                writer.close()
+                pool.shutdown(wait=True)
+            self.assertEqual(writes, [0, 1, 2])
+            with self.assertRaisesRegex(RuntimeError, "closed"):
+                writer.request(wait=False)
         finally:
             writer.close()
 

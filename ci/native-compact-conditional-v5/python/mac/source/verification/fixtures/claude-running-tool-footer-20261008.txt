@@ -1,0 +1,10 @@
+Synthetic reduction of a captured Claude TUI; no user conversation or task identifiers.
+
+──────────────────────────────────────────────────────────────────────────────────────────
+❯
+──────────────────────────────────────────────────────────────────────────────────────────
+  [claude-opus-5-5[1M]] │ example-project git:(main) │ ⏱️  1h 11m
+  上下文 ██░░░░░░░░ 15%
+  2 CLAUDE.md | 9 MCPs | 7 钩子
+  ◐ Bash: .../example... | ✓ Bash ×19
+  ⏵⏵ bypass permissions on (shift+tab to cycle)

@@ -1,0 +1,62 @@
+{
+  "schema": "acp-capability-matrix/v1",
+  "purpose": "Measured, falsifiable provider capability data. DATA ONLY: no adapter, no interface, no transport. This file records what was observed on this machine so a later round can tell when a second real endpoint appears.",
+  "why_data_not_code": "An interface designed against a single implementation encodes that implementation's assumptions. Only one local endpoint exists today, so an abstraction would have exactly one instance to generalise from and would need breaking when the second arrives. Recording facts is cheap and reversible; shipping an interface is neither.",
+  "measured_at": "2026-08-31",
+  "measured_on": "darwin 25.5.0, local binaries only",
+  "method": "Each row is the provider's own --help output on this machine. No network calls, no adapter executed, nothing installed.",
+  "spec": {
+    "name": "Agent Client Protocol (ACP)",
+    "transport": "JSON-RPC over stdio with LSP-style Content-Length framing",
+    "session_flow": "initialize -> session/new -> session/prompt -> session/update -> response",
+    "canonical_repository": "agentclientprotocol/agent-client-protocol",
+    "canonical_repository_note": "GitHub redirects the older zed-industries/agent-client-protocol path; full_name is the canonical answer. A survey citation using the old slug was corrected after the redirect was measured.",
+    "dead_citation_observed": {
+      "url_in_third_party_readme": "anthropics/agent-protocol",
+      "observed_status": 404,
+      "seen_in": "cloga/optimus-code README"
+    }
+  },
+  "providers": [
+    {
+      "provider": "github-copilot-cli",
+      "binary": "copilot",
+      "version_measured": "1.0.80",
+      "acp_flag": "--acp",
+      "acp_flag_present": true,
+      "help_text_observed": "Start as Agent Client Protocol server",
+      "evidence": "local `copilot --help`",
+      "usable_as_acp_endpoint_today": true
+    },
+    {
+      "provider": "claude-code",
+      "binary": "claude",
+      "version_measured": "2.1.170",
+      "acp_flag": null,
+      "acp_flag_present": false,
+      "flags_counted": 58,
+      "evidence": "local `claude --help`; no --acp among 58 flags",
+      "usable_as_acp_endpoint_today": false,
+      "implication": "ACP reaches Claude Code only through a separate adapter binary, so an ACP-only plan would cover some peers and not others."
+    },
+    {
+      "provider": "codex",
+      "binary": "codex",
+      "version_measured": null,
+      "acp_flag": null,
+      "acp_flag_present": null,
+      "evidence": "not measured this round",
+      "usable_as_acp_endpoint_today": null,
+      "implication": "Unknown is recorded as null, never as false. An unmeasured capability must not read as an absent one."
+    }
+  ],
+  "endpoint_count_today": 1,
+  "revisit_trigger": "A second provider with a measured, executable ACP endpoint. Until then any adapter interface would have one instance to generalise from.",
+  "forbidden_now": [
+    "runtime ACP adapter code",
+    "an adapter interface or transport seam",
+    "A2A AgentCard / HTTP-gRPC transport",
+    "any claim that Copilot and Claude Code interoperate over ACP on this machine"
+  ],
+  "relationship_to_cmux": "cmux remains the runtime and the default transport. ACP would be an additional seam behind the existing interface, never a replacement."
+}

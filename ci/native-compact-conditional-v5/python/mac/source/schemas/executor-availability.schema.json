@@ -1,0 +1,126 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "title": "Executor availability v2",
+  "required": [
+    "contract_version",
+    "task_id",
+    "workspace_uuid",
+    "executor_uuid",
+    "executor_surface",
+    "state",
+    "ttl_seconds",
+    "updated_at",
+    "expires_at",
+    "authorization_source",
+    "fallback_policy",
+    "protected_paths",
+    "history",
+    "revision"
+  ],
+  "properties": {
+    "contract_version": {
+      "const": 2
+    },
+    "task_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "workspace_uuid": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "executor_uuid": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "executor_surface": {
+      "type": "string",
+      "minLength": 1
+    },
+    "state": {
+      "enum": [
+        "ACTIVE",
+        "EXECUTOR_DEGRADED",
+        "UNAVAILABLE_AUTH",
+        "UNAVAILABLE_BILLING",
+        "UNAVAILABLE_QUOTA",
+        "SOLO_TAKEOVER",
+        "HANDOFF_READY"
+      ]
+    },
+    "ttl_seconds": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 604800
+    },
+    "updated_at": {
+      "type": "number"
+    },
+    "expires_at": {
+      "type": "number"
+    },
+    "authorization_source": {
+      "enum": [
+        "none",
+        "user_message"
+      ]
+    },
+    "authorization_record": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/fileRef"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "fallback_policy": {
+      "enum": [
+        "manual",
+        "automatic_user_authorized"
+      ]
+    },
+    "protected_paths": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "history": {
+      "type": "array"
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "replacement_session_allowed": {
+      "const": false
+    },
+    "model_switch_allowed": {
+      "const": false
+    }
+  },
+  "$defs": {
+    "fileRef": {
+      "type": "object",
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "pattern": "^(/|[A-Za-z]:[\\\\/])"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        }
+      }
+    }
+  }
+}

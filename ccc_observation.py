@@ -5,6 +5,7 @@ owns the verdict; controllers only project its public fields.
 """
 from __future__ import annotations
 
+import copy
 import errno
 import math
 import subprocess
@@ -13,6 +14,18 @@ from typing import Any
 
 
 HEALTH_PUBLISH_INTERVAL_SEC = 1.0
+PROVIDER_RETRY_HEALTH = {
+    'provider_retry_failure_reserved': 'waiting',
+    'provider_retry_superseded': 'waiting',
+    'provider_retry_server_floor': 'waiting',
+    'provider_retry_local_cooldown': 'waiting',
+    'provider_retry_shared_slot': 'waiting',
+    'provider_retry_fair_queue': 'waiting',
+    'provider_retry_budget_exhausted': 'blocked',
+    'provider_retry_evidence_missing': 'unknown',
+    'provider_retry_ledger_unavailable': 'unavailable',
+    'provider_retry_attempt_mismatch': 'blocked',
+}
 
 
 def transient_observation_error(error: BaseException | str) -> bool:
@@ -63,13 +76,63 @@ def transient_observation_error(error: BaseException | str) -> bool:
 def pause_health(target):
     """A transport message alone cannot establish who requested a pause."""
     if not target.get("enabled", True):
-        return "paused", "explicitly_paused_or_disabled"
+        return "disabled", "monitoring_disabled"
     origin = str(target.get("pause_origin") or "")
     if origin.startswith("automatic_"):
         return "unavailable", "paused_after_observation_error"
     if origin != "user" and transient_observation_error(str(target.get("paused_reason") or "")):
         return "unknown", "pause_origin_unverified"
-    return "paused", "explicitly_paused_or_disabled"
+    return "paused", "monitoring_paused"
+
+
+def pause_metadata(target, *, now):
+    """Project the stored pause without inferring an actor or changing policy.
+
+    The CLI has used origin=user for both human and agent-issued pauses. Keep
+    that original value; it is not authenticated evidence of a human operator.
+    An absent, invalid or future timestamp cannot establish a pause duration.
+    """
+    paused = bool(target.get("paused"))
+    at = target.get("paused_at")
+    age = None
+    if not paused:
+        time_status = "not_paused"
+    elif at is None or (type(at) in (int, float) and at == 0):
+        time_status = "missing"
+    elif type(at) not in (int, float) or not math.isfinite(at) or at < 0:
+        time_status = "invalid"
+    elif at > now:
+        time_status = "future"
+    else:
+        time_status, age = "valid", round(now - at, 3)
+    return {
+        "enabled": bool(target.get("enabled", True)), "paused": paused,
+        "pause_origin": target.get("pause_origin", ""),
+        "paused_reason": target.get("paused_reason", ""), "paused_at": at,
+        "pause_age_sec": age, "pause_time_status": time_status,
+    }
+
+
+def pause_summary(status, rows):
+    """Keep deliberate holds visible without reviving closed or idle targets."""
+    applicable = [row for row in rows if row.get("status") not in {"missing", "inactive", "dormant"}]
+    enabled = [row for row in applicable if row.get("enabled", True) and row.get("status") != "disabled"]
+    paused = sum(bool(row.get("paused") or row.get("status") == "paused") for row in enabled)
+    disabled = len(applicable) - len(enabled)
+    attention = []
+    if paused:
+        attention.append("all_enabled_targets_paused" if paused == len(enabled) else "some_enabled_targets_paused")
+    if disabled:
+        attention.append("all_targets_disabled" if not enabled else "some_targets_disabled")
+    # A known failure or missing evidence still outranks an intentional hold.
+    if status == "ok":
+        if paused and paused == len(enabled):
+            status = "paused"
+        elif disabled and not enabled:
+            status = "disabled"
+        elif attention:
+            status = "attention"
+    return {"status": status, "attention_reasons": attention}
 
 
 def objects(value: Any):
@@ -147,6 +210,7 @@ def observation_row(target, record, process, terminal, runtime, *, owner_alive, 
     fresh = checked > 0 and 0 <= now - checked <= stale_after
     row = {
         "surface_id": sid, "workspace_id": wid,
+        **pause_metadata(target, now=now),
         "agent_kind": kind, "agent_pid": pid,
         "runtime_ready": native, "observed_at": now,
         "viewport_checked_at": checked,
@@ -168,8 +232,9 @@ def observation_row(target, record, process, terminal, runtime, *, owner_alive, 
         # An incomplete OS scan cannot establish that a shell has no agent.
         # Keep that uncertainty separate from stale viewport/Hook failures;
         # positive native ownership still follows the normal observation path.
-        if (target.get("paused") or not target.get("enabled", True)) and pause_health(target)[0] == "paused":
-            row.update(status="paused", reason_code="explicitly_paused_or_disabled")
+        if (target.get("paused") or not target.get("enabled", True)) and pause_health(target)[0] in {"paused", "disabled"}:
+            health, reason = pause_health(target)
+            row.update(status=health, reason_code=reason)
         else:
             row["reason_code"] = "process_inventory_incomplete"
     elif (inventory_complete and process.get("process_snapshot_present")
@@ -201,17 +266,19 @@ def observation_row(target, record, process, terminal, runtime, *, owner_alive, 
 
 
 def summarize_observation(rows, *, now, stale_after):
-    counts = {key: 0 for key in ("readable", "live_unreadable", "dormant", "paused", "missing", "unknown")}
+    counts = {key: 0 for key in ("readable", "live_unreadable", "dormant", "paused", "disabled", "missing", "unknown")}
     projected = []
     for original in rows:
         row = dict(original)
-        if row.get("status") != "paused" and not 0 <= now - float(row.get("observed_at") or 0) <= stale_after:
+        if "paused" in row:
+            row.update(pause_metadata(row, now=now))
+        if row.get("status") not in {"paused", "disabled"} and not 0 <= now - float(row.get("observed_at") or 0) <= stale_after:
             row.update(status="unknown", reason_code="diagnostic_snapshot_stale")
         status = row.get("status", "unknown")
         counts[status if status in counts else "unknown"] += 1
         projected.append(row)
     status = "degraded" if counts["live_unreadable"] else "unknown" if counts["unknown"] else "ok"
-    return {"status": status, "scope": "authorized_targets", "observed_at": now,
+    return {**pause_summary(status, projected), "scope": "authorized_targets", "observed_at": now,
             "stale_after_sec": stale_after, "counts": counts, "targets": projected}
 
 
@@ -252,16 +319,44 @@ def continuation_row(target, runtime, *, now, poll_interval=1.0, observation=Non
         deadline_age = published_at - checked
         publication_age = now - published_at
         reason = "current_published_observation"
+    # A newer viewport/state invalidates an old provider decision. Never infer
+    # the reason by parsing paused_reason or perform another reservation here.
+    provider_retry = runtime.get('provider_retry_status')
+    provider_checked = provider_retry.get('checked_at') if isinstance(provider_retry, Mapping) else None
+    observed_at = runtime.get('observed_at', 0)
+    if type(observed_at) not in (int, float) or not math.isfinite(observed_at):
+        observed_at = 0
+    # Repeated reads of the same failed native turn do not supersede its retry
+    # decision. Only retain an older verdict when it is explicitly bound to
+    # that turn and the watcher is still waiting on it. Active/successful work,
+    # another turn and legacy unbound verdicts keep the freshness requirement.
+    same_failed_turn = (isinstance(provider_retry, Mapping)
+        and bool(provider_retry.get('observed_turn_key'))
+        and provider_retry['observed_turn_key'] == runtime.get('codex_observed_turn_key')
+        and phase in {'awaiting_transition', 'queued_followup', 'error', 'recoverable_error',
+                      'provider_blocked', 'token_exhausted'})
+    if (not isinstance(provider_retry, Mapping)
+            or not isinstance(provider_retry.get('reason_code'), str)
+            or provider_retry.get('reason_code') not in PROVIDER_RETRY_HEALTH
+            or type(provider_checked) not in (int, float) or not math.isfinite(provider_checked)
+            or not 0 < provider_checked <= now
+            or (provider_checked < max(checked, observed_at) and not same_failed_turn)
+            or ('observed_turn_key' in provider_retry
+                and provider_retry['observed_turn_key'] != runtime.get('codex_observed_turn_key', ''))):
+        provider_retry = {}
+    else:
+        provider_retry = dict(provider_retry)
     if current and observed.get("status") == "missing":
         status, reason = "missing", "surface_closed_owner_exited"
     elif current and observed.get("status") == "dormant":
         status, reason = "inactive", str(observed.get("reason_code") or "no_supported_agent")
     elif not target.get("enabled", True):
-        status, reason = "paused", "explicitly_paused_or_disabled"
+        status, reason = "disabled", "monitoring_disabled"
     elif (current and observed.get("status") == "unknown"
           and observed.get("reason_code") == "process_inventory_incomplete"
           and (not target.get("paused") or pause_health(target)[0] != "paused")
-          and delivery not in {"unknown", "failed", "sending"}
+           and delivery not in {"unknown", "failed", "sending"}
+           and not phase.startswith("codex_compact_")
           and phase not in {"cmux_unavailable", "send_guard_unavailable", "incompatible", "claude_viewport_blind",
                             "provider_blocked", "token_exhausted", "network_wait", "queue_recovery_unconfirmed",
                             "claude_hook_config_degraded", "claude_hook_gap_exhausted", "claude_model_unavailable"}):
@@ -281,6 +376,18 @@ def continuation_row(target, runtime, *, now, poll_interval=1.0, observation=Non
         status, reason = "delivery_unknown", "send_acknowledgement_overdue"
     elif delivery == "failed":
         status, reason = "send_failed", "cmux_rejected_send"
+    elif phase.startswith("codex_compact_"):
+        # A live viewport does not prove continuation is available. Preserve
+        # the compaction controller's explicit ownership/failure verdict.
+        status = {
+            "codex_compact_compacting": "waiting",
+            "codex_compact_control_pending": "waiting",
+            "codex_compact_compacted": "waiting",
+            "codex_compact_unavailable": "unavailable",
+            "codex_compact_uncertain": "unknown",
+            "codex_compact_exhausted": "blocked",
+        }.get(phase, "unknown")
+        reason = phase
     elif phase in {"cmux_unavailable", "send_guard_unavailable", "incompatible", "claude_viewport_blind"}:
         status, reason = "unavailable", phase
     elif phase in {"provider_blocked", "token_exhausted", "network_wait"}:
@@ -289,18 +396,25 @@ def continuation_row(target, runtime, *, now, poll_interval=1.0, observation=Non
         status, reason = "unknown", phase
     elif phase in {"claude_hook_config_degraded", "claude_hook_gap_exhausted", "claude_model_unavailable"}:
         status, reason = "blocked", phase
+    elif phase == "queue_recovery_unconfirmed":
+        status, reason = "delivery_unknown", phase
+    elif phase == "missing_or_error":
+        status, reason = "unavailable", phase
+    elif provider_retry:
+        reason = provider_retry['reason_code']
+        status = PROVIDER_RETRY_HEALTH[reason]
+    elif phase == "awaiting_transition":
+        status, reason = "waiting", "awaiting_native_turn_transition"
     elif phase in {"error_superseded", "queued_followup"}:
         # Waiting on the agent is not a failed watcher. This explicitly does
         # not claim successful model access, task completion or queue delivery.
         status, reason = "waiting", "previous_error_superseded" if phase == "error_superseded" else "followup_queued"
     elif phase in {"unknown", "queue_recovery_submitted"}:
         status, reason = "unknown", "task_progress_unconfirmed"
-    elif phase == "missing_or_error":
-        status, reason = "unavailable", phase
-    elif phase == "queue_recovery_unconfirmed":
-        status, reason = "delivery_unknown", phase
+    timings = runtime.get('observation_timings')
     return {
         "surface_id": str(target["surface_id"]), "workspace_id": str(target["workspace_id"]),
+        **pause_metadata(target, now=now),
         "status": status, "reason_code": reason, "state": phase,
         "viewport_checked_at": checked, "observation_age_sec": round(age, 3) if age is not None else None,
         "observation_deadline_age_sec": round(deadline_age, 3) if deadline_age is not None else None,
@@ -310,6 +424,9 @@ def continuation_row(target, runtime, *, now, poll_interval=1.0, observation=Non
         "observation_interval_ms": runtime.get("observation_interval_ms", 0),
         "scheduler_lag_ms": runtime.get("scheduler_lag_ms", 0),
         "read_duration_ms": runtime.get("read_duration_ms", 0),
+        # Nested stage totals belong to this published snapshot. Later worker
+        # updates or consumer edits must not mutate the other side's metrics.
+        "observation_timings": copy.deepcopy(dict(timings)) if isinstance(timings, Mapping) else {},
         "send_queue_ms": runtime.get("send_queue_ms", 0),
         "send_duration_ms": runtime.get("send_duration_ms", 0),
         "send_persist_duration_ms": runtime.get("send_persist_duration_ms", 0),
@@ -318,6 +435,7 @@ def continuation_row(target, runtime, *, now, poll_interval=1.0, observation=Non
         "send_io_started_at": runtime.get("send_io_started_at", 0),
         "send_completed_at": runtime.get("send_completed_at", 0),
         "last_send_error": runtime.get("last_send_error", ""),
+        "provider_retry_status": provider_retry,
     }
 
 
@@ -326,13 +444,106 @@ def continuation_report(targets, runtime, *, now, poll_interval=1.0, observation
     rows = [continuation_row(t, runtime.get(str(t["surface_id"]), {}), now=now, poll_interval=poll_interval,
                              observation=by_id.get(t["surface_id"]), published_at=published_at)
             for t in targets]
-    counts = {key: 0 for key in ("ok", "paused", "unknown", "delayed", "delivery_unknown",
+    counts = {key: 0 for key in ("ok", "paused", "disabled", "unknown", "delayed", "delivery_unknown",
                                "send_failed", "unavailable", "blocked", "missing", "inactive", "waiting")}
     for row in rows:
         counts[row["status"]] += 1
     bad = sum(counts[key] for key in ("delayed", "delivery_unknown", "send_failed", "unavailable", "blocked"))
-    return {"status": "degraded" if bad else "unknown" if counts["unknown"] else "ok",
+    status = "degraded" if bad else "unknown" if counts["unknown"] else "ok"
+    return {**pause_summary(status, rows),
             "observed_at": now, "scope": "authorized_targets", "counts": counts, "targets": rows}
+
+
+def session_start_observation_candidate(events, target, observation, runtime, ledger, *, now):
+    """Bind an original rejected SessionStart as evidence, never a lifecycle event."""
+    def valid_time(value, *, zero=False):
+        return (type(value) in (int, float) and math.isfinite(value)
+                and (value >= 0 if zero else value > 0) and value <= now)
+
+    if type(now) not in (int, float) or not math.isfinite(now) or now <= 0:
+        return None, "observation_time_unverified"
+    relevant = []
+    for event in events:
+        if not isinstance(event, Mapping):
+            return None, "event_identity_unverified"
+        if event.get("surface_id") != target.get("surface_id") or event.get("synthetic_fallback"):
+            continue
+        if not valid_time(event.get("created_at")):
+            return None, "event_time_unverified"
+        relevant.append(event)
+    if not relevant:
+        return None, "no_session_start"
+    latest = max(enumerate(relevant), key=lambda item: (item[1]["created_at"], item[0]))[1]
+    if latest.get("event_name") != "SessionStart" or latest.get("completed"):
+        return None, "latest_event_not_session_start"
+    strings = ("event_id", "surface_id", "workspace_id", "session_id", "transcript_id", "message_hash", "source")
+    if (type(latest.get("version")) is not int or latest["version"] != 1
+            or any(not isinstance(latest.get(key), str) or not latest[key].strip() for key in strings)
+            or latest["workspace_id"] != target.get("workspace_id")):
+        return None, "event_identity_unverified"
+    if any(e["created_at"] == latest["created_at"] and e != latest for e in relevant):
+        return None, "ambiguous_session_start"
+    row = ledger.get(latest["event_id"], {})
+    if (not isinstance(row, Mapping) or row.get("status") != "unmapped"
+            or row.get("detail") != "surface is not authorized"):
+        return None, "session_start_not_originally_unmapped"
+    identity = ("surface_id", "workspace_id", "session_id", "event_name", "agent_pid",
+                "created_at", "transcript_id", "message_hash")
+    if (any(row.get(key) != latest.get(key) for key in identity)
+            or any(key in row and row[key] != latest.get(key)
+                   for key in ("event_id", "version", "source", "cwd_hash", "process_generation"))
+            or type(row.get("agent_pid")) is not int
+            or not valid_time(row.get("created_at"))
+            or not valid_time(row.get("handled_at")) or row["handled_at"] < latest["created_at"]):
+        return None, "original_rejection_identity_unverified"
+    pid, generation, born = observation.get("pid"), observation.get("generation"), observation.get("started_epoch")
+    if (type(pid) is not int or pid <= 0 or type(latest.get("agent_pid")) is not int
+            or latest["agent_pid"] != pid
+            or pid not in [p for p in observation.get("identity_verified_pids", []) if type(p) is int]
+            or not isinstance(generation, str) or not generation
+            or not valid_time(born) or born > latest["created_at"]
+            or ("process_generation" in latest and latest["process_generation"] != generation)):
+        return None, "session_start_process_unverified"
+    if (type(runtime.get("claude_process_pid")) is not int or runtime["claude_process_pid"] != pid
+            or runtime.get("claude_process_generation") != generation
+            or runtime.get("claude_session_id") not in (None, "", latest["session_id"])):
+        return None, "session_start_runtime_identity_mismatch"
+    for key in ("claude_last_hook_at", "claude_turn_started_at", "claude_last_rejected_hook_at", "last_send_at"):
+        watermark = runtime.get(key, 0)
+        if not valid_time(watermark, zero=True) or watermark > latest["created_at"]:
+            return None, "session_start_superseded"
+    # A handler may have advanced the ledger while the journal was being read.
+    for event_id, other in ledger.items():
+        if (event_id != latest["event_id"] and isinstance(other, Mapping)
+                and other.get("surface_id") == latest["surface_id"] and not other.get("synthetic_fallback")
+                and (not valid_time(other.get("created_at")) or other["created_at"] >= latest["created_at"])):
+            return None, "session_start_ledger_advanced"
+    return {
+        "version": 1, "kind": "session_start_observation", "observed_at": now,
+        "execution_authority": False,
+        "process": {"pid": pid, "generation": generation, "started_epoch": born},
+        "event": copy.deepcopy(dict(latest)), "original_rejection": copy.deepcopy(dict(row)),
+    }, "session_start_observed"
+
+
+def session_start_observation_matches(proof, target, observation, runtime, *, now):
+    """Recheck stored evidence against current identity without granting input."""
+    if (type(now) not in (int, float) or not math.isfinite(now) or now <= 0
+            or not isinstance(proof, Mapping) or type(proof.get("version")) is not int or proof["version"] != 1
+            or proof.get("kind") != "session_start_observation" or proof.get("execution_authority") is not False
+            or type(proof.get("observed_at")) not in (int, float) or not math.isfinite(proof["observed_at"])
+            or not 0 < proof["observed_at"] <= now):
+        return False
+    event, process = proof.get("event"), proof.get("process")
+    if (not isinstance(event, Mapping) or not isinstance(process, Mapping)
+            or not isinstance(event.get("event_id"), str)
+            or any(process.get(k) != observation.get(k) for k in ("pid", "generation", "started_epoch"))
+            or type(event.get("created_at")) not in (int, float)
+            or event["created_at"] > proof["observed_at"]):
+        return False
+    candidate, _ = session_start_observation_candidate(
+        [event], target, observation, runtime, {event["event_id"]: proof.get("original_rejection")}, now=now)
+    return candidate is not None and candidate["original_rejection"]["handled_at"] <= proof["observed_at"]
 
 
 def registration_rejection(row):

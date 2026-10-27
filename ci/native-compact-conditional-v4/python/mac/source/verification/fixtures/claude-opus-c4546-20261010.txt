@@ -1,0 +1,12 @@
+Synthetic history for the measured Claude footer geometry.
+Archived report: WAITING_SUPERVISOR; no live task or receipt evidence.
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+──────────────────────────────────────────────────────────────────────────────────────────────────────────
+  [Opus 5 (1M context)]
+  fixture/wrapped-footer git:(main) │ ⏱️  144h 52m
+  上下文 ██░░░░░░░░ 18%
+  1 CLAUDE.md | 9 MCPs | 7 钩子
+  ✓ Bash ×20
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents

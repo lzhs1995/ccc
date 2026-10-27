@@ -663,16 +663,24 @@ def native_launch_argv(config_path, job, index, *, native_argv=None):
     return argv
 
 
+# 原生 SessionStart Hook 时限。5 s 在多路并发冷启动时不够：解释器启动和导入还没写出
+# initial-hook-attempt 就被原生按时限结束，该路无法确认、永远停在 created
+# （2026-10-19 三批 150 路全部如此，slot 日志 hook/started→completed 恰为 5.000 s）。
+INITIAL_HOOK_TIMEOUT_SEC = 60
+# Hook 内文件清点的重试窗口，须小于上面的 Hook 时限。
+INITIAL_HOOK_INVENTORY_SEC = 20.0
+
+
 def initial_hook_arguments(hook):
     # Native 0.156's normalized hook identity uses sorted JSON via
     # version_for_toml; trust only this session-flags handler, not other hooks.
     normalized = {"event_name": "session_start", "matcher": "startup", "hooks": [
-        {"type": "command", "command": hook, "timeout": 5, "async": False}]}
+        {"type": "command", "command": hook, "timeout": INITIAL_HOOK_TIMEOUT_SEC, "async": False}]}
     trust = "sha256:" + hashlib.sha256(json.dumps(
         normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
     key = "/<session-flags>/config.toml:session_start:0:0"
     return ["--enable", "hooks", "-c", 'hooks.SessionStart=[{matcher="startup",hooks=[{type="command",command='
-            + json.dumps(hook) + ',timeout=5}]}]', "-c",
+            + json.dumps(hook) + ',timeout=%d}]}]' % INITIAL_HOOK_TIMEOUT_SEC, "-c",
             "hooks.state={" + json.dumps(key) + '={enabled=true,trusted_hash=' + json.dumps(trust) + '}}']
 
 
@@ -796,10 +804,35 @@ def bind_initial_session(config_path, job_id, index, launch_id, payload):
             or native["argv"] != claim["argv"]
             or Path(payload["cwd"]).resolve() != Path(claim["cwd"]).resolve()):
         raise RuntimeError("initial hook original native identity changed")
-    from ccc_codex_queue import process_writable_files
+    from ccc_codex_queue import (IncompleteVnodeRead, VnodeInventoryChanged,
+                                 process_writable_files)
     tui = Path(claim["tui_log"])
+    # Native startup opens and closes files while libproc samples its vnode
+    # table. Retry only that observation inside this original, consumed Hook;
+    # never rerun the Hook or substitute a later session. Incomplete samples
+    # are not evidence, and process birth is checked on both sides of each
+    # successful sample. Keep the whole read below the native Hook timeout.
+    inventory_deadline = time.monotonic() + INITIAL_HOOK_INVENTORY_SEC
+    while True:
+        if time.monotonic() >= inventory_deadline:
+            raise TimeoutError("initial hook file inventory deadline elapsed")
+        if birth(native["pid"], codex=True) != native["birth"]:
+            raise RuntimeError("initial hook process changed during file observation")
+        try:
+            files = process_writable_files(native["pid"], identities=True)
+        except (IncompleteVnodeRead, VnodeInventoryChanged):
+            remaining = inventory_deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("initial hook file inventory deadline elapsed")
+            time.sleep(min(0.02, remaining))
+            continue
+        if time.monotonic() >= inventory_deadline:
+            raise TimeoutError("initial hook file inventory deadline elapsed")
+        if birth(native["pid"], codex=True) != native["birth"]:
+            raise RuntimeError("initial hook process changed during file observation")
+        break
     st = tui.stat()
-    fd = process_writable_files(native["pid"], identities=True).get(tui.resolve(), {})
+    fd = files.get(tui.resolve(), {})
     if ([st.st_dev, st.st_ino] != claim["tui_log_identity"]
             or [fd.get("device"), fd.get("inode")] != claim["tui_log_identity"]):
         raise RuntimeError("initial hook original native event writer missing")

@@ -63,12 +63,27 @@ ccc arm
 `scripts/render-launchagents.sh` renders installation files without loading
 services. `cmux-stack` mutations require their documented `--apply` switch.
 
+JEV can classify current native failures that the local error rules leave unknown.
+Known errors keep the local route with no API request. Configure `TYPESAFE_API_KEY`
+or put the key in `typesafe-api-key` beside the watcher's `config.json`, owned by
+the daemon user with mode `0600`. This private file also works under launchd;
+the key is not copied into a plist or the installed source bundle. Install and
+restart the watcher after enabling it. A missing key, timeout or unrecognized
+answer keeps the original behavior.
+
+Classification runs in one bounded background worker. Cached answers for the
+same native turn/event can select the existing rate-limit or upstream retry
+route. Identity, current input, compaction, delivery deduplication and durable
+retry budgets still decide whether a continuation may be sent. Claude rechecks
+the answer within its existing provider retry window; there is no added wait.
+Continuation uses the configured fixed prompt, so DeepSeek is optional.
+
 ## Verification
 
 Run the source-only checks before any LaunchAgent action:
 
 ```sh
-python3 -m unittest discover -s tests -p 'test_*.py'
+python3 -m unittest discover -s tests -t . -p 'test_*.py'
 python3 -B tests/test_cmux_stack.py
 python3 -B tools/ccp_pty_stress.py --script ./ccp_new.py --rounds 3
 bash -n janitor/src/cmux-janitor.sh janitor/src/guard.sh
@@ -221,7 +236,7 @@ including the current `response_item` user-message format, before that slot is
 released to the guard. An uncertain Enter is never repeated. Process fallback
 ignores read-only history files that Codex opens while indexing older sessions.
 
-- **监控**：`未登记` / `监控中` / `空转` / `整池空转` / `已暂停` / `整池` / `整池／启动中` / `已排除` / `待检测` / `投递待验` / `发送失败` / `读取异常` / `服务阻塞`。登记仍保留，投递异常直接显示；焦点行显示最近检查的年龄。
+- **监控**：`未登记` / `监控中` / `空转` / `整池空转` / `已暂停` / `已停用` / `整池` / `整池／启动中` / `已排除` / `待检测` / `未纳入` / `检测延迟` / `投递待验` / `发送失败` / `读取异常` / `服务阻塞`。活 Claude 未纳入 Codex 整池时显示 `未纳入`；过期观测显示 `检测延迟`。登记仍保留，投递异常直接显示；焦点行显示最近检查的年龄及原暂停原因、来源、时间与时长。
 - **程序**：`Codex` / `Claude` / `grok` / `Copilot` / `gh` / `shell` / `其他` / `未知`。程序列只显示身份；空转属于「监控」列。
 - **画面**：`空闲` / `运行中` / `菜单` / `待续跑` / `已排队` / `已过时` / `额度耗尽` / `正在输入` / `看不清` / `非Codex` / `Claude关` / `Hook等待` / `输入保护` / `发送中` / `已完成` / `已续跑` / `Hook待验` / `Hook未验` / `配置待核` / `模型错误` / `身份冲突` / `需人工` / `未初始化` / `等待压缩` / `压缩中` / `读不出` / `提交中` / `未确认` / `投递待验` / `发送失败` / `服务阻塞` / `报告待核`。完成、压缩和客户端重试不代表续跑器故障。`报告待核` 表示 Claude 报告已就绪、回调尚未确认；续跑器停止催促该任务，等待监督侧核收，新的人工任务仍可正常继续。
 - **Hook**：当前进程代次的 Hook 验证结果；历史身份记录本身不能授予发送权限。
@@ -281,6 +296,19 @@ never an empty agent inventory. Input uses one connection and one attempt. A
 lost, malformed or mismatched acknowledgement remains uncertain in the ledger;
 CCC never retries that write through a second transport.
 
+For a transient provider failure, recovery follows the latest authenticated native
+turn. A complete failed-turn ending at a stable log boundary can establish that
+an older Goal no longer describes the current failure. Later user input or an
+incomplete trailing record withholds that authority. New proved failures retain
+capped backoff without a permanent retry-count ceiling; old failure keys remain
+protected against replay. Missing deployments, exhausted balance and invalid
+credentials remain explicit provider blockers.
+
+Claude submission uses the complete bordered composer and the shared pane and
+target delivery locks. A draft that contains prompt symbols, rules or footer text
+still counts as input. Lock contention or replacement defers submission while
+preserving the original attempt and Enter budget.
+
 ## Registration recovery and observation coverage (v0.2.0)
 
 Explicit registration triggers background readiness checks. If the latest genuine
@@ -299,7 +327,14 @@ prove that an agent belongs to a terminal slot.
 
 `ccc status` adds `observation_coverage` and `registration_readiness` while keeping
 existing fields. Coverage distinguishes readable targets, live unreadable agents,
-dormant native runtimes, paused targets, closed targets and unknown evidence.
+dormant native runtimes, paused targets, disabled targets, closed targets and unknown evidence.
+Pause metadata is read-only: `pause_origin=user` records the legacy CLI origin,
+not proof that a human issued the command. Missing, invalid or future pause times
+produce an unknown duration. Among applicable live targets, all enabled targets
+paused yields `paused`, all disabled yields `disabled`, and mixed active/held
+targets yield `attention` with separate counts and `attention_reasons`. Known
+faults and uncertain evidence keep precedence; closed and idle history is excluded.
+These displays never expire a pause or authorize an automatic resume.
 `cmux-stack status --json` projects the component-owned verdict and safe counts.
 Live coverage gaps degrade the stack; incomplete or stale evidence is unknown.
 A daemon PID by itself cannot make the entire stack healthy. Unregistered agents

@@ -1,0 +1,186 @@
+name: Native conditional compact v4
+
+on:
+  push:
+    paths:
+      - .github/workflows/native-compact-conditional-v4.yml
+      - ci/native-compact-conditional-v4/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-conditional-v4-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      RUST_MIN_STACK: "8388608"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - name: Reconstruct and verify all pinned source files
+        id: source
+        run: |
+          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/native-conditional-target" >> "$GITHUB_ENV"
+          python3 -I -B ci/native-compact-conditional-v4/prepare.py \
+            --output "$RUNNER_TEMP/native-conditional/source" \
+            --report "$GITHUB_WORKSPACE/conditional-evidence/reconstruction.json"
+      - name: Require build capacity on the GitHub runner
+        timeout-minutes: 8
+        run: |
+          python3 -I -B -c 'import os,shutil; free=shutil.disk_usage(os.environ["RUNNER_TEMP"]).free; print(f"Free GiB: {free/2**30:.1f}"); assert free>=25*2**30'
+          sudo timeout --kill-after=10s 180s apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update -y
+          sudo timeout --kill-after=10s 180s apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y --no-install-recommends build-essential pkg-config libcap-dev libasound2-dev bubblewrap
+          sudo sysctl -w kernel.unprivileged_userns_clone=1
+          if sudo sysctl -a 2>/dev/null | grep -q '^kernel.apparmor_restrict_unprivileged_userns'; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Verify real Python producer sources and create native-reader files
+        id: producer
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          python3 -I -B ci/native-compact-conditional-v4/python/verify_source.py 2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/python-source.log"
+          CCC_COMPACT_TEST_RUNTIME="$GITHUB_WORKSPACE/ci/native-compact-conditional-v4/python" \
+            python3 -I -B ci/native-compact-conditional-v4/python/test_native_compact.py 2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/python-safety-tests.log"
+          export CCC_COMPACT_TEST_RUNTIME="$GITHUB_WORKSPACE/ci/native-compact-conditional-v4/python"
+          python3 -I -B ci/native-compact-conditional-v4/python/test_control_durability.py \
+            2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/python-control-durability.log"
+          python3 -I -B ci/native-compact-conditional-v4/python/test_backup_ownership.py \
+            2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/python-backup-ownership.log"
+          V13_INTENTS_DIR="$CCC_COMPACT_TEST_RUNTIME" \
+            CCC_BASELINE_INTENTS_DIR="$CCC_COMPACT_TEST_RUNTIME/baseline" \
+            python3 -I -B ci/native-compact-conditional-v4/python/test_pin_retirement.py \
+            2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/python-pin-retirement.log"
+          python3 -I -B ci/native-compact-conditional-v4/python/test_archive_process_death.py \
+            2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/python-archive-process-death.log"
+          python3 -I -B ci/native-compact-conditional-v4/python/test_health_lock_gates.py \
+            2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/python-health-lock-gates.log"
+          python3 -I -B ci/native-compact-conditional-v4/python/test_backup_kernel_faults.py \
+            2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/python-backup-kernel-faults.log"
+          python3 -I -B ci/native-compact-conditional-v4/python/generate_reader_fixtures.py \
+            --runtime "$GITHUB_WORKSPACE/ci/native-compact-conditional-v4/python" \
+            --output "$GITHUB_WORKSPACE/conditional-evidence/producer-fixtures" \
+            2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/producer-generation.log"
+          echo "CCC_REAL_PRODUCER_MANIFEST=$GITHUB_WORKSPACE/conditional-evidence/producer-fixtures/manifest.json" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582
+        with:
+          toolchain: 1.95.0
+          components: rustfmt,clippy
+      - uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532
+        with:
+          tool: just@1.51.0,nextest@0.9.103
+      - name: Check Rust formatting
+        id: fmt
+        continue-on-error: true
+        working-directory: ${{ runner.temp }}/native-conditional/source/codex-rs
+        run: |
+          set -o pipefail
+          cargo fmt --all -- --config imports_granularity=Item --check 2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/rustfmt.log"
+      - name: Compile native packages and all Goal/state tests
+        id: check
+        continue-on-error: true
+        working-directory: ${{ runner.temp }}/native-conditional/source/codex-rs
+        run: |
+          set -o pipefail
+          cargo check --locked -p codex-app-server -p codex-core -p codex-tui -p codex-app-server-protocol -p codex-protocol -p codex-rollout -p codex-goal-extension -p codex-state -p codex-skills-extension --tests 2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/cargo-check.log"
+      - name: Run native admission, authority, occurrence and preserved timeout tests
+        id: focused
+        if: steps.check.outcome == 'success' && steps.producer.outcome == 'success'
+        continue-on-error: true
+        working-directory: ${{ runner.temp }}/native-conditional/source/codex-rs
+        run: |
+          set -o pipefail
+          just test --locked -p codex-app-server -p codex-core -p codex-tui -p codex-rollout -p codex-api --lib \
+            -E 'test(input_queue) | test(compact_recovery) | test(compact_original_intent) | test(extension_interruption) | test(turn_timing) | test(client_thread_observation) | test(compact_interrupt) | test(compact_deadline) | test(compact_cancel_wait) | test(collect_compaction_output) | test(close_and_wait_joins_the_websocket_pump) | test(policy)' \
+            --retries 0 2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/focused-tests.log"
+      - name: Run protocol and Goal library regressions
+        id: regressions
+        if: steps.focused.outcome == 'success'
+        continue-on-error: true
+        working-directory: ${{ runner.temp }}/native-conditional/source/codex-rs
+        run: |
+          set -o pipefail
+          just test --locked -p codex-app-server-protocol -p codex-protocol -p codex-goal-extension -p codex-skills-extension --lib --retries 0 2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/library-regressions.log"
+      - name: Run real Goal backend and state CAS regressions
+        id: goal_backend
+        if: steps.focused.outcome == 'success'
+        continue-on-error: true
+        working-directory: ${{ runner.temp }}/native-conditional/source/codex-rs
+        run: |
+          set -o pipefail
+          just test --locked -p codex-goal-extension --test goal_extension_backend --retries 0 \
+            2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/goal-backend-tests.log"
+          just test --locked -p codex-state --lib -E 'test(goals)' --retries 0 \
+            2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/state-goal-tests.log"
+      - name: Run real Goal admission and canceled Zsh command completion
+        id: goal_session
+        if: steps.check.outcome == 'success' && steps.producer.outcome == 'success'
+        continue-on-error: true
+        working-directory: ${{ runner.temp }}/native-conditional/source/codex-rs
+        run: |
+          set -o pipefail
+          just test --locked -p codex-app-server --test all -E 'test(native_compact_goal_f1) | test(turn_start_shell_zsh_fork_subcommand_decline_marks_parent_declined_v2)' --retries 0 \
+            2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/goal-session-tests.log"
+      - name: Run corrected full-suite regressions and TLS diagnostics
+        id: previous_failures
+        if: steps.check.outcome == 'success' && steps.producer.outcome == 'success'
+        continue-on-error: true
+        working-directory: ${{ runner.temp }}/native-conditional/source/codex-rs
+        run: |
+          set -o pipefail
+          cargo build --locked -p codex-linux-sandbox --bin codex-linux-sandbox \
+            2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/regression-sandbox-helper.log"
+          export CARGO_BIN_EXE_codex_linux_sandbox="$CARGO_TARGET_DIR/debug/codex-linux-sandbox"
+          export TMPDIR="$RUNNER_TEMP/nativefulltesttmp"
+          mkdir -m 700 "$TMPDIR"
+          cargo tree --locked -p codex-http-client -e features -i reqwest@0.12.28 \
+            --target x86_64-unknown-linux-gnu > "$GITHUB_WORKSPACE/conditional-evidence/reqwest-features.txt"
+          test_status=0
+          env -u CODEX_CA_CERTIFICATE -u SSL_CERT_FILE -u SSH_CLIENT -u SSH2_CLIENT \
+            just test --locked -p codex-app-server -p codex-cli -p codex-core \
+            -p codex-exec-server -p codex-external-agent-migration -p codex-http-client \
+            -p codex-linux-sandbox -p codex-tui \
+            -E 'test(external_agent_config_secondary_source_imports_session_and_plugin_end_to_end) | test(skills_list_uses_cached_result_after_session_default_writes_until_force_reload) | test(packaged_daemon_explicit_replacement_migrates_running_legacy) | test(permission_request_hook_allows_exec_command_without_user_approval) | test(conversation_second_start_replaces_runtime) | test(snapshot_failure_retries_are_bounded_and_single_flight) | test(detects_cur_sessions_in_batches_and_redetects_modified_imports) | test(detects_cur_transcript_with_project_cwd) | test(resolves_cur_project_names_with_common_separators) | test(skips_cur_subagent_transcripts) | test(shell_snapshot_concurrent_replays_keep_independent_readers) | test(remote_exec_server_survives_closed_child_stdin) | test(denied_dev_) | test(denied_non_dev_directory_does_not_create_a_mount_target) | test(route_aware_client_pool) | test(tls_backend_fallback_tests) | test(sandbox_keeps_parent_repo_discovery_while_blocking_child_metadata) | test(fresh_startup_reads_destination_and_cleared_model_uses_catalog)' \
+            --success-output immediate --retries 0 2>&1 | tee "$GITHUB_WORKSPACE/conditional-evidence/previous-failures-tests.log" || test_status=$?
+          python3 -I -B "$GITHUB_WORKSPACE/ci/native-compact-conditional-v4/collect_tls_features.py" \
+            --target "$CARGO_TARGET_DIR" \
+            --output "$GITHUB_WORKSPACE/conditional-evidence/tls-compiled-features.json"
+          exit "$test_status"
+      - name: Upload complete validation evidence
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: native-conditional-v4-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            conditional-evidence/
+            ${{ runner.temp }}/native-conditional-target/nextest/local/junit.xml
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Require every validation gate
+        if: always()
+        env:
+          SOURCE_RESULT: ${{ steps.source.outcome }}
+          PRODUCER_RESULT: ${{ steps.producer.outcome }}
+          FORMAT_RESULT: ${{ steps.fmt.outcome }}
+          CHECK_RESULT: ${{ steps.check.outcome }}
+          FOCUSED_RESULT: ${{ steps.focused.outcome }}
+          REGRESSION_RESULT: ${{ steps.regressions.outcome }}
+          GOAL_BACKEND_RESULT: ${{ steps.goal_backend.outcome }}
+          GOAL_SESSION_RESULT: ${{ steps.goal_session.outcome }}
+          PREVIOUS_FAILURES_RESULT: ${{ steps.previous_failures.outcome }}
+        run: |
+          python3 -I -B -c 'import os; r={k:os.environ[k] for k in ("SOURCE_RESULT","PRODUCER_RESULT","FORMAT_RESULT","CHECK_RESULT","FOCUSED_RESULT","REGRESSION_RESULT","GOAL_BACKEND_RESULT","GOAL_SESSION_RESULT","PREVIOUS_FAILURES_RESULT")}; print(r); assert all(v=="success" for v in r.values()), "Native conditional candidate failed or remains incomplete"'

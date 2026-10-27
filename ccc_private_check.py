@@ -374,11 +374,31 @@ class PrivateChecks:
         except (OSError, ValueError, KeyError, TypeError, RuntimeError):
             return False
 
-    def reserve(self, proof, attempt_id):
+    @staticmethod
+    def _receipt_matches(ledger, proof, attempt_id, phase):
+        record = ledger.get(attempt_id, {})
+        return (record.get("phase") == phase
+                and all(record.get(key) == value for key, value in proof.items())
+                and (phase != "not_sent" or (type(record.get("io_started_at")) in {int, float}
+                                            and record["io_started_at"] == 0))
+                and not any(key != attempt_id and value.get("failed_turn_id") == proof["failed_turn_id"]
+                            for key, value in ledger.items()))
+
+    def receipt_matches(self, proof, attempt_id, phase):
+        try:
+            return self._receipt_matches(self._ledger(proof["origin"]), proof, attempt_id, phase)
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+            return False
+
+    def reserve(self, proof, attempt_id, *, reuse=False):
         target = proof["origin"]
         ledger = self._ledger(target)
-        if any(r.get("failed_turn_id") == proof["failed_turn_id"]
-               and r.get("phase") not in {"not_sent", "failed"} for r in ledger.values()):
+        # A private retry needs the *same* attempt and the matching durable
+        # zero-input receipt. A missing delivery proof, an old failed row or a
+        # second attempt must never turn a partial two-store write into input.
+        if (reuse and not self._receipt_matches(ledger, proof, attempt_id, "not_sent")) or (
+                not reuse and (attempt_id in ledger or any(
+                    r.get("failed_turn_id") == proof["failed_turn_id"] for r in ledger.values()))):
             raise RuntimeError("原短检查发送已有回执或尚待核验；不重复投递")
         ledger[attempt_id] = {**proof, "phase": "intent", "at": time.time()}
         from cmux_codex_watch import atomic_write_json
@@ -388,7 +408,7 @@ class PrivateChecks:
         target = proof["origin"]
         ledger = self._ledger(target)
         original = ledger.get(attempt_id)
-        if not original or original.get("origin") != target or original.get("phase") != "intent":
+        if not self._receipt_matches(ledger, proof, attempt_id, "intent"):
             raise RuntimeError("private check send receipt changed")
         ledger[attempt_id] = {**original, "phase": phase, "io_started_at": io_started_at, "finished_at": time.time()}
         from cmux_codex_watch import atomic_write_json

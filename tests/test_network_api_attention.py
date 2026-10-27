@@ -11,8 +11,8 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import ccc_network_guard as network
 from ccc_mihomo import ProbeResult, ResponsesProbe, route
-import test_network_guard as base
-from test_network_resilience import RoutingController, MANUAL_GROUP
+from tests import test_network_guard as base
+from tests.test_network_resilience import RoutingController, MANUAL_GROUP
 
 
 class ApiRetryTests(unittest.TestCase):

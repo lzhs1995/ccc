@@ -1,5 +1,6 @@
 """Read native foreground-thread evidence without reading credential configuration."""
 import json
+import hashlib
 import os
 from pathlib import Path
 import stat
@@ -12,7 +13,7 @@ import ccc_guard_scope as scope
 _seen = set()
 
 
-def read_foreground(pid, opt_in, directory=None):
+def read_foreground(pid, opt_in, directory=None, *, _record=None):
     """Return (status, thread_id, evidence).
 
     A null thread is an explicit selection clear, not permission to use argv.
@@ -21,6 +22,9 @@ def read_foreground(pid, opt_in, directory=None):
     environment. This is available even if the very first publication fails,
     and survives panel restarts without relying on this module's seen cache.
     """
+    if _record is not None:
+        # v2 合同：入口清空调用方容器；只有全部复核通过的 ok 分支写入，其余出口一律为空。
+        _record.clear()
     generation = scope.birth(pid, codex=True)
     # A failed identity read is not evidence of PID reuse or a legacy client.
     # Otherwise a missing record can revive the startup thread and its Key.
@@ -98,6 +102,28 @@ def read_foreground(pid, opt_in, directory=None):
                 or identity(root)[:4] != identity(directory.lstat())[:4]
                 or identity(after) != identity(path.lstat())):
             return "invalid", None, None
-        return "ok", thread, (key, epoch, stamp, identity(after), str(directory))
+        result = "ok", thread, (key, epoch, stamp, identity(after), str(directory))
+        if _record is not None:
+            # 同一 fd 读出、全部复核通过后的同一份记录；不二次打开/解析。返回值先算好再写入。
+            _record.update(data)
+            _record['_source_sha256'] = hashlib.sha256(raw).hexdigest()
+            _record['_source_path'] = str(path)
+        return result
     except (OSError, ValueError, TypeError, KeyError):
+        if _record is not None:
+            _record.clear()  # 异常出口同样不留半份记录
         return "invalid", None, None
+
+COMPACT_INTERRUPT_CAPABILITY = "thread-compact-interrupt-v4"
+
+
+def read_compact_capability(pid, opt_in, directory=None):
+    """Return (status, thread_id, evidence, capable). capable 仅当同一认证记录携带精确常量。
+
+    缺失/未知/旧记录一律 False；不看 argv、不看旧记录、不看环境变量。
+    """
+    record = {}
+    status, thread, evidence = read_foreground(pid, opt_in, directory, _record=record)
+    capable = (status == "ok" and thread is not None
+               and record.get("compact_interrupt_capability") == COMPACT_INTERRUPT_CAPABILITY)
+    return status, thread, evidence, capable

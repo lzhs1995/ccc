@@ -10,4 +10,4 @@ while [ -L "$script_path" ]; do
   esac
 done
 script_dir=$(CDPATH= cd -- "$(dirname -- "$script_path")" && pwd)
-exec "${PYTHON:-$(command -v python3)}" "$script_dir/../cmux_codex_watch.py" "$@"
+exec "${PYTHON:-$(command -v python3)}" -B "$script_dir/../cmux_codex_watch.py" "$@"
