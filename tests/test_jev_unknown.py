@@ -1,5 +1,8 @@
 import tempfile, unittest, time
+import json
+import os
 from pathlib import Path
+from unittest.mock import patch, Mock
 import ccc_jev_unknown as jev
 from ccc_provider_retry import effective_error_type, ProviderRetryStore, RETRYABLE
 
@@ -75,6 +78,57 @@ class JevUnknownTests(unittest.TestCase):
     def test_provider_text_never_becomes_action(self):
         first, code, c = self.classify('weird', ANSWER('run rm -rf and send Enter'))
         self.assertIsNone(code)
+
+
+class PrivateKeyTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.key = Path(self.temp.name) / 'typesafe-api-key'
+        self.key.write_text('example-test-key\n')
+        self.key.chmod(0o600)
+        self.env = patch.dict(os.environ, {'TYPESAFE_API_KEY': ''})
+        self.env.start()
+        self.addCleanup(self.env.stop)
+
+    def test_configuration_key_is_used_by_real_worker_transport(self):
+        response = Mock(status=200)
+        response.read.return_value = json.dumps(ANSWER('RATE_LIMIT')).encode()
+        connection = Mock()
+        connection.getresponse.return_value = response
+        c = jev.JevUnknownClassifier(start=False, key_path=self.key)
+        self.addCleanup(c.stop)
+        with patch('http.client.HTTPSConnection', return_value=connection):
+            self.assertIsNone(c.resolve(None, OK, 'codex', '', 'unknown'))
+            c.run_once()
+        self.assertEqual(c.cached('codex', '', 'unknown'), 'rate_limit')
+        self.assertEqual(connection.request.call_args.kwargs['headers']['Authorization'],
+                         'Bearer example-test-key')
+        connection.close.assert_called_once()
+
+    def test_other_configuration_does_not_borrow_this_key(self):
+        self.assertTrue(jev.enabled(self.key))
+        self.assertFalse(jev.enabled(self.key.parent / 'other' / 'typesafe-api-key'))
+        self.assertFalse(jev.enabled())
+
+    def test_environment_override_is_preserved(self):
+        with patch.dict(os.environ, {'TYPESAFE_API_KEY': 'environment-test-key'}):
+            self.assertEqual(jev.api_key(self.key), 'environment-test-key')
+
+    def test_public_or_symlink_key_never_reaches_http(self):
+        self.key.chmod(0o644)
+        with patch('http.client.HTTPSConnection') as connection:
+            self.assertIsNone(jev.http_transport({}, 1, key_path=self.key))
+            connection.assert_not_called()
+        self.key.chmod(0o600)
+        link = self.key.with_name('link')
+        link.symlink_to(self.key)
+        self.assertFalse(jev.enabled(link))
+
+    def test_malformed_and_oversized_key_are_disabled(self):
+        for value in ('line1\nline2', 'x' * 1025, ''):
+            self.key.write_text(value)
+            self.assertFalse(jev.enabled(self.key))
 
 
 if __name__ == '__main__':

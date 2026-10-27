@@ -12,6 +12,7 @@ import math
 import os
 import queue
 import re
+import stat
 import threading
 
 MODEL = 'jev-1.14.0'
@@ -81,13 +82,31 @@ def parse_answer(body):
     return ALLOWED.get(choice)
 
 
-def enabled():
-    return bool(os.environ.get('TYPESAFE_API_KEY'))
-
-
-def http_transport(request, timeout):
-    import http.client
+def api_key(key_path=None):
+    """Environment override or this daemon configuration's private key file."""
     key = os.environ.get('TYPESAFE_API_KEY')
+    if not key and key_path is not None:
+        try:
+            fd = os.open(key_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, 'r', encoding='utf-8') as stream:
+                info = os.fstat(stream.fileno())
+                if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                        or info.st_mode & 0o077 or info.st_size > 1024):
+                    return None
+                key = stream.read(1025)
+        except (OSError, UnicodeError, ValueError, TypeError):
+            return None
+    key = str(key or '').strip()
+    return key if key and len(key) <= 1024 and not any(c.isspace() for c in key) else None
+
+
+def enabled(key_path=None):
+    return bool(api_key(key_path))
+
+
+def http_transport(request, timeout, *, key_path=None):
+    import http.client
+    key = api_key(key_path)
     if not key:
         return None
     conn = http.client.HTTPSConnection(ENDPOINT_HOST, timeout=timeout)
@@ -101,9 +120,10 @@ def http_transport(request, timeout):
 
 
 class JevUnknownClassifier:
-    def __init__(self, transport=http_transport, *, start=True, is_enabled=enabled):
-        self.transport = transport
-        self.is_enabled = is_enabled
+    def __init__(self, transport=None, *, start=True, is_enabled=None, key_path=None):
+        self.transport = (transport if transport is not None else
+            lambda request, timeout: http_transport(request, timeout, key_path=key_path))
+        self.is_enabled = is_enabled if is_enabled is not None else lambda: enabled(key_path)
         self.cache = {}
         self.pending = set()
         self.queue = queue.Queue(QUEUE_LIMIT)
@@ -124,7 +144,10 @@ class JevUnknownClassifier:
 
     def cached(self, client, model, text, provider=''):
         """Poll-path lookup: cache only, never schedules or calls."""
-        return self.cache.get(fingerprint(client, model, text, provider))
+        if self.stopped or not self.is_enabled():
+            return None
+        with self.lock:
+            return self.cache.get(fingerprint(client, model, text, provider))
 
     def resolve(self, local_code, gates, client, model, text, provider=''):
         """Known local code wins; UNKNOWN schedules at most one gated request."""

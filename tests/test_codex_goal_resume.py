@@ -18,6 +18,14 @@ from tests.test_watch import FakeClient, armed_daemon, span
 from tests.native_goal_fixture import install as install_goal_evidence
 
 
+def without_jev(fake):
+    # Retry gates now ask _resolved_native_error; with no classifier it only applies local rules.
+    fake.jev_classifier = None
+    fake._resolved_native_error = (lambda target, proof, **kw:
+        core.WatchDaemon._resolved_native_error(fake, target, proof, **kw))
+    return fake
+
+
 class NativeGoalEvidenceTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -248,8 +256,8 @@ class NativeGoalEvidenceTests(unittest.TestCase):
         self.assertEqual(goal.provider_for_turn(self.target, turn), 'original-provider')
         clock = [turn["at"] + .1]
         store = ProviderRetryStore(self.goals.parent / 'retry.sqlite', clock=lambda: clock[0], jitter=lambda: 0)
-        daemon = SimpleNamespace(codex_queue_recovery=SimpleNamespace(current_turn=lambda _: turn),
-            _provider_retry=store, _codex_turn_key_identity=core.WatchDaemon._codex_turn_key_identity)
+        daemon = without_jev(SimpleNamespace(codex_queue_recovery=SimpleNamespace(current_turn=lambda _: turn),
+            _provider_retry=store, _codex_turn_key_identity=core.WatchDaemon._codex_turn_key_identity))
         runtime = core.TargetRuntime(paused_reason='')
         method = core.WatchDaemon._provider_retry_gate
         state = SimpleNamespace(error_type='rate_limit')
@@ -343,9 +351,9 @@ class NativeGoalEvidenceTests(unittest.TestCase):
 
     def retry_daemon(self, turn, store):
         from types import SimpleNamespace
-        return SimpleNamespace(codex_queue_recovery=SimpleNamespace(current_turn=lambda _: turn),
+        return without_jev(SimpleNamespace(codex_queue_recovery=SimpleNamespace(current_turn=lambda _: turn),
             _current_blocked_goal=lambda target: goal.blocked_goal(target, 12345),
-            _provider_retry=store, _codex_turn_key_identity=core.WatchDaemon._codex_turn_key_identity)
+            _provider_retry=store, _codex_turn_key_identity=core.WatchDaemon._codex_turn_key_identity))
 
     def test_none_and_unknown_rollout_use_bound_goal_retry_evidence(self):
         from types import SimpleNamespace

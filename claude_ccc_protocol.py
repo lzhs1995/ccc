@@ -401,7 +401,26 @@ def build_event(payload: Mapping[str, Any], environ: Mapping[str, str] | None = 
     else:
         event["completed"] = completion_reported(assistant_message)
         event.update(classify_stop_failure(error, error_details))
+        # 仅「本地未识别」的失败保留有界诊断原文，供 JEV 异步分类；
+        # 原文须完整且其摘要等于 error_evidence_hash，截断则不保留（可验来源）。
+        evidence = _stop_failure_evidence_text(error, error_details)
+        if (event["error_kind"] == "claude_api" and event["stop_failure_error"] == "unknown"
+                and len(evidence) <= JEV_EXCERPT_LIMIT
+                and _digest(evidence) == event["error_evidence_hash"]):
+            event["error_excerpt"] = evidence
     return event
+
+
+JEV_EXCERPT_LIMIT = 600
+
+
+def _stop_failure_evidence_text(error: Any, error_details: Any) -> str:
+    """Same text that classify_stop_failure hashes into error_evidence_hash."""
+    def text(value: Any) -> str:
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, ensure_ascii=False, sort_keys=True)
+        return str(value or "")
+    return text(error) + "\n" + text(error_details)
 
 
 def append_event(event: Mapping[str, Any], path: Path = EVENT_JOURNAL_PATH) -> None:

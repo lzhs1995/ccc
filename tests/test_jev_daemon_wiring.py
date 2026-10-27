@@ -2,6 +2,8 @@ import math, types, unittest
 from unittest import mock
 import ccc_jev_unknown as jev
 import cmux_codex_watch as w
+import ccc_compact_guard as compact
+from pathlib import Path
 
 OK = jev.Gates(True, True, True)
 def resp(choice, conf=0.95, model=jev.MODEL, typ='choice'):
@@ -45,17 +47,28 @@ class DaemonWiringTests(unittest.TestCase):
         d = w.WatchDaemon.__new__(w.WatchDaemon)
         d.jev_classifier = jev.JevUnknownClassifier(Fake(reply), start=False, is_enabled=lambda: True)
         err = {'message': message}
+        snapshot = {'kind': 'task_complete', 'session_id': 's', 'turn_id': turn, 'error': err,
+                    'at': 100, 'signature': [1, 2, 3],
+                    'terminal_tail': {'offset': 0, 'end': 2, 'sha256': '0' * 64}}
         d.goal = {'proof_source': 'native_failed_eof_v1', 'session_id': 's', 'turn_id': turn, 'error': err,
-                  'model_provider': 'custom', 'native_evidence': {'snapshot': {'turn_id': turn, 'error': err}}}
+                  'kind': 'goal_blocked', 'model_provider': 'custom', 'native_evidence': {'snapshot': snapshot}}
+        d.config = {'mode': 'armed'}
+        d.config_path = Path('unused-test-config')
+        d.stop_requested = False
+        d.runtime = {'surface-uuid': w.TargetRuntime()}
         d._current_blocked_goal = lambda target: d.goal
-        d.codex_queue_recovery = types.SimpleNamespace(current_turn=lambda target: {'session_id': 's'})
+        d.codex_queue_recovery = types.SimpleNamespace(
+            current_turn=lambda target: dict(d.goal['native_evidence']['snapshot']),
+            has_pending_draft=lambda sid: False, blocks_turn=lambda target, turn: False)
         d._codex_terminal_tail_proven = lambda snap: True
         return d
     def call(self, d, draft_empty=True):
-        state = w.ScreenState('recoverable_error', error_type='rate_limit', screen_signature='sig')
+        state = w.ScreenState('idle', screen_signature='sig')
         grid = types.SimpleNamespace(lines=['', 'Goal stalled (/goal resume)', '', ''], cursor=types.SimpleNamespace(row=0))
-        with mock.patch.object(w, '_goal_boundary_signature', return_value=('ok',) if draft_empty else None):
-            return d._native_goal_error_state({}, state, grid), state
+        with mock.patch.object(w, '_goal_boundary_signature', return_value=('ok',) if draft_empty else None), \
+                mock.patch.object(compact, 'inspect', return_value={}), \
+                mock.patch.object(compact, 'status', return_value=None):
+            return d._native_goal_error_state({'surface_id': 'surface-uuid'}, state, grid), state
     def test_unknown_native_failure_async_then_cached_retry_reason(self):
         d = self.daemon(resp('RATE_LIMIT'), 'the model service said: please slow your request pace')
         first, state = self.call(d)
