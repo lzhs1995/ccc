@@ -102,7 +102,6 @@ RUNTIME_FILES += ("ccc_standby_sources.py", "ccc_standby_rollouts.py", "ccc_stan
                   "ccc_standby_target.py", "ccc_standby_caller.py", "ccc_standby_runner.py")
 RUNTIME_FILES += ("ccc_claude_closeout.py",)
 RUNTIME_FILES += ("ccc_daemon_liveness.py",)
-RUNTIME_FILES += ("ccc_jev_unknown.py",)
 RUNTIME_FILES += ("ccc_state_snapshot.py",)
 RUNTIME_FILES += ("ccc_compact_guard.py", "ccc_codex_goal_control.py")
 RUNTIME_FILES += ('ccc_compact_goals.py', 'ccc_compact_handoff.py', 'ccc_compact_inputs.py', 'ccc_compact_intents.py', 'ccc_compact_runtime.py', 'ccc_compact_sensor.py', 'ccc_compact_support.py', 'ccc_compact_trace.py', 'ccc_compact_watchdog.py')
@@ -125,9 +124,13 @@ RUNTIME_FILES += ("ccc_compact_backup.py", "ccc_compact_control_health.py", "ccc
 RUNTIME_MAC_FILE_COUNT = 334
 RUNTIME_MAC_SOURCE_SHA256 = "2b03b27c92792a430b06aa5b7e0dba5b55c853b7698317e4b00ec002f7560ce7"
 RUNTIME_CURRENT_MAC = (RUNTIME_MAC_FILE_COUNT, RUNTIME_MAC_SOURCE_SHA256)
+# Freeze the installed 82-module shape before extending the new bundle.
+RUNTIME_PRE_JEV_FILES = RUNTIME_FILES
+RUNTIME_FILES += ("ccc_jev_unknown.py",)
 # Exact supported (module set -> MAC pair) shapes; nothing else validates.
 RUNTIME_SUPPORTED_SHAPES = (
     (frozenset(RUNTIME_FILES), RUNTIME_CURRENT_MAC),
+    (frozenset(RUNTIME_PRE_JEV_FILES), RUNTIME_CURRENT_MAC),
     (frozenset(RUNTIME_PREVIOUS_FILES), RUNTIME_PREVIOUS_MAC),
     (frozenset(RUNTIME_LEGACY_FILES), RUNTIME_PREVIOUS_MAC),
 )
