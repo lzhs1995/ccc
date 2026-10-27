@@ -342,13 +342,13 @@ class ProviderGuardTests(unittest.TestCase):
                         inside.update(transport=True, replayed=False)
                     self.guard_transport(c, before)
                     raw_replay = c.replay
-                    def replay(*args):
+                    def replay(*args, **kwargs):
                         if inside["transport"]:
                             inside["replayed"] = True
                             if boundary == "replay":
                                 c.payload = claude_grid_payload(lines=[text])
                                 c._base_payload = copy.deepcopy(c.payload)
-                        return raw_replay(*args)
+                        return raw_replay(*args, **kwargs)
                     def late(*args):
                         if inside["transport"] and inside["replayed"]:
                             self.hold(d, t, r, e, text)
@@ -380,13 +380,13 @@ class ProviderGuardTests(unittest.TestCase):
                 inside = {"transport": False, "replayed": False}
                 self.guard_transport(c, lambda kind: inside.update(transport=True, replayed=False))
                 raw_replay = c.replay
-                def replay(*args):
+                def replay(*args, **kwargs):
                     if inside["transport"]:
                         inside["replayed"] = True
                         if boundary == "replay":
                             c.payload = claude_grid_payload(lines=[AUTH])
                             c._base_payload = copy.deepcopy(c.payload)
-                    return raw_replay(*args)
+                    return raw_replay(*args, **kwargs)
                 def late(*args):
                     if inside["transport"] and inside["replayed"]:
                         self.hold(d, t, r, e)

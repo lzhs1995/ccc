@@ -392,8 +392,8 @@ class DispatchRecoveryTests(unittest.TestCase):
         original = self.client.replay
         seen = []
 
-        def changed(*args):
-            result = original(*args)
+        def changed(*args, **kwargs):
+            result = original(*args, **kwargs)
             callers = {frame.function for frame in inspect.stack(0)[1:12]}
             if self.client.sent_text and 'submit_check' in callers:
                 seen.append(len(seen) + 1)

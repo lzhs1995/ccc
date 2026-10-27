@@ -58,7 +58,7 @@ class ReadOnlyClient:
         self.payload = payload
         self.replays = []
 
-    def replay(self, workspace_id, surface_id):
+    def replay(self, workspace_id, surface_id, *, live=None, timeout=12.0):
         self.replays.append((workspace_id, surface_id))
         return self.payload
 

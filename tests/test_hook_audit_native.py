@@ -28,7 +28,7 @@ class Client:
   self.calls+=1
   if self.error: raise core.CmuxError("GUI unavailable")
   return self.payload
- def replay(self,*args): raise core.CmuxError("No viewport fixture; this test never sends input")
+ def replay(self,*args,**kwargs): raise core.CmuxError("No viewport fixture; this test never sends input")
 
 class AuditTests(unittest.TestCase):
  def audit(self,rows=None,top=None,tty="ttyFake",error=False,device=10,changed=False,entries=None,native_error=False):

@@ -8224,10 +8224,12 @@ class WatchDaemon:
 
         def replay_claude() -> ScreenState:
             try:
-                current_grid = grid or Grid.from_rpc(
-                    client.replay(str(target["workspace_id"]), str(target["surface_id"])),
+                # Claude input belongs to the live terminal screen. A scrolled
+                # viewport can contain an old reply without its composer.
+                current_grid = (grid if grid is not None and grid.raw.get("anchor") == "screen" else Grid.from_rpc(
+                    client.replay(str(target["workspace_id"]), str(target["surface_id"]), live=True),
                     str(target["surface_id"]),
-                )
+                ))
                 state = classify_claude_grid(
                     current_grid,
                     claude_message=str(self.config.get("claude_message") or CLAUDE_MESSAGE),
@@ -10477,7 +10479,7 @@ class WatchDaemon:
         # Keep read-screen in the preflight: it is viewport-only and proves the
         # target still resolves before the larger render-grid RPC.
         client.read_screen(workspace_id, surface_id)
-        grid = Grid.from_rpc(client.replay(workspace_id, surface_id), surface_id)
+        grid = Grid.from_rpc(client.replay(workspace_id, surface_id, live=True), surface_id)
         composer_kind, _ = _claude_composer_state(grid)
         state = classify_claude_grid(
             grid,
@@ -11743,7 +11745,7 @@ class WatchDaemon:
                 if (runtime.claude_submit_message_hash
                         and runtime.claude_submit_message_hash != _short_hash(message)):
                     raise InputNotSentError('Claude pending message configuration changed')
-                frame = Grid.from_rpc(base.replay(str(target["workspace_id"]), surface_id), surface_id)
+                frame = Grid.from_rpc(base.replay(str(target["workspace_id"]), surface_id, live=True), surface_id)
                 state = classify_claude_grid(frame, claude_message=message)
                 if self._claude_provider_guard_reason(target, runtime, state, event=submit):
                     return False
@@ -12337,7 +12339,7 @@ class WatchDaemon:
         def text_input_check():
             with _ClaudeInputGuardTrace(self.logger, surface_id, str(event.get('event_id') or ''), 'text') as _guard_trace:
                 _guard_trace.step('replay')
-                frame = Grid.from_rpc(base.replay(str(target['workspace_id']), surface_id), surface_id)
+                frame = Grid.from_rpc(base.replay(str(target['workspace_id']), surface_id, live=True), surface_id)
                 _guard_trace.step('classify')
                 current_state = classify_claude_grid(frame, claude_message=message)
                 # A working or occupied frame can only reject input. Do not
@@ -12466,7 +12468,7 @@ class WatchDaemon:
         # transaction pending for the next poll and never press a user's key.
         try:
             verification_grid = Grid.from_rpc(
-                base.replay(str(target["workspace_id"]), surface_id), surface_id,
+                base.replay(str(target["workspace_id"]), surface_id, live=True), surface_id,
             )
             verification_state = classify_claude_grid(
                 verification_grid, claude_message=message,
@@ -13736,7 +13738,7 @@ class WatchDaemon:
                     and event.get('stop_failure_error') == 'unknown'
                     and event.get('error_excerpt')):
                 try:
-                    grid = Grid.from_rpc(client.replay(str(target['workspace_id']), surface_id), surface_id)
+                    grid = Grid.from_rpc(client.replay(str(target['workspace_id']), surface_id, live=True), surface_id)
                     current_state = classify_claude_grid(grid,
                         claude_message=str(self.config.get('claude_message') or CLAUDE_MESSAGE))
                     if current_state.kind in {'claude_stopped', 'recoverable_error'}:
@@ -16504,7 +16506,7 @@ class WatchDaemon:
                     if is_dock_surface(tree, sid):
                         raise ValueError("provider source is a dock surface")
                     client.read_screen(target["workspace_id"], sid)
-                    grid = Grid.from_rpc(client.replay(target["workspace_id"], sid), sid)
+                    grid = Grid.from_rpc(client.replay(target["workspace_id"], sid, live=True), sid)
                     composer, _ = _claude_composer_state(grid)
                     state = classify_claude_grid(grid, claude_message=str(config.get("claude_message") or CLAUDE_MESSAGE))
                     if (composer != "empty" or state.claude_native_activity
@@ -17454,7 +17456,7 @@ def audit_claude_surfaces(
         screen_state = "unreadable"
         live_context: dict[str, Any] = {}
         try:
-            payload = client.replay(str(record["workspace_id"]), surface_id)
+            payload = client.replay(str(record["workspace_id"]), surface_id, live=True)
             classified = classify_claude_grid(
                 Grid.from_rpc(payload, surface_id),
                 claude_message=str(config.get("claude_message") or CLAUDE_MESSAGE),
