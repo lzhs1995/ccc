@@ -369,7 +369,7 @@ def _native_blocked_goal(target, pid, turn, diagnostics):
                 or type(at) not in (int, float) or not math.isfinite(at)
                 or at < max(born, writer_born) or at > time.time()
                 or not isinstance(error, dict) or not isinstance(error.get('message'), str)
-                or not native._retryable_completed_message(error['message'])):
+                or not error['message'].strip()):
             return refused()
         stage = 'native_goal_database'
         writer = shared['writer_pid']

@@ -45,6 +45,7 @@ from claude_ccc_protocol import (
     EVENT_JOURNAL_PATH, EVENT_SOCKET_PATH, completion_reported, report_ready_task,
     classify_stop_failure, CLAUDE_PROVIDER_RETRY_KINDS, STOP_FAILURE_METADATA,
 )
+from claude_ccc_protocol import _digest as claude_protocol_digest
 import claude_dispatch_recovery as dispatch_recovery
 import claude_provider_recovery as provider_recovery
 import claude_provider_native_evidence as provider_native
@@ -60,6 +61,7 @@ from ccc_native_processes import (
 from ccc_scheduling import CoalescingWriter, SnapshotCache, SnapshotClient, SurfaceScheduler, TreeSnapshot
 from ccc_delivery import DeliveryStore
 from ccc_state_snapshot import AtomicJSONSnapshot
+import ccc_jev_unknown as _jev
 from ccc_provider_retry import (
     ProviderRetryStore, RETRYABLE as PROVIDER_RETRYABLE,
     BLOCKED as PROVIDER_BLOCKED, BLOCKED_REASONS as PROVIDER_BLOCKED_REASONS,
@@ -122,9 +124,13 @@ RUNTIME_FILES += ("ccc_compact_backup.py", "ccc_compact_control_health.py", "ccc
 RUNTIME_MAC_FILE_COUNT = 334
 RUNTIME_MAC_SOURCE_SHA256 = "2b03b27c92792a430b06aa5b7e0dba5b55c853b7698317e4b00ec002f7560ce7"
 RUNTIME_CURRENT_MAC = (RUNTIME_MAC_FILE_COUNT, RUNTIME_MAC_SOURCE_SHA256)
+# Freeze the installed 82-module shape before extending the new bundle.
+RUNTIME_PRE_JEV_FILES = RUNTIME_FILES
+RUNTIME_FILES += ("ccc_jev_unknown.py",)
 # Exact supported (module set -> MAC pair) shapes; nothing else validates.
 RUNTIME_SUPPORTED_SHAPES = (
     (frozenset(RUNTIME_FILES), RUNTIME_CURRENT_MAC),
+    (frozenset(RUNTIME_PRE_JEV_FILES), RUNTIME_CURRENT_MAC),
     (frozenset(RUNTIME_PREVIOUS_FILES), RUNTIME_PREVIOUS_MAC),
     (frozenset(RUNTIME_LEGACY_FILES), RUNTIME_PREVIOUS_MAC),
 )
@@ -6435,6 +6441,8 @@ class WatchDaemon:
         self.codex_queue_recovery.guard_config_path = config_path
         from ccc_private_check import PrivateChecks
         self.private_checks = PrivateChecks(config_path, self.codex_queue_recovery.sessions_root)
+        jev_key_path = self.config_path.parent / 'typesafe-api-key'
+        self.jev_classifier = _jev.JevUnknownClassifier(key_path=jev_key_path) if _jev.enabled(jev_key_path) else None
         self.network = network_health.NetworkClient()
         if hook_settings_manager is not None:
             self.claude_hook_settings = hook_settings_manager
@@ -7418,6 +7426,82 @@ class WatchDaemon:
             self.save()
         return False
 
+    def _jev_native_turn(self, target, proof):
+        """Reauthenticate the complete failure used by a cached diagnosis."""
+        if not isinstance(proof, Mapping):
+            return None
+        turn = self.codex_queue_recovery.current_turn(target)
+        if not self._codex_terminal_tail_proven(turn):
+            return None
+        if proof.get('kind') == 'goal_blocked':
+            evidence = proof.get('native_evidence')
+            snapshot = evidence.get('snapshot') if isinstance(evidence, Mapping) else None
+            if (proof.get('proof_source') != 'native_failed_eof_v1'
+                    or not isinstance(snapshot, Mapping)
+                    or any(proof.get(k) != turn.get(k) for k in
+                           ('session_id', 'turn_id', 'pid', 'birth', 'process_start', 'error'))
+                    or any(snapshot.get(k) != turn.get(k) for k in
+                           ('kind', 'turn_id', 'at', 'error', 'signature', 'terminal_tail'))):
+                return None
+        elif proof != turn:
+            return None
+        error = turn.get('error')
+        if (not isinstance(error, Mapping) or not isinstance(error.get('message'), str)
+                or not error['message'].strip()
+                or not turn.get('session_id') or not turn.get('turn_id')):
+            return None
+        return turn
+
+    def _resolved_native_error(self, target, proof, *, enqueue=False, grid=None):
+        """Local rules first; final gates only read the exact current JEV cache.
+
+        Enqueue is allowed only at candidate observation with a fresh empty
+        composer. A later lookup reauthenticates the failure; it never requests
+        a model call, changes a delivery record or supplies input permission.
+        """
+        error = proof.get('error') if isinstance(proof, Mapping) else None
+        message = error.get('message') if isinstance(error, Mapping) else None
+        local = _match_error_block(message) if isinstance(message, str) else None
+        if local is not None:
+            return local
+        classifier = getattr(self, 'jev_classifier', None)
+        if classifier is None or classifier.stopped or not classifier.is_enabled():
+            return None
+        turn = self._jev_native_turn(target, proof)
+        if turn is None:
+            return None
+        # Canonical identity comes from current_turn for both Goal and ordinary
+        # routes, never a caller's provider hint or a truncated text excerpt.
+        binding = json.dumps([target.get('surface_id'), turn.get('session_id'),
+            turn.get('turn_id'), turn.get('pid'), turn.get('birth'),
+            turn.get('process_start'), turn.get('signature'), turn.get('model_provider')],
+            sort_keys=True)
+        model = str(turn.get('model') or '')
+        if not enqueue:
+            return classifier.cached('codex', model, message, provider=binding)
+        runtime = self.runtime.get(str(target.get('surface_id')))
+        if (runtime is None or self.stop_requested or target.get('paused')
+                or not target.get('enabled', True) or self.config.get('global_paused')
+                or self.config.get('mode') != 'armed' or runtime.paused_reason
+                or runtime.delivery_status in {'sending', 'unknown'}
+                or runtime.awaiting or grid is None
+                or _goal_boundary_signature(grid, draft=False) is None
+                or str(target.get('surface_id')) in getattr(self, '_local_paused_surface_ids', ())
+                or self.codex_queue_recovery.has_pending_draft(target['surface_id'])
+                or self.codex_queue_recovery.blocks_turn(target, turn)):
+            return None
+        from ccc_compact_guard import inspect as inspect_compact, status as compact_status
+        compact = inspect_compact(self.config_path, target, terminal_turn=turn)
+        if compact_status(self.config_path, target, inspection=compact):
+            return None
+        # These values are proved by the checks above, rather than constants
+        # that skip the runtime's unknown delivery/queue/compaction boundaries.
+        gates = _jev.Gates(current_native_error=True, identity_bound=True,
+            composer_empty=True, previous_delivery_unknown=False)
+        if self.codex_queue_recovery.current_turn(target) != turn:
+            return None
+        return classifier.resolve(None, gates, 'codex', model, message, provider=binding)
+
     def _native_goal_error_state(self, target, state, grid):
         """Resolve a superseded provider card only from an authenticated Goal EOF.
 
@@ -7425,11 +7509,27 @@ class WatchDaemon:
         at the connected input boundary; original turn, Goal, draft, queue,
         compact, provider, placement and durable-attempt guards remain intact.
         """
-        if (state.kind not in {'error_superseded', 'recoverable_error'} or state.error_type not in ORDINARY_CONTINUE_GOAL_ERRORS
-                or _goal_boundary_signature(grid, draft=False) is None
-                or not any('Goal stalled (/goal resume)' in line
-                           for line in grid.lines[grid.cursor.row + 1:grid.cursor.row + 4])):
+        if (state.kind not in {'idle', 'unknown', 'error_superseded', 'recoverable_error'}
+                or (state.error_type is not None and state.error_type not in ORDINARY_CONTINUE_GOAL_ERRORS)
+                or _goal_boundary_signature(grid, draft=False) is None):
             return state
+        stalled = any('Goal stalled (/goal resume)' in line
+                      for line in grid.lines[grid.cursor.row + 1:grid.cursor.row + 4])
+        if not stalled:
+            # A newly worded native failure need not have a recognized card or
+            # an active Goal. Its authenticated terminal EOF is still required.
+            if state.error_type is not None:
+                return state
+            turn = self.codex_queue_recovery.current_turn(target)
+            error_type = self._resolved_native_error(target, turn, enqueue=True, grid=grid)
+            if not error_type or error_type in PROVIDER_BLOCKED:
+                return state
+            message = turn['error']['message']
+            fingerprint = _short_hash(_stable_error_block(message))
+            return ScreenState('recoverable_error', error_type=error_type,
+                fingerprint=fingerprint, content_fingerprint=fingerprint,
+                screen_signature=state.screen_signature, message_kind='codex',
+                reason='authenticated current native failure classified', requires_goal_proof=True)
         goal = self._current_blocked_goal(target)
         if not isinstance(goal, Mapping):
             return state
@@ -7450,7 +7550,8 @@ class WatchDaemon:
                 or snapshot.get('turn_id') != goal.get('turn_id')
                 or snapshot.get('error') != goal.get('error')):
             return state
-        error_type = _match_error_block('■ ' + error['message'])
+        # Local rules stay final; only their UNKNOWN may read a gated, turn-keyed JEV cache.
+        error_type = self._resolved_native_error(target, goal, enqueue=True, grid=grid)
         if not error_type or error_type in PROVIDER_BLOCKED:
             return state
         fingerprint = _short_hash(_stable_error_block(goal['error']['message']))
@@ -8118,7 +8219,9 @@ class WatchDaemon:
             if prefilter.kind == "idle":
                 if looks_like_claude:
                     return self._claude_observed_state("Claude UI")
-                return prefilter
+                if getattr(self, 'jev_classifier', None) is None:
+                    return prefilter
+                return replay_codex()
             label = self._candidate_process_label(target, client)
             agent_kind = label.get("agent_kind")
             if agent_kind == "claude":
@@ -8137,6 +8240,8 @@ class WatchDaemon:
             if label.get("agent_kind") == "claude":
                 return replay_claude()
             if label.get("agent_kind") == "codex":
+                if getattr(self, 'jev_classifier', None) is not None:
+                    return replay_codex()
                 return dataclasses.replace(prefilter, message_kind="codex")
             return prefilter
         label = self._candidate_process_label(target, client)
@@ -8721,6 +8826,8 @@ class WatchDaemon:
             return 0
         finally:
             sys.setswitchinterval(previous_switch_interval)
+            if self.jev_classifier is not None:
+                self.jev_classifier.stop()
             batch_reconciler.close()
             native_wakeup.close()
             self._native_process_index.close()
@@ -9279,7 +9386,13 @@ class WatchDaemon:
             original = self._current_blocked_goal(target) or turn
         error = original.get('error')
         message = str(error.get('message') or '') if isinstance(error, dict) else ''
-        error_type = _match_error_block(message) or (state.error_type if state else None)
+        error_type = self._resolved_native_error(target, original)
+        classifier = getattr(self, 'jev_classifier', None)
+        # A stopped or disabled classifier cannot answer; use the original route.
+        if error_type is None and (classifier is None or classifier.stopped or not classifier.is_enabled()):
+            error_type = state.error_type if state else None
+        if error_type is None and state and state.error_type in _jev.ALLOWED.values():
+            return False
         if error_type in PROVIDER_BLOCKED:
             self._record_state(str(target['surface_id']), runtime, ScreenState(
                 'token_exhausted' if error_type == 'token_exhausted' else 'provider_blocked',
@@ -9378,7 +9491,7 @@ class WatchDaemon:
             if not goal:
                 return None
             queue_blocker = blocked_state(goal['error']['message'])
-            if (queue_blocker is not None or not _match_error_block('■ ' + goal['error']['message'])
+            if (queue_blocker is not None or not self._resolved_native_error(target, goal)
                     or runtime.codex_sent_turn_key.startswith('goal:')
                     and runtime.codex_sent_turn_key == self._goal_turn_key(goal)):
                 return None
@@ -9971,6 +10084,68 @@ class WatchDaemon:
         runtime.error_type = str((guard or {}).get("error_kind") or "claude_provider_blocked")
         return reason
 
+    def _jev_refine_claude_failure(self, target, runtime, event, *, composer_kind=None):
+        """Local-UNKNOWN Claude StopFailure: cached JEV code refines diagnosis only.
+
+        The caller supplies the current host composer, never old telemetry.
+        A pending answer uses the existing provider retry wait; JEV adds no
+        delay. A cached answer for the same event only relabels the existing
+        claude_429/claude_503 route. Input, identity and budget checks stay final.
+        """
+        classifier = getattr(self, 'jev_classifier', None)
+        excerpt = event.get('error_excerpt')
+        if (classifier is None or not isinstance(excerpt, str) or not excerpt
+                or event.get('error_kind') != 'claude_api'
+                or event.get('stop_failure_error') != 'unknown'
+                or claude_protocol_digest(excerpt) != event.get('error_evidence_hash')):
+            return event
+        gates = _jev.Gates(
+            current_native_error=not bool(event.get('completed')),
+            identity_bound=bool(event.get('session_id')) and event.get('session_id') == runtime.claude_session_id,
+            composer_empty=composer_kind == 'empty',
+            busy_or_queued=bool(runtime.claude_handshake_wait or runtime.paused_reason
+                or getattr(runtime, 'claude_handshake_challenge', None)
+                or getattr(runtime, 'claude_supervisor_wait', None)
+                or getattr(runtime, 'claude_submit_phase', 'none') != 'none'
+                or getattr(runtime, 'claude_submit_write_unknown', False)
+                or target.get('paused') or not target.get('enabled', True)
+                or self.config.get('mode') != 'armed' or self.config.get('global_paused')
+                or self.stop_requested),
+            compacting=bool(runtime.claude_compaction_started_at),
+            previous_delivery_unknown=runtime.delivery_status in {'sending', 'unknown'})
+        provider = '%s|%s' % (event.get('session_id') or '', event.get('event_id') or '')
+        code = classifier.resolve(None, gates, 'claude', '', excerpt, provider=provider)
+        mapped = {'rate_limit': ('claude_429', 'rate_limited'),
+                  'http_503': ('claude_503', 'provider_overloaded')}.get(code)
+        if mapped is None:
+            # 守护进程内存槽（不进持久 guard 白名单）：同一事件稍后复查缓存。
+            runtime.__dict__['_jev_pending_claude'] = {
+                'event_id': str(event.get('event_id') or ''), 'excerpt': excerpt,
+                'error_evidence_hash': event.get('error_evidence_hash')}
+            return event
+        runtime.__dict__.pop('_jev_pending_claude', None)
+        return {**event, 'error_kind': mapped[0], 'error_reason': mapped[1], 'jev_classified': code}
+
+    def _jev_refresh_deferred_claude_failure(self, target, runtime, state) -> None:
+        """Refine the same event during its existing provider retry window.
+
+        The original provider guard already waits at least 60 seconds, longer
+        than the JEV request timeout. A missing answer never adds another wait.
+        The send path still obtains its own current host and native evidence.
+        """
+        deferred = runtime.claude_deferred_event
+        pending = runtime.__dict__.get('_jev_pending_claude')
+        if (not isinstance(deferred, Mapping) or not isinstance(pending, Mapping)
+                or pending.get('event_id') != deferred.get('event_id')
+                or pending.get('error_evidence_hash') != deferred.get('error_evidence_hash')):
+            return
+        context = getattr(state, 'claude_context', None)
+        composer = str(getattr(context, 'composer_kind', '') or 'unverified')
+        refined = self._jev_refine_claude_failure(
+            target, runtime, {**deferred, 'error_excerpt': pending['excerpt']}, composer_kind=composer)
+        if refined.get('jev_classified'):
+            runtime.claude_deferred_event = {k: v for k, v in refined.items() if k != 'error_excerpt'}
+
     def _validated_claude_provider_event(
         self, target: Mapping[str, Any], runtime: TargetRuntime, event: Mapping[str, Any],
         *, allow_new_session: bool = False,
@@ -10292,6 +10467,7 @@ class WatchDaemon:
         waited = max(0.0, time.time() - runtime.claude_deferred_since) if held else 0.0
         parked_reason = runtime.claude_deferred_reason or ""
         runtime.claude_deferred_event = None
+        runtime.__dict__.pop('_jev_pending_claude', None)
         runtime.claude_deferred_reason = reason or None
         runtime.claude_deferred_since = 0.0
         runtime.claude_deferred_attempts = 0
@@ -10751,6 +10927,8 @@ class WatchDaemon:
             return False
         if runtime.claude_submit_phase != "none":
             return False
+        self._jev_refresh_deferred_claude_failure(target, runtime, state)
+        deferred = runtime.claude_deferred_event
         if deferred.get("error_kind") in CLAUDE_PROVIDER_RETRY_KINDS:
             status = self.claude_event_ledger.status_of(str(deferred.get("event_id") or ""))
             if status not in {"handling", "provider_retry_wait"} and not (
@@ -13477,6 +13655,20 @@ class WatchDaemon:
             self._sync_claude_provider_guard(surface_id, runtime)
             return
         if provider_failure_event:
+            composer_kind = None
+            if (getattr(self, 'jev_classifier', None) is not None
+                    and event.get('error_kind') == 'claude_api'
+                    and event.get('stop_failure_error') == 'unknown'
+                    and event.get('error_excerpt')):
+                try:
+                    grid = Grid.from_rpc(client.replay(str(target['workspace_id']), surface_id), surface_id)
+                    current_state = classify_claude_grid(grid,
+                        claude_message=str(self.config.get('claude_message') or CLAUDE_MESSAGE))
+                    if current_state.kind in {'claude_stopped', 'recoverable_error'}:
+                        composer_kind = _claude_composer_state(grid)[0]
+                except (CmuxError, OSError, ValueError, TypeError):
+                    pass  # Observation failure retains the original provider route.
+            event = self._jev_refine_claude_failure(target, runtime, event, composer_kind=composer_kind)
             # This must precede pending-submit de-duplication: a rejection is
             # neither a consumption receipt nor permission to retry old Enter.
             guard = self._remember_claude_provider_failure(target, runtime, event, event=event)
@@ -15015,7 +15207,7 @@ class WatchDaemon:
                         and type(at) in (int, float) and math.isfinite(at)
                         and at > runtime.send_started_at
                         and isinstance(error, Mapping)
-                        and _match_error_block('■ ' + str(error.get('message') or '')) == state.error_type)
+                        and self._resolved_native_error(target, proof) == state.error_type)
                 if (runtime.codex_input_phase != 'text_retained'
                         and state.kind == 'recoverable_error' and state.error_type
                         and (later_failure(goal, authenticated=bool(goal))
@@ -15053,7 +15245,7 @@ class WatchDaemon:
                    if turn else "")
             if (turn and turn.get("kind") == "task_complete" and turn.get("signature")
                     and isinstance(turn.get("error"), Mapping)
-                    and _match_error_block("■ " + str(turn["error"].get("message") or "")) == state.error_type
+                    and self._resolved_native_error(target, turn) == state.error_type
                     and 0 < float(turn.get("at") or 0) < runtime.send_started_at
                     and runtime.send_completed_at > 0
                     and time.time() - runtime.send_completed_at >= 2
@@ -15100,7 +15292,7 @@ class WatchDaemon:
         error = turn.get('error')
         if (turn.get('kind') != 'task_complete' or not turn.get('signature')
                 or not isinstance(error, Mapping)
-                or _match_error_block('■ ' + str(error.get('message') or '')) != state.error_type
+                or self._resolved_native_error(target, turn) != state.error_type
                 or type(turn.get('at')) not in (int, float) or not 0 < turn['at'] < started
                 or key != runtime.codex_sent_turn_key or key != runtime.codex_observed_turn_key):
             return False
@@ -15191,7 +15383,7 @@ class WatchDaemon:
                     <= runtime.send_started_at <= last_attempt_at
                     < new_birth[0] + new_birth[1] / 1e6 <= turn['at'])
                 or not isinstance(turn.get('error'), Mapping)
-                or _match_error_block('■ ' + str(turn['error'].get('message') or '')) != error_type):
+                or self._resolved_native_error(target, turn) != error_type):
             return False
         try:
             current = birth(old['pid'])
@@ -15946,7 +16138,7 @@ class WatchDaemon:
         if state.native_goal_only or state.native_goal_stalled or (state.kind == 'recoverable_error' and state.error_type):
             diagnostics = {}
             goal = self._current_blocked_goal(target, diagnostics=diagnostics)
-            goal_error = _match_error_block("■ " + goal["error"]["message"]) if goal else None
+            goal_error = self._resolved_native_error(target, goal) if goal else None
             ordinary_goal = bool(goal and goal_error == state.error_type
                                  and goal_error in ORDINARY_CONTINUE_GOAL_ERRORS)
             if goal and goal_error == state.error_type and not ordinary_goal:
@@ -16001,7 +16193,7 @@ class WatchDaemon:
                 active_failed = bool(status == 'active'
                     and goal_turn == terminal_turn
                     and self._codex_terminal_tail_proven(goal_turn)
-                    and _match_error_block('■ ' + str((goal_turn.get('error') or {}).get('message') or ''))
+                    and self._resolved_native_error(target, goal_turn)
                         == state.error_type)
                 # The ordinary resource route keeps every other status veto:
                 # only the same authenticated blocked failed turn may proceed.
@@ -16011,7 +16203,7 @@ class WatchDaemon:
                 paused_ordinary_failed = False
                 if (status == 'paused' and goal_turn == terminal_turn
                         and self._codex_terminal_tail_proven(goal_turn)
-                        and _match_error_block('■ ' + str((goal_turn.get('error') or {}).get('message') or ''))
+                        and self._resolved_native_error(target, goal_turn)
                             == state.error_type):
                     from ccc_codex_goal import ordinary_turn_after_pause
                     paused_ordinary_failed = bool(ordinary_turn_after_pause(
@@ -16049,7 +16241,7 @@ class WatchDaemon:
         # later turn makes the visible error historical.
         error = turn.get("error")
         if (turn.get("kind") == "task_complete" and isinstance(error, Mapping)
-                and _match_error_block("■ " + str(error.get("message") or "")) == state.error_type):
+                and self._resolved_native_error(target, turn) == state.error_type):
             if self.codex_queue_recovery.blocks_turn(target, turn):
                 return False
             key = f"{turn.get('session_id')}:{turn.get('turn_id')}:{turn.get('at')}"

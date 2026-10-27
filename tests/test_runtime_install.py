@@ -92,6 +92,21 @@ class RuntimeInstallTests(unittest.TestCase):
         )
         self.assertEqual(hook.returncode, 0, hook.stderr)
 
+    def test_pre_jev_release_remains_valid_for_inspection_and_rollback(self):
+        historical_files = tuple(name for name in core.RUNTIME_FILES
+                                 if name != "ccc_jev_unknown.py")
+        with mock.patch.object(core, "RUNTIME_FILES", historical_files):
+            release = core.stage_runtime_release()
+        core.validate_runtime_release(release)
+        manifest = json.loads((release / "manifest.json").read_text())
+        self.assertNotIn("ccc_jev_unknown.py", manifest["files"])
+        core._set_runtime_pointer(self.runtime, release)
+        self.assertEqual((self.runtime / "current").resolve(), release)
+        # A missing manifest member remains corruption, not another old shape.
+        (release / "ccc_provider_retry.py").unlink()
+        with self.assertRaises(RuntimeError):
+            core.validate_runtime_release(release)
+
     def test_staged_daemon_constructs_without_checkout_or_external_io(self):
         for name in core.RUNTIME_FILES:
             shutil.copyfile(SOURCE / name, self.source / name)

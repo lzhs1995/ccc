@@ -63,6 +63,21 @@ ccc arm
 `scripts/render-launchagents.sh` renders installation files without loading
 services. `cmux-stack` mutations require their documented `--apply` switch.
 
+JEV can classify current native failures that the local error rules leave unknown.
+Known errors keep the local route with no API request. Configure `TYPESAFE_API_KEY`
+or put the key in `typesafe-api-key` beside the watcher's `config.json`, owned by
+the daemon user with mode `0600`. This private file also works under launchd;
+the key is not copied into a plist or the installed source bundle. Install and
+restart the watcher after enabling it. A missing key, timeout or unrecognized
+answer keeps the original behavior.
+
+Classification runs in one bounded background worker. Cached answers for the
+same native turn/event can select the existing rate-limit or upstream retry
+route. Identity, current input, compaction, delivery deduplication and durable
+retry budgets still decide whether a continuation may be sent. Claude rechecks
+the answer within its existing provider retry window; there is no added wait.
+Continuation uses the configured fixed prompt, so DeepSeek is optional.
+
 ## Verification
 
 Run the source-only checks before any LaunchAgent action:
