@@ -249,7 +249,7 @@ class EnterLeaseTests(_Fixture, unittest.TestCase):
 
     def replace_on_unknown_save(self, d, r, index, displaced, holder=None):
         """After the last pre-Enter save, another delivery replaces lock ``index``."""
-        raw = d.save
+        raw = d._save_claude_surface
 
         def save(*args, **kwargs):
             result = raw(*args, **kwargs)
@@ -274,7 +274,7 @@ class EnterLeaseTests(_Fixture, unittest.TestCase):
                     before = self.snapshot(r)
                     keys, displaced = list(c.sent_keys), []
                     state = w.classify_claude_grid(self.grid(c.payload))
-                    with mock.patch.object(d, "save", side_effect=self.replace_on_unknown_save(
+                    with mock.patch.object(d, "_save_claude_surface", side_effect=self.replace_on_unknown_save(
                             d, r, index, displaced)):
                         if route == "enter":
                             self.assertFalse(d._send_claude_enter(t, r, c, reason="race",
