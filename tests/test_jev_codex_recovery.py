@@ -131,6 +131,34 @@ class CodexJevRecoveryTests(unittest.TestCase):
         self.assertEqual(self.daemon.jev_classifier.queue.qsize(), 0)
         self.assertEqual(self.client.sent, [])
 
+    def test_disabling_jev_restores_visible_retry_without_refunding_failure(self):
+        classifier = self.daemon.jev_classifier
+        runtime = self.daemon.runtime.setdefault('surface-uuid', core.TargetRuntime())
+        state = core.ScreenState('recoverable_error', error_type='rate_limit', message_kind='codex')
+        self.allow_provider_delay()
+        # An enabled classifier still requires its answer for this unknown EOF.
+        self.assertFalse(self.daemon._provider_retry_gate(self.target, runtime, state, dry_run=True))
+        classifier.is_enabled = lambda: False
+        self.assertTrue(self.daemon._provider_retry_gate(self.target, runtime, state, dry_run=True))
+        evidence = self.daemon._provider_retry.observe(self.sid, 'synthetic-provider',
+            'failed', 'rate_limit', UNKNOWN, 200)
+        self.assertTrue(self.daemon._provider_retry.evaluate(evidence, 'original-attempt', reserve=True).allowed)
+        self.retry_now += 100
+        # Turning the optional classifier off cannot refund a reserved input.
+        self.assertFalse(self.daemon._provider_retry_gate(self.target, runtime, state, dry_run=True))
+        self.assertEqual(runtime.provider_retry_status['reason_code'], 'provider_retry_failure_reserved')
+        self.assertEqual(self.client.sent, [])
+        self.assertEqual(self.requests, [])
+
+    def test_stopped_classifier_keeps_original_visible_retry_route(self):
+        self.daemon.jev_classifier.stop()
+        self.allow_provider_delay()
+        runtime = self.daemon.runtime.setdefault('surface-uuid', core.TargetRuntime())
+        state = core.ScreenState('recoverable_error', error_type='rate_limit', message_kind='codex')
+        self.assertTrue(self.daemon._provider_retry_gate(self.target, runtime, state, dry_run=True))
+        self.assertEqual(self.client.sent, [])
+        self.assertEqual(self.requests, [])
+
 
 if __name__ == '__main__':
     unittest.main()

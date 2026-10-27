@@ -9384,7 +9384,9 @@ class WatchDaemon:
         error = original.get('error')
         message = str(error.get('message') or '') if isinstance(error, dict) else ''
         error_type = self._resolved_native_error(target, original)
-        if error_type is None and getattr(self, 'jev_classifier', None) is None:
+        classifier = getattr(self, 'jev_classifier', None)
+        # A stopped or disabled classifier cannot answer; use the original route.
+        if error_type is None and (classifier is None or classifier.stopped or not classifier.is_enabled()):
             error_type = state.error_type if state else None
         if error_type is None and state and state.error_type in _jev.ALLOWED.values():
             return False
