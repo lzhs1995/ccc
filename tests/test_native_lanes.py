@@ -6,6 +6,7 @@ import time
 import unittest
 import sys
 import subprocess
+import queue
 from unittest.mock import Mock, patch
 from types import SimpleNamespace
 
@@ -17,6 +18,26 @@ from ccc_delivery import DeliveryStore
 
 
 class NativeLaneTests(unittest.TestCase):
+    def test_cleanup_failure_retains_lane_until_original_interpreter_quiesces(self):
+        lane = object.__new__(InterpreterLane)
+        lane._interpreter = Mock()
+        lane._interpreter.close.side_effect = [RuntimeError('threads running'),
+                                              RuntimeError('threads running'), None]
+        lane._stopped = False
+        lane._thread = Mock()
+        lane._thread.is_alive.return_value = False
+        lane.results = queue.SimpleQueue()
+        lane.error = None
+        self.assertFalse(lane._finish_close())
+        rows = lane.drain()
+        self.assertEqual([row['type'] for row in rows], ['failure'])
+        self.assertFalse(lane._stopped)
+        self.assertIsNotNone(lane._interpreter)
+        self.assertEqual([row['type'] for row in lane.drain()], ['stopped'])
+        self.assertTrue(lane._stopped)
+        self.assertIsNone(lane._interpreter)
+        self.assertEqual(lane.drain(), [])
+
     def test_empty_lane_does_not_read_or_serialize_fleet_history_parent_retains_it(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -179,6 +200,63 @@ for _ in range(2):
             self.assertEqual(cells.shared()[lane.cell],0)
             self.assertFalse((root/'state.json').exists())
             self.assertTrue(any(r['type']=='stopped' for r in lane.drain()))
+
+    @unittest.skipUnless(sys.version_info >= (3,14), 'native lanes use Python 3.14 interpreters')
+    def test_real_interpreter_with_jev_key_starts_and_quiesces_without_cmux(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);cells=AuthorizationCells()
+            key=root/'typesafe-api-key'
+            key.write_text('example-test-key\n')
+            key.chmod(0o600)
+            lane=self.lane(root,cells)
+            try:
+                rows=self.wait_for(lane,'ready')
+                self.assertFalse(any(r['type']=='failure' for r in rows))
+                lane.update([])
+            finally:
+                lane.close()
+            self.assertIsNone(lane.error)
+            self.assertEqual(cells.shared()[lane.cell],0)
+            self.assertTrue(any(r['type']=='stopped' for r in lane.drain()))
+
+    @unittest.skipUnless(sys.version_info >= (3,14), 'native lanes use Python 3.14 interpreters')
+    def test_key_enabled_startup_failure_leaves_no_jev_thread(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            config=root/'config.json'
+            core.atomic_write_json(config,core.default_config())
+            key=root/'typesafe-api-key'
+            key.write_text('example-test-key\n');key.chmod(0o600)
+            settings={'config_path':str(config),'state_path':str(root/'state.json'),
+                'capabilities':{'protocol':'cmux-socket','version':2,
+                    'socket_path':str(root/'missing.sock'),'access_mode':'automation','methods':[]}}
+            child = '''
+import ccc_native_lanes as native
+import threading
+original=native._create_lane_daemon
+def create(settings):
+    daemon=original(settings)
+    assert daemon.jev_classifier is not None
+    assert daemon.jev_classifier.thread is None
+    def fail():
+        raise RuntimeError('original-startup-failure')
+    daemon._delivery_store.start=fail
+    return daemon
+native._create_lane_daemon=create
+try:
+    native.run_native_lane(SETTINGS,bytes([1]),0,None,None)
+except RuntimeError as exc:
+    assert str(exc)=='original-startup-failure'
+else:
+    raise AssertionError('expected startup failure')
+assert not any(t.name=='ccc-jev' for t in threading.enumerate())
+'''.replace('SETTINGS',repr(json.dumps(settings)))
+            script=("from concurrent import interpreters\n"
+                    "lane=interpreters.create()\ntry:\n"
+                    "    lane.exec("+repr(child)+")\nfinally:\n    lane.close()\n")
+            result=subprocess.run([sys.executable,'-B','-c',script],
+                cwd=Path(core.__file__).parent,capture_output=True,text=True,timeout=20)
+            self.assertEqual(result.returncode,0,result.stderr)
 
     @unittest.skipUnless(sys.version_info >= (3,14), 'native lanes use Python 3.14 interpreters')
     def test_malformed_assignment_fails_closed_and_revokes_lane(self):

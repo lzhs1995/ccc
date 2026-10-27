@@ -8,6 +8,7 @@ No Codex process, model request or workspace is created here.
 from __future__ import annotations
 
 import json
+from contextlib import ExitStack
 import queue
 from pathlib import Path
 import subprocess
@@ -109,6 +110,8 @@ class InterpreterLane:
         self._wire_results = interpreters.create_queue()
         self.results = queue.SimpleQueue()
         self.error = None
+        self._interpreter = None
+        self._stopped = False
         self._initial = json.dumps(initial)
         self._source, self._service = str(Path(source).resolve()), service
         self._thread = threading.Thread(target=self._run, name="ccc-native-lane", daemon=True)
@@ -134,6 +137,7 @@ class InterpreterLane:
                             return
         try:
             interpreter = interpreters.create()
+            self._interpreter = interpreter
             interpreter.prepare_main(source=self._source, initial=self._initial,
                 flags=self.cells.shared(), lane_cell=self.cell,
                 commands=self.commands, results=self._wire_results, service=self._service)
@@ -150,12 +154,24 @@ class InterpreterLane:
             relay_stop.set()
             if relay is not None:
                 relay.join()
-            if interpreter is not None:
-                try:
-                    interpreter.close()
-                except BaseException as exc:
-                    self.error = f"interpreter cleanup: {type(exc).__name__}: {exc}"
-            self.results.put({"type":"stopped", "error":self.error})
+            self._finish_close()
+
+    def _finish_close(self):
+        if self._stopped:
+            return True
+        try:
+            if self._interpreter is not None:
+                self._interpreter.close()
+        except BaseException as exc:
+            error = f"interpreter cleanup: {type(exc).__name__}: {exc}"
+            if error != self.error:
+                self.error = error
+                self.results.put({"type":"failure", "error":error})
+            return False
+        self._interpreter = None
+        self._stopped = True
+        self.results.put({"type":"stopped", "error":self.error})
+        return True
 
     def update(self, assignments):
         if not self._thread.is_alive() or not self.cells.shared()[self.cell]:
@@ -163,6 +179,10 @@ class InterpreterLane:
         self.commands.put({"type":"assign", "assignments":assignments})
 
     def drain(self):
+        # A late API worker may finish after exec() returned. Recheck the same
+        # original interpreter; ownership stays reserved until close succeeds.
+        if not self._thread.is_alive() and not self._stopped:
+            self._finish_close()
         rows = []
         while True:
             try:
@@ -176,6 +196,8 @@ class InterpreterLane:
         self._thread.join(timeout)
         if self._thread.is_alive():
             raise RuntimeError("native lane has not quiesced; its ownership must remain blocked")
+        if not self._finish_close():
+            raise RuntimeError("native interpreter has not quiesced; its ownership must remain blocked")
 
 
 class NativeDispatcher:
@@ -546,6 +568,8 @@ def _create_lane_daemon(settings):
     import cmux_codex_watch as core
 
     class LaneDaemon(core.WatchDaemon):
+        _jev_daemon_threads = False
+
         def _load_config_at_startup(self):
             # The parent performs migration and global service maintenance.
             return self._load_config()
@@ -665,8 +689,10 @@ def run_native_lane(initial, flags, lane_cell, commands, results):
         daemon_threads=False)
     scheduler.observation_interval = native.observation_interval
     native.start()
-    results.put({"type":"ready"})
     try:
+        if daemon.jev_classifier is not None:
+            daemon.jev_classifier.start_worker()
+        results.put({"type":"ready"})
         while flags[lane_cell]:
             while True:
                 try:
@@ -723,9 +749,12 @@ def run_native_lane(initial, flags, lane_cell, commands, results):
             scheduler.wakeup.clear()
     finally:
         daemon.stop_requested = True
-        native.close()
-        scheduler.close()
-        daemon._process_snapshots.close()
-        daemon._delivery_store.close()
+        with ExitStack() as cleanup:
+            cleanup.callback(daemon._delivery_store.close)
+            cleanup.callback(daemon._process_snapshots.close)
+            if daemon.jev_classifier is not None:
+                cleanup.callback(daemon.jev_classifier.stop)
+            cleanup.callback(scheduler.close)
+            cleanup.callback(native.close)
         results.put({"type":"runtime", "rows":{sid:{"cell":a["cell"],
             "runtime":daemon.runtime[sid].to_dict()} for sid,a in assignments.items() if sid in daemon.runtime}})

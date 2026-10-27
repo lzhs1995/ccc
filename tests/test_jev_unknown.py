@@ -21,6 +21,29 @@ class Fake:
 
 
 class JevUnknownTests(unittest.TestCase):
+    def test_non_quiescent_worker_never_reports_closed(self):
+        c = jev.JevUnknownClassifier(start=False)
+        c.thread = Mock(daemon=False)
+        c.thread.is_alive.return_value = True
+        with self.assertRaisesRegex(RuntimeError, 'has not quiesced'):
+            c.stop()
+        self.assertTrue(c.stopped)
+        c.thread.join.assert_called_once_with(jev.TIMEOUT_SECONDS + 1)
+
+    def test_non_daemon_worker_classifies_and_quiesces(self):
+        c = jev.JevUnknownClassifier(Fake(ANSWER('RATE_LIMIT')),
+            is_enabled=lambda: True, daemon_threads=False)
+        try:
+            self.assertIsNone(c.resolve(None, OK, 'codex', 'm', 'new terminal failure'))
+            deadline = time.monotonic() + 2
+            while c.cached('codex', 'm', 'new terminal failure') is None and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertEqual(c.cached('codex', 'm', 'new terminal failure'), 'rate_limit')
+            self.assertEqual(c.calls, 1)
+        finally:
+            c.stop()
+        self.assertFalse(c.thread.is_alive())
+
     def classify(self, text, reply, gates=OK):
         c = jev.JevUnknownClassifier(Fake(reply), start=False, is_enabled=lambda: True)
         first = effective_error_type(text, classifier=c, gates=gates, client='codex', model='m')

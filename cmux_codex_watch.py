@@ -1002,11 +1002,24 @@ class TargetRuntime:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "TargetRuntime":
-        fields = {field.name for field in dataclasses.fields(cls)}
-        return cls(**{key: value[key] for key in fields if key in value})
+        return cls(**{key: value[key] for key in _runtime_field_names(cls) if key in value})
 
     def to_dict(self) -> dict[str, Any]:
-        return dataclasses.asdict(self)
+        # Runtime evidence is JSON data. Scalar fields need no recursive walk;
+        # mutable evidence still belongs to the snapshot, never the live row.
+        snapshot = {}
+        for name in _runtime_field_names(type(self)):
+            value = getattr(self, name)
+            snapshot[name] = value if type(value) in _RUNTIME_SCALARS else copy.deepcopy(value)
+        return snapshot
+
+
+_RUNTIME_SCALARS = frozenset((str, int, float, bool, type(None)))
+
+
+@functools.lru_cache(maxsize=8)
+def _runtime_field_names(cls):
+    return tuple(field.name for field in dataclasses.fields(cls))
 
 
 def _short_hash(value: str) -> str:
@@ -4915,6 +4928,28 @@ class CmuxClient:
             raise CmuxError("top JSON is not an object")
         return value
 
+    def top_for_input(self, workspace_id: str) -> Mapping[str, Any]:
+        """Bound the GUI hint; native surface/TTY proof remains mandatory.
+
+        Use a separate read connection, including inside an admitted input
+        guard, so a timed-out GUI reply cannot corrupt its input socket.
+        """
+        transport = self.viewport_socket
+        if transport is None:
+            return {}
+        timeout = 0.5
+        remaining = self.connected_input_remaining()
+        if remaining is not None:
+            timeout = min(timeout, remaining)
+        try:
+            with transport.connection_window(timeout) as budget:
+                value = self._control_rpc_once(
+                    "system.top", {"workspace_id": workspace_id, "include_processes": True},
+                    timeout=budget)
+            return value if isinstance(value, Mapping) else {}
+        except (OSError, CmuxError):
+            return {}
+
     # 全机进程表一次读：进程多时 cmux 要十几秒才返回。8 s 默认时限让 discovery 连续失败、
     # 新会话进不了监控（2026-10-19 实测 6–16 s）。只放宽这一个只读请求；每个请求独占连接。
     TOP_ALL_TIMEOUT_SEC = 30.0
@@ -6442,7 +6477,10 @@ class WatchDaemon:
         from ccc_private_check import PrivateChecks
         self.private_checks = PrivateChecks(config_path, self.codex_queue_recovery.sessions_root)
         jev_key_path = self.config_path.parent / 'typesafe-api-key'
-        self.jev_classifier = _jev.JevUnknownClassifier(key_path=jev_key_path) if _jev.enabled(jev_key_path) else None
+        self.jev_classifier = (_jev.JevUnknownClassifier(
+            key_path=jev_key_path, daemon_threads=getattr(self, '_jev_daemon_threads', True),
+            start=getattr(self, '_jev_daemon_threads', True))
+            if _jev.enabled(jev_key_path) else None)
         self.network = network_health.NetworkClient()
         if hook_settings_manager is not None:
             self.claude_hook_settings = hook_settings_manager
@@ -7640,19 +7678,26 @@ class WatchDaemon:
                 or (not live_pane and target.get("pane_id")
                     and record.get("pane_id") != target["pane_id"])):
             return unknown
-        top = base.top(str(target["workspace_id"]))
-        labels = classify_surface_processes(top)
-        live = surface_process_label(labels, target)
-        if live.get("identity_conflicts"):
-            return unknown
         records = display_surface_records(tree, main_surface_records(tree))
-        gui_claude = live.get("agent_kind") == "claude"
         native_target_available = any(
             item.get("surface_id") == str(target["surface_id"])
             and isinstance(item.get("native_display_target"), Mapping)
             and item["native_display_target"].get("tty")
             for item in records
         )
+        reader = (getattr(base, "top_for_input", base.top)
+                  if native_target_available else base.top)
+        try:
+            top = reader(str(target["workspace_id"]))
+        except CmuxError:
+            if not native_target_available:
+                raise
+            top = {}
+        labels = classify_surface_processes(top)
+        live = surface_process_label(labels, target)
+        if live.get("identity_conflicts"):
+            return unknown
+        gui_claude = live.get("agent_kind") == "claude"
         # A new explicit/workspace-auto transaction may follow this same UUID
         # into its live pane. Carry a complete native proof through Text and
         # delayed Enter; a bare GUI label cannot prove the original topology
@@ -7684,8 +7729,12 @@ class WatchDaemon:
         # Even after top recovers, retain the pinned native process and unique
         # surface/TTY join instead of falling back to second-resolution birth.
         raw_recovered = gui_claude
+        # The fresh scan still includes every process on this surface, including
+        # duplicate and foreign-TTY candidates. Do not build unrelated proofs
+        # while holding this surface's input lease.
         native = surface_process_label(display_process_labels(
-            records, {} if raw_recovered else labels, {} if raw_recovered else top,
+            [item for item in records if item.get("surface_id") == str(target["surface_id"])],
+            {} if raw_recovered else labels, {} if raw_recovered else top,
             agent_kind="claude"), target)
         proof = native.get("native_identity")
         if gui_claude and (not proof or native.get("agent_kind") != "claude"
@@ -10050,9 +10099,10 @@ class WatchDaemon:
         # Journal replay must revalidate it; it is not release authority.
         migrated_claim_source = self._claude_provider_migrated_claim_source(target, runtime, guard)
         with self.claude_event_ledger._lock:
+            # Most retained claims belong to other sessions. Filter their cheap
+            # identity fields before inspecting a current provider claim.
             pending = any(
                 claim_id != migrated_claim_source
-                and self.claude_event_ledger.provider_claim_pending(row)
                 and row.get("surface_id") == surface_id
                 and row.get("workspace_id") == target.get("workspace_id")
                 and row.get("session_id") == runtime.claude_session_id
@@ -10063,6 +10113,7 @@ class WatchDaemon:
                 and math.isfinite(row["created_at"])
                 and max(runtime.claude_turn_started_at, runtime.claude_last_hook_at)
                     <= row["created_at"] <= time.time() + 1
+                and self.claude_event_ledger.provider_claim_pending(row)
                 for claim_id, row in self.claude_event_ledger.events.items()
             )
         if guard and guard.get("status") == "blocked":
@@ -16782,12 +16833,13 @@ def uninstall_cli_link(path: Path = DEFAULT_CLI_LINK) -> None:
 
 
 def supervisor_command(config_path: Path = DEFAULT_CONFIG_PATH, suggested_surface: str = "") -> str:
-    command = [
+    installed_entry = DEFAULT_APP_DIR / "cli" / "current" / "bin" / APP_NAME
+    command = [str(installed_entry)] if installed_entry.is_file() else [
         DEFAULT_PYTHON,
+        "-B",
         str(PROJECT_DIR / "cmux_codex_watch.py"),
-        "--config", str(config_path),
-        "tui",
     ]
+    command.extend(["--config", str(config_path), "tui"])
     if suggested_surface:
         command.extend(["--suggest-surface", suggested_surface])
     return shlex.join(command)
@@ -16821,7 +16873,8 @@ def install_dock_control(
         "title": "Supervisor",
         "type": "terminal",
         "command": supervisor_command(config_path),
-        "cwd": str(PROJECT_DIR),
+        "cwd": str(DEFAULT_APP_DIR if (DEFAULT_APP_DIR / "cli" / "current" / "bin" / APP_NAME).is_file()
+                   else PROJECT_DIR),
         "height": 420,
     }
     merged_controls = [item for item in controls if item.get("id") != control["id"]]

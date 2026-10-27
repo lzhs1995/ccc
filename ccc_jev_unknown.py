@@ -120,7 +120,8 @@ def http_transport(request, timeout, *, key_path=None):
 
 
 class JevUnknownClassifier:
-    def __init__(self, transport=None, *, start=True, is_enabled=None, key_path=None):
+    def __init__(self, transport=None, *, start=True, is_enabled=None, key_path=None,
+                 daemon_threads=True):
         self.transport = (transport if transport is not None else
             lambda request, timeout: http_transport(request, timeout, key_path=key_path))
         self.is_enabled = is_enabled if is_enabled is not None else lambda: enabled(key_path)
@@ -131,9 +132,19 @@ class JevUnknownClassifier:
         self.calls = 0
         self.stopped = False
         self.thread = None
+        self.daemon_threads = daemon_threads
         if start:
-            self.thread = threading.Thread(target=self._worker, daemon=True, name='ccc-jev')
-            self.thread.start()
+            self.start_worker()
+
+    def start_worker(self):
+        if self.thread is not None or self.stopped:
+            return
+        thread = threading.Thread(target=self._worker, daemon=self.daemon_threads, name='ccc-jev')
+        thread.start()
+        self.thread = thread
+        import logging
+        logging.getLogger('ccc-jev').info('JEV worker started model=%s daemon_threads=%s',
+                                        MODEL, self.daemon_threads)
 
     def stop(self):
         self.stopped = True
@@ -141,6 +152,13 @@ class JevUnknownClassifier:
             self.queue.put_nowait(None)
         except queue.Full:
             pass
+        # Isolated native interpreters require non-daemon workers to quiesce
+        # before their original interpreter can close. Requests remain bounded.
+        if (self.thread is not None and not self.thread.daemon
+                and self.thread is not threading.current_thread()):
+            self.thread.join(TIMEOUT_SECONDS + 1)
+            if self.thread.is_alive():
+                raise RuntimeError('JEV worker has not quiesced')
 
     def cached(self, client, model, text, provider=''):
         """Poll-path lookup: cache only, never schedules or calls."""

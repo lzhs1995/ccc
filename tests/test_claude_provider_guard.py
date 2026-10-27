@@ -43,6 +43,24 @@ class ProviderGuardTests(unittest.TestCase):
                 "event_name": "StopFailure", "event_id": event_id, "agent_pid": 1234,
                 "synthetic_fallback": False, "created_at": stamp or time.time() - 10}
 
+    def test_foreign_history_is_skipped_but_current_pending_claim_blocks(self):
+        with tempfile.TemporaryDirectory() as root:
+            d, t, r, e, c = self.case(root)
+            claim = self.failure(e, RPM, stamp=time.time())
+            d.claude_event_ledger.events = {
+                str(i): dict(claim, surface_id='other-surface', status='handling')
+                for i in range(1000)}
+            with mock.patch.object(d.claude_event_ledger, 'provider_claim_pending',
+                                   wraps=d.claude_event_ledger.provider_claim_pending) as pending:
+                self.assertEqual(d._claude_provider_guard_reason(t, r, event=e), '')
+                pending.assert_not_called()
+                d.claude_event_ledger.events['current-claim'] = dict(
+                    claim, session_id=r.claude_session_id, status='handling',
+                    process_generation=r.claude_process_generation)
+                self.assertEqual(d._claude_provider_guard_reason(t, r, event=e),
+                                 'claude_provider_verifying')
+                pending.assert_called_once()
+
     def hold(self, d, t, r, e, text=AUTH, *, stamp=None):
         event = self.failure(e, text, stamp=stamp)
         d._remember_claude_provider_failure(t, r, event, event=event)
