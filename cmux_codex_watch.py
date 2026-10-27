@@ -8337,6 +8337,17 @@ class WatchDaemon:
         with self._state_save_lock:
             self._state_snapshot.write(self._runtime_snapshot())
 
+    def _save_claude_surface(self, surface_id: str, runtime: TargetRuntime) -> None:
+        # Claude's original transaction, identity, UNKNOWN flags and key budget
+        # must all reach the same recovery file before this surface proceeds.
+        # Do not queue an O(fleet) snapshot at every text/key boundary. This
+        # writer shares the snapshot lock and both durable fsync barriers with
+        # complete background publications, retaining all other UUID records.
+        if not surface_id:
+            raise RuntimeError("Claude persistence requires its original surface")
+        with self._state_save_lock:
+            self._state_snapshot.update({surface_id: runtime.to_dict()})
+
     def request_stop(self, *_: Any) -> None:
         self.stop_requested = True
         if self._scheduler is not None:
@@ -11373,7 +11384,7 @@ class WatchDaemon:
                 self.claude_event_ledger.mark(event, "sent")
         if (runtime.claude_deferred_event or {}).get("event_id") == event_id:
             self._clear_claude_deferred(runtime, reason="sent")
-        self.save()
+        self._save_claude_surface(str(event["surface_id"]), runtime)
 
 
     def _native_claude_supervisor_wait(self, target, runtime, identity, event):
@@ -11774,7 +11785,7 @@ class WatchDaemon:
                 runtime.claude_submit_not_sent = False
                 runtime.claude_submit_write_unknown = True
                 write_intent = True
-                self.save()
+                self._save_claude_surface(str(target["surface_id"]), runtime)
                 # Last local step before the key bytes: the same lock inodes
                 # must still be ours. The connected input_guard repeats it.
                 self._verify_claude_delivery_lease()
@@ -11809,14 +11820,14 @@ class WatchDaemon:
                 runtime.claude_submit_last_reason = f"enter not sent: {exc}"
             for key, value in previous_echo.items():
                 setattr(runtime, key, value)
-            self.save()
+            self._save_claude_surface(str(target["surface_id"]), runtime)
             self.logger.info("surface=%s Claude Enter withheld: %s", surface_id[:8], exc)
             return False
         except (CmuxError, RuntimeError, OSError, ValueError, TypeError) as exc:
             if not owns_submit():
                 return False
             runtime.claude_submit_last_reason = f"enter failed: {exc}"
-            self.save()
+            self._save_claude_surface(str(target["surface_id"]), runtime)
             self.logger.warning(
                 "surface=%s Claude submit Enter failed phase=%s reason=%s",
                 surface_id[:8], runtime.claude_submit_phase, reason,
@@ -11933,7 +11944,7 @@ class WatchDaemon:
         if not entered and self._claude_provider_guard_reason(target, runtime, state):
             runtime.claude_orphan_enter_at = previous_orphan_at
             runtime.claude_orphan_enter_count = previous_orphan_count
-            self.save()
+            self._save_claude_surface(str(target["surface_id"]), runtime)
             return True
         if not entered and getattr(self._claude_delivery_local, "lease_fault", None) is not None:
             # A lease fault (replaced/busy lock inside the Enter path) pressed
@@ -11941,7 +11952,7 @@ class WatchDaemon:
             runtime.claude_orphan_enter_at = previous_orphan_at
             runtime.claude_orphan_enter_count = previous_orphan_count
             runtime.state = "claude_delivery_wait"
-            self.save()
+            self._save_claude_surface(str(target["surface_id"]), runtime)
             return True
         runtime.state = "claude_orphan_enter"
         return True
@@ -12318,7 +12329,7 @@ class WatchDaemon:
         # expensive than it is and hid disk latency entirely.
         self.claude_event_ledger.mark(event, "reserved", detail="before cmux send")
         _submit_stage("ledger_reserve_ms")
-        self.save()
+        self._save_claude_surface(str(target["surface_id"]), runtime)
         _submit_stage("persist_reserve_ms")
         if not available_for_submit():
             return False, "Claude submit owner changed before transaction initialization"
@@ -12365,7 +12376,7 @@ class WatchDaemon:
         runtime.claude_orphan_enter_at = 0.0
         submit_owner = self._claude_submit_owner(runtime)
         _submit_stage("transaction_init_ms")
-        self.save()
+        self._save_claude_surface(str(target["surface_id"]), runtime)
         text_attempted = False
         try:
             if not text_input_check():
@@ -12375,21 +12386,24 @@ class WatchDaemon:
             with guard:
                 if not owns_submit():
                     raise InputNotSentError("Claude submit owner changed before text")
-                text_attempted = True
                 runtime.claude_submit_write_unknown = True
-                self.save()
+                self._save_claude_surface(str(target["surface_id"]), runtime)
+                text_attempted = True
                 client.send_text(str(target["workspace_id"]), surface_id, message)
             if not owns_submit():
                 return False, "Claude submit owner changed after text"
             runtime.claude_submit_write_unknown = False
-            self.save()
+            self._save_claude_surface(str(target["surface_id"]), runtime)
         except (CmuxError, RuntimeError) as exc:
             if (not isinstance(exc, InputNotSentError)
                     and (text_attempted or runtime.claude_submit_write_unknown)):
                 if not owns_submit():
                     return False, "Claude submit owner changed during text transport"
-                self.save()
-                return False, f"cmux send text failed after reservation: {exc}"
+                detail = ("cmux send text failed after reservation" if text_attempted
+                          else "Claude state persistence failed before text")
+                runtime.claude_submit_last_reason = f"{detail}: {exc}"
+                self._save_claude_surface(str(target["surface_id"]), runtime)
+                return False, f"{detail}: {exc}"
             if not owns_submit():
                 return False, "Claude submit owner changed before text"
             # This branch has proved zero Text input and cannot proceed to
@@ -12441,9 +12455,9 @@ class WatchDaemon:
                     self._defer_claude_event(surface_id, runtime, event, "provider_retry_wait")
                 else:
                     self.claude_event_ledger.mark(event, "provider_blocked", detail=provider_reason)
-                self.save()
+                self._save_claude_surface(str(target["surface_id"]), runtime)
                 return False, provider_reason
-            self.save()
+            self._save_claude_surface(str(target["surface_id"]), runtime)
             return False, f"Claude input not sent: {exc}"
         _submit_stage("text_ms")
         # Close the race with a human typing between the double-frame
@@ -12473,7 +12487,7 @@ class WatchDaemon:
             runtime.claude_submit_last_reason = f"submit readback failed: {exc}"
             return False, f"Claude submit readback failed; waiting for confirmation: {exc}"
         _submit_stage("readback_ms")
-        self.save()
+        self._save_claude_surface(str(target["surface_id"]), runtime)
         _submit_stage("persist_pre_enter_ms")
         if not owns_submit():
             return False, "Claude submit owner changed before Enter"
@@ -12490,7 +12504,7 @@ class WatchDaemon:
         _post_stage("finalize_bookkeeping_ms")
         self.claude_event_ledger.mark(event, "sent")
         _post_stage("ledger_finalize_ms")
-        self.save()
+        self._save_claude_surface(str(target["surface_id"]), runtime)
         _post_stage("persist_finalize_ms")
         warning_after = int(self.config.get("claude_repeat_warning_after", CLAUDE_REPEAT_WARNING_AFTER))
         if runtime.claude_consecutive_resumes >= warning_after and not runtime.claude_repeat_warning:
@@ -12506,7 +12520,7 @@ class WatchDaemon:
                 surface_id[:8],
                 runtime.claude_consecutive_resumes,
             )
-            self.save()
+            self._save_claude_surface(str(target["surface_id"]), runtime)
             _post_stage("notify_ms")
         latency = max(0.0, now - float(event.get("created_at") or now))
         inbox_source = str(event.get("_inbox_source") or "socket")
@@ -17313,6 +17327,87 @@ def hook_coverage_status(config, snapshot):
     return {"status": "unknown", "reason": "Hook inventory missing or stale"}
 
 
+
+def _claude_audit_native_inventory(inventory):
+    """Supplement this audit only; uncertain observations never prove exit."""
+    import stat
+    import ccc_native_processes as native
+    import ccc_guard_scope as scope
+
+    failed, unavailable, incomplete = set(), [], []
+    for wid in inventory.workspaces:
+        key = "" if inventory.fleet else wid
+        if key not in failed:
+            try:
+                inventory._load(wid)
+            except (CmuxError, OSError, RuntimeError):
+                failed.add(key)
+                inventory.tops[key] = {"sample": {"enumeration_complete": False}}
+        if key in failed:
+            unavailable.append(wid)
+        source = inventory.tops.get(key)
+        if isinstance(source, Mapping) and source.get("sample", {}).get("enumeration_complete") is False:
+            incomplete.append(wid)
+    # Keep complete payloads, including nested lists and conflicting entries.
+    top = {"snapshots": list(inventory.tops.values())}
+    classified = classify_surface_processes(top)
+    records = native.display_surface_records(inventory.tree, list(inventory.records.values()))
+    native_available = True
+    try:
+        processes = scope.scan(reader=native.display_process)
+    except (OSError, ValueError, RuntimeError, TypeError, KeyError):
+        processes, native_available = [], False
+
+    groups, devices = {}, set()
+    for row in processes:
+        groups.setdefault(row["surface_id"], []).append(row)
+        devices.add(row["tdev"])
+    if any(r.get("native_display_target") and not r["native_display_target"].get("tty")
+           for r in records):
+        ttys = {}
+        try:
+            with os.scandir("/dev") as entries:
+                for entry in entries:
+                    if not (entry.name.startswith("tty") and entry.name.isascii()
+                            and entry.name.isalnum()):
+                        continue
+                    try:
+                        info = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if stat.S_ISCHR(info.st_mode) and info.st_rdev in devices:
+                        ttys.setdefault(info.st_rdev, []).append(entry.name)
+        except OSError:
+            pass
+        enriched = []
+        for record in records:
+            target = record.get("native_display_target")
+            group = groups.get(record["surface_id"], [])
+            if target and not target.get("tty") and len(group) == 1:
+                names = ttys.get(group[0]["tdev"], [])
+                if len(names) == 1:
+                    record = {**record, "native_display_target": {**target, "tty": names[0]}}
+            enriched.append(record)
+        records = enriched
+    labels = native.display_process_labels(
+        records, classified, top, processes=processes, agent_kind="claude")
+    inventory.records = {r["surface_id"]: r for r in records}
+    inventory.workspaces = {}
+    for record in records:
+        if record.get("type") == "terminal":
+            inventory.workspaces.setdefault(record["workspace_id"], []).append(record)
+    inventory.native_processes = processes
+    inventory.labels = {key: labels for key in inventory.tops}
+    return labels, {
+        "gui_status": "unavailable" if unavailable and len(unavailable) == len(inventory.workspaces)
+                      else "partial" if unavailable or incomplete else "observed",
+        "gui_unavailable_workspaces": unavailable,
+        "gui_incomplete_workspaces": incomplete,
+        "native_status": "observed" if native_available else "unavailable",
+        "live_count_semantics": "observed Claude identities; missing evidence does not prove exit",
+    }
+
+
 def audit_claude_surfaces(
     config: Mapping[str, Any],
     state: Mapping[str, Any],
@@ -17325,10 +17420,8 @@ def audit_claude_surfaces(
     hook_config_healthy = bool(hook_config.get("healthy"))
     tree = client.tree()
     inventory = DiscoverySnapshot(client, tree=tree)
+    processes, inventory_report = _claude_audit_native_inventory(inventory)
     records = inventory.records
-    processes = {}
-    for wid in inventory.workspaces:
-        processes.update(inventory._load(wid)[1])
     explicit = {
         str(target.get("surface_id") or ""): target
         for target in effective_targets(config, discover_all_targets(inventory, config))
@@ -17469,6 +17562,8 @@ def audit_claude_surfaces(
             "surface_ref": str(target.get("ref") or ""),
             "paused": bool(target.get("paused")),
             "paused_reason": str(target.get("paused_reason") or ""),
+            "observation_status": "not_observed",
+            "exit_confirmed": False,
         }
         for surface_id, target in explicit.items()
         if surface_id not in live_ids
@@ -17496,7 +17591,9 @@ def audit_claude_surfaces(
         },
         "live_count": len(rows),
         "live": rows,
-        "stale_registered": stale,
+        "inventory": inventory_report,
+        "unobserved_registered": stale,
+        "stale_registered": stale,  # Compatibility alias; not proof of process exit.
     }
 
 

@@ -21,6 +21,7 @@ import uuid
 
 
 BLOCK_SIZE = 4096
+_UNSET = object()
 
 
 @lru_cache(maxsize=1)
@@ -85,6 +86,15 @@ class AtomicJSONSnapshot:
             return None
         return _identity(value) if stat.S_ISREG(value.st_mode) else None
 
+    def _update_identity(self):
+        try:
+            value = self.path.lstat()
+        except FileNotFoundError:
+            return None
+        if not stat.S_ISREG(value.st_mode):
+            raise RuntimeError("snapshot update source is not a regular file")
+        return _identity(value)
+
     @staticmethod
     def _encode(value):
         result = {}
@@ -107,9 +117,54 @@ class AtomicJSONSnapshot:
             offset += capacity
         return slots, offset
 
+    def update(self, value) -> dict:
+        """Durably replace selected rows without re-encoding archived history.
+
+        The same complete JSON file remains the recovery source. A cold or
+        invalidated cache reads the original file before merging; malformed,
+        changing or non-regular sources grant no persistence acknowledgement.
+        Callers must serialize writes. Source checks detect external changes;
+        checking identity and replacing the file are not one atomic operation.
+        """
+        current = self._update_identity()
+        if self._identity is not None and current == self._identity:
+            entries = dict(self._entries)
+        else:
+            try:
+                source = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            except FileNotFoundError:
+                if self.path.is_symlink():
+                    raise RuntimeError("snapshot update source is not a regular file")
+                if self._entries:
+                    raise RuntimeError("snapshot source disappeared before update")
+                previous = {}
+                current = None
+            else:
+                try:
+                    before = os.fstat(source)
+                    if not stat.S_ISREG(before.st_mode):
+                        raise RuntimeError("snapshot update source is not a regular file")
+                    with os.fdopen(os.dup(source), "rb") as reader:
+                        previous = json.load(reader)
+                    current = _identity(before)
+                    if (_identity(os.fstat(source)) != current
+                            or self._current_identity() != current):
+                        raise RuntimeError("snapshot source changed during update read")
+                finally:
+                    os.close(source)
+            if not isinstance(previous, dict):
+                raise ValueError("snapshot update source is not a JSON object")
+            entries = self._encode(previous)
+        entries.update(self._encode(value))
+        return self._write_entries(entries, expected=current)
+
     def write(self, value) -> dict:
-        entries = self._encode(value)
-        current = self._current_identity()
+        return self._write_entries(self._encode(value))
+
+    def _write_entries(self, entries, *, expected=_UNSET) -> dict:
+        current = self._current_identity() if expected is _UNSET else self._update_identity()
+        if expected is not _UNSET and current != expected:
+            raise RuntimeError("snapshot source changed before update")
         reusable = self._identity is not None and current == self._identity
         if reusable and entries == self._entries:
             return {"mode": "unchanged", "written_bytes": 0,
@@ -182,6 +237,8 @@ class AtomicJSONSnapshot:
             os.ftruncate(destination, size)
             os.fchmod(destination, 0o600)
             os.fsync(destination)
+            if expected is not _UNSET and self._update_identity() != expected:
+                raise RuntimeError("snapshot source changed before update publication")
             os.replace(name, self.path.name, src_dir_fd=directory, dst_dir_fd=directory)
             published = True
             os.fsync(directory)
