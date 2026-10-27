@@ -6,6 +6,7 @@ asks JEV once per fingerprint; the answer only selects an allowlisted existing
 retry code and never becomes an action. Any failure keeps UNKNOWN.
 """
 from dataclasses import dataclass
+from functools import lru_cache
 import hashlib
 import json
 import math
@@ -14,6 +15,7 @@ import queue
 import re
 import stat
 import threading
+import time
 
 MODEL = 'jev-1.14.0'
 ENDPOINT_HOST = 'api.typesafe.ai'
@@ -104,19 +106,106 @@ def enabled(key_path=None):
     return bool(api_key(key_path))
 
 
+@lru_cache(maxsize=1)
+def _curl_api():
+    """Use the system library only when DNS and initialization are thread safe.
+
+    Isolated native interpreters cannot delegate to subprocesses. Socket timeouts
+    do not bound slow-drip responses or DNS, so an unsupported library abstains.
+    Global cleanup would affect other interpreters; only request handles close.
+    """
+    import ctypes as c
+    import ctypes.util
+    library = ctypes.util.find_library('curl')
+    if not library:
+        raise OSError('bounded JEV HTTP transport unavailable')
+    lib = c.CDLL(library)
+    lib.curl_global_init.argtypes = [c.c_long]
+    lib.curl_global_init.restype = c.c_int
+    if lib.curl_global_init(3):
+        raise OSError('bounded JEV HTTP initialization failed')
+    class Version(c.Structure):
+        _fields_ = [('age', c.c_int), ('version', c.c_char_p),
+                    ('number', c.c_uint), ('host', c.c_char_p), ('features', c.c_int)]
+    lib.curl_version_info.argtypes = [c.c_int]
+    lib.curl_version_info.restype = c.POINTER(Version)
+    info = lib.curl_version_info(0)
+    required = (1 << 7) | (1 << 30)  # ASYNCHDNS, THREADSAFE
+    if not info or info.contents.features & required != required:
+        raise OSError('bounded JEV HTTP transport unavailable')
+    lib.curl_easy_init.restype = c.c_void_p
+    lib.curl_easy_init.argtypes = []
+    lib.curl_easy_setopt.argtypes = [c.c_void_p, c.c_int]
+    lib.curl_easy_setopt.restype = c.c_int
+    lib.curl_easy_perform.argtypes = [c.c_void_p]
+    lib.curl_easy_perform.restype = c.c_int
+    lib.curl_easy_getinfo.argtypes = [c.c_void_p, c.c_int]
+    lib.curl_easy_getinfo.restype = c.c_int
+    lib.curl_easy_cleanup.argtypes = [c.c_void_p]
+    lib.curl_easy_cleanup.restype = None
+    lib.curl_slist_append.argtypes = [c.c_void_p, c.c_char_p]
+    lib.curl_slist_append.restype = c.c_void_p
+    lib.curl_slist_free_all.argtypes = [c.c_void_p]
+    lib.curl_slist_free_all.restype = None
+    return lib
+
+
+def _curl_post_json(url, request, key, timeout):
+    """One total deadline covers DNS, connect, TLS, headers and response body."""
+    import ctypes as c
+    if not math.isfinite(timeout) or timeout <= 0:
+        return None
+    deadline = time.monotonic() + timeout
+    lib = _curl_api()
+    handle = lib.curl_easy_init()
+    if not handle:
+        return None
+    headers = None
+    body = bytearray()
+    payload = json.dumps(request, ensure_ascii=False).encode()
+    @c.CFUNCTYPE(c.c_size_t, c.c_void_p, c.c_size_t, c.c_size_t, c.c_void_p)
+    def receive(data, size, count, _):
+        length = size * count
+        if len(body) + length > 64 * 1024:
+            return 0
+        body.extend(c.string_at(data, length))
+        return length
+    def option(code, value):
+        if lib.curl_easy_setopt(handle, code, value):
+            raise OSError('bounded JEV HTTP option failed')
+    try:
+        for value in ('Authorization: Bearer ' + key, 'Content-Type: application/json'):
+            updated = lib.curl_slist_append(headers, value.encode())
+            if not updated:
+                raise OSError('bounded JEV HTTP headers unavailable')
+            headers = updated
+        option(10002, c.c_char_p(url.encode()))           # URL
+        option(10004, c.c_char_p(b''))                    # preserve direct transport
+        option(10023, c.c_void_p(headers))                # HTTPHEADER
+        option(10015, c.c_char_p(payload))                # POSTFIELDS (retained here)
+        option(60, c.c_long(len(payload)))                # POSTFIELDSIZE
+        option(99, c.c_long(1))                          # NOSIGNAL in worker threads
+        option(20011, c.cast(receive, c.c_void_p))         # WRITEFUNCTION
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        option(155, c.c_long(max(1, int(remaining * 1000)))) # TIMEOUT_MS, never unlimited
+        if lib.curl_easy_perform(handle) or time.monotonic() >= deadline:
+            return None
+        status = c.c_long()
+        if lib.curl_easy_getinfo(handle, 0x200002, c.byref(status)) or status.value != 200:
+            return None
+        return json.loads(body)
+    finally:
+        lib.curl_easy_cleanup(handle)
+        lib.curl_slist_free_all(headers)
+
+
 def http_transport(request, timeout, *, key_path=None):
-    import http.client
     key = api_key(key_path)
     if not key:
         return None
-    conn = http.client.HTTPSConnection(ENDPOINT_HOST, timeout=timeout)
-    try:
-        conn.request('POST', ENDPOINT_PATH, body=json.dumps(request, ensure_ascii=False).encode(),
-                     headers={'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json'})
-        response = conn.getresponse()
-        return json.loads(response.read(64 * 1024)) if response.status == 200 else None
-    finally:
-        conn.close()
+    return _curl_post_json('https://' + ENDPOINT_HOST + ENDPOINT_PATH, request, key, timeout)
 
 
 class JevUnknownClassifier:

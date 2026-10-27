@@ -7645,7 +7645,7 @@ class WatchDaemon:
         except (CmuxError, OSError, ValueError, TypeError, RuntimeError):
             return surface_process_label(labels, target)
 
-    def _live_claude_process_label(self, target, client, *, pinned=None, allow_unpinned=True):
+    def _live_claude_process_label(self, target, client, *, pinned=None, allow_unpinned=True, tree=None):
         """Fresh topology + process proof; a cache never grants terminal input.
 
         Empty cmux process arrays are incomplete observations on newer cmux.
@@ -7655,7 +7655,7 @@ class WatchDaemon:
         topology proof; no proof is manufactured for an old unknown write.
         """
         base = client.client if isinstance(client, SnapshotClient) else client
-        tree = base.tree()
+        tree = base.tree() if tree is None else tree
         record = find_main_surface(tree, str(target["surface_id"]))
         unknown = {"agent_kind": "unknown", "summary": "live Claude identity unverified"}
         # Explicit surface targets persist pane_id only for display. cmux may
@@ -11567,7 +11567,7 @@ class WatchDaemon:
         except (OSError, ValueError) as exc:
             raise DeliveryLeaseError(f"shared delivery lock unverifiable: {exc}") from exc
 
-    def _acquire_claude_delivery(self, target, runtime, client) -> bool:
+    def _acquire_claude_delivery(self, target, runtime, client, *, tree=None) -> bool:
         """Join MAC's deliveries-v1 pane→target lease, without waiting.
 
         Identity comes from a fresh tree, never a cached pane ref. These exact
@@ -11579,7 +11579,7 @@ class WatchDaemon:
         stack = None
         try:
             base = client.client if isinstance(client, SnapshotClient) else client
-            record = find_main_surface(base.tree(), str(target["surface_id"]))
+            record = find_main_surface(base.tree() if tree is None else tree, str(target["surface_id"]))
             if (record.get("workspace_id") != target["workspace_id"]
                     or not record.get("pane_id")):
                 raise InputNotSentError("shared delivery identity unavailable")
@@ -12205,17 +12205,21 @@ class WatchDaemon:
                     ):
                         return False
                     _guard_trace.step('tree_lookup')
-                    record = find_main_surface(base.tree(), surface_id)
+                    # One fresh topology per check; never reuse it across
+                    # live_initial, live_final or an actual input operation.
+                    current_tree = base.tree()
+                    record = find_main_surface(current_tree, surface_id)
                     _guard_trace.detail['expected_workspace'] = target.get('workspace_id')
                     _guard_trace.detail['observed_workspace'] = record.get('workspace_id')
                     _guard_trace.detail['configured_pane'] = target.get('pane_id')
                     _guard_trace.detail['observed_pane'] = record.get('pane_id')
                     if _guard_trace.step('workspace_changed') and record.get('workspace_id') != target['workspace_id']:
                         return False
-                    if _guard_trace.step('delivery_lease') and (not self._acquire_claude_delivery(target, runtime, client)):
+                    if _guard_trace.step('delivery_lease') and (not self._acquire_claude_delivery(target, runtime, client, tree=current_tree)):
                         return False
                     _guard_trace.step('live_process_label')
-                    live = self._live_claude_process_label(target, base, pinned=pinned_native_identity, allow_unpinned=False)
+                    live = self._live_claude_process_label(target, base, pinned=pinned_native_identity,
+                                                          allow_unpinned=False, tree=current_tree)
                     if (
                         _guard_trace.step('live_agent_kind')
                         and live.get('agent_kind') != 'claude'
@@ -12321,12 +12325,18 @@ class WatchDaemon:
         message = str(self.config.get("claude_message") or CLAUDE_MESSAGE)
         def text_input_check():
             with _ClaudeInputGuardTrace(self.logger, surface_id, str(event.get('event_id') or ''), 'text') as _guard_trace:
-                if _guard_trace.step('live_initial') and (not live_input_check()):
-                    return False
                 _guard_trace.step('replay')
                 frame = Grid.from_rpc(base.replay(str(target['workspace_id']), surface_id), surface_id)
                 _guard_trace.step('classify')
                 current_state = classify_claude_grid(frame, claude_message=message)
+                # A working or occupied frame can only reject input. Do not
+                # hold the pane lease for a full native scan to learn that.
+                if (current_state.kind not in {'claude_stopped', 'recoverable_error'}
+                        or current_state.claude_native_activity):
+                    _guard_trace.step('composer_kind')
+                    return False
+                if _guard_trace.step('live_initial') and (not live_input_check()):
+                    return False
                 if _guard_trace.step('provider_guard_screen') and self._claude_provider_guard_reason(target, runtime, current_state, event=event):
                     return False
                 _guard_trace.result = (

@@ -13,11 +13,65 @@ from types import SimpleNamespace
 import cmux_codex_watch as core
 from ccc_native_lanes import (AuthorizationCells, InterpreterLane, refresh_native_bindings,
                               _binding_process_current, _binding_matches,
-                              _create_lane_daemon, _restore_assignment_runtime)
+                              _create_lane_daemon, _restore_assignment_runtime, run_native_lane)
 from ccc_delivery import DeliveryStore
 
 
 class NativeLaneTests(unittest.TestCase):
+    @unittest.skipUnless(sys.version_info >= (3,14), 'native lanes use Python 3.14 interpreters')
+    def test_cleanup_errors_preserve_original_lane_rows_and_propagate_failure(self):
+        for failed in ('native', 'scheduler', 'jev', 'processes', 'delivery'):
+            with self.subTest(failed=failed):
+                closed = []
+                services = {name: Mock() for name in
+                            ('native', 'scheduler', 'jev', 'processes', 'delivery')}
+                def closer(name):
+                    def close():
+                        closed.append(name)
+                        if name == failed:
+                            raise RuntimeError('original-' + name + '-failure')
+                    return close
+                for name, service in services.items():
+                    if name == 'jev':
+                        service.stop.side_effect = closer(name)
+                    else:
+                        service.close.side_effect = closer(name)
+                runtime = core.TargetRuntime(delivery_status='unknown',
+                    send_attempt_id='original-attempt', claude_submit_phase='text_written',
+                    claude_submit_write_unknown=True, claude_submit_attempts=2)
+                daemon = SimpleNamespace(_delivery_store=services['delivery'],
+                    _process_snapshots=services['processes'], config_store=Mock(),
+                    codex_queue_recovery=Mock(), _active_send_target=Mock(),
+                    _native_retry_needed=Mock(), _native_failed=Mock(),
+                    _scheduled_native=Mock(), _scheduled_native_event=Mock(),
+                    _record_dispatch=Mock(), _scheduled_error=Mock(),
+                    jev_classifier=services['jev'], runtime={'selected': runtime})
+                assignment = {'target': {'surface_id': 'selected', 'workspace_id': 'owned'},
+                              'cell': 1, 'binding': {}, 'runtime': runtime.to_dict()}
+                commands = queue.SimpleQueue()
+                commands.put({'type': 'assignments', 'assignments': [assignment]})
+                commands.put({'type': 'stop'})
+                results = queue.SimpleQueue()
+                with patch('ccc_native_lanes._create_lane_daemon', return_value=daemon), \
+                        patch('ccc_native_lanes._restore_assignment_runtime'), \
+                        patch('ccc_native_lanes._bound_native_turn', return_value={'kind': 'unknown'}), \
+                        patch.object(core, 'CmuxViewportSocket'), \
+                        patch('ccc_codex_queue.NativeCompletionWatcher', return_value=services['native']), \
+                        patch('ccc_scheduling.SurfaceScheduler', return_value=services['scheduler']):
+                    with self.assertRaisesRegex(RuntimeError, 'original-' + failed + '-failure'):
+                        run_native_lane('{"capabilities": {}}', bytearray([1, 1]), 0, commands, results)
+                self.assertEqual(closed, ['native', 'scheduler', 'jev', 'processes', 'delivery'])
+                self.assertEqual(results.get_nowait()['type'], 'ready')
+                final = results.get_nowait()
+                self.assertEqual(final['type'], 'runtime')
+                self.assertEqual(final['rows']['selected']['cell'], 1)
+                saved = final['rows']['selected']['runtime']
+                self.assertEqual(saved['send_attempt_id'], 'original-attempt')
+                self.assertEqual(saved['delivery_status'], 'unknown')
+                self.assertTrue(saved['claude_submit_write_unknown'])
+                self.assertEqual(saved['claude_submit_attempts'], 2)
+                self.assertTrue(daemon.stop_requested)
+
     def test_cleanup_failure_retains_lane_until_original_interpreter_quiesces(self):
         lane = object.__new__(InterpreterLane)
         lane._interpreter = Mock()

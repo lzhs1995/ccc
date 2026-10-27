@@ -750,11 +750,14 @@ def run_native_lane(initial, flags, lane_cell, commands, results):
     finally:
         daemon.stop_requested = True
         with ExitStack() as cleanup:
+            # Publish after every close attempt, including a failed JEV join.
+            # ExitStack still propagates the failure and retains ownership.
+            cleanup.callback(lambda: results.put({"type":"runtime", "rows":{
+                sid:{"cell":a["cell"], "runtime":daemon.runtime[sid].to_dict()}
+                for sid,a in assignments.items() if sid in daemon.runtime}}))
             cleanup.callback(daemon._delivery_store.close)
             cleanup.callback(daemon._process_snapshots.close)
             if daemon.jev_classifier is not None:
                 cleanup.callback(daemon.jev_classifier.stop)
             cleanup.callback(scheduler.close)
             cleanup.callback(native.close)
-        results.put({"type":"runtime", "rows":{sid:{"cell":a["cell"],
-            "runtime":daemon.runtime[sid].to_dict()} for sid,a in assignments.items() if sid in daemon.runtime}})

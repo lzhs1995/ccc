@@ -87,6 +87,36 @@ class GuiNativeContinuityTests(unittest.TestCase):
             self.assertEqual(len(c.sent_text), 1)
             self.assertEqual(len(c.sent_keys), 1)
 
+    def test_each_input_check_shares_only_its_own_fresh_topology(self):
+        with self.case() as (d, t, r, e, c, *_):
+            original_tree = c.tree
+            c.tree = mock.Mock(side_effect=lambda: copy.deepcopy(original_tree()))
+            with mock.patch.object(d, '_acquire_claude_delivery', wraps=d._acquire_claude_delivery) as lease, \
+                    mock.patch.object(d, '_live_claude_process_label', wraps=d._live_claude_process_label) as identity:
+                self.assertTrue(d._send_claude_event(e, t, r, c)[0])
+            trees = [call.kwargs['tree'] for call in identity.call_args_list if 'tree' in call.kwargs]
+            lease_trees = [call.kwargs['tree'] for call in lease.call_args_list if 'tree' in call.kwargs]
+            self.assertGreaterEqual(len(trees), 2)
+            self.assertEqual(len({id(tree) for tree in trees}), len(trees))
+            self.assertTrue(all(any(tree is value for value in lease_trees) for tree in trees))
+            self.assertEqual(len(c.sent_text), 1)
+            self.assertEqual(len(c.sent_keys), 1)
+
+    def test_working_frame_rejects_text_before_expensive_native_validation(self):
+        with self.case() as (d, t, r, e, c, *_):
+            classify = w.classify_claude_grid
+            def working_after_reservation(frame, **kwargs):
+                if d.claude_event_ledger.status_of(e['event_id']) == 'reserved':
+                    return w.ScreenState('working', message_kind='claude', claude_native_activity=True)
+                return classify(frame, **kwargs)
+            with mock.patch.object(w, 'classify_claude_grid', side_effect=working_after_reservation), \
+                    mock.patch.object(d, '_live_claude_process_label', wraps=d._live_claude_process_label) as identity:
+                self.assertFalse(d._send_claude_event(e, t, r, c)[0])
+            self.assertFalse(any(call.kwargs.get('allow_unpinned') is False for call in identity.call_args_list))
+            self.assertEqual(c.sent_text, [])
+            self.assertEqual(c.sent_keys, [])
+            self.assertEqual(d.claude_event_ledger.status_of(e['event_id']), 'deferred_input_not_sent')
+
     def test_gui_failure_keeps_mixed_native_surface_ambiguous(self):
         with self.case() as (d, t, r, e, c, row, scan, *_):
             c.top = mock.Mock(side_effect=w.CmuxError('system.top response deadline exceeded'))

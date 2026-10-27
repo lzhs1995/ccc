@@ -1,12 +1,27 @@
 """Durable runtime snapshots keep unknown transactions and independent evidence."""
 import dataclasses
 import json
+import types
+import typing
 import unittest
 
 from cmux_codex_watch import TargetRuntime
 
 
 class RuntimeSnapshotCopyTests(unittest.TestCase):
+    def test_runtime_annotations_keep_the_json_snapshot_contract(self):
+        def json_annotation(annotation):
+            if annotation in (str, int, float, bool, type(None), typing.Any):
+                return True
+            origin = typing.get_origin(annotation)
+            return (origin in (dict, list, typing.Union, types.UnionType)
+                    and all(json_annotation(arg) for arg in typing.get_args(annotation)))
+
+        for name, annotation in typing.get_type_hints(TargetRuntime).items():
+            with self.subTest(field=name):
+                self.assertTrue(json_annotation(annotation),
+                    'Non-JSON runtime fields need explicit asdict-compatible serialization')
+
     def runtime(self):
         return TargetRuntime(
             delivery_status='unknown', send_attempt_id='original-attempt',
