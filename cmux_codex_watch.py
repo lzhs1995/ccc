@@ -60,7 +60,7 @@ from ccc_native_processes import (
 )
 from ccc_scheduling import CoalescingWriter, SnapshotCache, SnapshotClient, SurfaceScheduler, TreeSnapshot
 from ccc_delivery import DeliveryStore
-from ccc_state_snapshot import AtomicJSONSnapshot
+from ccc_state_snapshot import AtomicJSONSnapshot, RuntimeRecords
 import ccc_jev_unknown as _jev
 from ccc_provider_retry import (
     ProviderRetryStore, RETRYABLE as PROVIDER_RETRYABLE,
@@ -6532,7 +6532,7 @@ class WatchDaemon:
         self._config_mtime_ns = self._config_mtime()
         self.config = self._load_config_at_startup()
         self._observation_policy = ObservationPolicy(self.config)
-        self.runtime: dict[str, TargetRuntime] = self._load_runtime()
+        self.runtime: dict[str, TargetRuntime] = RuntimeRecords(self._load_runtime())
         self._live_claude_hook_epoch = object()
         self._clear_stale_runtime_pause_reasons()
         self.dynamic_targets: dict[str, dict[str, Any]] = {}
@@ -6935,6 +6935,8 @@ class WatchDaemon:
         # F2 重置点之三：人工重新 arm 是明确的"再试一次"授权，孤儿 Enter
         # 预算随之归零。只在 非armed→armed 的边沿触发，普通配置刷新不重置。
         if previous_mode != "armed" and str(reloaded.get("mode", "")) == "armed":
+            if isinstance(self.runtime, RuntimeRecords):
+                self.runtime.touch_all()
             for runtime in self.runtime.values():
                 runtime.claude_orphan_enter_count = 0
                 runtime.claude_orphan_enter_at = 0.0
@@ -8337,7 +8339,22 @@ class WatchDaemon:
 
     def _save_now(self) -> None:
         with self._state_save_lock:
-            self._state_snapshot.write(self._runtime_snapshot())
+            records = self.runtime
+            generation, candidates = (records.publication()
+                                     if isinstance(records, RuntimeRecords) else (None, ()))
+            if (not isinstance(records, RuntimeRecords)
+                    or getattr(self, "_published_runtime_records", None) is not records
+                    or getattr(self, "_published_runtime_removals", None) != generation):
+                # The first publication includes restored delivery/provider
+                # evidence. Deletions and replacement catalogs also need a
+                # complete snapshot; never trim historical recovery records.
+                self._state_snapshot.write(self._runtime_snapshot())
+                self._published_runtime_records = records
+                self._published_runtime_removals = generation
+            else:
+                # Candidates survive every write: a worker may retain a runtime
+                # reference or mutate its nested evidence between heartbeats.
+                self._state_snapshot.update(self._runtime_snapshot(candidates))
 
     def _save_claude_surface(self, surface_id: str, runtime: TargetRuntime) -> None:
         # Claude's original transaction, identity, UNKNOWN flags and key budget
@@ -8348,6 +8365,8 @@ class WatchDaemon:
         if not surface_id:
             raise RuntimeError("Claude persistence requires its original surface")
         with self._state_save_lock:
+            if isinstance(self.runtime, RuntimeRecords):
+                self.runtime.touch(surface_id)
             self._state_snapshot.update({surface_id: runtime.to_dict()})
 
     def request_stop(self, *_: Any) -> None:

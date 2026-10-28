@@ -9,6 +9,7 @@ file and its containing directory have been fsynced.
 from __future__ import annotations
 
 import contextlib
+import copy
 import ctypes
 import errno
 from functools import lru_cache
@@ -17,11 +18,97 @@ import os
 from pathlib import Path
 import stat
 import sys
+import threading
 import uuid
 
 
 BLOCK_SIZE = 4096
 _UNSET = object()
+
+
+class RuntimeRecords(dict):
+    """Keep every fetched runtime eligible for later background publication.
+
+    A worker may hold a record or mutate a nested value after a save, so these
+    candidates are never cleared. Untouched startup history remains on disk.
+    Bulk mutation through ``items``/``values`` must explicitly call touch_all.
+    Removing a key requires one full publication to remove it from the file.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._candidate_lock = threading.Lock()
+        self._candidates = set()
+        self._removals = 0
+
+    def touch(self, key):
+        with self._candidate_lock:
+            self._candidates.add(key)
+
+    def touch_all(self):
+        with self._candidate_lock:
+            self._candidates.update(tuple(super().keys()))
+
+    def publication(self):
+        with self._candidate_lock:
+            return self._removals, tuple(self._candidates)
+
+    def __getitem__(self, key):
+        value = super().__getitem__(key)
+        self.touch(key)
+        return value
+
+    def get(self, key, default=None):
+        value = super().get(key, _UNSET)
+        if value is _UNSET:
+            return default
+        self.touch(key)
+        return value
+
+    def setdefault(self, key, default=None):
+        value = super().setdefault(key, default)
+        self.touch(key)
+        return value
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        self.touch(key)
+
+    def update(self, *args, **kwargs):
+        values = dict(*args, **kwargs)
+        super().update(values)
+        with self._candidate_lock:
+            self._candidates.update(values)
+
+    def __ior__(self, values):
+        self.update(values)
+        return self
+
+    def __delitem__(self, key):
+        super().__delitem__(key)
+        with self._candidate_lock:
+            self._removals += 1
+
+    def pop(self, key, *default):
+        existed = key in self
+        value = super().pop(key, *default)
+        if existed:
+            with self._candidate_lock:
+                self._removals += 1
+        return value
+
+    def popitem(self):
+        value = super().popitem()
+        with self._candidate_lock:
+            self._removals += 1
+        return value
+
+    def clear(self):
+        existed = bool(self)
+        super().clear()
+        if existed:
+            with self._candidate_lock:
+                self._removals += 1
 
 
 @lru_cache(maxsize=1)
@@ -62,6 +149,20 @@ def _write_at(fd: int, data: bytes, offset: int) -> None:
         offset += written
 
 
+def _same_record(left, right):
+    # Python considers True == 1 and 1 == 1.0; their JSON encodings differ.
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return all(isinstance(key, str) for key in left) and left.keys() == right.keys() and all(
+            _same_record(value, right[key]) for key, value in left.items())
+    if isinstance(left, (list, tuple)):
+        return len(left) == len(right) and all(_same_record(a, b) for a, b in zip(left, right))
+    if isinstance(left, float):
+        return left.hex() == right.hex()
+    return left == right
+
+
 class AtomicJSONSnapshot:
     """Single-writer snapshot cache; the caller serializes calls to ``write``.
 
@@ -74,6 +175,9 @@ class AtomicJSONSnapshot:
     def __init__(self, path: Path):
         self.path = Path(path)
         self._entries: dict[str, bytes] = {}
+        # Only selected publication candidates are retained as decoded copies;
+        # storing a second decoded copy of all startup history is unnecessary.
+        self._selected_records: dict[str, object] = {}
         self._slots: dict[str, tuple[int, int]] = {}
         self._identity = None
         self._end = BLOCK_SIZE
@@ -126,10 +230,15 @@ class AtomicJSONSnapshot:
         Callers must serialize writes. Source checks detect external changes;
         checking identity and replacing the file are not one atomic operation.
         """
+        value = copy.deepcopy(value)
         current = self._update_identity()
         if self._identity is not None and current == self._identity:
             entries = dict(self._entries)
+            changed = {key: record for key, record in value.items()
+                       if key not in self._selected_records
+                       or not _same_record(record, self._selected_records[key])}
         else:
+            self._selected_records.clear()
             try:
                 source = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
             except FileNotFoundError:
@@ -155,10 +264,14 @@ class AtomicJSONSnapshot:
             if not isinstance(previous, dict):
                 raise ValueError("snapshot update source is not a JSON object")
             entries = self._encode(previous)
-        entries.update(self._encode(value))
-        return self._write_entries(entries, expected=current)
+            changed = value
+        entries.update(self._encode(changed))
+        result = self._write_entries(entries, expected=current)
+        self._selected_records.update(changed)
+        return result
 
     def write(self, value) -> dict:
+        self._selected_records.clear()
         return self._write_entries(self._encode(value))
 
     def _write_entries(self, entries, *, expected=_UNSET) -> dict:

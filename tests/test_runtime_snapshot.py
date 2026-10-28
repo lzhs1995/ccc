@@ -109,6 +109,109 @@ class RuntimeSnapshotTests(unittest.TestCase):
                 self.assertEqual(set(daemon.runtime), {"first", "new"})
 
 
+class RuntimePublicationTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        daemon = self.daemon = snapshot_daemon()
+        daemon.runtime = core.RuntimeRecords({
+            "live": core.TargetRuntime(observation_timings={"samples": [1]}),
+            "history": core.TargetRuntime(delivery_status="unknown", send_attempt_id="original",
+                codex_input_phase="text_retained", claude_submit_write_unknown=True),
+        })
+        daemon.state_path = Path(temporary.name) / "state.json"
+        daemon._state_save_lock = threading.Lock()
+        daemon._state_snapshot = core.AtomicJSONSnapshot(daemon.state_path)
+        daemon._save_now()
+        self.history = json.loads(daemon.state_path.read_text())["history"]
+
+    def read(self):
+        return json.loads(self.daemon.state_path.read_text())
+
+    def test_retained_reference_and_nested_mutations_survive_multiple_saves(self):
+        daemon = self.daemon
+        held = daemon.runtime.get("live")
+        # The history lookup is deliberately bypassed for this negative control.
+        history = dict.__getitem__(daemon.runtime, "history")
+        with mock.patch.object(history, "to_dict", side_effect=AssertionError("history copied")):
+            held.observation_timings["samples"].append(2)
+            daemon._save_now()
+            held.observation_timings["samples"].append(3)
+            held.claude_submit_phase = "text_written"
+            held.claude_submit_write_unknown = True
+            daemon._save_now()
+        saved = self.read()
+        self.assertEqual(saved["live"]["observation_timings"]["samples"], [1, 2, 3])
+        self.assertTrue(saved["live"]["claude_submit_write_unknown"])
+        self.assertEqual(saved["history"], self.history)
+
+    def test_fetch_and_assignment_routes_publish_the_original_record(self):
+        daemon = self.daemon
+        routes = {
+            "index": lambda: daemon.runtime["live"],
+            "get": lambda: daemon.runtime.get("live"),
+            "setdefault": lambda: daemon.runtime.setdefault("live", core.TargetRuntime()),
+            "assignment": lambda: daemon.runtime.__setitem__("live", core.TargetRuntime()),
+            "update": lambda: daemon.runtime.update({"live": core.TargetRuntime()}),
+            "union": lambda: daemon.runtime.__ior__({"live": core.TargetRuntime()}),
+        }
+        for index, (name, fetch) in enumerate(routes.items(), 1):
+            with self.subTest(route=name):
+                fetch()
+                held = dict.__getitem__(daemon.runtime, "live")
+                held.send_attempt_id = f"original-{index}"
+                daemon._save_now()
+                self.assertEqual(self.read()["live"]["send_attempt_id"], f"original-{index}")
+                self.assertEqual(self.read()["history"], self.history)
+
+    def test_empty_candidates_do_not_copy_or_reencode_history(self):
+        daemon = self.daemon
+        before = daemon.state_path.stat()
+        with mock.patch.object(core.TargetRuntime, "to_dict", side_effect=AssertionError("history copied")), \
+             mock.patch.object(daemon._state_snapshot, "_encode", wraps=daemon._state_snapshot._encode) as encoded:
+            daemon._save_now()
+        self.assertEqual(encoded.call_args.args[0], {})
+        self.assertEqual(daemon.state_path.stat().st_ino, before.st_ino)
+        self.assertEqual(self.read()["history"], self.history)
+
+    def test_bulk_mutation_and_removal_require_complete_coverage(self):
+        daemon = self.daemon
+        daemon.runtime.touch_all()
+        for runtime in daemon.runtime.values():
+            runtime.claude_orphan_enter_count = 0
+            runtime.paused_reason = "bulk change"
+        daemon._save_now()
+        self.assertTrue(all(row["paused_reason"] == "bulk change" for row in self.read().values()))
+        del daemon.runtime["live"]
+        daemon._save_now()
+        self.assertEqual(set(self.read()), {"history"})
+        daemon.runtime.clear()
+        daemon._save_now()
+        self.assertEqual(self.read(), {})
+
+    def test_failed_publication_keeps_candidates_for_a_durable_retry(self):
+        daemon = self.daemon
+        held = daemon.runtime["live"]
+        held.delivery_status = "unknown"
+        with mock.patch.object(daemon._state_snapshot, "_write_entries", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                daemon._save_now()
+        held.codex_input_phase = "text_retained"
+        daemon._save_now()
+        self.assertEqual(self.read()["live"]["delivery_status"], "unknown")
+        self.assertEqual(self.read()["live"]["codex_input_phase"], "text_retained")
+        self.assertEqual(self.read()["history"], self.history)
+
+    def test_startup_full_snapshot_includes_unfetched_pause_reset(self):
+        daemon = self.daemon
+        daemon.runtime = core.RuntimeRecords({"history": core.TargetRuntime(paused_reason="old pause")})
+        daemon.config = {"targets": [{"surface_id": "history", "paused": False}]}
+        daemon._clear_stale_runtime_pause_reasons()
+        self.assertEqual(daemon.runtime.publication()[1], ())
+        daemon._save_now()
+        self.assertIsNone(self.read()["history"]["paused_reason"])
+
+
 class HealthSnapshotScopeTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
