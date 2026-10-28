@@ -1527,11 +1527,12 @@ class SessionResolver:
             # taking down the whole refresh for one malformed record.  Skip the
             # bad entry instead: that surface resolves to 未测量 and the rest of
             # the table still gets ids.
-            runtime_copy = {
-                key: dict(value)
-                for key, value in runtimes.items()
-                if isinstance(value, Mapping)
-            }
+            runtime_copy = {}
+            for item in payload:
+                key = str(item.get("surface_id") or "")
+                value = runtimes.get(key)
+                if isinstance(value, Mapping):
+                    runtime_copy[key] = dict(value)
             worker = threading.Thread(
                 target=self._resolve_once, args=(payload, runtime_copy, token),
                 name="session-resolver", daemon=True,
@@ -3271,7 +3272,6 @@ class SupervisorModel:
     def refresh(self, *, force: bool = False) -> None:
         self.config = self.store.load()
         self.network_state = self.network.snapshot(self.config.get("network_guard", {}))
-        self.runtime = core.load_json(self.config_path.parent / "state.json", {})
         self.hook_config = core.ClaudeHookSettingsManager().inspect()
         # Kicks off a background ctl read when the cached snapshot is due; it
         # never joins the worker, so a slow or wedged ctl cannot stall a redraw.
@@ -3284,7 +3284,10 @@ class SupervisorModel:
         if not force and now - self.last_top_refresh < 5:
             self._refresh_batch_snapshots()
             return
-        self.last_top_refresh = now
+        # Runtime only feeds the rows rebuilt below. Avoid parsing archived
+        # history on the intervening keyboard/status-only refreshes.
+        self.runtime = core.load_json(self.config_path.parent / "state.json", {})
+        self.last_top_refresh = time.monotonic()
         try:
             if not self._control_ready:
                 self._control_socket.configure(self.client.capabilities())
