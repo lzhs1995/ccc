@@ -348,11 +348,13 @@ class Worker:
                 clock = read_only_root_clock(previous, self.target['session_id'], after, compact)
                 atomic_json(clock_path, clock)
             root = clock.get('episode') if clock is not None else None
-            started = root['root_started_at'] if root else compact['started_at'] if compact else None
+            started = (root['root_started_at'] if root else None) if root_clock else (
+                compact['started_at'] if compact else None)
             age = max(0, now - started) if started is not None else None
             level = (300 if age >= LIMIT else 180 if age >= WARN else 0) if age is not None else 0
             path = self.directory / 'read-only-observation.json'
-            key = root['key'] if root else compact['key'] if compact else None
+            key = (root['key'] if root else None) if root_clock else (
+                compact['key'] if compact else None)
             # Keep the notification budget independent of the latest sample:
             # a partial append or temporary unknown must not permit a repeat.
             warning_id = hashlib.sha256(json.dumps([after['file_id'], key]).encode()).hexdigest()

@@ -126,3 +126,14 @@ class ObservationClockTests(unittest.TestCase):
                 saved = json.loads((worker.directory / 'read-only-root-clock.json').read_text())
                 self.assertEqual(saved['episode']['key'], first['compact_key'])
                 self.assertFalse((worker.directory / 'state.json').exists())
+                # A stale compact query after real user input must not fall
+                # back to the old start once the durable clock is closed.
+                current.update(user_offset=30, user_at=420.0)
+                now.return_value = 500.0
+                closed = worker.observe_without_control('no control', root_clock=True)
+                self.assertIsNone(closed['observation_clock']['episode'])
+                self.assertIsNone(closed['root_started_at'])
+                self.assertIsNone(closed['compact_key'])
+                self.assertIsNone(closed['elapsed'])
+                self.assertEqual(closed['warning_level'], 0)
+                self.assertEqual(len(notices), 2)
