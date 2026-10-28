@@ -12342,9 +12342,12 @@ class WatchDaemon:
                 frame = Grid.from_rpc(base.replay(str(target['workspace_id']), surface_id, live=True), surface_id)
                 _guard_trace.step('classify')
                 current_state = classify_claude_grid(frame, claude_message=message)
+                # Re-prove the empty composer at this actual write boundary.
+                # A provider error cannot authorize an unparseable input box.
                 # A working or occupied frame can only reject input. Do not
                 # hold the pane lease for a full native scan to learn that.
-                if (current_state.kind not in {'claude_stopped', 'recoverable_error'}
+                if (_claude_composer_state(frame)[0] != 'empty'
+                        or current_state.kind not in {'claude_stopped', 'recoverable_error'}
                         or current_state.claude_native_activity):
                     _guard_trace.step('composer_kind')
                     return False

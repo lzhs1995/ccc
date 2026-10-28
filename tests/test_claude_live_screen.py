@@ -87,6 +87,55 @@ class LiveScreenTests(unittest.TestCase):
         self.assertTrue(calls)
         self.assertTrue(all(value is True for value in calls))
 
+    def provider_retry_case(self):
+        payload = bordered_payload([""], transcript=("⏺ API Error: connection reset by peer",))[2]
+        d, t, r, e, c, calls = self.case(payload, payload)
+        with self.assertRaises(w.IncompatibleError):
+            d._claude_event_snapshot(t, c)
+        self.assertEqual(r.claude_provider_guard["status"], "retry_wait")
+        due = r.claude_provider_guard["retry_after"] + 1
+        e["created_at"] = due
+        return d, t, r, e, c, calls, due
+
+    def test_missing_composer_at_connected_text_write_never_writes(self):
+        d, t, r, e, c, calls, due = self.provider_retry_case()
+        payload = copy.deepcopy(c.payload)
+        grid = w.Grid.from_rpc(payload, "surface-uuid")
+        bottom = w._claude_composer_box(grid.lines)[1]
+        payload["render_grid"]["row_spans"] = [
+            span for span in payload["render_grid"]["row_spans"] if span["row"] != bottom]
+        changed = w.Grid.from_rpc(payload, "surface-uuid")
+        self.assertEqual(w._claude_composer_state(changed)[0], "unverified")
+        self.assertEqual(w.classify_claude_grid(changed).kind, "recoverable_error")
+        reached = []
+
+        def before_write(kind):
+            if kind == "text":
+                reached.append(kind)
+                c.payload = c._base_payload = copy.deepcopy(payload)
+
+        provider_guard.ProviderGuardTests().guard_transport(c, before_write)
+        r.claude_orphan_enter_count, r.claude_orphan_enter_at = 2, 123.0
+        with mock.patch.object(w.time, "time", return_value=due):
+            sent, _ = d._send_claude_event(e, t, r, c)
+        self.assertFalse(sent)
+        self.assertEqual(reached, ["text"], "earlier empty preflights must reach the final write guard")
+        self.assertEqual((c.sent_text, c.sent_keys), ([], []))
+        self.assertEqual((r.claude_orphan_enter_count, r.claude_orphan_enter_at), (2, 123.0))
+        self.assertEqual(r.claude_submit_phase, "none")
+        self.assertFalse(r.claude_submit_write_unknown)
+        self.assertEqual(d.claude_event_ledger.events[e["event_id"]]["input_not_sent"]["phase"], "text")
+        self.assertTrue(all(value is True for value in calls))
+
+    def test_empty_composer_still_allows_retry_after_original_provider_backoff(self):
+        d, t, r, e, c, calls, due = self.provider_retry_case()
+        provider_guard.ProviderGuardTests().guard_transport(c)
+        with mock.patch.object(w.time, "time", return_value=due):
+            sent, detail = d._send_claude_event(e, t, r, c)
+        self.assertTrue(sent, detail)
+        self.assertEqual((len(c.sent_text), len(c.sent_keys)), (1, 1))
+        self.assertTrue(all(value is True for value in calls))
+
 
 if __name__ == "__main__":
     unittest.main()
