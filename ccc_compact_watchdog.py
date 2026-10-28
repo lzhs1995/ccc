@@ -84,6 +84,56 @@ def settled(episode, snapshot):
             and facts['replacement_items'] > 0)
 
 
+def read_only_root_clock(previous, session_id, facts, compact):
+    """Keep an observation clock until native completion or new user input.
+
+    This clock is separate from control episodes and grants no recovery or
+    retry budget. Missing samples, HTTP/reasoning and a changed compact/turn
+    identifier cannot erase the first observed start.
+    """
+    if not facts['caught_up'] or facts.get('session_id') != session_id:
+        raise RuntimeError('incomplete original-session facts; retain observation clock')
+    scope = dict(session_id=session_id, path=facts['path'], file_id=facts['file_id'])
+    if previous is not None and (previous.get('schema') != 'read-only-root-clock-v1'
+                                 or previous.get('scope') != scope):
+        raise RuntimeError('original observation clock binding changed')
+    clock = copy.deepcopy(previous) if previous is not None else dict(
+        schema='read-only-root-clock-v1', scope=scope, episode=None, last_closed=None)
+    episode = clock['episode']
+    if episode:
+        if (facts['user_offset'] < episode['user_offset']
+                or facts['compacted_offset'] < episode['compacted_offset']):
+            raise RuntimeError('original observation watermark regressed')
+        completed = (facts['compacted_offset'] > episode['compacted_offset']
+                     and facts['compacted_at'] >= episode['root_started_at']
+                     and facts['replacement_items'] > 0)
+        new_input = facts['user_offset'] > episode['user_offset']
+        if completed or new_input:
+            boundary = facts['compacted_at'] if completed else facts['user_at']
+            if new_input:
+                boundary = max(boundary, facts['user_at'])
+            clock['last_closed'] = dict(episode, reason='compacted' if completed else 'new_input',
+                                        boundary_at=boundary)
+            clock['episode'] = episode = None
+    closed = clock['last_closed']
+    if compact and closed and (compact['started_at'] <= closed['boundary_at']
+                               or compact['key'] == closed['latest_compact_key']):
+        compact = None
+    if compact:
+        if episode is None:
+            key = hashlib.sha256(json.dumps([scope, compact['key']], sort_keys=True).encode()).hexdigest()
+            episode = dict(key=key, root_started_at=compact['started_at'],
+                           user_offset=facts['user_offset'], compacted_offset=facts['compacted_offset'],
+                           first_compact_key=compact['key'], latest_compact_key=compact['key'])
+            clock['episode'] = episode
+        else:
+            episode['root_started_at'] = min(episode['root_started_at'], compact['started_at'])
+            episode['latest_compact_key'] = compact['key']
+    clock.update(current_start_observed=compact is not None, control_verified=False,
+                 recovery_enabled=False, phase='completion_not_observed' if episode else 'idle')
+    return clock
+
+
 class Worker:
     def __init__(self, target, directory, lib, stop, *, apply=False, intent_index=None,
                  config_path=CONFIG, db_path=LOG_DB, enrollment_path=None):
@@ -266,7 +316,7 @@ class Worker:
         except Exception as exc:
             self.journal.record('NOTIFICATION_FAILED', error=str(exc)[:200])
 
-    def observe_without_control(self, control_error, *, notify=True):
+    def observe_without_control(self, control_error, *, notify=True, root_clock=False):
         """Keep original-session journal observation alive if RPC is unavailable.
 
         This writes separate observation and notification evidence. It never adopts a process,
@@ -291,14 +341,23 @@ class Worker:
             config = json.loads(self.config_path.read_text())
             is_paused = paused(config, self.target) or (self.directory.parent / 'STOP').exists()
             now = time.time()
-            age = max(0, now - compact['started_at']) if compact else None
+            clock = None
+            if root_clock:
+                clock_path = self.directory / 'read-only-root-clock.json'
+                previous = json.loads(pinned_file(clock_path)[1]) if clock_path.exists() else None
+                clock = read_only_root_clock(previous, self.target['session_id'], after, compact)
+                atomic_json(clock_path, clock)
+            root = clock.get('episode') if clock is not None else None
+            started = root['root_started_at'] if root else compact['started_at'] if compact else None
+            age = max(0, now - started) if started is not None else None
             level = (300 if age >= LIMIT else 180 if age >= WARN else 0) if age is not None else 0
             path = self.directory / 'read-only-observation.json'
-            key = compact['key'] if compact else None
+            key = root['key'] if root else compact['key'] if compact else None
             # Keep the notification budget independent of the latest sample:
             # a partial append or temporary unknown must not permit a repeat.
             warning_id = hashlib.sha256(json.dumps([after['file_id'], key]).encode()).hexdigest()
-            warning_paths = {n: self.directory / f'read-only-warning-{warning_id}-{n}.json'
+            warning_prefix = 'read-only-root-warning' if root_clock else 'read-only-warning'
+            warning_paths = {n: self.directory / f'{warning_prefix}-{warning_id}-{n}.json'
                              for n in (180, 300)}
             prior_level = max((n for n, p in warning_paths.items() if p.exists()), default=0)
             should_notify = bool(notify and level > prior_level and not is_paused)
@@ -317,6 +376,11 @@ class Worker:
                           unsettled_compaction=compact, compact_key=key, elapsed=age,
                           warning_level=level,
                           notification_intent_level=level if should_notify else prior_level)
+            if clock is not None:
+                result.update(observation_clock=clock, root_started_at=started,
+                              handling_status='CAPABILITY_UNAVAILABLE_OBSERVE_ONLY' if level == 300
+                              else 'WARNING' if level == 180 else 'OBSERVING',
+                              native_rpc_count=0)
             # Persist warning deduplication before notification. An uncertain
             # notification is not retried and never grants a control budget.
             atomic_json(path, result)
