@@ -9067,6 +9067,39 @@ class WatchDaemon:
                 if reconcile_detail_calls is not None:
                     reconcile_detail_calls[name] = reconcile_detail_calls.get(name, 0) + 1
 
+        def empty_working_claude_frame():
+            return (state.kind in {"working", "menu"}
+                    and state.message_kind != "codex"
+                    and self._runtime_is_claude(runtime, state)
+                    and not runtime.claude_supervisor_wait)
+
+        def needs_submit_reconciliation():
+            # The base runtime guards just observed this frame. Working/menu
+            # with no transaction or orphan has no input to reconcile. Keep
+            # the original guarded methods for every retained input or wait.
+            return not (
+                empty_working_claude_frame()
+                and runtime.claude_submit_phase == "none"
+                and not runtime.claude_submit_event_id
+                and not runtime.claude_submit_write_unknown
+                and not runtime.claude_handshake_wait
+                and not self._legacy_claude_report_latch(runtime)
+                and not runtime.claude_orphan_enter_count
+                and not state.watchdog_echo
+            )
+
+        def needs_deferred_reconciliation():
+            return bool(runtime.claude_deferred_event) or not empty_working_claude_frame()
+
+        def needs_hook_gap_reconciliation():
+            # A stopped/unknown frame still runs the original guard, as does
+            # an existing candidate whose reset or preservation matters.
+            return (not empty_working_claude_frame()
+                    or bool(runtime.claude_fallback_candidate_fingerprint)
+                    or bool(runtime.claude_fallback_candidate_polls)
+                    or bool(runtime.claude_fallback_candidate_generation)
+                    or bool(runtime.claude_fallback_attempt_token))
+
         @contextlib.contextmanager
         def surface_locked():
             started, acquired = time.monotonic() if observation_timings is not None else 0.0, False
@@ -9148,16 +9181,16 @@ class WatchDaemon:
                 if self._runtime_is_claude(runtime, state) and not measured_reconcile(
                         "fresh_authorization", current, fresh=True):
                     return None
-                if measured_reconcile("claude_submit",
+                if needs_submit_reconciliation() and measured_reconcile("claude_submit",
                         self._reconcile_claude_submit, target, runtime, state, client):
                     return
                 measured_reconcile("restore_unsent_deferred",
                     self._restore_unsent_claude_deferred, target, runtime, state)
                 measured_reconcile("restore_deferred", self._restore_expired_claude_deferred, runtime)
-                if measured_reconcile("deferred_stop",
+                if needs_deferred_reconciliation() and measured_reconcile("deferred_stop",
                         self._maybe_send_deferred_claude_stop, target, runtime, state, client):
                     return
-                if self._runtime_is_claude(runtime, state) and measured_reconcile(
+                if self._runtime_is_claude(runtime, state) and needs_hook_gap_reconciliation() and measured_reconcile(
                     "hook_gap_fallback", self._maybe_send_claude_hook_gap_fallback,
                     target, runtime, state, observation, client,
                 ):
@@ -9262,16 +9295,16 @@ class WatchDaemon:
                         if self._runtime_is_claude(runtime, state) and not measured_reconcile(
                                 "fresh_authorization", current, fresh=True):
                             return None
-                        if measured_reconcile("claude_submit",
+                        if needs_submit_reconciliation() and measured_reconcile("claude_submit",
                                 self._reconcile_claude_submit, target, runtime, state, client):
                             return
                         measured_reconcile("restore_unsent_deferred",
                             self._restore_unsent_claude_deferred, target, runtime, state)
                         measured_reconcile("restore_deferred", self._restore_expired_claude_deferred, runtime)
-                        if measured_reconcile("deferred_stop",
+                        if needs_deferred_reconciliation() and measured_reconcile("deferred_stop",
                                 self._maybe_send_deferred_claude_stop, target, runtime, state, client):
                             return
-                        if self._runtime_is_claude(runtime, state) and measured_reconcile(
+                        if self._runtime_is_claude(runtime, state) and needs_hook_gap_reconciliation() and measured_reconcile(
                             "hook_gap_fallback", self._maybe_send_claude_hook_gap_fallback,
                             target, runtime, state, observation, client,
                         ):
