@@ -13043,10 +13043,10 @@ class WatchDaemon:
         reserved event and uses the existing deferred sender. Original journal,
         ledger rows, generation, watermark and consumption records stay intact.
         """
-        if self._claude_provider_guard_reason(self._event_target(surface_id), runtime, state):
-            return False
         if (not runtime.claude_handshake_wait or state.claude_native_activity
                 or state.kind not in {"claude_stopped", "recoverable_error"}):
+            return False
+        if self._claude_provider_guard_reason(self._event_target(surface_id), runtime, state):
             return False
         with self._surface_lock(surface_id):
             challenge = copy.deepcopy(runtime.claude_handshake_challenge)
@@ -13287,11 +13287,6 @@ class WatchDaemon:
         sent derived row wins over a stale state.json after a crash.
         """
 
-        if self._claude_supervisor_wait_guard(self._event_target(surface_id), runtime):
-            return False
-        if self._claude_provider_guard_reason(self._event_target(surface_id), runtime):
-            return False
-
         with self._surface_lock(surface_id):
             source_id = str(runtime.claude_completion_event_id or "")
             if (not self._legacy_claude_report_latch(runtime)
@@ -13299,6 +13294,10 @@ class WatchDaemon:
                     or runtime.claude_submit_phase != "none" or runtime.claude_submit_write_unknown
                     or runtime.claude_deferred_event or runtime.claude_handshake_wait
                     or runtime.claude_handshake_provider_conflict):
+                return False
+            if self._claude_supervisor_wait_guard(self._event_target(surface_id), runtime):
+                return False
+            if self._claude_provider_guard_reason(self._event_target(surface_id), runtime):
                 return False
             target = copy.deepcopy(self._event_target(surface_id))
             if not target:
