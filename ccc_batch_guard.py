@@ -67,11 +67,18 @@ def native_binary(*, entrypoint=None, metadata=None):
         wrapper = link.with_name("codex-guard").resolve()
         observed = {}
 
+        def identity(info):
+            # Reading can update atime without changing the verified file.
+            # Keep content, ownership, permissions and nanosecond change fences.
+            return tuple(getattr(info, name) for name in (
+                'st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns',
+                'st_mode', 'st_uid', 'st_gid', 'st_nlink'))
+
         def read_small(path):
             before = path.stat()
             with path.open('rb') as stream:
                 raw = stream.read(65537)
-            if len(raw) > 65536 or path.stat() != before:
+            if len(raw) > 65536 or identity(path.stat()) != identity(before):
                 raise ValueError(error)
             observed[path] = (before, raw)
             return raw
@@ -116,7 +123,7 @@ def native_binary(*, entrypoint=None, metadata=None):
                 or entry.resolve(strict=True) != installed):
             raise ValueError(error)
         for path, (before, raw) in observed.items():
-            if path.stat() != before or path.read_bytes() != raw:
+            if identity(path.stat()) != identity(before) or path.read_bytes() != raw:
                 raise ValueError(error)
         if entry.resolve(strict=True) != installed:
             raise ValueError(error)
