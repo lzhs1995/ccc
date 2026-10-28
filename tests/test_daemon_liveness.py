@@ -2,6 +2,7 @@ import json
 import contextlib
 import os
 from pathlib import Path
+import select
 import signal
 import subprocess
 import sys
@@ -13,6 +14,65 @@ from unittest.mock import Mock, patch
 import ccc_daemon_liveness as live
 import cmux_codex_watch as watch
 from tests.test_watch import FakeClient, armed_daemon, claude_grid_payload
+
+
+@unittest.skipUnless(hasattr(signal, 'SIGUSR1'), 'requires Unix signals')
+class PythonStackDiagnosticTests(unittest.TestCase):
+    def test_registered_signal_dumps_real_stack_without_exiting(self):
+        code = '''
+import pathlib, sys
+import ccc_daemon_liveness as live
+guard = live.LivenessGuard(pathlib.Path(sys.argv[1]) / 'journal')
+assert guard._register_python_stacks([1, 2])
+def diagnostic_wait():
+    print('READY', flush=True)
+    sys.stdin.readline()
+diagnostic_wait()
+guard._close_python_stacks()
+print('CLOSED', flush=True)
+'''
+        with tempfile.TemporaryDirectory() as folder:
+            child = subprocess.Popen([sys.executable, '-B', '-c', code, folder],
+                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE, text=True)
+            try:
+                self.assertTrue(select.select([child.stdout], [], [], 5)[0])
+                self.assertEqual(child.stdout.readline().strip(), 'READY')
+                journal = json.loads((Path(folder) / 'journal').read_text())
+                self.assertEqual(journal['parent_pid'], child.pid)
+                path = Path(journal['stack_path'])
+                self.assertEqual((path.stat().st_dev, path.stat().st_ino),
+                                 (journal['device'], journal['inode']))
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+                os.kill(child.pid, signal.SIGUSR1)
+                deadline = time.monotonic() + 3
+                while not path.stat().st_size and time.monotonic() < deadline:
+                    time.sleep(.01)
+                self.assertIn('diagnostic_wait', path.read_text())
+                stdout, stderr = child.communicate('\n', timeout=5)
+                self.assertEqual(child.returncode, 0, stderr)
+                self.assertIn('CLOSED', stdout)
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                child.communicate(timeout=5)
+
+    def test_existing_signal_handler_is_preserved(self):
+        code = '''
+import pathlib, signal, sys
+import ccc_daemon_liveness as live
+handler = lambda *_: None
+signal.signal(signal.SIGUSR1, handler)
+guard = live.LivenessGuard(pathlib.Path(sys.argv[1]) / 'journal')
+assert not guard._register_python_stacks([1, 2])
+guard._close_python_stacks()
+assert signal.getsignal(signal.SIGUSR1) is handler
+assert not list(pathlib.Path(sys.argv[1]).iterdir())
+'''
+        with tempfile.TemporaryDirectory() as folder:
+            result = subprocess.run([sys.executable, '-B', '-c', code, folder],
+                                    capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
 
 
 class DaemonAvailabilityLivenessTests(unittest.TestCase):
@@ -161,7 +221,8 @@ class LivenessIdentityTests(unittest.TestCase):
 
     def test_unrelated_parent_never_signalled(self):
         with patch.object(live.os, 'getppid', return_value=12), patch.object(live.os, 'kill') as kill:
-            self.assertEqual(live.monitor(-1, 34, [1, 2], Path('/unused'), birth=lambda _: [1, 2]), 2)
+            self.assertEqual(live.monitor(-1, 34, [1, 2], Path('/unused'),
+                                          birth=lambda _: [1, 2], python_stacks=True), 2)
             kill.assert_not_called()
 
     def test_reused_pid_never_signalled(self):
@@ -286,9 +347,12 @@ import json, os, signal, subprocess, sys, time
 import ccc_daemon_liveness as live
 mode, journal = sys.argv[1:]
 if mode == 'ignore_term': signal.signal(signal.SIGTERM, signal.SIG_IGN)
+if mode == 'stacks':
+    guard = live.LivenessGuard(journal)
+    assert guard._register_python_stacks(live.process_birth(os.getpid()))
 read_fd, write_fd = os.pipe()
 channels = "(b'M',b'H',b'O')" if mode in ('stale_observers','health_file_failure') else "(b'M',b'H')"
-code = 'import json,sys; from pathlib import Path; import ccc_daemon_liveness as l; raise SystemExit(l.monitor(int(sys.argv[1]),int(sys.argv[2]),json.loads(sys.argv[3]),Path(sys.argv[4]),timeout=0.6,grace=0.25,channels=' + channels + '))'
+code = 'import json,sys; from pathlib import Path; import ccc_daemon_liveness as l; raise SystemExit(l.monitor(int(sys.argv[1]),int(sys.argv[2]),json.loads(sys.argv[3]),Path(sys.argv[4]),timeout=0.6,grace=0.25,channels=' + channels + ',python_stacks=' + str(mode == 'stacks') + '))'
 child = subprocess.Popen([sys.executable, '-B', '-c', code, str(read_fd), str(os.getpid()), json.dumps(live.process_birth(os.getpid())), journal], pass_fds=(read_fd,))
 os.close(read_fd)
 until = time.monotonic() + 1.3
@@ -308,7 +372,19 @@ child.wait(timeout=3)
             result = subprocess.run([sys.executable, '-B', '-c', program, mode, str(journal)],
                                     cwd=Path(live.__file__).parent, capture_output=True, timeout=6)
             rows = [json.loads(x) for x in journal.read_text().splitlines()] if journal.exists() else []
+            if mode == 'stacks':
+                registered = next(row for row in rows if row['event'] == 'python_stack_handler_registered')
+                self.assertIn('<module>', Path(registered['stack_path']).read_text())
             return result, rows
+
+    def test_stalled_parent_dumps_stack_before_unchanged_term_recovery(self):
+        result, rows = self.run_parent('stacks')
+        self.assertEqual(result.returncode, -signal.SIGTERM, result.stderr)
+        events = [row['event'] for row in rows]
+        self.assertEqual(events[:5], [
+            'python_stack_handler_registered', 'armed', 'stalled',
+            'python_stack_requested', 'sigterm'])
+        self.assertTrue(all(event == 'identity_unavailable' for event in events[5:]))
 
     def test_real_stalled_daemon_receives_term(self):
         result, rows = self.run_parent('stalled')
