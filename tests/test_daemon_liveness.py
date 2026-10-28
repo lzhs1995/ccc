@@ -355,6 +355,23 @@ channels = "(b'M',b'H',b'O')" if mode in ('stale_observers','health_file_failure
 code = 'import json,sys; from pathlib import Path; import ccc_daemon_liveness as l; raise SystemExit(l.monitor(int(sys.argv[1]),int(sys.argv[2]),json.loads(sys.argv[3]),Path(sys.argv[4]),timeout=0.6,grace=0.25,channels=' + channels + ',python_stacks=' + str(mode == 'stacks') + '))'
 child = subprocess.Popen([sys.executable, '-B', '-c', code, str(read_fd), str(os.getpid()), json.dumps(live.process_birth(os.getpid())), journal], pass_fds=(read_fd,))
 os.close(read_fd)
+# Begin the exercise after the child's real startup, not after Popen returns.
+# A loaded machine can otherwise consume the whole exercise importing Python.
+from pathlib import Path
+armed_deadline = time.monotonic() + 5
+while True:
+    rows = []
+    try:
+        for line in Path(journal).read_text().splitlines():
+            try: rows.append(json.loads(line))
+            except ValueError: pass
+    except FileNotFoundError:
+        pass
+    if any(row.get('event') == 'armed' and row.get('parent_pid') == os.getpid() for row in rows):
+        break
+    if child.poll() is not None or time.monotonic() >= armed_deadline:
+        raise RuntimeError('watchdog did not arm before the exercise')
+    time.sleep(.01)
 until = time.monotonic() + 1.3
 while time.monotonic() < until:
     if mode == 'healthy': os.write(write_fd,b'MH')

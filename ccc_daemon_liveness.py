@@ -7,7 +7,6 @@ No terminal, client process, task, delivery record or provider state is changed.
 from __future__ import annotations
 
 import argparse
-import faulthandler
 import json
 import math
 import os
@@ -261,11 +260,14 @@ class LivenessGuard:
             os.getpid(), *generation))
         stream = None
         try:
+            # ObservationProgress also runs in isolated native interpreters.
+            # faulthandler is process-wide and must be loaded only by the guard.
+            import faulthandler
             path.parent.mkdir(parents=True, exist_ok=True)
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             stream = os.fdopen(fd, 'wb')
             faulthandler.register(signal.SIGUSR1, file=stream, all_threads=True)
-        except (OSError, RuntimeError, ValueError) as error:
+        except (ImportError, OSError, RuntimeError, ValueError) as error:
             if stream is not None:
                 stream.close()
             record(self.journal, event='python_stack_registration_unavailable',
@@ -282,6 +284,7 @@ class LivenessGuard:
 
     def _close_python_stacks(self):
         if self.stack_file is not None:
+            import faulthandler
             faulthandler.unregister(signal.SIGUSR1)
             self.stack_file.close()
             self.stack_file = None
