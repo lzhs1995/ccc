@@ -437,8 +437,7 @@ class CloseoutEvidence:
             rows = []
             selected = None
             offset = source["offset_bytes"]
-            for line in data.splitlines(keepends=True):
-                row = json.loads(line)
+            for line, row in zip(data.splitlines(keepends=True), _native_journal_rows(data)):
                 if not isinstance(row, dict):
                     return None
                 if row.get("type") in ("system", "user", "assistant") and row.get("isSidechain") is not True:

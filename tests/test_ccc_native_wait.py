@@ -124,6 +124,33 @@ class NativeEvidenceTests(NativeFixture):
         write(self.task["marker_path"], dict(self.task["marker"], ttl_seconds=100))
         self.assertIsNone(self.observe())
 
+    def test_repeated_native_tail_rechecks_deadline_watermark_and_callback(self):
+        self.append(self.summary)
+        first = self.observe()
+        self.assertIsNotNone(first)
+        expired = self.observe(now=self.now + 600)
+        self.assertEqual(expired["status"], adapter.TIMED_OUT)
+        self.assertEqual(expired["deadline_at"], first["deadline_at"])
+        self.assertIsNone(self.observe(after=self.now - 19))
+        changed = copy.deepcopy(self.attempt)
+        changed["binding"]["report_sha256"] = "0" * 64
+        write(self.attempt_path, changed)
+        self.assertIsNone(self.observe())
+        self.assert_no_receipt()
+
+    def test_repeated_native_tail_rechecks_writer_lock_and_permissions(self):
+        self.append(self.summary)
+        self.assertIsNotNone(self.observe())
+        with self.native.open("rb") as writer:
+            fcntl.flock(writer.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertIsNone(self.observe())
+        self.assertIsNotNone(self.observe())
+        self.native.chmod(0o666)
+        self.assertIsNone(self.observe())
+        self.native.chmod(0o600)
+        self.assertIsNotNone(self.observe())
+        self.assert_no_receipt()
+
     def test_summary_requires_real_identity_and_wait_result(self):
         for changes in (
             {"sessionId": "another-session"}, {"isSidechain": True},
