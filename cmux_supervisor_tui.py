@@ -5318,7 +5318,7 @@ def batch_preparation_progress(batch, *, now=None):
             {'private_check': '空目录短答50', 'access_check': '旧节费50'}.get(batch.get('startup_mode'), '原B50'))
     wait = batch.get('wait') if isinstance(batch.get('wait'), dict) else {}
     phase = wait.get('message') or {
-        'complete': '首任务已全数启动', 'running': '准备中', 'waiting': '等待准备',
+        'complete': '首任务已全数启动（任务结果未核验）', 'running': '准备中', 'waiting': '等待准备',
         'workspace_closed': '工作区已关闭', 'cancelled': '已取消',
         'needs_attention': '部分原会话待处理',
     }.get(batch.get('status'), batch.get('status') or '状态未知')
@@ -5328,7 +5328,7 @@ def batch_preparation_progress(batch, *, now=None):
               + (f" 命名 {named}/{total}" if named is not None else '')
               + f" 首任务 {batch.get('started', 0)}/{total}")
     if batch.get('failed'):
-        result += f" | 待处理 {batch['failed']}"
+        result += f" | 启动待处理 {batch['failed']}"
     at = batch.get('last_progress_at')
     if type(at) in {int, float} and 0 < at < float('inf'):
         age = max(0, int((time.time() if now is None else now) - at))
