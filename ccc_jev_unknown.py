@@ -68,8 +68,8 @@ def build_request(client, excerpt):
         questions={'diagnosis': dict(type='choice', instructions=INSTRUCTIONS, criteria=CRITERIA)})
 
 
-def parse_answer(body):
-    """RESPONSE-01 shape only: model, choice type, finite 0.8<=confidence<=1, allowlisted label."""
+def validated_diagnosis(body):
+    """Keep only a typed, confident diagnosis from the original model."""
     if not isinstance(body, dict) or body.get('model') != MODEL:
         return None
     answers = body.get('answers')
@@ -77,11 +77,18 @@ def parse_answer(body):
     if not isinstance(answer, dict) or answer.get('type') != 'choice':
         return None
     choice, confidence = answer.get('choice'), answer.get('confidence')
-    if not isinstance(choice, str) or type(confidence) not in (int, float):
+    if (not isinstance(choice, str) or choice not in CRITERIA
+            or type(confidence) not in (int, float)):
         return None
     if not math.isfinite(confidence) or not MIN_CONFIDENCE <= confidence <= 1:
         return None
-    return ALLOWED.get(choice)
+    return {'choice': choice, 'confidence': float(confidence)}
+
+
+def parse_answer(body):
+    """Diagnosis never expands the allowlisted retry codes."""
+    diagnosis = validated_diagnosis(body)
+    return ALLOWED.get(diagnosis['choice']) if diagnosis else None
 
 
 def api_key(key_path=None):
@@ -289,12 +296,28 @@ class JevUnknownClassifier:
             return False
         key, client, model, excerpt = item
         result = None
+        diagnosis = None
+        outcome = 'invalid_response'
+        started = time.monotonic()
         try:
             self.calls += 1
-            result = parse_answer(self.transport(build_request(client, excerpt), TIMEOUT_SECONDS))
+            diagnosis = validated_diagnosis(
+                self.transport(build_request(client, excerpt), TIMEOUT_SECONDS))
+            if diagnosis:
+                result = ALLOWED.get(diagnosis['choice'])
+                outcome = 'retry_diagnosis' if result else 'abstained'
         except Exception:
-            result = None
+            outcome = 'transport_error'
         self._store(key, result)
+        try:
+            import logging
+            logging.getLogger('ccc-jev').info(
+                'JEV_DECISION fingerprint=%s diagnosis=%s confidence=%s retry_code=%s outcome=%s elapsed_ms=%.2f',
+                key[:16], diagnosis['choice'] if diagnosis else 'UNVERIFIED',
+                diagnosis['confidence'] if diagnosis else None, result, outcome,
+                (time.monotonic() - started) * 1000)
+        except Exception:
+            pass  # An observation failure never changes the committed cache.
         return True
 
     def _worker(self):
