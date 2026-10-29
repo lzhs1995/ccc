@@ -12104,6 +12104,19 @@ class WatchDaemon:
             # an old report is neither a receipt nor permission to retry Enter.
             runtime.state = "claude_report_ready"
             return True
+        if (runtime.claude_submit_phase == "enter_sent"
+                and not runtime.claude_submit_event_id
+                and not runtime.claude_submit_write_unknown
+                and runtime.claude_last_submit_at > 0
+                and runtime.claude_last_submit_session_id == runtime.claude_session_id
+                and runtime.claude_last_submit_generation == runtime.claude_process_generation
+                and state.claude_native_activity != "queued"
+                and state.kind in {"working", "menu"} and not state.watchdog_echo):
+            # A returned orphan key has no ledger event to confirm. Release
+            # only its pending slot; retain the original key evidence/budget
+            # and do not invent a native receipt or cover a deferred Stop.
+            self._clear_claude_submit(runtime, reason="orphan_composer_consumed")
+            return True
         if runtime.claude_submit_phase == "none" or not runtime.claude_submit_event_id:
             # F2 重置点之一：composer 内容变化即孤儿事件结束。``empty`` 表示
             # 文字已被消费或清空；``composer_busy`` 且回显不再匹配表示用户在
@@ -13906,6 +13919,19 @@ class WatchDaemon:
                 and not (event_name in {"Stop", "StopFailure"} and bool(event.get("completed")))):
             self._mark_claude_event(event, runtime, "suppressed_waiting_supervisor", detail=waiting)
             return
+        if (runtime.claude_submit_phase == "enter_sent"
+                and not runtime.claude_submit_event_id
+                and not runtime.claude_submit_write_unknown
+                and not synthetic_fallback
+                and event_name in {"UserPromptSubmit", "Stop", "StopFailure"}
+                and runtime.claude_last_submit_at > 0 and stamp > runtime.claude_last_submit_at
+                and session_id == runtime.claude_last_submit_session_id == runtime.claude_session_id
+                and runtime.claude_last_submit_generation == runtime.claude_process_generation
+                and self._validated_claude_provider_event(target, runtime, event) is not None):
+            # A fresh original lifecycle boundary ends the orphan slot before
+            # provider/human attribution. The old provider guard still needs
+            # its own verified release; this is not delivery confirmation.
+            self._clear_claude_submit(runtime, reason="orphan_native_boundary")
         if (event_name == "UserPromptSubmit" and not protocol_event
                 and runtime.claude_provider_guard):
             if self._confirm_claude_provider_submission(target, runtime, event):
