@@ -300,6 +300,52 @@ class ProviderGuardTests(unittest.TestCase):
                 self.assertEqual(bool(r2.claude_deferred_event), status in {"handling", "provider_retry_wait"})
                 self.assert_no_input(c)
 
+    def test_later_send_retires_only_original_retry_and_does_not_repark_after_restart(self):
+        with tempfile.TemporaryDirectory() as root:
+            d, t, r, e, c = self.case(root)
+            event = self.failure(e, RPM, stamp=time.time() - 100)
+            event["process_generation"] = r.claude_process_generation
+            d.claude_event_ledger.mark(event, "provider_retry_wait")
+            guard = d._remember_claude_provider_failure(t, r, event, event=event)
+            before_guard = copy.deepcopy(guard)
+            r.last_send_at = time.time() - 1
+            d._sync_claude_provider_guard(t["surface_id"], r)
+            state = w.ScreenState("claude_stopped", message_kind="claude")
+            with mock.patch.object(w.time, "time", return_value=guard["retry_after"] + 1), \
+                    mock.patch.object(d.logger, "info") as info:
+                d._maybe_send_deferred_claude_stop(t, r, state, c)
+                d._sync_claude_provider_guard(t["surface_id"], r)
+                d._maybe_send_deferred_claude_stop(t, r, state, c)
+            self.assertIsNone(r.claude_deferred_event)
+            self.assertEqual(d.claude_event_ledger.status_of(event["event_id"]), "deferred_cleared")
+            self.assertEqual(d.claude_event_ledger.provider_guard(t["surface_id"]), before_guard)
+            releases = [call for call in info.call_args_list if "deferred stop released" in call.args[0]]
+            self.assertEqual(len(releases), 1)
+            d.save()
+            restarted, restored = self.restart(d, c)
+            self.assertIsNone(restored.claude_deferred_event)
+            self.assert_no_input(c)
+
+    def test_retry_cleanup_preserves_delivery_archives_and_foreign_generations(self):
+        for protection in ("provider_native_receipt", "provider_superseded_submission", "foreign_generation"):
+            with self.subTest(protection=protection), tempfile.TemporaryDirectory() as root:
+                d, t, r, e, c = self.case(root)
+                event = self.failure(e, RPM, stamp=time.time() - 100)
+                event["process_generation"] = r.claude_process_generation
+                d.claude_event_ledger.mark(event, "provider_retry_wait")
+                d._remember_claude_provider_failure(t, r, event, event=event)
+                d._sync_claude_provider_guard(t["surface_id"], r)
+                r.last_send_at = time.time() - 1
+                row = d.claude_event_ledger.events[event["event_id"]]
+                if protection == "foreign_generation":
+                    row["process_generation"] = "other-generation"
+                else:
+                    row[protection] = {"original": "immutable"}
+                before = copy.deepcopy(row)
+                d._clear_claude_deferred(r, reason="covered_by_later_send")
+                self.assertEqual(d.claude_event_ledger.events[event["event_id"]], before)
+                self.assert_no_input(c)
+
     def test_pending_unknown_and_reserved_are_not_reopened_by_a_provider_error(self):
         for unknown in (False, True):
             with self.subTest(unknown=unknown), tempfile.TemporaryDirectory() as root:

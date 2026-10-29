@@ -10598,6 +10598,7 @@ class WatchDaemon:
 
         deferred = runtime.claude_deferred_event or {}
         held = str(deferred.get("event_id") or "")
+        deferred_since = runtime.claude_deferred_since
         waited = max(0.0, time.time() - runtime.claude_deferred_since) if held else 0.0
         parked_reason = runtime.claude_deferred_reason or ""
         runtime.claude_deferred_event = None
@@ -10617,7 +10618,29 @@ class WatchDaemon:
             current = str(row.get("status") or "")
             archived = any(isinstance(row.get(key), Mapping) for key in (
                 "provider_superseded_submission", "provider_native_receipt"))
-        final = current
+            final = current
+            guard = self.claude_event_ledger.provider_guard(str(deferred.get("surface_id") or ""))
+            # A later send already covered this retry. Retire only its original
+            # row, retaining the provider hold and every delivery archive. A
+            # timestamp alone is not evidence of provider recovery.
+            if (current == "provider_retry_wait" and not archived
+                    and parked_reason == "provider_retry_wait"
+                    and reason == "covered_by_later_send"
+                    and runtime.last_send_at > deferred_since > 0
+                    and guard and guard.get("status") == "retry_wait"
+                    and (guard.get("retry_event") or {}).get("event_id") == held
+                    and all(row.get(key) and row.get(key) == deferred.get(key) == guard.get(key)
+                            for key in ("surface_id", "workspace_id", "session_id", "agent_pid", "process_generation"))
+                    and row.get("session_id") == runtime.claude_session_id
+                    and row.get("agent_pid") == runtime.claude_process_pid
+                    and row.get("process_generation") == runtime.claude_process_generation):
+                final = "deferred_cleared"
+                events = {**self.claude_event_ledger.events, held: {
+                    **row, "status": final,
+                    "detail": f"parked={parked_reason} released={reason} waited_sec={waited:.0f}",
+                }}
+                self.claude_event_ledger._write(events)
+                self.claude_event_ledger.events = events
         if current.startswith("deferred_") and not archived:
             # ``undeferrable: <detail>`` embeds the cancel detail, so it cannot
             # be a dict key; it and any future reason both mean "not retried".
@@ -11778,8 +11801,12 @@ class WatchDaemon:
             if input_check is None:
                 expected_pid = runtime.claude_process_pid
                 expected_generation = runtime.claude_process_generation
+                recovery_identity = copy.deepcopy(runtime.claude_submit_native_identity)
+                orphan_recovery = (submit_phase == "none" and not submit_id
+                                   and reason == "orphan_watchdog_echo")
 
                 def input_check():
+                    nonlocal recovery_identity
                     current = self._active_send_target(target)
                     if (current != target or self.stop_requested or self.config.get("mode") != "armed"
                             or self.config.get("global_paused") or not self.config.get("claude_enabled")
@@ -11788,12 +11815,20 @@ class WatchDaemon:
                         return False
                     record = find_main_surface(base.tree(), surface_id)
                     live = self._live_claude_process_label(
-                        target, base, pinned=runtime.claude_submit_native_identity, allow_unpinned=False)
+                        target, base, pinned=recovery_identity,
+                        allow_unpinned=orphan_recovery and recovery_identity is None)
                     identity = self._claude_send_process_identity(expected_pid)
-                    return (record.get("workspace_id") == target["workspace_id"]
+                    valid = (record.get("workspace_id") == target["workspace_id"]
                             and live.get("agent_kind") == "claude" and live.get("agent_pid") == expected_pid
                             and bool(identity.get("started_epoch"))
                             and identity.get("generation") == expected_generation)
+                    if (valid and orphan_recovery and recovery_identity is None
+                            and live.get("native_identity") is not None):
+                        # A fresh recovery observation is not a retrospective
+                        # pin for the expired transaction. Retain it locally for
+                        # every exact-composer and connected key recheck.
+                        recovery_identity = copy.deepcopy(live.get("native_identity"))
+                    return valid
 
             identity_check = input_check
 
@@ -12026,6 +12061,17 @@ class WatchDaemon:
             runtime.state = "claude_delivery_wait"
             self._save_claude_surface(str(target["surface_id"]), runtime)
             return True
+        if (not entered and runtime.claude_submit_not_sent
+                and not runtime.claude_submit_write_unknown
+                and runtime.claude_submit_last_attempt_at >= now
+                and runtime.claude_submit_last_reason.startswith("enter not sent: ")):
+            # Typed InputNotSentError proves this key never left our process.
+            # Keep the retry timestamp, original owner and every earlier budget
+            # entry; a guard refusal cannot consume a new actual-key attempt.
+            runtime.claude_orphan_enter_count = previous_orphan_count
+            runtime.state = "claude_submit_pending"
+            self._save_claude_surface(str(target["surface_id"]), runtime)
+            return True
         runtime.state = "claude_orphan_enter"
         return True
 
@@ -12113,7 +12159,8 @@ class WatchDaemon:
         timeout = float(self.config.get(
             "claude_submit_confirm_timeout_sec", CLAUDE_SUBMIT_CONFIRM_TIMEOUT_SEC,
         ))
-        if age >= timeout and not runtime.claude_submit_not_sent:
+        if (age >= timeout and not runtime.claude_submit_not_sent
+                and not (runtime.claude_submit_phase == "text_written" and state.watchdog_echo)):
             self.logger.warning(
                 "surface=%s Claude submit confirmation timeout event=%s attempts=%d",
                 surface_id[:8], str(runtime.claude_submit_event_id)[:8],

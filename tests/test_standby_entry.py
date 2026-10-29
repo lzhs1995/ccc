@@ -1,7 +1,10 @@
 """Existing batch button routing with a real Unix endpoint; no native input."""
 import copy
+import json
+import os
 from pathlib import Path
 import tempfile
+import threading
 import time
 import unittest
 from tests.context_fixture import enter_context
@@ -157,6 +160,14 @@ class EntryTests(unittest.TestCase):
         self.owner.on_status = lambda: self.store.mutate(lambda c: c.update(global_paused=True))
         self.assertFalse(hint.covered(self.config, targets[0]))
         self.assertTrue(self.store.load()['global_paused'])
+        self.assertEqual(rpc.call_count, 1)
+
+    def test_cached_configuration_permissions_are_rechecked_before_coverage(self):
+        hint, targets = self.hint_fixture()
+        _, rpc = self.isolated_hint_status()
+        self.assertTrue(hint.covered(self.config, targets[0]))
+        self.config.chmod(0o644)
+        self.assertFalse(hint.covered(self.config, targets[0]))
         self.assertEqual(rpc.call_count, 1)
 
     def test_periodic_hint_registration_boot_and_foreign_owner_rejected(self):
@@ -325,6 +336,89 @@ class EntryTests(unittest.TestCase):
         with self.assertRaises((RuntimeError, ValueError)):
             self.invoke()
         self.assertEqual(self.owner.calls, [])
+
+
+class ConfigurationReadTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory(prefix='ccc-config-read-')
+        self.addCleanup(temp.cleanup)
+        self.path = Path(temp.name).resolve() / 'config.json'
+        self.before = b'{"serial":"AAAA"}'
+        self.after = b'{"serial":"BBBB"}'
+        self.path.write_bytes(self.before)
+        self.path.chmod(0o600)
+        self.hint = entry.PeriodicObservationHint()
+
+    def test_unchanged_private_bytes_reuse_decode_but_public_reads_are_independent(self):
+        from ccc_standby_timing import _read
+        with patch.object(entry.json, 'loads', wraps=json.loads) as decode:
+            self.assertEqual(self.hint._config(self.path), ({'serial': 'AAAA'}, self.before))
+            self.assertEqual(self.hint._config(self.path), ({'serial': 'AAAA'}, self.before))
+            self.assertEqual(decode.call_count, 1)
+        first, _ = _read(self.path)
+        first['serial'] = 'changed by caller'
+        self.assertEqual(_read(self.path), ({'serial': 'AAAA'}, self.before))
+
+    def test_same_length_edit_with_restored_mtime_cannot_reuse_old_authorization(self):
+        self.hint._config(self.path)
+        original = self.path.stat()
+        self.path.write_bytes(self.after)
+        os.utime(self.path, ns=(original.st_atime_ns, original.st_mtime_ns))
+        self.assertEqual(self.path.stat().st_size, original.st_size)
+        self.assertEqual(self.path.stat().st_mtime_ns, original.st_mtime_ns)
+        self.assertEqual(self.hint._config(self.path), ({'serial': 'BBBB'}, self.after))
+
+    def test_cached_private_bytes_do_not_bypass_permissions_or_symlink_checks(self):
+        self.hint._config(self.path)
+        self.path.chmod(0o644)
+        with self.assertRaises(ValueError):
+            self.hint._config(self.path)
+        self.path.chmod(0o600)
+        original = self.path.with_name('original.json')
+        self.path.rename(original)
+        self.path.symlink_to(original)
+        with self.assertRaises(ValueError):
+            self.hint._config(self.path)
+
+    def test_malformed_replacement_does_not_fall_back_to_cached_configuration(self):
+        self.hint._config(self.path)
+        self.path.write_bytes(b'[' + b' ' * (len(self.before) - 1))
+        with self.assertRaises(ValueError):
+            self.hint._config(self.path)
+
+    def test_overlapping_reads_keep_each_decoded_value_bound_to_its_exact_bytes(self):
+        decoding = threading.Event()
+        release = threading.Event()
+        results, errors = [], []
+        original_decode = json.loads
+
+        def decode(raw):
+            if raw == self.before:
+                decoding.set()
+                if not release.wait(2):
+                    raise TimeoutError('test decode was not released')
+            return original_decode(raw)
+
+        def read_old():
+            try:
+                results.append(self.hint._config(self.path))
+            except Exception as error:
+                errors.append(error)
+
+        with patch.object(entry.json, 'loads', side_effect=decode):
+            worker = threading.Thread(target=read_old)
+            worker.start()
+            try:
+                self.assertTrue(decoding.wait(2))
+                self.path.write_bytes(self.after)
+                self.assertEqual(self.hint._config(self.path), ({'serial': 'BBBB'}, self.after))
+            finally:
+                release.set()
+                worker.join(2)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(results, [({'serial': 'AAAA'}, self.before)])
+            self.assertEqual(self.hint._config(self.path), ({'serial': 'BBBB'}, self.after))
 
 
 if __name__ == '__main__':

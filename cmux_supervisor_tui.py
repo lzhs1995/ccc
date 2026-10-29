@@ -452,10 +452,11 @@ def native_display_labels(records, classified, top):
 
     needs_tty = any(record.get("native_display_target")
                     and not record["native_display_target"].get("tty")
-                    and core.surface_process_label(classified, record).get("agent_kind", "unknown") == "unknown"
+                    and core.surface_process_label(classified, record).get("agent_kind", "unknown")
+                        in {"unknown", "codex", "claude"}
                     for record in records)
     if not needs_tty:
-        return records, native.display_process_labels(records, classified, top)
+        return records, native.display_process_labels(records, classified, top, verify_classified=True)
     try:
         processes = scope.scan(reader=native.display_process)
         groups = {}
@@ -483,7 +484,8 @@ def native_display_labels(records, classified, top):
                     # display_process_labels rechecks this exact process and TTY.
                     record = {**record, "native_display_target": {**target, "tty": names[0]}}
             result.append(record)
-        return result, native.display_process_labels(result, classified, top, processes=processes)
+        return result, native.display_process_labels(result, classified, top, processes=processes,
+                                                     verify_classified=True)
     except (OSError, ValueError, RuntimeError, KeyError, TypeError):
         return records, dict(classified)
 

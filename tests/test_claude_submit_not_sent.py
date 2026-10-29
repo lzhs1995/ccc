@@ -52,6 +52,93 @@ class SubmitNotSentTests(unittest.TestCase):
                 d._reconcile_claude_submit(t,r,w.ScreenState('composer_busy',watchdog_echo=True),c)
                 enter.assert_called_once()
 
+    def test_unsent_exact_draft_timeout_retains_original_owner_and_native_pin(self):
+        with tempfile.TemporaryDirectory() as root:
+            d,t,r,e,c = self.setup_case(root)
+            r.claude_submit_since = time.time()-1000
+            r.claude_submit_native_identity = {"original": "native-generation"}
+            owner = d._claude_submit_owner(r)
+            with mock.patch.object(d, '_send_claude_enter', return_value=False) as enter:
+                d._reconcile_claude_submit(t,r,w.ScreenState('composer_busy',watchdog_echo=True),c)
+                enter.assert_called_once()
+            self.assertEqual(d._claude_submit_owner(r), owner)
+            d.save()
+            restarted = w.WatchDaemon(d.config_path,d.state_path,client=c)
+            self.assertEqual(restarted._claude_submit_owner(restarted.runtime[t['surface_id']]), owner)
+
+    def test_refused_orphan_key_preserves_actual_key_budget_and_backoff(self):
+        with tempfile.TemporaryDirectory() as root:
+            d,t,r,e,c = self.setup_case(root)
+            r.claude_submit_phase = 'none'
+            r.claude_submit_event_id = None
+            r.claude_process_pid = 1234
+            state = w.ScreenState('composer_busy',watchdog_echo=True)
+            with mock.patch.object(d, '_live_claude_process_label', return_value={'agent_kind':'unknown'}), \
+                    mock.patch.object(c, 'send_key') as key:
+                d._recover_orphan_watchdog_submit(t,r,state,c)
+                key.assert_not_called()
+            self.assertEqual(r.claude_orphan_enter_count,0)
+            self.assertGreater(r.claude_orphan_enter_at,0)
+            self.assertTrue(r.claude_submit_not_sent)
+
+    def test_orphan_ack_loss_keeps_spent_budget_and_uncertainty(self):
+        with tempfile.TemporaryDirectory() as root:
+            d,t,r,e,c = self.setup_case(root)
+            r.claude_submit_phase = 'none'
+            r.claude_submit_event_id = None
+            r.claude_process_pid = 1234
+            native={'agent_kind':'claude','agent_pid':1234,'native_identity':{'original':'proof'}}
+            with mock.patch.object(d,'_live_claude_process_label',return_value=native), \
+                    mock.patch.object(d,'_claude_send_process_identity',return_value={'generation':'generation-a','started_epoch':1}), \
+                    mock.patch.object(c,'send_key',side_effect=w.UncertainDeliveryError('lost')):
+                d._recover_orphan_watchdog_submit(t,r,w.ScreenState('composer_busy',watchdog_echo=True),c)
+            self.assertEqual(r.claude_orphan_enter_count,1)
+            self.assertTrue(r.claude_submit_write_unknown)
+
+    def test_orphan_native_pin_is_reused_without_rewriting_expired_owner(self):
+        with tempfile.TemporaryDirectory() as root:
+            d,t,r,e,c = self.setup_case(root)
+            r.claude_submit_phase = 'none'
+            r.claude_submit_event_id = None
+            r.claude_submit_native_identity = None
+            r.claude_process_pid = 1234
+            proof = {'fresh': 'native recovery'}
+            native = {'agent_kind':'claude', 'agent_pid':1234, 'native_identity':proof}
+            with mock.patch.object(d, '_live_claude_process_label', return_value=native) as live, \
+                    mock.patch.object(d, '_claude_send_process_identity', return_value={'generation':'generation-a','started_epoch':1}), \
+                    mock.patch.object(c, 'send_text', side_effect=AssertionError('duplicate paste')):
+                self.assertTrue(d._send_claude_enter(t,r,c,reason='orphan_watchdog_echo'))
+            self.assertGreaterEqual(live.call_count, 2)
+            self.assertTrue(live.call_args_list[0].kwargs['allow_unpinned'])
+            for call in live.call_args_list[1:]:
+                self.assertFalse(call.kwargs['allow_unpinned'])
+                self.assertEqual(call.kwargs['pinned'], proof)
+            self.assertIsNone(r.claude_submit_native_identity)
+
+    def test_orphan_native_change_after_first_check_withholds_key_and_budget(self):
+        with tempfile.TemporaryDirectory() as root:
+            d,t,r,e,c = self.setup_case(root)
+            r.claude_submit_phase = 'none'
+            r.claude_submit_event_id = None
+            r.claude_submit_native_identity = None
+            r.claude_process_pid = 1234
+            proof = {'fresh': 'native recovery'}
+            def changed(target, client, *, pinned, allow_unpinned):
+                if pinned is None:
+                    self.assertTrue(allow_unpinned)
+                    return {'agent_kind':'claude', 'agent_pid':1234, 'native_identity':proof}
+                self.assertEqual(pinned, proof)
+                self.assertFalse(allow_unpinned)
+                return {'agent_kind':'unknown'}
+            with mock.patch.object(d, '_live_claude_process_label', side_effect=changed), \
+                    mock.patch.object(d, '_claude_send_process_identity', return_value={'generation':'generation-a','started_epoch':1}), \
+                    mock.patch.object(c, 'send_key') as key:
+                d._recover_orphan_watchdog_submit(t,r,w.ScreenState('composer_busy',watchdog_echo=True),c)
+                key.assert_not_called()
+            self.assertEqual(r.claude_orphan_enter_count, 0)
+            self.assertTrue(r.claude_submit_not_sent)
+            self.assertIsNone(r.claude_submit_native_identity)
+
     def test_config_message_change_does_not_submit_a_different_transaction(self):
         with tempfile.TemporaryDirectory() as root:
             d,t,r,e,c = self.setup_case(root)
