@@ -56,6 +56,13 @@ def bordered_payload(draft, *, columns=60, **kwargs):
     return top, bottom, payload_from_lines(rows_text, columns=columns, cursor_row=bottom - 1)
 
 
+def labeled_payload(draft, *, columns=60, **kwargs):
+    top, bottom, rows_text = bordered_rows(draft, columns=columns, **kwargs)
+    label = " ultracode ─"
+    rows_text[top] = "─" * (columns - len(label)) + label
+    return top, bottom, payload_from_lines(rows_text, columns=columns, cursor_row=bottom - 1)
+
+
 def watchdog_draft(columns=60, message=w.CLAUDE_MESSAGE):
     """Our exact message as Claude wraps it: first row after ``❯ ``, then the gutter."""
     chunks = wrap_to_cells(message, columns - 4)
@@ -108,6 +115,85 @@ class _Fixture:
 
 class ComposerBoxTests(_Fixture, unittest.TestCase):
     """The whole bordered box is the composer; every row inside it is draft."""
+
+    def test_ultracode_empty_frame_and_reply_classification(self):
+        for columns in (60, 177):
+            for reply, kind in (("unfinished answer", "claude_stopped"),
+                                ("完成，建议检查 usage: /context", "claude_completed"),
+                                ("API Error: 503 no available accounts", "recoverable_error")):
+                with self.subTest(columns=columns, reply=reply):
+                    top, bottom, payload = labeled_payload(
+                        [""], columns=columns, transcript=("❯ previous user", "⏺ " + reply))
+                    grid = self.grid(payload)
+                    self.assertEqual(w._claude_composer_box(grid.lines), (top, bottom))
+                    self.assertEqual(w._claude_composer_state(grid)[0], "empty")
+                    self.assertNotIn("ultracode", w._claude_latest_reply(grid.lines, top + 1))
+                    self.assertEqual(w.classify_claude_grid(grid).kind, kind)
+
+    def test_ultracode_drafts_keep_all_send_routes_closed(self):
+        for draft in (["actual user draft"], ["", "  hidden continuation"],
+                      ["", "  [Opus 5] typed footer"],
+                      watchdog_draft() + ["", "  other sender's notice"]):
+            with self.subTest(draft=draft):
+                top, bottom, payload = labeled_payload(draft)
+                grid = self.grid(payload)
+                self.assertEqual(w._claude_composer_box(grid.lines), (top, bottom))
+                self.assertEqual(w._claude_composer_state(grid)[0], "busy")
+                self.assertEqual(w.classify_claude_grid(grid).kind, "composer_busy")
+                self.refused_everywhere(payload)
+
+    def test_ultracode_does_not_hide_live_activity_or_reuse_old_activity(self):
+        # Measured B mid-tool frame: the label is below the live spinner.
+        statuses = (("✻ Spinning… (14m 24s · ↓ 6.3k tokens)", "working"),
+                    ("✻ Waiting for API response · will retry in 2m 36s · check your network", "retry"),
+                    ("✽ Compacting conversation… (7m 7s · ↓ 5.9k tokens)", "compacting"))
+        for status, activity in statuses:
+            with self.subTest(status=status):
+                top, _, payload = labeled_payload(
+                    [""], columns=177,
+                    transcript=("❯ previous user", "⏺ Running command · 4s",
+                                "     (ctrl+b to run in background)", "", status, ""))
+                current = w.classify_claude_grid(self.grid(payload))
+                self.assertEqual((current.kind, current.claude_native_activity), ("working", activity))
+                d, t, r, e, c = self.case()
+                c.payload = c._base_payload = copy.deepcopy(payload)
+                self.assertFalse(d._send_claude_event(e, t, r, c)[0])
+                self.assertEqual((c.sent_text, c.sent_keys), ([], []))
+        for newer, expected in (("⏺ New unfinished answer.", "claude_stopped"),
+                                ("API Error: 503 no available accounts", "recoverable_error"),
+                                ("✻ Worked for 3m", "claude_stopped"),
+                                ("⏺ 完成，建议检查 usage: /context", "claude_completed")):
+            with self.subTest(newer=newer):
+                payload = labeled_payload([""], columns=177,
+                    transcript=("❯ previous user", statuses[0][0], newer))[2]
+                current = w.classify_claude_grid(self.grid(payload))
+                self.assertEqual(current.kind, expected)
+                self.assertIsNone(current.claude_native_activity)
+
+    def test_ultracode_requires_the_exact_complete_equal_width_frame(self):
+        top, bottom, payload = labeled_payload([""])
+        original = list(self.grid(payload).lines)
+        shapes = {}
+        for name, upper, lower in (
+                ("other_label", original[top].replace("ultracode", "ultrac0de"), original[bottom]),
+                ("wrong_lower_width", original[top], original[bottom][:-1]),
+                ("labeled_lower", original[top], original[top]),
+                ("indented_upper", " " + original[top], original[bottom]),
+                ("partial_upper", "─" * 7 + " ultracode ─", "─" * 18)):
+            rows = original.copy()
+            rows[top], rows[bottom] = upper, lower
+            shapes[name] = rows
+        shapes["missing_lower"] = original[:bottom]
+        shapes["later_prompt"] = original + ["❯ actual user draft"]
+        for name, rows in shapes.items():
+            with self.subTest(shape=name):
+                changed = payload_from_lines(
+                    rows, columns=max(60, *(display_width(row) for row in rows)),
+                    cursor_row=min(bottom - 1, len(rows) - 1))
+                grid = self.grid(changed)
+                self.assertIsNone(w._claude_composer_box(grid.lines))
+                self.assertNotEqual(w._claude_composer_state(grid)[0], "empty")
+                self.refused_everywhere(changed)
 
     def refused_everywhere(self, payload):
         """No Text and no Enter through orphan, pending, direct Enter or a fresh paste."""

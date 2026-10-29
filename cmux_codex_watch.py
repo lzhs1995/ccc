@@ -1976,14 +1976,16 @@ def _claude_faint(grid: Grid, span: Span) -> bool:
 
 
 CLAUDE_COMPOSER_BORDER_RE = re.compile(r"─{8,}")
+CLAUDE_COMPOSER_LABELED_BORDER_RE = re.compile(r"─{8,} ultracode ─")
 
 
 def _claude_composer_box(lines: Sequence[str]) -> tuple[int, int] | None:
     """(top, bottom) border rows of the live Claude composer, or None.
 
     The structural start is a column-0 ``────`` border directly above a
-    column-0 ``❯``; the end is the first later row identical to that border
-    (the same rule as MAC's exact-composer check). Only the live box draws
+    column-0 ``❯``; the end is the first later matching bare rule. Claude
+    2.1.303 can put the exact ``ultracode`` label in the upper rule; its
+    lower rule must still be bare and have the same width. Only the live box draws
     borders, and draft rows carry a two-column gutter, so a pasted ``❯``, rule
     or footer text can never move either boundary. Every row between the
     borders is draft. A missing closing border (cropped viewport) or a
@@ -1992,15 +1994,27 @@ def _claude_composer_box(lines: Sequence[str]) -> tuple[int, int] | None:
 
     for top in range(len(lines) - 2, -1, -1):
         border = lines[top]
-        if not (CLAUDE_COMPOSER_BORDER_RE.fullmatch(border)
-                and lines[top + 1].startswith("❯")):
+        if not lines[top + 1].startswith("❯"):
+            continue
+        if CLAUDE_COMPOSER_BORDER_RE.fullmatch(border):
+            lower = border
+        elif CLAUDE_COMPOSER_LABELED_BORDER_RE.fullmatch(border):
+            lower = "─" * len(border)
+        else:
             continue
         bottom = next((row for row in range(top + 2, len(lines))
-                       if lines[row] == border), None)
+                       if lines[row] == lower), None)
         if bottom is None or any(line.startswith("❯") for line in lines[bottom + 1:]):
             return None
         return top, bottom
     return None
+
+
+def _claude_reply_end(lines: Sequence[str], prompt_row: int) -> int:
+    # Exclude only the structurally proven live upper rule from reply text.
+    # Its label must not hide a completion report or a current API error.
+    box = _claude_composer_box(lines)
+    return box[0] if box is not None and prompt_row == box[0] + 1 else prompt_row
 
 
 def _claude_cursor_inside_composer(grid: Grid, prompt_row: int) -> bool:
@@ -2186,6 +2200,9 @@ def _claude_native_activity(lines: Sequence[str], end: int) -> str | None:
     a subsequent stop. Keep composer ownership separate from this evidence.
     """
 
+    # The proven upper rule can have a label; it is not newer output that
+    # should hide the live spinner or client retry immediately above it.
+    end = _claude_reply_end(lines, end)
     # With the composer hidden, ``end`` includes the configurable statusline.
     # Its tool/MCP counters are not transcript content. Locate the footer by
     # the Claude marker immediately below its rule, rather than whitelisting
@@ -2327,7 +2344,7 @@ def _claude_last_content_lines(
 
     nudge_rows = _claude_watchdog_prompt_rows(lines, prompt_row, claude_message)
     collected: list[str] = []
-    for row in range(min(prompt_row, len(lines)) - 1, -1, -1):
+    for row in range(min(_claude_reply_end(lines, prompt_row), len(lines)) - 1, -1, -1):
         text = lines[row].strip()
         if row in nudge_rows:
             if collected:
@@ -2351,7 +2368,7 @@ def _claude_latest_reply(lines, prompt_row, claude_message=CLAUDE_MESSAGE):
     for row in range(min(prompt_row, len(lines))):
         if CLAUDE_PROMPT_RE.match(lines[row].strip()):
             start = row + 1
-    reply = list(lines[start:prompt_row])
+    reply = list(lines[start:_claude_reply_end(lines, prompt_row)])
     while reply and _claude_is_chrome_line(reply[-1]):
         reply.pop()
     # Recaps are UI text after the stopped-turn timer, not assistant output.
@@ -2419,7 +2436,8 @@ def _claude_current_error(grid: Grid, prompt_row: int) -> dict[str, Any] | None:
     Physical wraps may split a word, so reconstruct full-width continuations
     separately from deliberate line breaks before using the Hook classifier.
     """
-    lines = [_CLAUDE_ERROR_ANSI_RE.sub("", line) for line in grid.lines[:prompt_row]]
+    lines = [_CLAUDE_ERROR_ANSI_RE.sub("", line)
+             for line in grid.lines[:_claude_reply_end(grid.lines, prompt_row)]]
     code_rows: set[int] = set()
     fence = None
     for row, line in enumerate(lines):
