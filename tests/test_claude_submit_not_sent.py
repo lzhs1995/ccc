@@ -5,6 +5,7 @@ import unittest
 from unittest import mock
 import cmux_codex_watch as w
 from tests import test_claude_delivery_recovery as recovery
+from tests import test_claude_composer_boundaries as composer
 from tests import test_cmux_control_socket as control
 from tests.test_cmux_viewport_socket import server, send, response
 
@@ -103,6 +104,45 @@ class SubmitNotSentTests(unittest.TestCase):
             self.assertEqual(r.state, 'claude_submit_unconfirmed')
             self.assertEqual(r.claude_submit_confirmed_at, 0)
 
+    def test_unsent_text_keeps_owner_while_echo_frame_settles(self):
+        for kind in ('unreadable', 'working', 'composer_busy'):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as root:
+                d,t,r,e,c = self.setup_case(root)
+                r.claude_submit_since = time.time() - 120
+                original = r.claude_submit_since
+                r.claude_submit_native_identity = {'original': 'paste-owner'}
+                owner = d._claude_submit_owner(r)
+                state = w.ScreenState(kind, watchdog_echo=False)
+                with mock.patch.object(c, 'send_text') as text, \
+                        mock.patch.object(c, 'send_key') as key, \
+                        mock.patch.object(d, '_clear_claude_submit') as clear:
+                    self.assertTrue(d._reconcile_claude_submit(t,r,state,c))
+                    text.assert_not_called()
+                    key.assert_not_called()
+                    clear.assert_not_called()
+                self.assertEqual(r.claude_submit_phase, 'text_written')
+                self.assertEqual(d._claude_submit_owner(r), owner)
+                self.assertEqual(r.claude_submit_since, original)
+                self.assertEqual(r.claude_submit_attempts, 0)
+                self.assertTrue(r.claude_submit_not_sent)
+                self.assertEqual(r.state, 'claude_submit_pending')
+
+    def test_settled_owned_echo_reuses_original_unsent_transaction(self):
+        with tempfile.TemporaryDirectory() as root:
+            d,t,r,e,c = self.setup_case(root)
+            r.claude_submit_since = time.time() - 120
+            owner = d._claude_submit_owner(r)
+            with mock.patch.object(d, '_send_claude_enter', return_value=False) as enter, \
+                    mock.patch.object(c, 'send_text') as text:
+                d._reconcile_claude_submit(t,r,w.ScreenState('unreadable'),c)
+                enter.assert_not_called()
+                d._reconcile_claude_submit(
+                    t,r,w.ScreenState('composer_busy',watchdog_echo=True),c)
+                enter.assert_called_once_with(t,r,c,reason='pending_watchdog_echo')
+                text.assert_not_called()
+            self.assertEqual(d._claude_submit_owner(r), owner)
+            self.assertEqual(r.claude_submit_phase, 'text_written')
+
     def test_known_key_rejection_recovers_once_after_restart_without_paste(self):
         with tempfile.TemporaryDirectory() as root:
             d,t,r,e,c = self.setup_case(root)
@@ -117,6 +157,104 @@ class SubmitNotSentTests(unittest.TestCase):
                 self.assertTrue(d2._send_claude_enter(t,r2,c,reason='recovered',input_check=lambda: True))
             self.assertEqual(r2.send_count,1)
             self.assertEqual(d2.claude_event_ledger.status_of(e['event_id']),'sent')
+
+    def test_complete_user_draft_retires_unsent_owner_without_input(self):
+        with tempfile.TemporaryDirectory() as root:
+            d,t,r,e,c = self.setup_case(root)
+            r.claude_submit_since = time.time() - 120
+            r.claude_orphan_enter_count = 2
+            frame = w.Grid.from_rpc(composer.bordered_payload(['my changed draft'])[2], 'surface-uuid')
+            state = w.classify_claude_grid(frame)
+            self.assertEqual(state.kind, 'composer_busy')
+            self.assertTrue(state.claude_composer_conflict)
+            with mock.patch.object(c, 'send_text') as text, \
+                    mock.patch.object(c, 'send_key') as key, \
+                    mock.patch.object(d, '_clear_claude_submit', wraps=d._clear_claude_submit) as clear:
+                d._reconcile_claude_submit(t,r,state,c)
+                clear.assert_called_once_with(r, reason='user_input_conflict')
+                text.assert_not_called()
+                key.assert_not_called()
+            self.assertEqual(r.claude_submit_phase, 'none')
+            self.assertEqual(r.state, 'composer_busy')
+            self.assertEqual(r.claude_orphan_enter_count, 2)
+            self.assertEqual(d.claude_event_ledger.status_of(e['event_id']), 'reserved')
+
+    def test_cropped_or_settling_prefix_does_not_prove_user_conflict(self):
+        frames = [
+            composer.bordered_payload([w.CLAUDE_MESSAGE[:15]])[2],
+            composer.payload_from_lines(['previous output', '❯ my changed draft'], cursor_row=1),
+        ]
+        for payload in frames:
+            with self.subTest(payload=payload), tempfile.TemporaryDirectory() as root:
+                d,t,r,e,c = self.setup_case(root)
+                r.claude_submit_since = time.time() - 120
+                owner = d._claude_submit_owner(r)
+                state = w.classify_claude_grid(w.Grid.from_rpc(payload, 'surface-uuid'))
+                self.assertFalse(state.watchdog_echo)
+                self.assertFalse(state.claude_composer_conflict)
+                with mock.patch.object(c, 'send_text') as text, \
+                        mock.patch.object(c, 'send_key') as key, \
+                        mock.patch.object(d, '_clear_claude_submit') as clear:
+                    d._reconcile_claude_submit(t,r,state,c)
+                    clear.assert_not_called()
+                    text.assert_not_called()
+                    key.assert_not_called()
+                self.assertEqual(d._claude_submit_owner(r), owner)
+                self.assertEqual(r.claude_submit_phase, 'text_written')
+
+    def test_recent_enter_does_not_use_stale_paste_confirmation_clock(self):
+        with tempfile.TemporaryDirectory() as root:
+            d,t,r,e,c = self.setup_case(root)
+            now = time.time()
+            r.claude_submit_phase = 'enter_sent'
+            r.claude_submit_since = now - 120
+            r.claude_submit_last_attempt_at = now - 5
+            owner = d._claude_submit_owner(r)
+            with mock.patch.object(w.time, 'time', return_value=now), \
+                    mock.patch.object(c, 'send_key') as key, \
+                    mock.patch.object(d, '_clear_claude_submit') as clear:
+                d._reconcile_claude_submit(t,r,w.ScreenState('empty'),c)
+                clear.assert_not_called()
+                key.assert_not_called()
+            self.assertEqual(d._claude_submit_owner(r), owner)
+            self.assertEqual(r.claude_submit_enter_since, now - 5)
+            d.save()
+            restarted = w.WatchDaemon(d.config_path,d.state_path,client=c)
+            self.assertEqual(restarted.runtime[t['surface_id']].claude_submit_enter_since, now - 5)
+
+    def test_later_retry_does_not_extend_first_enter_confirmation_deadline(self):
+        with tempfile.TemporaryDirectory() as root:
+            d,t,r,e,c = self.setup_case(root)
+            now = time.time()
+            r.claude_submit_phase = 'enter_sent'
+            r.claude_submit_since = now - 120
+            r.claude_submit_enter_since = now - 20
+            r.claude_submit_last_attempt_at = now - 1
+            with mock.patch.object(w.time, 'time', return_value=now), \
+                    mock.patch.object(c, 'send_key') as key, \
+                    mock.patch.object(d, '_clear_claude_submit', wraps=d._clear_claude_submit) as clear:
+                d._reconcile_claude_submit(t,r,w.ScreenState('composer_busy', watchdog_echo=True),c)
+                clear.assert_called_once_with(r, reason='confirmation_timeout')
+                key.assert_not_called()
+
+    def test_first_returned_enter_starts_clock_once_without_changing_owner(self):
+        with tempfile.TemporaryDirectory() as root:
+            d,t,r,e,c = self.setup_case(root)
+            now = time.time()
+            r.claude_submit_since = now - 120
+            owner = d._claude_submit_owner(r)
+            frame = c.replay(t['workspace_id'],t['surface_id'])
+            with mock.patch.object(c, 'replay', return_value=frame), \
+                    mock.patch.object(w.time, 'time', return_value=now):
+                self.assertTrue(d._send_claude_enter(t,r,c,reason='first',input_check=lambda: True))
+            self.assertEqual(r.claude_submit_enter_since, now)
+            self.assertEqual(d._claude_submit_owner(r), owner)
+            with mock.patch.object(c, 'replay', return_value=frame), \
+                    mock.patch.object(w.time, 'time', return_value=now + 5):
+                self.assertTrue(d._send_claude_enter(t,r,c,reason='retry',input_check=lambda: True))
+            self.assertEqual(r.claude_submit_enter_since, now)
+            self.assertEqual(d._claude_submit_owner(r), owner)
+            self.assertEqual(r.claude_submit_attempts, 2)
 
     def test_known_rejection_retains_original_event_beyond_timeout_and_backs_off(self):
         with tempfile.TemporaryDirectory() as root:

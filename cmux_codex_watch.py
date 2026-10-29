@@ -696,6 +696,9 @@ class ScreenState:
     # watchdog prompt.  It prevents the prompt's brief echo from masquerading
     # as new user input that would re-arm the same stop event.
     watchdog_echo: bool = False
+    # A complete live box contains text that is neither the watchdog prompt
+    # nor its settling prefix. Missing/cropped frames never prove a conflict.
+    claude_composer_conflict: bool = False
     claude_context: "ClaudeContextTelemetry | None" = None
     # Native activity is independent of composer ownership: an exact watchdog
     # draft may coexist with Claude's own retry, work or compaction.
@@ -960,6 +963,9 @@ class TargetRuntime:
     claude_submit_fingerprint: str | None = None
     claude_submit_native_identity: dict[str, Any] | None = None
     claude_submit_since: float = 0.0
+    # Confirmation starts at the first returned Enter, independently of the
+    # paste/owner clock. Further Enter retries do not restart this deadline.
+    claude_submit_enter_since: float = 0.0
     claude_submit_last_attempt_at: float = 0.0
     claude_submit_phase: str = "none"
     claude_submit_not_sent: bool = False
@@ -2322,6 +2328,19 @@ def _claude_watchdog_prompt_rows(
     return set()
 
 
+def _claude_active_prompt_text(
+    lines: Sequence[str],
+    prompt_row: int,
+) -> str | None:
+    """Normalized whole live composer, only when both borders are present."""
+    box = _claude_composer_box(lines)
+    if box is None or prompt_row != box[0] + 1:
+        return None
+    first = CLAUDE_PROMPT_RE.sub("", lines[prompt_row].strip(), count=1)
+    pieces = [first] + [line.strip() for line in lines[prompt_row + 1:box[1]]]
+    return _normalise_claude_prompt("".join(pieces))
+
+
 def _claude_active_prompt_is_watchdog(
     lines: Sequence[str],
     prompt_row: int,
@@ -2342,12 +2361,7 @@ def _claude_active_prompt_is_watchdog(
     # row followed by another sender's notice, or a pasted ``❯`` line inside
     # the borders are all draft. A cropped or unbordered composer has no
     # provable end and cannot authorize Enter, whatever its visible prefix.
-    box = _claude_composer_box(lines)
-    if box is None or prompt_row != box[0] + 1:
-        return False
-    first = CLAUDE_PROMPT_RE.sub("", lines[prompt_row].strip(), count=1)
-    pieces = [first] + [line.strip() for line in lines[prompt_row + 1:box[1]]]
-    return _normalise_claude_prompt("".join(pieces)) == target
+    return _claude_active_prompt_text(lines, prompt_row) == target
 
 
 def _claude_last_content_lines(
@@ -2607,6 +2621,8 @@ def classify_claude_grid(grid: Grid, *, claude_message: str = CLAUDE_MESSAGE) ->
             claude_provider_failure=provider_failure,
         )
     if composer_kind == "busy":
+        composer_text = _claude_active_prompt_text(grid.lines, prompt_row)
+        watchdog_text = _normalise_claude_prompt(claude_message)
         return ScreenState(
             "composer_busy",
             screen_signature=signature,
@@ -2618,6 +2634,8 @@ def classify_claude_grid(grid: Grid, *, claude_message: str = CLAUDE_MESSAGE) ->
                 prompt_row,
                 claude_message,
             ),
+            claude_composer_conflict=bool(composer_text and watchdog_text
+                                          and not watchdog_text.startswith(composer_text)),
             claude_context=context,
             claude_native_activity=native_activity,
             claude_provider_failure=provider_failure,
@@ -11451,6 +11469,7 @@ class WatchDaemon:
         runtime.claude_submit_fingerprint = None
         runtime.claude_submit_native_identity = None
         runtime.claude_submit_since = 0.0
+        runtime.claude_submit_enter_since = 0.0
         runtime.claude_submit_last_attempt_at = 0.0
         runtime.claude_submit_phase = "none"
         runtime.claude_submit_attempts = 0
@@ -11971,6 +11990,8 @@ class WatchDaemon:
         runtime.claude_submit_write_unknown = False
         runtime.claude_submit_not_sent = False
         runtime.claude_submit_phase = "enter_sent"
+        if not runtime.claude_submit_enter_since:
+            runtime.claude_submit_enter_since = runtime.claude_last_submit_at or now
         runtime.claude_submit_last_attempt_at = now
         runtime.claude_submit_attempts += 1
         runtime.claude_last_event_status = "submitted"
@@ -12187,10 +12208,20 @@ class WatchDaemon:
             # A queue is not an execution receipt or a reason to type again.
             runtime.state = "claude_submit_unconfirmed"
             return True
-        if state.claude_native_activity and runtime.claude_submit_phase == "text_written":
-            # Native activity may hide the composer without consuming our
-            # draft. Preserve the event and text; neither confirm nor expire
-            # an Enter that has never been sent.
+        if (runtime.claude_submit_phase == "text_written"
+                and runtime.claude_submit_attempts == 0
+                and not state.claude_native_activity and state.claude_composer_conflict
+                and runtime.claude_submit_message_hash == _short_hash(
+                    str(self.config.get("claude_message") or CLAUDE_MESSAGE))):
+            self._clear_claude_submit(runtime, reason="user_input_conflict")
+            runtime.state = "composer_busy"
+            return True
+        if runtime.claude_submit_phase == "text_written" and (
+                state.claude_native_activity
+                or (runtime.claude_submit_attempts == 0 and not state.watchdog_echo)):
+            # Activity or an unsettled viewport may hide our unsent draft.
+            # Preserve its owner and clock; a missing echo is no evidence that
+            # a confirmation deadline has started before the first Enter.
             runtime.claude_submit_not_sent = True
             runtime.state = "claude_submit_pending"
             return True
@@ -12208,7 +12239,15 @@ class WatchDaemon:
             self._clear_claude_submit(runtime, reason="confirmed")
             return True
 
-        age = max(0.0, now - runtime.claude_submit_since)
+        confirmation_since = runtime.claude_submit_since
+        if runtime.claude_submit_phase == "enter_sent":
+            if not runtime.claude_submit_enter_since:
+                # Adopt a legacy pending transaction once; subsequent retries
+                # keep this anchor rather than extending its confirmation wait.
+                runtime.claude_submit_enter_since = (
+                    runtime.claude_submit_last_attempt_at or runtime.claude_submit_since)
+            confirmation_since = runtime.claude_submit_enter_since
+        age = max(0.0, now - confirmation_since)
         timeout = float(self.config.get(
             "claude_submit_confirm_timeout_sec", CLAUDE_SUBMIT_CONFIRM_TIMEOUT_SEC,
         ))
@@ -12527,6 +12566,7 @@ class WatchDaemon:
         runtime.claude_submit_fingerprint = final.content_fingerprint or final_signature or first_signature
         runtime.claude_submit_native_identity = pinned_native_identity
         runtime.claude_submit_since = time.time()
+        runtime.claude_submit_enter_since = 0.0
         runtime.claude_submit_last_attempt_at = 0.0
         runtime.claude_submit_phase = "text_written"
         runtime.claude_submit_not_sent = False
