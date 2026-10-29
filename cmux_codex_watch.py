@@ -1564,6 +1564,26 @@ def _find_last_error(
     return None
 
 
+def _codex_new_activity_rows(grid: Grid, composer_row: int) -> frozenset[int]:
+    """The complete centered follow-control bar is UI, not a new reply.
+
+    Keep partial notices, transcript prefixes, other positions and additional
+    text blocking. Error and native-turn/input admission remain separate.
+    """
+    text = "New activity · ↓ Back to bottom · esc"
+    column = (grid.columns - len(text)) // 2
+    if column < 2:
+        return frozenset()
+    for row in range(max(0, composer_row - 3), composer_row):
+        line = grid.lines[row]
+        if line.strip() != text or len(line) - len(line.lstrip()) != column:
+            continue
+        if any(grid.lines[i].strip() for i in range(row + 1, composer_row)):
+            continue
+        return frozenset((row,))
+    return frozenset()
+
+
 def _codex_status_chrome_rows(grid: Grid, composer_row: int) -> frozenset[int]:
     """Recognize only the dim background-terminal bar next to the composer.
 
@@ -2730,6 +2750,7 @@ def _codex_error_scan(
     lines = grid.lines
     limit = composer_row if content_end is None else content_end
     chrome_rows = (_codex_status_chrome_rows(grid, composer_row)
+                   | _codex_new_activity_rows(grid, composer_row)
                    | _spinner_chrome_rows(grid, composer_row)
                    | _codex_hook_failure_rows(grid, composer_row)
                    | _codex_startup_notice_rows(grid, composer_row))
