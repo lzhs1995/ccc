@@ -131,12 +131,14 @@ def native_tail(path):
                   "bytes_read": len(data), "sha256": hashlib.sha256(data).hexdigest()}
 
 
-@functools.lru_cache(maxsize=1)
+@functools.lru_cache(maxsize=4)
 def _native_journal_rows(data):
     """Reuse decoding only for identical freshly authenticated tail bytes.
 
     Never cache source proof, wait decisions or task identity. The caller still
     performs native_tail on every observation, including lock/stat validation.
+    Keep a few active tails so observations of different peers do not evict
+    each other and repeatedly decode the same multi-megabyte native records.
     """
     return tuple(json.loads(line) for line in data.splitlines())
 
