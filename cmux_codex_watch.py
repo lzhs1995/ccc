@@ -10174,6 +10174,7 @@ class WatchDaemon:
     def _claude_provider_guard_reason(
         self, target: Mapping[str, Any] | None, runtime: TargetRuntime,
         state: ScreenState | None = None, *, event: Mapping[str, Any] | None = None,
+        orphan_recovery: bool = False,
     ) -> str:
         if not target:
             return ""
@@ -10199,7 +10200,7 @@ class WatchDaemon:
         guard = self._sync_claude_provider_guard(surface_id, runtime)
         if event is None and guard and float(guard.get("release_created_at") or 0) > 0:
             submit_id = str(runtime.claude_submit_event_id or "")
-            if submit_id or (state and state.watchdog_echo):
+            if submit_id or (orphan_recovery and state is not None and state.watchdog_echo):
                 with self.claude_event_ledger._lock:
                     event = {**self.claude_event_ledger.events.get(submit_id, {}), "event_id": submit_id}
         # Do not race a crash-left, identity-compatible native rejection claim.
@@ -12009,7 +12010,7 @@ class WatchDaemon:
 
         if self._claude_supervisor_wait_guard(target, runtime):
             return True
-        if self._claude_provider_guard_reason(target, runtime, state):
+        if self._claude_provider_guard_reason(target, runtime, state, orphan_recovery=True):
             return True
 
         if runtime.claude_handshake_wait:
@@ -12072,7 +12073,7 @@ class WatchDaemon:
             runtime.claude_submit_last_reason,
         )
         entered = self._send_claude_enter(target, runtime, client, reason="orphan_watchdog_echo")
-        if not entered and self._claude_provider_guard_reason(target, runtime, state):
+        if not entered and self._claude_provider_guard_reason(target, runtime, state, orphan_recovery=True):
             runtime.claude_orphan_enter_at = previous_orphan_at
             runtime.claude_orphan_enter_count = previous_orphan_count
             self._save_claude_surface(str(target["surface_id"]), runtime)

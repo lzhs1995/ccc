@@ -840,6 +840,66 @@ class ProviderGuardTests(unittest.TestCase):
             self.assertEqual(d._claude_provider_guard_reason(t, r, state), "claude_provider_retry_wait")
             self.assertEqual((r.claude_provider_guard["status"], r.claude_provider_guard["retry_count"]), ("retry_wait", 1))
             self.assertNotIn("invalid", r.claude_provider_guard)
+
+    def released_echo_case(self, root):
+        d, t, r, e, c = self.case(root)
+        self.hold(d, t, r, e)
+        prompt, path = self.native_prompt(root, e)
+        with mock.patch.object(w.dispatch_recovery, "native_path", return_value=path):
+            self.assertTrue(d._release_claude_provider_guard(
+                t["surface_id"], r, prompt, reason="native_human_prompt"))
+        self.assertIsNone(r.claude_submit_event_id)
+        self.assertGreater(r.claude_provider_guard["release_created_at"], 0)
+        return d, t, r, e, c, w.ScreenState("idle", watchdog_echo=True)
+
+    def test_released_echo_without_submit_id_does_not_manufacture_stale_event(self):
+        with tempfile.TemporaryDirectory() as root:
+            d, t, r, e, c, state = self.released_echo_case(root)
+            self.assertNotIn("", d.claude_event_ledger.events)
+            self.assertEqual(d._claude_provider_guard_reason(t, r, state), "")
+            self.assertIsNone(r.claude_submit_event_id)
+
+    def test_released_echo_blocks_only_orphan_recovery_without_spending_input(self):
+        with tempfile.TemporaryDirectory() as root:
+            d, t, r, e, c, _ = self.released_echo_case(root)
+            state = w.ScreenState("composer_busy", watchdog_echo=True, message_kind="claude")
+            r.claude_orphan_enter_count = 2
+            self.assertEqual(d._claude_provider_guard_reason(t, r, state), "")
+            self.assertEqual(d._claude_provider_guard_reason(
+                t, r, state, orphan_recovery=True), "claude_provider_event_superseded")
+            self.assertTrue(d._recover_orphan_watchdog_submit(t, r, state, c))
+            self.assertEqual(r.claude_orphan_enter_count, 2)
+            self.assertIsNone(r.claude_submit_event_id)
+            self.assert_no_input(c)
+
+    def test_released_echo_still_refuses_a_real_stale_submit_event(self):
+        with tempfile.TemporaryDirectory() as root:
+            d, t, r, e, c, state = self.released_echo_case(root)
+            r.claude_submit_event_id = "old-submit"
+            d.claude_event_ledger.events["old-submit"] = dict(
+                e, event_id="old-submit", completed=False,
+                created_at=r.claude_provider_guard["release_created_at"] - 1)
+            self.assertEqual(d._claude_provider_guard_reason(t, r, state),
+                             "claude_provider_event_superseded")
+
+    def test_released_echo_still_refuses_a_current_pending_provider_claim(self):
+        with tempfile.TemporaryDirectory() as root:
+            d, t, r, e, c, state = self.released_echo_case(root)
+            pending = self.failure(e, RPM, stamp=time.time(), event_id="current-claim")
+            d.claude_event_ledger.events["current-claim"] = dict(
+                pending, session_id=r.claude_session_id, status="handling",
+                process_generation=r.claude_process_generation)
+            self.assertEqual(d._claude_provider_guard_reason(t, r, state),
+                             "claude_provider_verifying")
+
+    def test_released_echo_allows_a_genuine_new_submit_event(self):
+        with tempfile.TemporaryDirectory() as root:
+            d, t, r, e, c, state = self.released_echo_case(root)
+            r.claude_submit_event_id = "new-submit"
+            d.claude_event_ledger.events["new-submit"] = dict(
+                e, event_id="new-submit", created_at=time.time())
+            self.assertEqual(d._claude_provider_guard_reason(t, r, state), "")
+
     def consume(self, d, r, attempt, stamp, *, surface="surface-uuid", generation="generation-a"):
         """Credit one identity-bound durable submission to a recorded attempt."""
         guard = dict(r.claude_provider_guard)
