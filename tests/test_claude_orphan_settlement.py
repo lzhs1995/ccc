@@ -57,6 +57,22 @@ class OrphanSettlementTests(unittest.TestCase):
                 self.assertEqual(c.sent, sent)
                 self.assertFalse(r.claude_last_submit_has_receipt)
 
+    def test_consumed_known_orphan_settles_while_provider_hold_remains(self):
+        for failure in (provider.AUTH, provider.RPM):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as root:
+                d, t, r, e, c = self.known_orphan(root)
+                provider.ProviderGuardTests().hold(d, t, r, e, failure)
+                before = copy.deepcopy(self.evidence(r))
+                guard = copy.deepcopy(d.claude_event_ledger.provider_guard(t['surface_id']))
+                sent = list(c.sent)
+                self.assertTrue(d._reconcile_claude_submit(t, r, w.ScreenState('working'), c))
+                self.assertEqual(r.claude_submit_phase, 'none')
+                self.assertEqual(r.claude_submit_last_reason, 'orphan_composer_consumed')
+                self.assertEqual(r.claude_submit_confirmed_at, 0)
+                self.assertEqual(self.evidence(r), before)
+                self.assertEqual(d.claude_event_ledger.provider_guard(t['surface_id']), guard)
+                self.assertEqual(c.sent, sent)
+
     def test_fresh_native_stop_retires_old_guard_after_known_orphan(self):
         with tempfile.TemporaryDirectory() as root:
             d, t, r, e, c = self.known_orphan(root)

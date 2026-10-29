@@ -12092,19 +12092,8 @@ class WatchDaemon:
 
         if self._claude_supervisor_wait_guard(target, runtime):
             return True
-        if self._claude_provider_guard_reason(target, runtime, state):
-            return True
-
-        if runtime.claude_handshake_wait:
-            runtime.state = "claude_handshake_wait"
-            return True
-        if self._legacy_claude_report_latch(runtime):
-            # A pending transaction can coexist with the historical report
-            # bug. Keep its evidence intact while migration is inadmissible;
-            # an old report is neither a receipt nor permission to retry Enter.
-            runtime.state = "claude_report_ready"
-            return True
-        if (runtime.claude_submit_phase == "enter_sent"
+        if (not runtime.claude_handshake_wait and not self._legacy_claude_report_latch(runtime)
+                and runtime.claude_submit_phase == "enter_sent"
                 and not runtime.claude_submit_event_id
                 and not runtime.claude_submit_write_unknown
                 and runtime.claude_last_submit_at > 0
@@ -12116,6 +12105,18 @@ class WatchDaemon:
             # only its pending slot; retain the original key evidence/budget
             # and do not invent a native receipt or cover a deferred Stop.
             self._clear_claude_submit(runtime, reason="orphan_composer_consumed")
+            return True
+        if self._claude_provider_guard_reason(target, runtime, state):
+            return True
+
+        if runtime.claude_handshake_wait:
+            runtime.state = "claude_handshake_wait"
+            return True
+        if self._legacy_claude_report_latch(runtime):
+            # A pending transaction can coexist with the historical report
+            # bug. Keep its evidence intact while migration is inadmissible;
+            # an old report is neither a receipt nor permission to retry Enter.
+            runtime.state = "claude_report_ready"
             return True
         if runtime.claude_submit_phase == "none" or not runtime.claude_submit_event_id:
             # F2 重置点之一：composer 内容变化即孤儿事件结束。``empty`` 表示
