@@ -2935,7 +2935,10 @@ def classify_grid(grid: Grid) -> ScreenState:
             or not _is_reconnect_marker(error.block)
         ),
         native_goal_stalled=goal_stalled,
-        requires_goal_proof=bool(error.superseded) or occupied,
+        # A scrolled viewport may hide a newer reply. Require the native EOF
+        # instead of falling back to an unbound legacy screen-only retry.
+        requires_goal_proof=(bool(error.superseded) or occupied
+                             or bool(_codex_new_activity_rows(grid, composer_row))),
         native_goal_only=occupied,
     )
 
