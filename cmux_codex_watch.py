@@ -12194,6 +12194,20 @@ class WatchDaemon:
             runtime.claude_submit_not_sent = True
             runtime.state = "claude_submit_pending"
             return True
+        # Once Claude has left the composer, the explicit Enter was accepted.
+        # Working/menu are both valid post-submit states; Hook events provide a
+        # stronger confirmation asynchronously but are not required for the
+        # transaction to stop retrying.
+        if (runtime.claude_submit_phase == "enter_sent"
+                and state.kind in {"working", "menu"} and not state.watchdog_echo):
+            runtime.claude_submit_confirmed_at = now
+            self.logger.info(
+                "surface=%s Claude submit confirmed state=%s event=%s",
+                surface_id[:8], state.kind, str(runtime.claude_submit_event_id)[:8],
+            )
+            self._clear_claude_submit(runtime, reason="confirmed")
+            return True
+
         age = max(0.0, now - runtime.claude_submit_since)
         timeout = float(self.config.get(
             "claude_submit_confirm_timeout_sec", CLAUDE_SUBMIT_CONFIRM_TIMEOUT_SEC,
@@ -12207,20 +12221,6 @@ class WatchDaemon:
             )
             self._clear_claude_submit(runtime, reason="confirmation_timeout")
             runtime.state = "claude_submit_unconfirmed"
-            return True
-
-        # Once Claude has left the composer, the explicit Enter was accepted.
-        # Working/menu are both valid post-submit states; Hook events provide a
-        # stronger confirmation asynchronously but are not required for the
-        # transaction to stop retrying.
-        if (runtime.claude_submit_phase == "enter_sent"
-                and state.kind in {"working", "menu"} and not state.watchdog_echo):
-            runtime.claude_submit_confirmed_at = now
-            self.logger.info(
-                "surface=%s Claude submit confirmed state=%s event=%s",
-                surface_id[:8], state.kind, str(runtime.claude_submit_event_id)[:8],
-            )
-            self._clear_claude_submit(runtime, reason="confirmed")
             return True
 
         if state.kind == "composer_busy" and not state.watchdog_echo:

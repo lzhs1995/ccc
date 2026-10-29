@@ -20,6 +20,89 @@ class SubmitNotSentTests(unittest.TestCase):
         c.send_text(t['workspace_id'], t['surface_id'], w.CLAUDE_MESSAGE)
         return d,t,r,e,c
 
+    def test_consumed_enter_beats_stale_transaction_timeout(self):
+        for kind in ('working', 'menu'):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as root:
+                d,t,r,e,c = self.setup_case(root)
+                now = time.time()
+                r.claude_submit_phase = 'enter_sent'
+                r.claude_submit_since = now - 120
+                r.claude_submit_not_sent = False
+                state = w.ScreenState(kind, watchdog_echo=False,
+                                      claude_native_activity='working')
+                with mock.patch.object(w.time, 'time', return_value=now), \
+                        mock.patch.object(c, 'send_text') as text, \
+                        mock.patch.object(c, 'send_key') as key, \
+                        mock.patch.object(d, '_clear_claude_submit',
+                                          wraps=d._clear_claude_submit) as clear, \
+                        mock.patch.object(d.logger, 'warning') as warning:
+                    self.assertTrue(d._reconcile_claude_submit(t,r,state,c))
+                    text.assert_not_called()
+                    key.assert_not_called()
+                    clear.assert_called_once_with(r, reason='confirmed')
+                    warning.assert_not_called()
+                self.assertEqual(r.claude_submit_confirmed_at, now)
+                self.assertEqual(r.claude_submit_phase, 'none')
+
+    def test_stale_queued_or_unknown_enter_stays_unconfirmed(self):
+        for condition in ('queued', 'write_unknown'):
+            with self.subTest(condition=condition), tempfile.TemporaryDirectory() as root:
+                d,t,r,e,c = self.setup_case(root)
+                r.claude_submit_phase = 'enter_sent'
+                r.claude_submit_since = time.time() - 120
+                r.claude_submit_not_sent = False
+                r.claude_submit_write_unknown = condition == 'write_unknown'
+                activity = 'queued' if condition == 'queued' else 'working'
+                state = w.ScreenState('working', watchdog_echo=False,
+                                      claude_native_activity=activity)
+                with mock.patch.object(c, 'send_text') as text, \
+                        mock.patch.object(c, 'send_key') as key, \
+                        mock.patch.object(d, '_clear_claude_submit') as clear:
+                    self.assertTrue(d._reconcile_claude_submit(t,r,state,c))
+                    text.assert_not_called()
+                    key.assert_not_called()
+                    clear.assert_not_called()
+                self.assertEqual(r.state, 'claude_submit_unconfirmed')
+                self.assertEqual(r.claude_submit_event_id, e['event_id'])
+                self.assertEqual(r.claude_submit_phase, 'enter_sent')
+                self.assertEqual(r.claude_submit_confirmed_at, 0)
+
+    def test_stale_unsent_text_with_native_activity_stays_pending(self):
+        with tempfile.TemporaryDirectory() as root:
+            d,t,r,e,c = self.setup_case(root)
+            r.claude_submit_since = time.time() - 120
+            state = w.ScreenState('working', watchdog_echo=False,
+                                  claude_native_activity='working')
+            with mock.patch.object(c, 'send_text') as text, \
+                    mock.patch.object(c, 'send_key') as key, \
+                    mock.patch.object(d, '_clear_claude_submit') as clear:
+                self.assertTrue(d._reconcile_claude_submit(t,r,state,c))
+                text.assert_not_called()
+                key.assert_not_called()
+                clear.assert_not_called()
+            self.assertEqual(r.state, 'claude_submit_pending')
+            self.assertTrue(r.claude_submit_not_sent)
+            self.assertEqual(r.claude_submit_event_id, e['event_id'])
+            self.assertEqual(r.claude_submit_phase, 'text_written')
+
+    def test_stale_enter_with_original_echo_still_times_out(self):
+        with tempfile.TemporaryDirectory() as root:
+            d,t,r,e,c = self.setup_case(root)
+            r.claude_submit_phase = 'enter_sent'
+            r.claude_submit_since = time.time() - 120
+            r.claude_submit_not_sent = False
+            state = w.ScreenState('composer_busy', watchdog_echo=True)
+            with mock.patch.object(c, 'send_text') as text, \
+                    mock.patch.object(c, 'send_key') as key, \
+                    mock.patch.object(d, '_clear_claude_submit',
+                                      wraps=d._clear_claude_submit) as clear:
+                self.assertTrue(d._reconcile_claude_submit(t,r,state,c))
+                text.assert_not_called()
+                key.assert_not_called()
+                clear.assert_called_once_with(r, reason='confirmation_timeout')
+            self.assertEqual(r.state, 'claude_submit_unconfirmed')
+            self.assertEqual(r.claude_submit_confirmed_at, 0)
+
     def test_known_key_rejection_recovers_once_after_restart_without_paste(self):
         with tempfile.TemporaryDirectory() as root:
             d,t,r,e,c = self.setup_case(root)
