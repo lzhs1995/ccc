@@ -6,6 +6,7 @@ asks JEV once per fingerprint; the answer only selects an allowlisted existing
 retry code and never becomes an action. Any failure keeps UNKNOWN.
 """
 from dataclasses import dataclass
+from functools import lru_cache
 import hashlib
 import json
 import math
@@ -14,6 +15,7 @@ import queue
 import re
 import stat
 import threading
+import time
 
 MODEL = 'jev-1.14.0'
 ENDPOINT_HOST = 'api.typesafe.ai'
@@ -66,8 +68,8 @@ def build_request(client, excerpt):
         questions={'diagnosis': dict(type='choice', instructions=INSTRUCTIONS, criteria=CRITERIA)})
 
 
-def parse_answer(body):
-    """RESPONSE-01 shape only: model, choice type, finite 0.8<=confidence<=1, allowlisted label."""
+def validated_diagnosis(body):
+    """Keep only a typed, confident diagnosis from the original model."""
     if not isinstance(body, dict) or body.get('model') != MODEL:
         return None
     answers = body.get('answers')
@@ -75,11 +77,18 @@ def parse_answer(body):
     if not isinstance(answer, dict) or answer.get('type') != 'choice':
         return None
     choice, confidence = answer.get('choice'), answer.get('confidence')
-    if not isinstance(choice, str) or type(confidence) not in (int, float):
+    if (not isinstance(choice, str) or choice not in CRITERIA
+            or type(confidence) not in (int, float)):
         return None
     if not math.isfinite(confidence) or not MIN_CONFIDENCE <= confidence <= 1:
         return None
-    return ALLOWED.get(choice)
+    return {'choice': choice, 'confidence': float(confidence)}
+
+
+def parse_answer(body):
+    """Diagnosis never expands the allowlisted retry codes."""
+    diagnosis = validated_diagnosis(body)
+    return ALLOWED.get(diagnosis['choice']) if diagnosis else None
 
 
 def api_key(key_path=None):
@@ -104,23 +113,111 @@ def enabled(key_path=None):
     return bool(api_key(key_path))
 
 
+@lru_cache(maxsize=1)
+def _curl_api():
+    """Use the system library only when DNS and initialization are thread safe.
+
+    Isolated native interpreters cannot delegate to subprocesses. Socket timeouts
+    do not bound slow-drip responses or DNS, so an unsupported library abstains.
+    Global cleanup would affect other interpreters; only request handles close.
+    """
+    import ctypes as c
+    import ctypes.util
+    library = ctypes.util.find_library('curl')
+    if not library:
+        raise OSError('bounded JEV HTTP transport unavailable')
+    lib = c.CDLL(library)
+    lib.curl_global_init.argtypes = [c.c_long]
+    lib.curl_global_init.restype = c.c_int
+    if lib.curl_global_init(3):
+        raise OSError('bounded JEV HTTP initialization failed')
+    class Version(c.Structure):
+        _fields_ = [('age', c.c_int), ('version', c.c_char_p),
+                    ('number', c.c_uint), ('host', c.c_char_p), ('features', c.c_int)]
+    lib.curl_version_info.argtypes = [c.c_int]
+    lib.curl_version_info.restype = c.POINTER(Version)
+    info = lib.curl_version_info(0)
+    required = (1 << 7) | (1 << 30)  # ASYNCHDNS, THREADSAFE
+    if not info or info.contents.features & required != required:
+        raise OSError('bounded JEV HTTP transport unavailable')
+    lib.curl_easy_init.restype = c.c_void_p
+    lib.curl_easy_init.argtypes = []
+    lib.curl_easy_setopt.argtypes = [c.c_void_p, c.c_int]
+    lib.curl_easy_setopt.restype = c.c_int
+    lib.curl_easy_perform.argtypes = [c.c_void_p]
+    lib.curl_easy_perform.restype = c.c_int
+    lib.curl_easy_getinfo.argtypes = [c.c_void_p, c.c_int]
+    lib.curl_easy_getinfo.restype = c.c_int
+    lib.curl_easy_cleanup.argtypes = [c.c_void_p]
+    lib.curl_easy_cleanup.restype = None
+    lib.curl_slist_append.argtypes = [c.c_void_p, c.c_char_p]
+    lib.curl_slist_append.restype = c.c_void_p
+    lib.curl_slist_free_all.argtypes = [c.c_void_p]
+    lib.curl_slist_free_all.restype = None
+    return lib
+
+
+def _curl_post_json(url, request, key, timeout):
+    """One total deadline covers DNS, connect, TLS, headers and response body."""
+    import ctypes as c
+    if not math.isfinite(timeout) or timeout <= 0:
+        return None
+    deadline = time.monotonic() + timeout
+    lib = _curl_api()
+    handle = lib.curl_easy_init()
+    if not handle:
+        return None
+    headers = None
+    body = bytearray()
+    payload = json.dumps(request, ensure_ascii=False).encode()
+    @c.CFUNCTYPE(c.c_size_t, c.c_void_p, c.c_size_t, c.c_size_t, c.c_void_p)
+    def receive(data, size, count, _):
+        length = size * count
+        if len(body) + length > 64 * 1024:
+            return 0
+        body.extend(c.string_at(data, length))
+        return length
+    def option(code, value):
+        if lib.curl_easy_setopt(handle, code, value):
+            raise OSError('bounded JEV HTTP option failed')
+    try:
+        for value in ('Authorization: Bearer ' + key, 'Content-Type: application/json'):
+            updated = lib.curl_slist_append(headers, value.encode())
+            if not updated:
+                raise OSError('bounded JEV HTTP headers unavailable')
+            headers = updated
+        option(10002, c.c_char_p(url.encode()))           # URL
+        option(10004, c.c_char_p(b''))                    # preserve direct transport
+        option(10023, c.c_void_p(headers))                # HTTPHEADER
+        option(10015, c.c_char_p(payload))                # POSTFIELDS (retained here)
+        option(60, c.c_long(len(payload)))                # POSTFIELDSIZE
+        option(99, c.c_long(1))                          # NOSIGNAL in worker threads
+        option(20011, c.cast(receive, c.c_void_p))         # WRITEFUNCTION
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        option(155, c.c_long(max(1, int(remaining * 1000)))) # TIMEOUT_MS, never unlimited
+        if lib.curl_easy_perform(handle) or time.monotonic() >= deadline:
+            return None
+        status = c.c_long()
+        if lib.curl_easy_getinfo(handle, 0x200002, c.byref(status)) or status.value != 200:
+            return None
+        return json.loads(body)
+    finally:
+        lib.curl_easy_cleanup(handle)
+        lib.curl_slist_free_all(headers)
+
+
 def http_transport(request, timeout, *, key_path=None):
-    import http.client
     key = api_key(key_path)
     if not key:
         return None
-    conn = http.client.HTTPSConnection(ENDPOINT_HOST, timeout=timeout)
-    try:
-        conn.request('POST', ENDPOINT_PATH, body=json.dumps(request, ensure_ascii=False).encode(),
-                     headers={'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json'})
-        response = conn.getresponse()
-        return json.loads(response.read(64 * 1024)) if response.status == 200 else None
-    finally:
-        conn.close()
+    return _curl_post_json('https://' + ENDPOINT_HOST + ENDPOINT_PATH, request, key, timeout)
 
 
 class JevUnknownClassifier:
-    def __init__(self, transport=None, *, start=True, is_enabled=None, key_path=None):
+    def __init__(self, transport=None, *, start=True, is_enabled=None, key_path=None,
+                 daemon_threads=True):
         self.transport = (transport if transport is not None else
             lambda request, timeout: http_transport(request, timeout, key_path=key_path))
         self.is_enabled = is_enabled if is_enabled is not None else lambda: enabled(key_path)
@@ -131,9 +228,19 @@ class JevUnknownClassifier:
         self.calls = 0
         self.stopped = False
         self.thread = None
+        self.daemon_threads = daemon_threads
         if start:
-            self.thread = threading.Thread(target=self._worker, daemon=True, name='ccc-jev')
-            self.thread.start()
+            self.start_worker()
+
+    def start_worker(self):
+        if self.thread is not None or self.stopped:
+            return
+        thread = threading.Thread(target=self._worker, daemon=self.daemon_threads, name='ccc-jev')
+        thread.start()
+        self.thread = thread
+        import logging
+        logging.getLogger('ccc-jev').info('JEV worker started model=%s daemon_threads=%s',
+                                        MODEL, self.daemon_threads)
 
     def stop(self):
         self.stopped = True
@@ -141,6 +248,13 @@ class JevUnknownClassifier:
             self.queue.put_nowait(None)
         except queue.Full:
             pass
+        # Isolated native interpreters require non-daemon workers to quiesce
+        # before their original interpreter can close. Requests remain bounded.
+        if (self.thread is not None and not self.thread.daemon
+                and self.thread is not threading.current_thread()):
+            self.thread.join(TIMEOUT_SECONDS + 1)
+            if self.thread.is_alive():
+                raise RuntimeError('JEV worker has not quiesced')
 
     def cached(self, client, model, text, provider=''):
         """Poll-path lookup: cache only, never schedules or calls."""
@@ -182,12 +296,28 @@ class JevUnknownClassifier:
             return False
         key, client, model, excerpt = item
         result = None
+        diagnosis = None
+        outcome = 'invalid_response'
+        started = time.monotonic()
         try:
             self.calls += 1
-            result = parse_answer(self.transport(build_request(client, excerpt), TIMEOUT_SECONDS))
+            diagnosis = validated_diagnosis(
+                self.transport(build_request(client, excerpt), TIMEOUT_SECONDS))
+            if diagnosis:
+                result = ALLOWED.get(diagnosis['choice'])
+                outcome = 'retry_diagnosis' if result else 'abstained'
         except Exception:
-            result = None
+            outcome = 'transport_error'
         self._store(key, result)
+        try:
+            import logging
+            logging.getLogger('ccc-jev').info(
+                'JEV_DECISION fingerprint=%s diagnosis=%s confidence=%s retry_code=%s outcome=%s elapsed_ms=%.2f',
+                key[:16], diagnosis['choice'] if diagnosis else 'UNVERIFIED',
+                diagnosis['confidence'] if diagnosis else None, result, outcome,
+                (time.monotonic() - started) * 1000)
+        except Exception:
+            pass  # An observation failure never changes the committed cache.
         return True
 
     def _worker(self):

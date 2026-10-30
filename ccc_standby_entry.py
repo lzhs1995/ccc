@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import threading
 import time
 from pathlib import Path
@@ -17,7 +18,7 @@ import ccc_standby_launch as launch
 import ccc_batch_timing as ui
 from ccc_native_standby import identifier
 from ccc_standby_service import request
-from ccc_standby_timing import _origin, _read
+from ccc_standby_timing import _origin, _read, _read_raw
 
 
 def owner_path(config_path, job_id):
@@ -34,6 +35,21 @@ class PeriodicObservationHint:
     def __init__(self):
         self.lock = threading.Lock()
         self.cache = {}
+        self._config_lock = threading.Lock()
+        self._config_cache = None
+
+    def _config(self, path):
+        # Every lookup still performs the full private-file and stable-byte
+        # read. This one tree never escapes the read-only coverage helpers.
+        raw = _read_raw(path)
+        with self._config_lock:
+            cached = self._config_cache
+        if cached is not None and cached[0] == path and cached[1] == raw:
+            return cached[2], raw
+        value = json.loads(raw)
+        with self._config_lock:
+            self._config_cache = (path, raw, value)
+        return value, raw
 
     def covered(self, config_path, target):
         try:
@@ -43,7 +59,7 @@ class PeriodicObservationHint:
 
     def _covered(self, config_path, target):
         sid, wid = str(target['surface_id']), str(target['workspace_id'])
-        config, config_raw = _read(config_path)
+        config, config_raw = self._config(config_path)
         rule = core.workspace_rule_by_id(config, wid)
         hold = core.batch_start_hold(rule, sid)
         if not hold or hold.get('legacy') or type(hold.get('index')) is not int:
@@ -107,8 +123,8 @@ class PeriodicObservationHint:
         return (isinstance(state, dict) and state.get('state') in {'ready', 'activation_queued'}
                 and state.get('job_terminal') is False and state.get('run_terminal') is False
                 and all(state.get(k) == v for k, v in selected.items())
-                and all(_read(path)[1] == raw for path, raw in originals)
-                and _read(receipt_path)[1] == receipt_raw
+                and all(_read_raw(path) == raw for path, raw in originals)
+                and _read_raw(receipt_path) == receipt_raw
                 and _identity(socket_path, stat.S_ISSOCK) == socket_identity
                 and ui.boot_id() == selected['boot_id']
                 and 0 <= time.monotonic() - started < .1)

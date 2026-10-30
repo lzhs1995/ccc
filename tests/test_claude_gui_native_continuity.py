@@ -76,6 +76,67 @@ class GuiNativeContinuityTests(unittest.TestCase):
             proof = json.loads(json.dumps(proof))
             self.assertEqual(d._live_claude_process_label(t, c, pinned=proof, allow_unpinned=False)['agent_pid'], 1234)
 
+    def test_gui_failure_does_not_strand_verified_native_continuation(self):
+        with self.case() as (d, t, r, e, c, *_):
+            c.top = mock.Mock(side_effect=w.CmuxError('system.top response deadline exceeded'))
+            self.assertTrue(d._send_claude_event(e, t, r, c)[0])
+            self.assertEqual(len(c.sent_text), 1)
+            self.assertEqual(len(c.sent_keys), 1)
+            self.assertEqual(d.claude_event_ledger.status_of(e['event_id']), 'sent')
+            self.assertFalse(d._send_claude_event(e, t, r, c)[0])
+            self.assertEqual(len(c.sent_text), 1)
+            self.assertEqual(len(c.sent_keys), 1)
+
+    def test_each_input_check_shares_only_its_own_fresh_topology(self):
+        with self.case() as (d, t, r, e, c, *_):
+            original_tree = c.tree
+            c.tree = mock.Mock(side_effect=lambda: copy.deepcopy(original_tree()))
+            with mock.patch.object(d, '_acquire_claude_delivery', wraps=d._acquire_claude_delivery) as lease, \
+                    mock.patch.object(d, '_live_claude_process_label', wraps=d._live_claude_process_label) as identity:
+                self.assertTrue(d._send_claude_event(e, t, r, c)[0])
+            trees = [call.kwargs['tree'] for call in identity.call_args_list if 'tree' in call.kwargs]
+            lease_trees = [call.kwargs['tree'] for call in lease.call_args_list if 'tree' in call.kwargs]
+            self.assertGreaterEqual(len(trees), 2)
+            self.assertEqual(len({id(tree) for tree in trees}), len(trees))
+            self.assertTrue(all(any(tree is value for value in lease_trees) for tree in trees))
+            self.assertEqual(len(c.sent_text), 1)
+            self.assertEqual(len(c.sent_keys), 1)
+
+    def test_working_frame_rejects_text_before_expensive_native_validation(self):
+        with self.case() as (d, t, r, e, c, *_):
+            classify = w.classify_claude_grid
+            def working_after_reservation(frame, **kwargs):
+                if d.claude_event_ledger.status_of(e['event_id']) == 'reserved':
+                    return w.ScreenState('working', message_kind='claude', claude_native_activity=True)
+                return classify(frame, **kwargs)
+            with mock.patch.object(w, 'classify_claude_grid', side_effect=working_after_reservation), \
+                    mock.patch.object(d, '_live_claude_process_label', wraps=d._live_claude_process_label) as identity:
+                self.assertFalse(d._send_claude_event(e, t, r, c)[0])
+            self.assertFalse(any(call.kwargs.get('allow_unpinned') is False for call in identity.call_args_list))
+            self.assertEqual(c.sent_text, [])
+            self.assertEqual(c.sent_keys, [])
+            self.assertEqual(d.claude_event_ledger.status_of(e['event_id']), 'deferred_input_not_sent')
+
+    def test_gui_failure_keeps_mixed_native_surface_ambiguous(self):
+        with self.case() as (d, t, r, e, c, row, scan, *_):
+            c.top = mock.Mock(side_effect=w.CmuxError('system.top response deadline exceeded'))
+            scan.return_value = [row, dict(row, pid=777, agent_kind='codex')]
+            self.assertFalse(d._send_claude_event(e, t, r, c)[0])
+            self.assertEqual(c.sent_text, [])
+            self.assertEqual(c.sent_keys, [])
+
+    def test_bounded_gui_read_never_borrows_input_socket(self):
+        import types
+        borrowed = mock.Mock(side_effect=AssertionError('must preserve input socket'))
+        transport = types.SimpleNamespace(
+            _connection_local=types.SimpleNamespace(read_rpc=borrowed, input_remaining=lambda: 4),
+            connection_window=lambda budget: contextlib.nullcontext(budget))
+        client = w.CmuxClient(viewport_socket=transport)
+        with mock.patch.object(client, '_control_rpc_once', side_effect=w.CmuxError('timeout')) as read:
+            self.assertEqual(client.top_for_input('workspace-uuid'), {})
+        self.assertEqual(read.call_args.kwargs['timeout'], 0.5)
+        borrowed.assert_not_called()
+
     def test_401_and_deleted_group_403_send_once_after_native_backoff(self):
         banners = ('⏺ Please run /login · API Error: 401 百倍0.08: API key is disabled',
                    '⏺ Please run /login · API Error: 403 百倍: API Key 所属分组已删除')
@@ -108,6 +169,22 @@ class GuiNativeContinuityTests(unittest.TestCase):
         with self.case() as (d, t, r, e, c, row, scan, *_):
             scan.return_value = [row, dict(row, pid=777)]
             self.assertEqual(d._live_claude_process_label(t, c)['agent_kind'], 'unknown')
+
+    def test_unrelated_surface_does_not_build_an_input_proof(self):
+        with self.case() as (d, t, r, e, c, row, scan, process, *_):
+            records = w.display_surface_records.side_effect
+            foreign = dict(row, pid=777, surface_id='other-surface')
+            scan.return_value = [row, foreign]
+            process.side_effect = lambda pid: row if pid == row['pid'] else foreign
+            other_record = dict(surface_id='other-surface', native_display_target=dict(
+                surface_id='other-surface', workspace_id='other-workspace',
+                pane_id='other-pane', window_id='window-uuid', tty='ttys077'))
+            with mock.patch.object(w, 'display_surface_records', side_effect=lambda tree, values:
+                                   records(tree, values) + [other_record]):
+                live = d._live_claude_process_label(t, c)
+            self.assertEqual(live['agent_pid'], row['pid'])
+            self.assertTrue(process.call_args_list)
+            self.assertTrue(all(call.args == (row['pid'],) for call in process.call_args_list))
 
     def test_pinned_birth_and_tty_changes_are_not_adopted(self):
         for change in ('birth', 'tty'):

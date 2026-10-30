@@ -22,6 +22,12 @@ from tests.test_watch import grid_payload, span
 RESOURCE = ('{"error":{"type":"invalid_request_error","code":null,"message":'
             '"The requested item was created under a different OpenAI resource. '
             'Please use the same resource to access this item."}}')
+MASKED_RESOURCE = json.dumps({'error': {
+    'code': None, 'param': None, 'type': 'invalid_request_error',
+    'message': ('agentrouter-B: OpenAI Responses bad request: The requested item was created under a '
+                'different *** OpenAI resource. Use the same resource that created the item to access it. '
+                '[trace_id=6f2f8ce70b9b3b1a248cb599693747dc]'),
+}})
 STREAM = "stream disconnected before completion: "
 HIGH_DEMAND = "We're currently experiencing high demand, which may cause temporary errors: "
 RATE = '{"error":{"message":"Request limit reached"}}'
@@ -61,6 +67,26 @@ class StructuredProviderEnvelopeTests(unittest.TestCase):
             with self.subTest(prefix=prefix):
                 self.assert_envelope(prefix + RESOURCE, "resource_mismatch", "recoverable_error")
                 self.assertTrue(_retryable_completed_message(prefix + RESOURCE))
+
+    def test_masked_resource_under_http_400_agrees_across_native_queue_and_viewport(self):
+        for body in (RESOURCE, MASKED_RESOURCE):
+            for prefix in ('', STREAM, HIGH_DEMAND, 'unexpected status 400 Bad Request: ',
+                           'HTTP/1.1 400 Bad Request: ', 'unknown status code 400: '):
+                with self.subTest(body=body, prefix=prefix):
+                    message = prefix + body
+                    self.assert_envelope(message, 'resource_mismatch', 'recoverable_error')
+                    self.assertTrue(_retryable_completed_message(message))
+                    self.assertTrue(_retryable_completed_message('\n'.join(
+                        message[i:i + 74] for i in range(0, len(message), 74))))
+
+    def test_resource_http_400_does_not_override_authentication_or_quoted_errors(self):
+        message = 'unexpected status 400 Bad Request: ' + MASKED_RESOURCE
+        for extra in (' unexpected status 401 Unauthorized', ' HTTP 403 Forbidden'):
+            self.assertFalse(_retryable_completed_message(message + extra))
+        for prefix in ('Documentation: ', 'Example: ', 'Quoted: ', 'Sample: '):
+            self.assertIsNone(structured_error_type(prefix + message))
+            self.assertFalse(_retryable_completed_message(prefix + message))
+        self.assertEqual(screen(message, composer='busy').kind, 'composer_busy')
 
     def test_plaintext_deployment_and_balance_block_every_recovery_layer(self):
         for body, expected in ((DEPLOYMENT, 'deployment_not_found'), (BALANCE, 'billing_exhausted')):
@@ -284,6 +310,8 @@ class NativeQueueEnvelopeTests(unittest.TestCase):
             path = root / "session.jsonl"
             recovery = QueueRecovery(root / "queue.json", root / "bindings", root, "任务请继续")
             cases = ((STREAM + RESOURCE, True), (HIGH_DEMAND + RESOURCE, True),
+                     ('unexpected status 400 Bad Request: ' + MASKED_RESOURCE, True),
+                     ('unexpected status 400 Bad Request: ' + MASKED_RESOURCE + ' HTTP 401 Unauthorized', False),
                      (STREAM + DEPLOYMENT, False), (STREAM + BALANCE, False),
                      (STREAM + "unexpected status 429 Too Many Requests: " + RATE, True),
                      (STREAM + "unexpected status 500 Internal Server Error: " + SERVER, True),

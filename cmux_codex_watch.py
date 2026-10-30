@@ -60,7 +60,7 @@ from ccc_native_processes import (
 )
 from ccc_scheduling import CoalescingWriter, SnapshotCache, SnapshotClient, SurfaceScheduler, TreeSnapshot
 from ccc_delivery import DeliveryStore
-from ccc_state_snapshot import AtomicJSONSnapshot
+from ccc_state_snapshot import AtomicJSONSnapshot, RuntimeRecords
 import ccc_jev_unknown as _jev
 from ccc_provider_retry import (
     ProviderRetryStore, RETRYABLE as PROVIDER_RETRYABLE,
@@ -696,6 +696,9 @@ class ScreenState:
     # watchdog prompt.  It prevents the prompt's brief echo from masquerading
     # as new user input that would re-arm the same stop event.
     watchdog_echo: bool = False
+    # A complete live box contains text that is neither the watchdog prompt
+    # nor its settling prefix. Missing/cropped frames never prove a conflict.
+    claude_composer_conflict: bool = False
     claude_context: "ClaudeContextTelemetry | None" = None
     # Native activity is independent of composer ownership: an exact watchdog
     # draft may coexist with Claude's own retry, work or compaction.
@@ -960,6 +963,9 @@ class TargetRuntime:
     claude_submit_fingerprint: str | None = None
     claude_submit_native_identity: dict[str, Any] | None = None
     claude_submit_since: float = 0.0
+    # Confirmation starts at the first returned Enter, independently of the
+    # paste/owner clock. Further Enter retries do not restart this deadline.
+    claude_submit_enter_since: float = 0.0
     claude_submit_last_attempt_at: float = 0.0
     claude_submit_phase: str = "none"
     claude_submit_not_sent: bool = False
@@ -1002,11 +1008,24 @@ class TargetRuntime:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "TargetRuntime":
-        fields = {field.name for field in dataclasses.fields(cls)}
-        return cls(**{key: value[key] for key in fields if key in value})
+        return cls(**{key: value[key] for key in _runtime_field_names(cls) if key in value})
 
     def to_dict(self) -> dict[str, Any]:
-        return dataclasses.asdict(self)
+        # Runtime evidence is JSON data. Scalar fields need no recursive walk;
+        # mutable evidence still belongs to the snapshot, never the live row.
+        snapshot = {}
+        for name in _runtime_field_names(type(self)):
+            value = getattr(self, name)
+            snapshot[name] = value if type(value) in _RUNTIME_SCALARS else copy.deepcopy(value)
+        return snapshot
+
+
+_RUNTIME_SCALARS = frozenset((str, int, float, bool, type(None)))
+
+
+@functools.lru_cache(maxsize=8)
+def _runtime_field_names(cls):
+    return tuple(field.name for field in dataclasses.fields(cls))
 
 
 def _short_hash(value: str) -> str:
@@ -1551,6 +1570,26 @@ def _find_last_error(
     return None
 
 
+def _codex_new_activity_rows(grid: Grid, composer_row: int) -> frozenset[int]:
+    """The complete centered follow-control bar is UI, not a new reply.
+
+    Keep partial notices, transcript prefixes, other positions and additional
+    text blocking. Error and native-turn/input admission remain separate.
+    """
+    text = "New activity · ↓ Back to bottom · esc"
+    column = (grid.columns - len(text)) // 2
+    if column < 2:
+        return frozenset()
+    for row in range(max(0, composer_row - 3), composer_row):
+        line = grid.lines[row]
+        if line.strip() != text or len(line) - len(line.lstrip()) != column:
+            continue
+        if any(grid.lines[i].strip() for i in range(row + 1, composer_row)):
+            continue
+        return frozenset((row,))
+    return frozenset()
+
+
 def _codex_status_chrome_rows(grid: Grid, composer_row: int) -> frozenset[int]:
     """Recognize only the dim background-terminal bar next to the composer.
 
@@ -1963,14 +2002,16 @@ def _claude_faint(grid: Grid, span: Span) -> bool:
 
 
 CLAUDE_COMPOSER_BORDER_RE = re.compile(r"─{8,}")
+CLAUDE_COMPOSER_LABELED_BORDER_RE = re.compile(r"─{8,} ultracode ─")
 
 
 def _claude_composer_box(lines: Sequence[str]) -> tuple[int, int] | None:
     """(top, bottom) border rows of the live Claude composer, or None.
 
     The structural start is a column-0 ``────`` border directly above a
-    column-0 ``❯``; the end is the first later row identical to that border
-    (the same rule as MAC's exact-composer check). Only the live box draws
+    column-0 ``❯``; the end is the first later matching bare rule. Claude
+    2.1.303 can put the exact ``ultracode`` label in the upper rule; its
+    lower rule must still be bare and have the same width. Only the live box draws
     borders, and draft rows carry a two-column gutter, so a pasted ``❯``, rule
     or footer text can never move either boundary. Every row between the
     borders is draft. A missing closing border (cropped viewport) or a
@@ -1979,15 +2020,27 @@ def _claude_composer_box(lines: Sequence[str]) -> tuple[int, int] | None:
 
     for top in range(len(lines) - 2, -1, -1):
         border = lines[top]
-        if not (CLAUDE_COMPOSER_BORDER_RE.fullmatch(border)
-                and lines[top + 1].startswith("❯")):
+        if not lines[top + 1].startswith("❯"):
+            continue
+        if CLAUDE_COMPOSER_BORDER_RE.fullmatch(border):
+            lower = border
+        elif CLAUDE_COMPOSER_LABELED_BORDER_RE.fullmatch(border):
+            lower = "─" * len(border)
+        else:
             continue
         bottom = next((row for row in range(top + 2, len(lines))
-                       if lines[row] == border), None)
+                       if lines[row] == lower), None)
         if bottom is None or any(line.startswith("❯") for line in lines[bottom + 1:]):
             return None
         return top, bottom
     return None
+
+
+def _claude_reply_end(lines: Sequence[str], prompt_row: int) -> int:
+    # Exclude only the structurally proven live upper rule from reply text.
+    # Its label must not hide a completion report or a current API error.
+    box = _claude_composer_box(lines)
+    return box[0] if box is not None and prompt_row == box[0] + 1 else prompt_row
 
 
 def _claude_cursor_inside_composer(grid: Grid, prompt_row: int) -> bool:
@@ -2173,6 +2226,9 @@ def _claude_native_activity(lines: Sequence[str], end: int) -> str | None:
     a subsequent stop. Keep composer ownership separate from this evidence.
     """
 
+    # The proven upper rule can have a label; it is not newer output that
+    # should hide the live spinner or client retry immediately above it.
+    end = _claude_reply_end(lines, end)
     # With the composer hidden, ``end`` includes the configurable statusline.
     # Its tool/MCP counters are not transcript content. Locate the footer by
     # the Claude marker immediately below its rule, rather than whitelisting
@@ -2272,6 +2328,19 @@ def _claude_watchdog_prompt_rows(
     return set()
 
 
+def _claude_active_prompt_text(
+    lines: Sequence[str],
+    prompt_row: int,
+) -> str | None:
+    """Normalized whole live composer, only when both borders are present."""
+    box = _claude_composer_box(lines)
+    if box is None or prompt_row != box[0] + 1:
+        return None
+    first = CLAUDE_PROMPT_RE.sub("", lines[prompt_row].strip(), count=1)
+    pieces = [first] + [line.strip() for line in lines[prompt_row + 1:box[1]]]
+    return _normalise_claude_prompt("".join(pieces))
+
+
 def _claude_active_prompt_is_watchdog(
     lines: Sequence[str],
     prompt_row: int,
@@ -2292,12 +2361,7 @@ def _claude_active_prompt_is_watchdog(
     # row followed by another sender's notice, or a pasted ``❯`` line inside
     # the borders are all draft. A cropped or unbordered composer has no
     # provable end and cannot authorize Enter, whatever its visible prefix.
-    box = _claude_composer_box(lines)
-    if box is None or prompt_row != box[0] + 1:
-        return False
-    first = CLAUDE_PROMPT_RE.sub("", lines[prompt_row].strip(), count=1)
-    pieces = [first] + [line.strip() for line in lines[prompt_row + 1:box[1]]]
-    return _normalise_claude_prompt("".join(pieces)) == target
+    return _claude_active_prompt_text(lines, prompt_row) == target
 
 
 def _claude_last_content_lines(
@@ -2314,7 +2378,7 @@ def _claude_last_content_lines(
 
     nudge_rows = _claude_watchdog_prompt_rows(lines, prompt_row, claude_message)
     collected: list[str] = []
-    for row in range(min(prompt_row, len(lines)) - 1, -1, -1):
+    for row in range(min(_claude_reply_end(lines, prompt_row), len(lines)) - 1, -1, -1):
         text = lines[row].strip()
         if row in nudge_rows:
             if collected:
@@ -2338,7 +2402,7 @@ def _claude_latest_reply(lines, prompt_row, claude_message=CLAUDE_MESSAGE):
     for row in range(min(prompt_row, len(lines))):
         if CLAUDE_PROMPT_RE.match(lines[row].strip()):
             start = row + 1
-    reply = list(lines[start:prompt_row])
+    reply = list(lines[start:_claude_reply_end(lines, prompt_row)])
     while reply and _claude_is_chrome_line(reply[-1]):
         reply.pop()
     # Recaps are UI text after the stopped-turn timer, not assistant output.
@@ -2406,7 +2470,8 @@ def _claude_current_error(grid: Grid, prompt_row: int) -> dict[str, Any] | None:
     Physical wraps may split a word, so reconstruct full-width continuations
     separately from deliberate line breaks before using the Hook classifier.
     """
-    lines = [_CLAUDE_ERROR_ANSI_RE.sub("", line) for line in grid.lines[:prompt_row]]
+    lines = [_CLAUDE_ERROR_ANSI_RE.sub("", line)
+             for line in grid.lines[:_claude_reply_end(grid.lines, prompt_row)]]
     code_rows: set[int] = set()
     fence = None
     for row, line in enumerate(lines):
@@ -2556,6 +2621,8 @@ def classify_claude_grid(grid: Grid, *, claude_message: str = CLAUDE_MESSAGE) ->
             claude_provider_failure=provider_failure,
         )
     if composer_kind == "busy":
+        composer_text = _claude_active_prompt_text(grid.lines, prompt_row)
+        watchdog_text = _normalise_claude_prompt(claude_message)
         return ScreenState(
             "composer_busy",
             screen_signature=signature,
@@ -2567,6 +2634,8 @@ def classify_claude_grid(grid: Grid, *, claude_message: str = CLAUDE_MESSAGE) ->
                 prompt_row,
                 claude_message,
             ),
+            claude_composer_conflict=bool(composer_text and watchdog_text
+                                          and not watchdog_text.startswith(composer_text)),
             claude_context=context,
             claude_native_activity=native_activity,
             claude_provider_failure=provider_failure,
@@ -2699,6 +2768,7 @@ def _codex_error_scan(
     lines = grid.lines
     limit = composer_row if content_end is None else content_end
     chrome_rows = (_codex_status_chrome_rows(grid, composer_row)
+                   | _codex_new_activity_rows(grid, composer_row)
                    | _spinner_chrome_rows(grid, composer_row)
                    | _codex_hook_failure_rows(grid, composer_row)
                    | _codex_startup_notice_rows(grid, composer_row))
@@ -2883,7 +2953,10 @@ def classify_grid(grid: Grid) -> ScreenState:
             or not _is_reconnect_marker(error.block)
         ),
         native_goal_stalled=goal_stalled,
-        requires_goal_proof=bool(error.superseded) or occupied,
+        # A scrolled viewport may hide a newer reply. Require the native EOF
+        # instead of falling back to an unbound legacy screen-only retry.
+        requires_goal_proof=(bool(error.superseded) or occupied
+                             or bool(_codex_new_activity_rows(grid, composer_row))),
         native_goal_only=occupied,
     )
 
@@ -4915,6 +4988,28 @@ class CmuxClient:
             raise CmuxError("top JSON is not an object")
         return value
 
+    def top_for_input(self, workspace_id: str) -> Mapping[str, Any]:
+        """Bound the GUI hint; native surface/TTY proof remains mandatory.
+
+        Use a separate read connection, including inside an admitted input
+        guard, so a timed-out GUI reply cannot corrupt its input socket.
+        """
+        transport = self.viewport_socket
+        if transport is None:
+            return {}
+        timeout = 0.5
+        remaining = self.connected_input_remaining()
+        if remaining is not None:
+            timeout = min(timeout, remaining)
+        try:
+            with transport.connection_window(timeout) as budget:
+                value = self._control_rpc_once(
+                    "system.top", {"workspace_id": workspace_id, "include_processes": True},
+                    timeout=budget)
+            return value if isinstance(value, Mapping) else {}
+        except (OSError, CmuxError):
+            return {}
+
     # 全机进程表一次读：进程多时 cmux 要十几秒才返回。8 s 默认时限让 discovery 连续失败、
     # 新会话进不了监控（2026-10-19 实测 6–16 s）。只放宽这一个只读请求；每个请求独占连接。
     TOP_ALL_TIMEOUT_SEC = 30.0
@@ -6442,7 +6537,10 @@ class WatchDaemon:
         from ccc_private_check import PrivateChecks
         self.private_checks = PrivateChecks(config_path, self.codex_queue_recovery.sessions_root)
         jev_key_path = self.config_path.parent / 'typesafe-api-key'
-        self.jev_classifier = _jev.JevUnknownClassifier(key_path=jev_key_path) if _jev.enabled(jev_key_path) else None
+        self.jev_classifier = (_jev.JevUnknownClassifier(
+            key_path=jev_key_path, daemon_threads=getattr(self, '_jev_daemon_threads', True),
+            start=getattr(self, '_jev_daemon_threads', True))
+            if _jev.enabled(jev_key_path) else None)
         self.network = network_health.NetworkClient()
         if hook_settings_manager is not None:
             self.claude_hook_settings = hook_settings_manager
@@ -6494,7 +6592,7 @@ class WatchDaemon:
         self._config_mtime_ns = self._config_mtime()
         self.config = self._load_config_at_startup()
         self._observation_policy = ObservationPolicy(self.config)
-        self.runtime: dict[str, TargetRuntime] = self._load_runtime()
+        self.runtime: dict[str, TargetRuntime] = RuntimeRecords(self._load_runtime())
         self._live_claude_hook_epoch = object()
         self._clear_stale_runtime_pause_reasons()
         self.dynamic_targets: dict[str, dict[str, Any]] = {}
@@ -6897,6 +6995,8 @@ class WatchDaemon:
         # F2 重置点之三：人工重新 arm 是明确的"再试一次"授权，孤儿 Enter
         # 预算随之归零。只在 非armed→armed 的边沿触发，普通配置刷新不重置。
         if previous_mode != "armed" and str(reloaded.get("mode", "")) == "armed":
+            if isinstance(self.runtime, RuntimeRecords):
+                self.runtime.touch_all()
             for runtime in self.runtime.values():
                 runtime.claude_orphan_enter_count = 0
                 runtime.claude_orphan_enter_at = 0.0
@@ -7101,13 +7201,14 @@ class WatchDaemon:
                 # stays unknown, even when the global inventory is complete.
                 owner = self._observation_owner_alive(runtime)
             owners[sid] = owner
-        if monitoring_config_key(config) != monitoring_config_key(self.config):
+        config_key = monitoring_config_key(config)
+        if config_key != monitoring_config_key(self.config):
             return
         with self._metadata_lock:
             self._observation_metadata = {"records": records, "labels": labels, "terminals": terminals,
                                           "owners": owners, "observed_at": metadata_at,
                                           "hook_inspections": inspections, "inventory_complete": inventory_complete,
-                                          "config_key": monitoring_config_key(config)}
+                                          "config_key": config_key}
         self._request_health_publish()
 
     def _request_health_publish(self):
@@ -7134,7 +7235,8 @@ class WatchDaemon:
         records, labels = metadata.get("records", {}), metadata.get("labels", {})
         terminals, owners = metadata.get("terminals", {}), metadata.get("owners", {})
         metadata_at = float(metadata.get("observed_at") or 0)
-        metadata_matches = metadata.get("config_key") == monitoring_config_key(config)
+        config_key = monitoring_config_key(config)
+        metadata_matches = metadata.get("config_key") == config_key
         now = time.time()
         stale_after = max(30.0, 3 * float(config.get("poll_interval_sec", 1)))
         rows = []
@@ -7154,7 +7256,7 @@ class WatchDaemon:
                 state, list(records.values()), labels, {str(t["surface_id"]): t for t in targets},
                 lambda pid: metadata.get("hook_inspections", {}).get(pid, {}), config,
             )
-        snapshot = {"version": 1, "config_key": monitoring_config_key(config), "rows": rows,
+        snapshot = {"version": 1, "config_key": config_key, "rows": rows,
                     "observed_at": now, "monitored_targets": [
                         {k: t[k] for k in ("surface_id", "workspace_id", "enabled", "paused") if k in t}
                         for t in targets],
@@ -7601,13 +7703,15 @@ class WatchDaemon:
         try:
             tree = client.tree()
             records = display_surface_records(tree, main_surface_records(tree))
+            records = [record for record in records
+                       if record.get("surface_id") == str(target["surface_id"])]
             augmented = display_process_labels(
                 records, labels, top or {}, processes=self._native_agent_processes(wait=False))
             return surface_process_label(augmented, target)
         except (CmuxError, OSError, ValueError, TypeError, RuntimeError):
             return surface_process_label(labels, target)
 
-    def _live_claude_process_label(self, target, client, *, pinned=None, allow_unpinned=True):
+    def _live_claude_process_label(self, target, client, *, pinned=None, allow_unpinned=True, tree=None):
         """Fresh topology + process proof; a cache never grants terminal input.
 
         Empty cmux process arrays are incomplete observations on newer cmux.
@@ -7617,7 +7721,7 @@ class WatchDaemon:
         topology proof; no proof is manufactured for an old unknown write.
         """
         base = client.client if isinstance(client, SnapshotClient) else client
-        tree = base.tree()
+        tree = base.tree() if tree is None else tree
         record = find_main_surface(tree, str(target["surface_id"]))
         unknown = {"agent_kind": "unknown", "summary": "live Claude identity unverified"}
         # Explicit surface targets persist pane_id only for display. cmux may
@@ -7640,19 +7744,26 @@ class WatchDaemon:
                 or (not live_pane and target.get("pane_id")
                     and record.get("pane_id") != target["pane_id"])):
             return unknown
-        top = base.top(str(target["workspace_id"]))
-        labels = classify_surface_processes(top)
-        live = surface_process_label(labels, target)
-        if live.get("identity_conflicts"):
-            return unknown
         records = display_surface_records(tree, main_surface_records(tree))
-        gui_claude = live.get("agent_kind") == "claude"
         native_target_available = any(
             item.get("surface_id") == str(target["surface_id"])
             and isinstance(item.get("native_display_target"), Mapping)
             and item["native_display_target"].get("tty")
             for item in records
         )
+        reader = (getattr(base, "top_for_input", base.top)
+                  if native_target_available else base.top)
+        try:
+            top = reader(str(target["workspace_id"]))
+        except CmuxError:
+            if not native_target_available:
+                raise
+            top = {}
+        labels = classify_surface_processes(top)
+        live = surface_process_label(labels, target)
+        if live.get("identity_conflicts"):
+            return unknown
+        gui_claude = live.get("agent_kind") == "claude"
         # A new explicit/workspace-auto transaction may follow this same UUID
         # into its live pane. Carry a complete native proof through Text and
         # delayed Enter; a bare GUI label cannot prove the original topology
@@ -7684,8 +7795,12 @@ class WatchDaemon:
         # Even after top recovers, retain the pinned native process and unique
         # surface/TTY join instead of falling back to second-resolution birth.
         raw_recovered = gui_claude
+        # The fresh scan still includes every process on this surface, including
+        # duplicate and foreign-TTY candidates. Do not build unrelated proofs
+        # while holding this surface's input lease.
         native = surface_process_label(display_process_labels(
-            records, {} if raw_recovered else labels, {} if raw_recovered else top,
+            [item for item in records if item.get("surface_id") == str(target["surface_id"])],
+            {} if raw_recovered else labels, {} if raw_recovered else top,
             agent_kind="claude"), target)
         proof = native.get("native_identity")
         if gui_claude and (not proof or native.get("agent_kind") != "claude"
@@ -8175,10 +8290,12 @@ class WatchDaemon:
 
         def replay_claude() -> ScreenState:
             try:
-                current_grid = grid or Grid.from_rpc(
-                    client.replay(str(target["workspace_id"]), str(target["surface_id"])),
+                # Claude input belongs to the live terminal screen. A scrolled
+                # viewport can contain an old reply without its composer.
+                current_grid = (grid if grid is not None and grid.raw.get("anchor") == "screen" else Grid.from_rpc(
+                    client.replay(str(target["workspace_id"]), str(target["surface_id"]), live=True),
                     str(target["surface_id"]),
-                )
+                ))
                 state = classify_claude_grid(
                     current_grid,
                     claude_message=str(self.config.get("claude_message") or CLAUDE_MESSAGE),
@@ -8286,7 +8403,35 @@ class WatchDaemon:
 
     def _save_now(self) -> None:
         with self._state_save_lock:
-            self._state_snapshot.write(self._runtime_snapshot())
+            records = self.runtime
+            generation, candidates = (records.publication()
+                                     if isinstance(records, RuntimeRecords) else (None, ()))
+            if (not isinstance(records, RuntimeRecords)
+                    or getattr(self, "_published_runtime_records", None) is not records
+                    or getattr(self, "_published_runtime_removals", None) != generation):
+                # The first publication includes restored delivery/provider
+                # evidence. Deletions and replacement catalogs also need a
+                # complete snapshot; never trim historical recovery records.
+                self._state_snapshot.write(self._runtime_snapshot())
+                self._published_runtime_records = records
+                self._published_runtime_removals = generation
+            else:
+                # Candidates survive every write: a worker may retain a runtime
+                # reference or mutate its nested evidence between heartbeats.
+                self._state_snapshot.update(self._runtime_snapshot(candidates))
+
+    def _save_claude_surface(self, surface_id: str, runtime: TargetRuntime) -> None:
+        # Claude's original transaction, identity, UNKNOWN flags and key budget
+        # must all reach the same recovery file before this surface proceeds.
+        # Do not queue an O(fleet) snapshot at every text/key boundary. This
+        # writer shares the snapshot lock and both durable fsync barriers with
+        # complete background publications, retaining all other UUID records.
+        if not surface_id:
+            raise RuntimeError("Claude persistence requires its original surface")
+        with self._state_save_lock:
+            if isinstance(self.runtime, RuntimeRecords):
+                self.runtime.touch(surface_id)
+            self._state_snapshot.update({surface_id: runtime.to_dict()})
 
     def request_stop(self, *_: Any) -> None:
         self.stop_requested = True
@@ -8758,14 +8903,7 @@ class WatchDaemon:
         batch_reconciler = BatchReconciler(self.config_path, self._observation_client())
         batch_reconciler.start()
         last_publish = 0.0
-        previous_switch_interval = sys.getswitchinterval()
         try:
-            # Viewport decoding and metadata work contend with the deadline
-            # thread for the GIL. With dozens of ready workers, CPython's
-            # default 5 ms slice can leave the scheduler waiting hundreds of
-            # milliseconds after a stat/condition wait. Bound each slice in
-            # this daemon only; do not change the user's polling cadence.
-            sys.setswitchinterval(min(previous_switch_interval, 0.001))
             while not self.stop_requested:
                 scheduler.wakeup.clear()
                 if not capabilities_ok and not client.ping():
@@ -8825,7 +8963,6 @@ class WatchDaemon:
                 scheduler.wakeup.wait(scheduler.wait_timeout())
             return 0
         finally:
-            sys.setswitchinterval(previous_switch_interval)
             if self.jev_classifier is not None:
                 self.jev_classifier.stop()
             batch_reconciler.close()
@@ -9005,6 +9142,39 @@ class WatchDaemon:
                 if reconcile_detail_calls is not None:
                     reconcile_detail_calls[name] = reconcile_detail_calls.get(name, 0) + 1
 
+        def empty_working_claude_frame():
+            return (state.kind in {"working", "menu"}
+                    and state.message_kind != "codex"
+                    and self._runtime_is_claude(runtime, state)
+                    and not runtime.claude_supervisor_wait)
+
+        def needs_submit_reconciliation():
+            # The base runtime guards just observed this frame. Working/menu
+            # with no transaction or orphan has no input to reconcile. Keep
+            # the original guarded methods for every retained input or wait.
+            return not (
+                empty_working_claude_frame()
+                and runtime.claude_submit_phase == "none"
+                and not runtime.claude_submit_event_id
+                and not runtime.claude_submit_write_unknown
+                and not runtime.claude_handshake_wait
+                and not self._legacy_claude_report_latch(runtime)
+                and not runtime.claude_orphan_enter_count
+                and not state.watchdog_echo
+            )
+
+        def needs_deferred_reconciliation():
+            return bool(runtime.claude_deferred_event) or not empty_working_claude_frame()
+
+        def needs_hook_gap_reconciliation():
+            # A stopped/unknown frame still runs the original guard, as does
+            # an existing candidate whose reset or preservation matters.
+            return (not empty_working_claude_frame()
+                    or bool(runtime.claude_fallback_candidate_fingerprint)
+                    or bool(runtime.claude_fallback_candidate_polls)
+                    or bool(runtime.claude_fallback_candidate_generation)
+                    or bool(runtime.claude_fallback_attempt_token))
+
         @contextlib.contextmanager
         def surface_locked():
             started, acquired = time.monotonic() if observation_timings is not None else 0.0, False
@@ -9086,16 +9256,16 @@ class WatchDaemon:
                 if self._runtime_is_claude(runtime, state) and not measured_reconcile(
                         "fresh_authorization", current, fresh=True):
                     return None
-                if measured_reconcile("claude_submit",
+                if needs_submit_reconciliation() and measured_reconcile("claude_submit",
                         self._reconcile_claude_submit, target, runtime, state, client):
                     return
                 measured_reconcile("restore_unsent_deferred",
                     self._restore_unsent_claude_deferred, target, runtime, state)
                 measured_reconcile("restore_deferred", self._restore_expired_claude_deferred, runtime)
-                if measured_reconcile("deferred_stop",
+                if needs_deferred_reconciliation() and measured_reconcile("deferred_stop",
                         self._maybe_send_deferred_claude_stop, target, runtime, state, client):
                     return
-                if self._runtime_is_claude(runtime, state) and measured_reconcile(
+                if self._runtime_is_claude(runtime, state) and needs_hook_gap_reconciliation() and measured_reconcile(
                     "hook_gap_fallback", self._maybe_send_claude_hook_gap_fallback,
                     target, runtime, state, observation, client,
                 ):
@@ -9200,16 +9370,16 @@ class WatchDaemon:
                         if self._runtime_is_claude(runtime, state) and not measured_reconcile(
                                 "fresh_authorization", current, fresh=True):
                             return None
-                        if measured_reconcile("claude_submit",
+                        if needs_submit_reconciliation() and measured_reconcile("claude_submit",
                                 self._reconcile_claude_submit, target, runtime, state, client):
                             return
                         measured_reconcile("restore_unsent_deferred",
                             self._restore_unsent_claude_deferred, target, runtime, state)
                         measured_reconcile("restore_deferred", self._restore_expired_claude_deferred, runtime)
-                        if measured_reconcile("deferred_stop",
+                        if needs_deferred_reconciliation() and measured_reconcile("deferred_stop",
                                 self._maybe_send_deferred_claude_stop, target, runtime, state, client):
                             return
-                        if self._runtime_is_claude(runtime, state) and measured_reconcile(
+                        if self._runtime_is_claude(runtime, state) and needs_hook_gap_reconciliation() and measured_reconcile(
                             "hook_gap_fallback", self._maybe_send_claude_hook_gap_fallback,
                             target, runtime, state, observation, client,
                         ):
@@ -10018,6 +10188,7 @@ class WatchDaemon:
     def _claude_provider_guard_reason(
         self, target: Mapping[str, Any] | None, runtime: TargetRuntime,
         state: ScreenState | None = None, *, event: Mapping[str, Any] | None = None,
+        orphan_recovery: bool = False,
     ) -> str:
         if not target:
             return ""
@@ -10043,16 +10214,19 @@ class WatchDaemon:
         guard = self._sync_claude_provider_guard(surface_id, runtime)
         if event is None and guard and float(guard.get("release_created_at") or 0) > 0:
             submit_id = str(runtime.claude_submit_event_id or "")
-            if submit_id or (state and state.watchdog_echo):
+            if submit_id or (orphan_recovery and state is not None and state.watchdog_echo):
                 with self.claude_event_ledger._lock:
                     event = {**self.claude_event_ledger.events.get(submit_id, {}), "event_id": submit_id}
         # Do not race a crash-left, identity-compatible native rejection claim.
         # Journal replay must revalidate it; it is not release authority.
         migrated_claim_source = self._claude_provider_migrated_claim_source(target, runtime, guard)
         with self.claude_event_ledger._lock:
+            # Only handling StopFailure rows can be pending provider claims.
+            # Keep identity checks before the error-kind membership test.
             pending = any(
                 claim_id != migrated_claim_source
-                and self.claude_event_ledger.provider_claim_pending(row)
+                and row.get("status") == "handling"
+                and row.get("event_name") == "StopFailure"
                 and row.get("surface_id") == surface_id
                 and row.get("workspace_id") == target.get("workspace_id")
                 and row.get("session_id") == runtime.claude_session_id
@@ -10063,6 +10237,7 @@ class WatchDaemon:
                 and math.isfinite(row["created_at"])
                 and max(runtime.claude_turn_started_at, runtime.claude_last_hook_at)
                     <= row["created_at"] <= time.time() + 1
+                and self.claude_event_ledger.provider_claim_pending(row)
                 for claim_id, row in self.claude_event_ledger.events.items()
             )
         if guard and guard.get("status") == "blocked":
@@ -10415,7 +10590,7 @@ class WatchDaemon:
         # Keep read-screen in the preflight: it is viewport-only and proves the
         # target still resolves before the larger render-grid RPC.
         client.read_screen(workspace_id, surface_id)
-        grid = Grid.from_rpc(client.replay(workspace_id, surface_id), surface_id)
+        grid = Grid.from_rpc(client.replay(workspace_id, surface_id, live=True), surface_id)
         composer_kind, _ = _claude_composer_state(grid)
         state = classify_claude_grid(
             grid,
@@ -10464,6 +10639,7 @@ class WatchDaemon:
 
         deferred = runtime.claude_deferred_event or {}
         held = str(deferred.get("event_id") or "")
+        deferred_since = runtime.claude_deferred_since
         waited = max(0.0, time.time() - runtime.claude_deferred_since) if held else 0.0
         parked_reason = runtime.claude_deferred_reason or ""
         runtime.claude_deferred_event = None
@@ -10483,7 +10659,29 @@ class WatchDaemon:
             current = str(row.get("status") or "")
             archived = any(isinstance(row.get(key), Mapping) for key in (
                 "provider_superseded_submission", "provider_native_receipt"))
-        final = current
+            final = current
+            guard = self.claude_event_ledger.provider_guard(str(deferred.get("surface_id") or ""))
+            # A later send already covered this retry. Retire only its original
+            # row, retaining the provider hold and every delivery archive. A
+            # timestamp alone is not evidence of provider recovery.
+            if (current == "provider_retry_wait" and not archived
+                    and parked_reason == "provider_retry_wait"
+                    and reason == "covered_by_later_send"
+                    and runtime.last_send_at > deferred_since > 0
+                    and guard and guard.get("status") == "retry_wait"
+                    and (guard.get("retry_event") or {}).get("event_id") == held
+                    and all(row.get(key) and row.get(key) == deferred.get(key) == guard.get(key)
+                            for key in ("surface_id", "workspace_id", "session_id", "agent_pid", "process_generation"))
+                    and row.get("session_id") == runtime.claude_session_id
+                    and row.get("agent_pid") == runtime.claude_process_pid
+                    and row.get("process_generation") == runtime.claude_process_generation):
+                final = "deferred_cleared"
+                events = {**self.claude_event_ledger.events, held: {
+                    **row, "status": final,
+                    "detail": f"parked={parked_reason} released={reason} waited_sec={waited:.0f}",
+                }}
+                self.claude_event_ledger._write(events)
+                self.claude_event_ledger.events = events
         if current.startswith("deferred_") and not archived:
             # ``undeferrable: <detail>`` embeds the cancel detail, so it cannot
             # be a dict key; it and any future reason both mean "not retried".
@@ -11269,6 +11467,7 @@ class WatchDaemon:
         runtime.claude_submit_fingerprint = None
         runtime.claude_submit_native_identity = None
         runtime.claude_submit_since = 0.0
+        runtime.claude_submit_enter_since = 0.0
         runtime.claude_submit_last_attempt_at = 0.0
         runtime.claude_submit_phase = "none"
         runtime.claude_submit_attempts = 0
@@ -11322,7 +11521,7 @@ class WatchDaemon:
                 self.claude_event_ledger.mark(event, "sent")
         if (runtime.claude_deferred_event or {}).get("event_id") == event_id:
             self._clear_claude_deferred(runtime, reason="sent")
-        self.save()
+        self._save_claude_surface(str(event["surface_id"]), runtime)
 
 
     def _native_claude_supervisor_wait(self, target, runtime, identity, event):
@@ -11516,7 +11715,7 @@ class WatchDaemon:
         except (OSError, ValueError) as exc:
             raise DeliveryLeaseError(f"shared delivery lock unverifiable: {exc}") from exc
 
-    def _acquire_claude_delivery(self, target, runtime, client) -> bool:
+    def _acquire_claude_delivery(self, target, runtime, client, *, tree=None) -> bool:
         """Join MAC's deliveries-v1 pane→target lease, without waiting.
 
         Identity comes from a fresh tree, never a cached pane ref. These exact
@@ -11528,7 +11727,7 @@ class WatchDaemon:
         stack = None
         try:
             base = client.client if isinstance(client, SnapshotClient) else client
-            record = find_main_surface(base.tree(), str(target["surface_id"]))
+            record = find_main_surface(base.tree() if tree is None else tree, str(target["surface_id"]))
             if (record.get("workspace_id") != target["workspace_id"]
                     or not record.get("pane_id")):
                 raise InputNotSentError("shared delivery identity unavailable")
@@ -11644,8 +11843,12 @@ class WatchDaemon:
             if input_check is None:
                 expected_pid = runtime.claude_process_pid
                 expected_generation = runtime.claude_process_generation
+                recovery_identity = copy.deepcopy(runtime.claude_submit_native_identity)
+                orphan_recovery = (submit_phase == "none" and not submit_id
+                                   and reason == "orphan_watchdog_echo")
 
                 def input_check():
+                    nonlocal recovery_identity
                     current = self._active_send_target(target)
                     if (current != target or self.stop_requested or self.config.get("mode") != "armed"
                             or self.config.get("global_paused") or not self.config.get("claude_enabled")
@@ -11654,12 +11857,20 @@ class WatchDaemon:
                         return False
                     record = find_main_surface(base.tree(), surface_id)
                     live = self._live_claude_process_label(
-                        target, base, pinned=runtime.claude_submit_native_identity, allow_unpinned=False)
+                        target, base, pinned=recovery_identity,
+                        allow_unpinned=orphan_recovery and recovery_identity is None)
                     identity = self._claude_send_process_identity(expected_pid)
-                    return (record.get("workspace_id") == target["workspace_id"]
+                    valid = (record.get("workspace_id") == target["workspace_id"]
                             and live.get("agent_kind") == "claude" and live.get("agent_pid") == expected_pid
                             and bool(identity.get("started_epoch"))
                             and identity.get("generation") == expected_generation)
+                    if (valid and orphan_recovery and recovery_identity is None
+                            and live.get("native_identity") is not None):
+                        # A fresh recovery observation is not a retrospective
+                        # pin for the expired transaction. Retain it locally for
+                        # every exact-composer and connected key recheck.
+                        recovery_identity = copy.deepcopy(live.get("native_identity"))
+                    return valid
 
             identity_check = input_check
 
@@ -11681,7 +11892,7 @@ class WatchDaemon:
                 if (runtime.claude_submit_message_hash
                         and runtime.claude_submit_message_hash != _short_hash(message)):
                     raise InputNotSentError('Claude pending message configuration changed')
-                frame = Grid.from_rpc(base.replay(str(target["workspace_id"]), surface_id), surface_id)
+                frame = Grid.from_rpc(base.replay(str(target["workspace_id"]), surface_id, live=True), surface_id)
                 state = classify_claude_grid(frame, claude_message=message)
                 if self._claude_provider_guard_reason(target, runtime, state, event=submit):
                     return False
@@ -11723,7 +11934,7 @@ class WatchDaemon:
                 runtime.claude_submit_not_sent = False
                 runtime.claude_submit_write_unknown = True
                 write_intent = True
-                self.save()
+                self._save_claude_surface(str(target["surface_id"]), runtime)
                 # Last local step before the key bytes: the same lock inodes
                 # must still be ours. The connected input_guard repeats it.
                 self._verify_claude_delivery_lease()
@@ -11758,14 +11969,14 @@ class WatchDaemon:
                 runtime.claude_submit_last_reason = f"enter not sent: {exc}"
             for key, value in previous_echo.items():
                 setattr(runtime, key, value)
-            self.save()
+            self._save_claude_surface(str(target["surface_id"]), runtime)
             self.logger.info("surface=%s Claude Enter withheld: %s", surface_id[:8], exc)
             return False
         except (CmuxError, RuntimeError, OSError, ValueError, TypeError) as exc:
             if not owns_submit():
                 return False
             runtime.claude_submit_last_reason = f"enter failed: {exc}"
-            self.save()
+            self._save_claude_surface(str(target["surface_id"]), runtime)
             self.logger.warning(
                 "surface=%s Claude submit Enter failed phase=%s reason=%s",
                 surface_id[:8], runtime.claude_submit_phase, reason,
@@ -11777,6 +11988,8 @@ class WatchDaemon:
         runtime.claude_submit_write_unknown = False
         runtime.claude_submit_not_sent = False
         runtime.claude_submit_phase = "enter_sent"
+        if not runtime.claude_submit_enter_since:
+            runtime.claude_submit_enter_since = now
         runtime.claude_submit_last_attempt_at = now
         runtime.claude_submit_attempts += 1
         runtime.claude_last_event_status = "submitted"
@@ -11816,7 +12029,7 @@ class WatchDaemon:
 
         if self._claude_supervisor_wait_guard(target, runtime):
             return True
-        if self._claude_provider_guard_reason(target, runtime, state):
+        if self._claude_provider_guard_reason(target, runtime, state, orphan_recovery=True):
             return True
 
         if runtime.claude_handshake_wait:
@@ -11879,10 +12092,10 @@ class WatchDaemon:
             runtime.claude_submit_last_reason,
         )
         entered = self._send_claude_enter(target, runtime, client, reason="orphan_watchdog_echo")
-        if not entered and self._claude_provider_guard_reason(target, runtime, state):
+        if not entered and self._claude_provider_guard_reason(target, runtime, state, orphan_recovery=True):
             runtime.claude_orphan_enter_at = previous_orphan_at
             runtime.claude_orphan_enter_count = previous_orphan_count
-            self.save()
+            self._save_claude_surface(str(target["surface_id"]), runtime)
             return True
         if not entered and getattr(self._claude_delivery_local, "lease_fault", None) is not None:
             # A lease fault (replaced/busy lock inside the Enter path) pressed
@@ -11890,7 +12103,18 @@ class WatchDaemon:
             runtime.claude_orphan_enter_at = previous_orphan_at
             runtime.claude_orphan_enter_count = previous_orphan_count
             runtime.state = "claude_delivery_wait"
-            self.save()
+            self._save_claude_surface(str(target["surface_id"]), runtime)
+            return True
+        if (not entered and runtime.claude_submit_not_sent
+                and not runtime.claude_submit_write_unknown
+                and runtime.claude_submit_last_attempt_at >= now
+                and runtime.claude_submit_last_reason.startswith("enter not sent: ")):
+            # Typed InputNotSentError proves this key never left our process.
+            # Keep the retry timestamp, original owner and every earlier budget
+            # entry; a guard refusal cannot consume a new actual-key attempt.
+            runtime.claude_orphan_enter_count = previous_orphan_count
+            runtime.state = "claude_submit_pending"
+            self._save_claude_surface(str(target["surface_id"]), runtime)
             return True
         runtime.state = "claude_orphan_enter"
         return True
@@ -11911,6 +12135,20 @@ class WatchDaemon:
         """
 
         if self._claude_supervisor_wait_guard(target, runtime):
+            return True
+        if (not runtime.claude_handshake_wait and not self._legacy_claude_report_latch(runtime)
+                and runtime.claude_submit_phase == "enter_sent"
+                and not runtime.claude_submit_event_id
+                and not runtime.claude_submit_write_unknown
+                and runtime.claude_last_submit_at > 0
+                and runtime.claude_last_submit_session_id == runtime.claude_session_id
+                and runtime.claude_last_submit_generation == runtime.claude_process_generation
+                and state.claude_native_activity != "queued"
+                and state.kind in {"working", "menu"} and not state.watchdog_echo):
+            # A returned orphan key has no ledger event to confirm. Release
+            # only its pending slot; retain the original key evidence/budget
+            # and do not invent a native receipt or cover a deferred Stop.
+            self._clear_claude_submit(runtime, reason="orphan_composer_consumed")
             return True
         if self._claude_provider_guard_reason(target, runtime, state):
             return True
@@ -11968,27 +12206,23 @@ class WatchDaemon:
             # A queue is not an execution receipt or a reason to type again.
             runtime.state = "claude_submit_unconfirmed"
             return True
-        if state.claude_native_activity and runtime.claude_submit_phase == "text_written":
-            # Native activity may hide the composer without consuming our
-            # draft. Preserve the event and text; neither confirm nor expire
-            # an Enter that has never been sent.
+        if (runtime.claude_submit_phase == "text_written"
+                and runtime.claude_submit_attempts == 0
+                and not state.claude_native_activity and state.claude_composer_conflict
+                and runtime.claude_submit_message_hash == _short_hash(
+                    str(self.config.get("claude_message") or CLAUDE_MESSAGE))):
+            self._clear_claude_submit(runtime, reason="user_input_conflict")
+            runtime.state = "composer_busy"
+            return True
+        if runtime.claude_submit_phase == "text_written" and (
+                state.claude_native_activity
+                or (runtime.claude_submit_attempts == 0 and not state.watchdog_echo)):
+            # Activity or an unsettled viewport may hide our unsent draft.
+            # Preserve its owner and clock; a missing echo is no evidence that
+            # a confirmation deadline has started before the first Enter.
             runtime.claude_submit_not_sent = True
             runtime.state = "claude_submit_pending"
             return True
-        age = max(0.0, now - runtime.claude_submit_since)
-        timeout = float(self.config.get(
-            "claude_submit_confirm_timeout_sec", CLAUDE_SUBMIT_CONFIRM_TIMEOUT_SEC,
-        ))
-        if age >= timeout and not runtime.claude_submit_not_sent:
-            self.logger.warning(
-                "surface=%s Claude submit confirmation timeout event=%s attempts=%d",
-                surface_id[:8], str(runtime.claude_submit_event_id)[:8],
-                runtime.claude_submit_attempts,
-            )
-            self._clear_claude_submit(runtime, reason="confirmation_timeout")
-            runtime.state = "claude_submit_unconfirmed"
-            return True
-
         # Once Claude has left the composer, the explicit Enter was accepted.
         # Working/menu are both valid post-submit states; Hook events provide a
         # stronger confirmation asynchronously but are not required for the
@@ -12001,6 +12235,29 @@ class WatchDaemon:
                 surface_id[:8], state.kind, str(runtime.claude_submit_event_id)[:8],
             )
             self._clear_claude_submit(runtime, reason="confirmed")
+            return True
+
+        confirmation_since = runtime.claude_submit_since
+        if runtime.claude_submit_phase == "enter_sent":
+            if not runtime.claude_submit_enter_since:
+                # Adopt a legacy pending transaction once; subsequent retries
+                # keep this anchor rather than extending its confirmation wait.
+                runtime.claude_submit_enter_since = (
+                    runtime.claude_submit_last_attempt_at or runtime.claude_submit_since)
+            confirmation_since = runtime.claude_submit_enter_since
+        age = max(0.0, now - confirmation_since)
+        timeout = float(self.config.get(
+            "claude_submit_confirm_timeout_sec", CLAUDE_SUBMIT_CONFIRM_TIMEOUT_SEC,
+        ))
+        if (age >= timeout and not runtime.claude_submit_not_sent
+                and not (runtime.claude_submit_phase == "text_written" and state.watchdog_echo)):
+            self.logger.warning(
+                "surface=%s Claude submit confirmation timeout event=%s attempts=%d",
+                surface_id[:8], str(runtime.claude_submit_event_id)[:8],
+                runtime.claude_submit_attempts,
+            )
+            self._clear_claude_submit(runtime, reason="confirmation_timeout")
+            runtime.state = "claude_submit_unconfirmed"
             return True
 
         if state.kind == "composer_busy" and not state.watchdog_echo:
@@ -12154,17 +12411,21 @@ class WatchDaemon:
                     ):
                         return False
                     _guard_trace.step('tree_lookup')
-                    record = find_main_surface(base.tree(), surface_id)
+                    # One fresh topology per check; never reuse it across
+                    # live_initial, live_final or an actual input operation.
+                    current_tree = base.tree()
+                    record = find_main_surface(current_tree, surface_id)
                     _guard_trace.detail['expected_workspace'] = target.get('workspace_id')
                     _guard_trace.detail['observed_workspace'] = record.get('workspace_id')
                     _guard_trace.detail['configured_pane'] = target.get('pane_id')
                     _guard_trace.detail['observed_pane'] = record.get('pane_id')
                     if _guard_trace.step('workspace_changed') and record.get('workspace_id') != target['workspace_id']:
                         return False
-                    if _guard_trace.step('delivery_lease') and (not self._acquire_claude_delivery(target, runtime, client)):
+                    if _guard_trace.step('delivery_lease') and (not self._acquire_claude_delivery(target, runtime, client, tree=current_tree)):
                         return False
                     _guard_trace.step('live_process_label')
-                    live = self._live_claude_process_label(target, base, pinned=pinned_native_identity, allow_unpinned=False)
+                    live = self._live_claude_process_label(target, base, pinned=pinned_native_identity,
+                                                          allow_unpinned=False, tree=current_tree)
                     if (
                         _guard_trace.step('live_agent_kind')
                         and live.get('agent_kind') != 'claude'
@@ -12263,19 +12524,28 @@ class WatchDaemon:
         # expensive than it is and hid disk latency entirely.
         self.claude_event_ledger.mark(event, "reserved", detail="before cmux send")
         _submit_stage("ledger_reserve_ms")
-        self.save()
+        self._save_claude_surface(str(target["surface_id"]), runtime)
         _submit_stage("persist_reserve_ms")
         if not available_for_submit():
             return False, "Claude submit owner changed before transaction initialization"
         message = str(self.config.get("claude_message") or CLAUDE_MESSAGE)
         def text_input_check():
             with _ClaudeInputGuardTrace(self.logger, surface_id, str(event.get('event_id') or ''), 'text') as _guard_trace:
-                if _guard_trace.step('live_initial') and (not live_input_check()):
-                    return False
                 _guard_trace.step('replay')
-                frame = Grid.from_rpc(base.replay(str(target['workspace_id']), surface_id), surface_id)
+                frame = Grid.from_rpc(base.replay(str(target['workspace_id']), surface_id, live=True), surface_id)
                 _guard_trace.step('classify')
                 current_state = classify_claude_grid(frame, claude_message=message)
+                # Re-prove the empty composer at this actual write boundary.
+                # A provider error cannot authorize an unparseable input box.
+                # A working or occupied frame can only reject input. Do not
+                # hold the pane lease for a full native scan to learn that.
+                if (_claude_composer_state(frame)[0] != 'empty'
+                        or current_state.kind not in {'claude_stopped', 'recoverable_error'}
+                        or current_state.claude_native_activity):
+                    _guard_trace.step('composer_kind')
+                    return False
+                if _guard_trace.step('live_initial') and (not live_input_check()):
+                    return False
                 if _guard_trace.step('provider_guard_screen') and self._claude_provider_guard_reason(target, runtime, current_state, event=event):
                     return False
                 _guard_trace.result = (
@@ -12294,6 +12564,7 @@ class WatchDaemon:
         runtime.claude_submit_fingerprint = final.content_fingerprint or final_signature or first_signature
         runtime.claude_submit_native_identity = pinned_native_identity
         runtime.claude_submit_since = time.time()
+        runtime.claude_submit_enter_since = 0.0
         runtime.claude_submit_last_attempt_at = 0.0
         runtime.claude_submit_phase = "text_written"
         runtime.claude_submit_not_sent = False
@@ -12304,7 +12575,7 @@ class WatchDaemon:
         runtime.claude_orphan_enter_at = 0.0
         submit_owner = self._claude_submit_owner(runtime)
         _submit_stage("transaction_init_ms")
-        self.save()
+        self._save_claude_surface(str(target["surface_id"]), runtime)
         text_attempted = False
         try:
             if not text_input_check():
@@ -12314,21 +12585,24 @@ class WatchDaemon:
             with guard:
                 if not owns_submit():
                     raise InputNotSentError("Claude submit owner changed before text")
-                text_attempted = True
                 runtime.claude_submit_write_unknown = True
-                self.save()
+                self._save_claude_surface(str(target["surface_id"]), runtime)
+                text_attempted = True
                 client.send_text(str(target["workspace_id"]), surface_id, message)
             if not owns_submit():
                 return False, "Claude submit owner changed after text"
             runtime.claude_submit_write_unknown = False
-            self.save()
+            self._save_claude_surface(str(target["surface_id"]), runtime)
         except (CmuxError, RuntimeError) as exc:
             if (not isinstance(exc, InputNotSentError)
                     and (text_attempted or runtime.claude_submit_write_unknown)):
                 if not owns_submit():
                     return False, "Claude submit owner changed during text transport"
-                self.save()
-                return False, f"cmux send text failed after reservation: {exc}"
+                detail = ("cmux send text failed after reservation" if text_attempted
+                          else "Claude state persistence failed before text")
+                runtime.claude_submit_last_reason = f"{detail}: {exc}"
+                self._save_claude_surface(str(target["surface_id"]), runtime)
+                return False, f"{detail}: {exc}"
             if not owns_submit():
                 return False, "Claude submit owner changed before text"
             # This branch has proved zero Text input and cannot proceed to
@@ -12380,9 +12654,9 @@ class WatchDaemon:
                     self._defer_claude_event(surface_id, runtime, event, "provider_retry_wait")
                 else:
                     self.claude_event_ledger.mark(event, "provider_blocked", detail=provider_reason)
-                self.save()
+                self._save_claude_surface(str(target["surface_id"]), runtime)
                 return False, provider_reason
-            self.save()
+            self._save_claude_surface(str(target["surface_id"]), runtime)
             return False, f"Claude input not sent: {exc}"
         _submit_stage("text_ms")
         # Close the race with a human typing between the double-frame
@@ -12391,7 +12665,7 @@ class WatchDaemon:
         # transaction pending for the next poll and never press a user's key.
         try:
             verification_grid = Grid.from_rpc(
-                base.replay(str(target["workspace_id"]), surface_id), surface_id,
+                base.replay(str(target["workspace_id"]), surface_id, live=True), surface_id,
             )
             verification_state = classify_claude_grid(
                 verification_grid, claude_message=message,
@@ -12412,7 +12686,7 @@ class WatchDaemon:
             runtime.claude_submit_last_reason = f"submit readback failed: {exc}"
             return False, f"Claude submit readback failed; waiting for confirmation: {exc}"
         _submit_stage("readback_ms")
-        self.save()
+        self._save_claude_surface(str(target["surface_id"]), runtime)
         _submit_stage("persist_pre_enter_ms")
         if not owns_submit():
             return False, "Claude submit owner changed before Enter"
@@ -12429,7 +12703,7 @@ class WatchDaemon:
         _post_stage("finalize_bookkeeping_ms")
         self.claude_event_ledger.mark(event, "sent")
         _post_stage("ledger_finalize_ms")
-        self.save()
+        self._save_claude_surface(str(target["surface_id"]), runtime)
         _post_stage("persist_finalize_ms")
         warning_after = int(self.config.get("claude_repeat_warning_after", CLAUDE_REPEAT_WARNING_AFTER))
         if runtime.claude_consecutive_resumes >= warning_after and not runtime.claude_repeat_warning:
@@ -12445,7 +12719,7 @@ class WatchDaemon:
                 surface_id[:8],
                 runtime.claude_consecutive_resumes,
             )
-            self.save()
+            self._save_claude_surface(str(target["surface_id"]), runtime)
             _post_stage("notify_ms")
         latency = max(0.0, now - float(event.get("created_at") or now))
         inbox_source = str(event.get("_inbox_source") or "socket")
@@ -12963,10 +13237,10 @@ class WatchDaemon:
         reserved event and uses the existing deferred sender. Original journal,
         ledger rows, generation, watermark and consumption records stay intact.
         """
-        if self._claude_provider_guard_reason(self._event_target(surface_id), runtime, state):
-            return False
         if (not runtime.claude_handshake_wait or state.claude_native_activity
                 or state.kind not in {"claude_stopped", "recoverable_error"}):
+            return False
+        if self._claude_provider_guard_reason(self._event_target(surface_id), runtime, state):
             return False
         with self._surface_lock(surface_id):
             challenge = copy.deepcopy(runtime.claude_handshake_challenge)
@@ -13207,11 +13481,6 @@ class WatchDaemon:
         sent derived row wins over a stale state.json after a crash.
         """
 
-        if self._claude_supervisor_wait_guard(self._event_target(surface_id), runtime):
-            return False
-        if self._claude_provider_guard_reason(self._event_target(surface_id), runtime):
-            return False
-
         with self._surface_lock(surface_id):
             source_id = str(runtime.claude_completion_event_id or "")
             if (not self._legacy_claude_report_latch(runtime)
@@ -13219,6 +13488,10 @@ class WatchDaemon:
                     or runtime.claude_submit_phase != "none" or runtime.claude_submit_write_unknown
                     or runtime.claude_deferred_event or runtime.claude_handshake_wait
                     or runtime.claude_handshake_provider_conflict):
+                return False
+            if self._claude_supervisor_wait_guard(self._event_target(surface_id), runtime):
+                return False
+            if self._claude_provider_guard_reason(self._event_target(surface_id), runtime):
                 return False
             target = copy.deepcopy(self._event_target(surface_id))
             if not target:
@@ -13661,7 +13934,7 @@ class WatchDaemon:
                     and event.get('stop_failure_error') == 'unknown'
                     and event.get('error_excerpt')):
                 try:
-                    grid = Grid.from_rpc(client.replay(str(target['workspace_id']), surface_id), surface_id)
+                    grid = Grid.from_rpc(client.replay(str(target['workspace_id']), surface_id, live=True), surface_id)
                     current_state = classify_claude_grid(grid,
                         claude_message=str(self.config.get('claude_message') or CLAUDE_MESSAGE))
                     if current_state.kind in {'claude_stopped', 'recoverable_error'}:
@@ -13710,6 +13983,19 @@ class WatchDaemon:
                 and not (event_name in {"Stop", "StopFailure"} and bool(event.get("completed")))):
             self._mark_claude_event(event, runtime, "suppressed_waiting_supervisor", detail=waiting)
             return
+        if (runtime.claude_submit_phase == "enter_sent"
+                and not runtime.claude_submit_event_id
+                and not runtime.claude_submit_write_unknown
+                and not synthetic_fallback
+                and event_name in {"UserPromptSubmit", "Stop", "StopFailure"}
+                and runtime.claude_last_submit_at > 0 and stamp > runtime.claude_last_submit_at
+                and session_id == runtime.claude_last_submit_session_id == runtime.claude_session_id
+                and runtime.claude_last_submit_generation == runtime.claude_process_generation
+                and self._validated_claude_provider_event(target, runtime, event) is not None):
+            # A fresh original lifecycle boundary ends the orphan slot before
+            # provider/human attribution. The old provider guard still needs
+            # its own verified release; this is not delivery confirmation.
+            self._clear_claude_submit(runtime, reason="orphan_native_boundary")
         if (event_name == "UserPromptSubmit" and not protocol_event
                 and runtime.claude_provider_guard):
             if self._confirm_claude_provider_submission(target, runtime, event):
@@ -16429,7 +16715,7 @@ class WatchDaemon:
                     if is_dock_surface(tree, sid):
                         raise ValueError("provider source is a dock surface")
                     client.read_screen(target["workspace_id"], sid)
-                    grid = Grid.from_rpc(client.replay(target["workspace_id"], sid), sid)
+                    grid = Grid.from_rpc(client.replay(target["workspace_id"], sid, live=True), sid)
                     composer, _ = _claude_composer_state(grid)
                     state = classify_claude_grid(grid, claude_message=str(config.get("claude_message") or CLAUDE_MESSAGE))
                     if (composer != "empty" or state.claude_native_activity
@@ -16782,12 +17068,13 @@ def uninstall_cli_link(path: Path = DEFAULT_CLI_LINK) -> None:
 
 
 def supervisor_command(config_path: Path = DEFAULT_CONFIG_PATH, suggested_surface: str = "") -> str:
-    command = [
+    installed_entry = DEFAULT_APP_DIR / "cli" / "current" / "bin" / APP_NAME
+    command = [str(installed_entry)] if installed_entry.is_file() else [
         DEFAULT_PYTHON,
+        "-B",
         str(PROJECT_DIR / "cmux_codex_watch.py"),
-        "--config", str(config_path),
-        "tui",
     ]
+    command.extend(["--config", str(config_path), "tui"])
     if suggested_surface:
         command.extend(["--suggest-surface", suggested_surface])
     return shlex.join(command)
@@ -16821,7 +17108,8 @@ def install_dock_control(
         "title": "Supervisor",
         "type": "terminal",
         "command": supervisor_command(config_path),
-        "cwd": str(PROJECT_DIR),
+        "cwd": str(DEFAULT_APP_DIR if (DEFAULT_APP_DIR / "cli" / "current" / "bin" / APP_NAME).is_file()
+                   else PROJECT_DIR),
         "height": 420,
     }
     merged_controls = [item for item in controls if item.get("id") != control["id"]]
@@ -17250,6 +17538,87 @@ def hook_coverage_status(config, snapshot):
     return {"status": "unknown", "reason": "Hook inventory missing or stale"}
 
 
+
+def _claude_audit_native_inventory(inventory):
+    """Supplement this audit only; uncertain observations never prove exit."""
+    import stat
+    import ccc_native_processes as native
+    import ccc_guard_scope as scope
+
+    failed, unavailable, incomplete = set(), [], []
+    for wid in inventory.workspaces:
+        key = "" if inventory.fleet else wid
+        if key not in failed:
+            try:
+                inventory._load(wid)
+            except (CmuxError, OSError, RuntimeError):
+                failed.add(key)
+                inventory.tops[key] = {"sample": {"enumeration_complete": False}}
+        if key in failed:
+            unavailable.append(wid)
+        source = inventory.tops.get(key)
+        if isinstance(source, Mapping) and source.get("sample", {}).get("enumeration_complete") is False:
+            incomplete.append(wid)
+    # Keep complete payloads, including nested lists and conflicting entries.
+    top = {"snapshots": list(inventory.tops.values())}
+    classified = classify_surface_processes(top)
+    records = native.display_surface_records(inventory.tree, list(inventory.records.values()))
+    native_available = True
+    try:
+        processes = scope.scan(reader=native.display_process)
+    except (OSError, ValueError, RuntimeError, TypeError, KeyError):
+        processes, native_available = [], False
+
+    groups, devices = {}, set()
+    for row in processes:
+        groups.setdefault(row["surface_id"], []).append(row)
+        devices.add(row["tdev"])
+    if any(r.get("native_display_target") and not r["native_display_target"].get("tty")
+           for r in records):
+        ttys = {}
+        try:
+            with os.scandir("/dev") as entries:
+                for entry in entries:
+                    if not (entry.name.startswith("tty") and entry.name.isascii()
+                            and entry.name.isalnum()):
+                        continue
+                    try:
+                        info = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if stat.S_ISCHR(info.st_mode) and info.st_rdev in devices:
+                        ttys.setdefault(info.st_rdev, []).append(entry.name)
+        except OSError:
+            pass
+        enriched = []
+        for record in records:
+            target = record.get("native_display_target")
+            group = groups.get(record["surface_id"], [])
+            if target and not target.get("tty") and len(group) == 1:
+                names = ttys.get(group[0]["tdev"], [])
+                if len(names) == 1:
+                    record = {**record, "native_display_target": {**target, "tty": names[0]}}
+            enriched.append(record)
+        records = enriched
+    labels = native.display_process_labels(
+        records, classified, top, processes=processes, agent_kind="claude")
+    inventory.records = {r["surface_id"]: r for r in records}
+    inventory.workspaces = {}
+    for record in records:
+        if record.get("type") == "terminal":
+            inventory.workspaces.setdefault(record["workspace_id"], []).append(record)
+    inventory.native_processes = processes
+    inventory.labels = {key: labels for key in inventory.tops}
+    return labels, {
+        "gui_status": "unavailable" if unavailable and len(unavailable) == len(inventory.workspaces)
+                      else "partial" if unavailable or incomplete else "observed",
+        "gui_unavailable_workspaces": unavailable,
+        "gui_incomplete_workspaces": incomplete,
+        "native_status": "observed" if native_available else "unavailable",
+        "live_count_semantics": "observed Claude identities; missing evidence does not prove exit",
+    }
+
+
 def audit_claude_surfaces(
     config: Mapping[str, Any],
     state: Mapping[str, Any],
@@ -17262,10 +17631,8 @@ def audit_claude_surfaces(
     hook_config_healthy = bool(hook_config.get("healthy"))
     tree = client.tree()
     inventory = DiscoverySnapshot(client, tree=tree)
+    processes, inventory_report = _claude_audit_native_inventory(inventory)
     records = inventory.records
-    processes = {}
-    for wid in inventory.workspaces:
-        processes.update(inventory._load(wid)[1])
     explicit = {
         str(target.get("surface_id") or ""): target
         for target in effective_targets(config, discover_all_targets(inventory, config))
@@ -17298,7 +17665,7 @@ def audit_claude_surfaces(
         screen_state = "unreadable"
         live_context: dict[str, Any] = {}
         try:
-            payload = client.replay(str(record["workspace_id"]), surface_id)
+            payload = client.replay(str(record["workspace_id"]), surface_id, live=True)
             classified = classify_claude_grid(
                 Grid.from_rpc(payload, surface_id),
                 claude_message=str(config.get("claude_message") or CLAUDE_MESSAGE),
@@ -17406,6 +17773,8 @@ def audit_claude_surfaces(
             "surface_ref": str(target.get("ref") or ""),
             "paused": bool(target.get("paused")),
             "paused_reason": str(target.get("paused_reason") or ""),
+            "observation_status": "not_observed",
+            "exit_confirmed": False,
         }
         for surface_id, target in explicit.items()
         if surface_id not in live_ids
@@ -17433,7 +17802,9 @@ def audit_claude_surfaces(
         },
         "live_count": len(rows),
         "live": rows,
-        "stale_registered": stale,
+        "inventory": inventory_report,
+        "unobserved_registered": stale,
+        "stale_registered": stale,  # Compatibility alias; not proof of process exit.
     }
 
 

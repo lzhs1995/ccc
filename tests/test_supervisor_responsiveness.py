@@ -75,6 +75,35 @@ class PanelResponsivenessTests(unittest.TestCase):
         self.assertEqual(self.model.config['version'], 2)
         self.assertEqual(self.client.calls, 2)
 
+    def test_status_only_refresh_does_not_parse_archived_runtime(self):
+        original = {"archived": {"state": "delivery_unknown"}}
+        self.model.runtime = original
+        self.model.last_top_refresh = 100
+        with patch.object(tui.time, 'monotonic', return_value=101), \
+                patch.object(self.model, '_refresh_batch_snapshots') as batches, \
+                patch.object(tui.core, 'load_json', side_effect=AssertionError('history read')) as read:
+            self.model.refresh()
+        self.assertIs(self.model.runtime, original)
+        read.assert_not_called()
+        batches.assert_called_once()
+
+    def test_slow_history_read_does_not_spend_the_next_refresh_interval(self):
+        clock = [100.0]
+        self.client.release.set()
+
+        def slow_read(path, default):
+            clock[0] += 10
+            return {"archived": {"state": "delivery_unknown"}}
+
+        with patch.object(tui.time, 'monotonic', side_effect=lambda: clock[0]), \
+                patch.object(self.model, '_refresh_batch_snapshots'), \
+                patch.object(tui.core, 'load_json', side_effect=slow_read) as read:
+            self.model.refresh(force=True)
+            clock[0] += 1
+            self.model.refresh()
+        self.assertEqual(read.call_count, 1)
+        self.assertEqual(self.client.calls, 1)
+
     def test_filter_refresh_and_quit_work_while_inventory_is_blocked(self):
         entered = self.client.entered
         class Screen:

@@ -55,12 +55,13 @@ def paused(config, target):
         return True
 
 
-def make_episode(snapshot, *, root=None, attempt=0, submitted_at=None):
+def make_episode(snapshot, *, root=None, attempt=0, submitted_at=None, root_started_at=None):
     compact, facts = snapshot['compact'], snapshot['facts']
     started = submitted_at if submitted_at is not None else compact['started_at']
     key = hashlib.sha256(compact['key'].encode()).hexdigest()[:24]
     return dict(key=key, root=root or key, attempt=attempt, phase='compacting',
                 turn_id=compact['turn_id'], started_at=started,
+                root_started_at=started if root_started_at is None else root_started_at,
                 compact_key=compact['key'], native_started_at=compact['started_at'],
                 path=facts['path'], file_id=facts['file_id'],
                 compacted_offset=facts['compacted_offset'], user_offset=facts['user_offset'],
@@ -81,6 +82,56 @@ def settled(episode, snapshot):
             and facts['compacted_offset'] > episode['compacted_offset']
             and facts['compacted_at'] >= episode['started_at']
             and facts['replacement_items'] > 0)
+
+
+def read_only_root_clock(previous, session_id, facts, compact):
+    """Keep an observation clock until native completion or new user input.
+
+    This clock is separate from control episodes and grants no recovery or
+    retry budget. Missing samples, HTTP/reasoning and a changed compact/turn
+    identifier cannot erase the first observed start.
+    """
+    if not facts['caught_up'] or facts.get('session_id') != session_id:
+        raise RuntimeError('incomplete original-session facts; retain observation clock')
+    scope = dict(session_id=session_id, path=facts['path'], file_id=facts['file_id'])
+    if previous is not None and (previous.get('schema') != 'read-only-root-clock-v1'
+                                 or previous.get('scope') != scope):
+        raise RuntimeError('original observation clock binding changed')
+    clock = copy.deepcopy(previous) if previous is not None else dict(
+        schema='read-only-root-clock-v1', scope=scope, episode=None, last_closed=None)
+    episode = clock['episode']
+    if episode:
+        if (facts['user_offset'] < episode['user_offset']
+                or facts['compacted_offset'] < episode['compacted_offset']):
+            raise RuntimeError('original observation watermark regressed')
+        completed = (facts['compacted_offset'] > episode['compacted_offset']
+                     and facts['compacted_at'] >= episode['root_started_at']
+                     and facts['replacement_items'] > 0)
+        new_input = facts['user_offset'] > episode['user_offset']
+        if completed or new_input:
+            boundary = facts['compacted_at'] if completed else facts['user_at']
+            if new_input:
+                boundary = max(boundary, facts['user_at'])
+            clock['last_closed'] = dict(episode, reason='compacted' if completed else 'new_input',
+                                        boundary_at=boundary)
+            clock['episode'] = episode = None
+    closed = clock['last_closed']
+    if compact and closed and (compact['started_at'] <= closed['boundary_at']
+                               or compact['key'] == closed['latest_compact_key']):
+        compact = None
+    if compact:
+        if episode is None:
+            key = hashlib.sha256(json.dumps([scope, compact['key']], sort_keys=True).encode()).hexdigest()
+            episode = dict(key=key, root_started_at=compact['started_at'],
+                           user_offset=facts['user_offset'], compacted_offset=facts['compacted_offset'],
+                           first_compact_key=compact['key'], latest_compact_key=compact['key'])
+            clock['episode'] = episode
+        else:
+            episode['root_started_at'] = min(episode['root_started_at'], compact['started_at'])
+            episode['latest_compact_key'] = compact['key']
+    clock.update(current_start_observed=compact is not None, control_verified=False,
+                 recovery_enabled=False, phase='completion_not_observed' if episode else 'idle')
+    return clock
 
 
 class Worker:
@@ -265,7 +316,7 @@ class Worker:
         except Exception as exc:
             self.journal.record('NOTIFICATION_FAILED', error=str(exc)[:200])
 
-    def observe_without_control(self, control_error, *, notify=True):
+    def observe_without_control(self, control_error, *, notify=True, root_clock=False):
         """Keep original-session journal observation alive if RPC is unavailable.
 
         This writes separate observation and notification evidence. It never adopts a process,
@@ -290,14 +341,25 @@ class Worker:
             config = json.loads(self.config_path.read_text())
             is_paused = paused(config, self.target) or (self.directory.parent / 'STOP').exists()
             now = time.time()
-            age = max(0, now - compact['started_at']) if compact else None
+            clock = None
+            if root_clock:
+                clock_path = self.directory / 'read-only-root-clock.json'
+                previous = json.loads(pinned_file(clock_path)[1]) if clock_path.exists() else None
+                clock = read_only_root_clock(previous, self.target['session_id'], after, compact)
+                atomic_json(clock_path, clock)
+            root = clock.get('episode') if clock is not None else None
+            started = (root['root_started_at'] if root else None) if root_clock else (
+                compact['started_at'] if compact else None)
+            age = max(0, now - started) if started is not None else None
             level = (300 if age >= LIMIT else 180 if age >= WARN else 0) if age is not None else 0
             path = self.directory / 'read-only-observation.json'
-            key = compact['key'] if compact else None
+            key = (root['key'] if root else None) if root_clock else (
+                compact['key'] if compact else None)
             # Keep the notification budget independent of the latest sample:
             # a partial append or temporary unknown must not permit a repeat.
             warning_id = hashlib.sha256(json.dumps([after['file_id'], key]).encode()).hexdigest()
-            warning_paths = {n: self.directory / f'read-only-warning-{warning_id}-{n}.json'
+            warning_prefix = 'read-only-root-warning' if root_clock else 'read-only-warning'
+            warning_paths = {n: self.directory / f'{warning_prefix}-{warning_id}-{n}.json'
                              for n in (180, 300)}
             prior_level = max((n for n, p in warning_paths.items() if p.exists()), default=0)
             should_notify = bool(notify and level > prior_level and not is_paused)
@@ -316,6 +378,11 @@ class Worker:
                           unsettled_compaction=compact, compact_key=key, elapsed=age,
                           warning_level=level,
                           notification_intent_level=level if should_notify else prior_level)
+            if clock is not None:
+                result.update(observation_clock=clock, root_started_at=started,
+                              handling_status='CAPABILITY_UNAVAILABLE_OBSERVE_ONLY' if level == 300
+                              else 'WARNING' if level == 180 else 'OBSERVING',
+                              native_rpc_count=0)
             # Persist warning deduplication before notification. An uncertain
             # notification is not retried and never grants a control budget.
             atomic_json(path, result)
@@ -328,7 +395,17 @@ class Worker:
         if self.timer:
             self.timer.stop.set()
         key = episode['key']
-        age = max(0, time.time() - episode['started_at'])
+        # Retry adoption changes the occurrence fence, never the total clock.
+        started = episode.get('root_started_at', episode['started_at'])
+        age = max(0, time.time() - started)
+        if episode['attempt'] and age >= LIMIT:
+            # The joined replacement already used the root's handling window.
+            # This interface also starts another compact: never consume a
+            # second restart immediately, and keep observing real settlement.
+            self.journal.record('ROOT_DEADLINE_HANDLED_OBSERVING', key=key,
+                                root=episode['root'], elapsed=age,
+                                recovery_at=started + LIMIT, replayed=False)
+            return
 
         def fire(event, elapsed):
             if self.stop.is_set():
@@ -347,8 +424,8 @@ class Worker:
         self.timer.started -= age
         self.timer.start()
         self.journal.record('DEADLINE_ARMED', key=key, elapsed_on_discovery=age,
-                            warning_at=episode['started_at'] + WARN,
-                            recovery_at=episode['started_at'] + LIMIT)
+                            warning_at=started + WARN,
+                            recovery_at=started + LIMIT)
 
     def close_episode(self, phase, **fields):
         ep = self.state['episode']
@@ -402,7 +479,8 @@ class Worker:
                 or not self.unchanged(ep, snap, new_turn=True)):
             return False
         next_ep = make_episode(snap, root=ep['root'], attempt=ep['attempt'] + 1,
-                               submitted_at=intent['epoch'])
+                               submitted_at=intent['epoch'],
+                               root_started_at=ep.get('root_started_at', ep['started_at']))
         next_ep['input_token'] = ep['input_token']
         next_ep['parent_key'] = ep['key']
         self.state['closed'] = (self.state['closed'] + [ep['key']])[-512:]
@@ -412,7 +490,7 @@ class Worker:
                             parent_key=ep['key'], submitted_at=intent['epoch'],
                             native_started_at=compact['started_at'], attempt=next_ep['attempt'],
                             trace_id=causal_trace, submission_id=compact['submission_id'],
-                            replayed=False, recovery_at=intent['epoch'] + LIMIT)
+                            replayed=False, recovery_at=next_ep['root_started_at'] + LIMIT)
         self.arm(next_ep)
         return True
 
@@ -481,7 +559,8 @@ class Worker:
                 or compact['started_at'] < intent['epoch']
                 or not self.unchanged(adopted_goal, snap, new_turn=True)):
             return False
-        next_ep = make_episode(snap, root=ep['root'], attempt=ep['attempt'] + 1)
+        next_ep = make_episode(snap, root=ep['root'], attempt=ep['attempt'] + 1,
+                               root_started_at=ep.get('root_started_at', ep['started_at']))
         next_ep.update(input_token=ep['input_token'], parent_key=ep['key'],
                        native_receipt=dict(path=str(self.directory / (ep['key'] + '-compact-started.json')),
                                            turn_id=started))
@@ -500,6 +579,11 @@ class Worker:
         with self.lock:
             ep = self.state.get('episode')
             if not ep or ep['key'] != key or ep['phase'] != 'compacting':
+                return
+            if (ep['attempt'] and time.time()
+                    >= ep.get('root_started_at', ep['started_at']) + LIMIT):
+                # No extra grace period, no new intent and no clearing an
+                # adopted retry's evidence just because the clock expired.
                 return
             if not self.apply or not self.target.get('recovery_enabled', True):
                 self.close_episode('observe_only', reason='control disabled for this enrollment')
@@ -529,7 +613,7 @@ class Worker:
                             last_warning=deferred.get('last_warning', 0))
                         self.save()
                         self.journal.record('RECOVERY_DEFERRED_BINDING_CHANGED',
-                            key=ep['key'], deadline=ep['started_at'] + LIMIT,
+                            key=ep['key'], deadline=ep.get('root_started_at', ep['started_at']) + LIMIT,
                             retry_not_before=now + LOCK_RETRY_SECONDS, zero_input=True)
                         return
                     if not may_interrupt(ep, snap) or snap['goal'] != ep['goal']:
@@ -640,7 +724,7 @@ class Worker:
                     last_warning=deferred.get('last_warning', 0))
                 self.save()
                 self.journal.record('RECOVERY_DEFERRED_SHARED_CONTROL', key=ep['key'],
-                                    deadline=ep['started_at'] + LIMIT,
+                                    deadline=ep.get('root_started_at', ep['started_at']) + LIMIT,
                                     retry_not_before=now + LOCK_RETRY_SECONDS, zero_input=True)
             except ControlLockBusy as exc:
                 if ep.get('phase') == 'control_pending':
@@ -663,7 +747,8 @@ class Worker:
                     self.notify('压缩恢复等待输入锁', '已超过五分钟；保留原次，三秒后重新核验，未发送中断。')
                 self.save()
                 self.journal.record('RECOVERY_DEFERRED_LOCK_BUSY', key=ep['key'],
-                                    deadline=ep['started_at'] + LIMIT, elapsed=now - ep['started_at'],
+                                    deadline=ep.get('root_started_at', ep['started_at']) + LIMIT,
+                                    elapsed=now - ep.get('root_started_at', ep['started_at']),
                                     retry_not_before=now + LOCK_RETRY_SECONDS, zero_input=True)
             except Exception as exc:
                 if ep.get('phase') == 'control_pending':
@@ -784,7 +869,7 @@ class Worker:
                     self.close_episode('cancelled', reason='external input or native turn changed')
                     return
                 deferred = ep.get('recovery_deferred')
-                if (deferred and time.time() >= max(ep['started_at'] + LIMIT,
+                if (deferred and time.time() >= max(ep.get('root_started_at', ep['started_at']) + LIMIT,
                                                     deferred['retry_not_before'])):
                     self.recover(ep['key'])
                     return
@@ -806,7 +891,14 @@ class Worker:
                 self.state['progress_after'] = None
             if (snap['compact'] and clear_guard(snap)
                     and (not ep or ep['phase'] != 'compacting')):
-                fresh = make_episode(snap)
+                # A reconnect/new occurrence without input or real compact
+                # progress remains the original incident. Keep cancellation
+                # and exact occurrence admission, but grant no fresh deadline.
+                continuing = ep and self.unchanged(ep, snap, new_turn=True)
+                fresh = make_episode(snap,
+                    root=ep['root'] if continuing else None,
+                    attempt=ep['attempt'] if continuing else 0,
+                    root_started_at=ep.get('root_started_at', ep['started_at']) if continuing else None)
                 if fresh['key'] not in self.state['closed']:
                     self.state['episode'] = fresh
                     self.save()

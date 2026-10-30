@@ -204,8 +204,13 @@ def display_identity_matches(proof):
         return False
 
 
-def display_process_labels(records, classified, top, *, processes=None, agent_kind=None):
-    """Fill only missing GUI observations; never return a send authorization."""
+def display_process_labels(records, classified, top, *, processes=None, agent_kind=None,
+                           verify_classified=False):
+    """Verify display identities; never return a send authorization.
+
+    The TUI also verifies an agreeing GUI label so its session cache keeps the
+    same native generation when the GUI inventory recovers.
+    """
     import ccc_guard_scope as scope
     import ccc_observation as observation
     import cmux_codex_watch as core
@@ -219,10 +224,14 @@ def display_process_labels(records, classified, top, *, processes=None, agent_ki
     for record in records:
         label = core.surface_process_label(classified, record)
         target = record.get("native_display_target")
-        if (target and target.get("tty")
-                and not {record.get("surface_id"), record.get("ref")} & populated
-                and label.get("agent_kind", "unknown") == "unknown"
-                and not label.get("agent_pids") and not label.get("identity_conflicts")):
+        missing = (not {record.get("surface_id"), record.get("ref")} & populated
+                   and label.get("agent_kind", "unknown") == "unknown"
+                   and not label.get("agent_pids"))
+        agreeing_gui = (verify_classified
+                        and label.get("agent_kind") in {"codex", "claude"}
+                        and bool(label.get("agent_pids")))
+        if (target and target.get("tty") and not label.get("identity_conflicts")
+                and (missing or agreeing_gui)):
             wanted.append((record, target))
     if not wanted:
         return output
@@ -262,6 +271,13 @@ def display_process_labels(records, classified, top, *, processes=None, agent_ki
                 continue
         # Other agent kinds were never filtered out of the group above.
         if agent_kind is not None and row["agent_kind"] != agent_kind:
+            continue
+        label = core.surface_process_label(classified, record)
+        if label.get("agent_kind", "unknown") != "unknown" and (
+                label.get("agent_kind") != row["agent_kind"]
+                or row["pid"] not in label.get("agent_pids", [])
+                or not set(label.get("agent_pids", [])).issubset(
+                    {item["pid"] for item in group})):
             continue
         proof = {"process": row, "target": target}
         if not display_identity_matches(proof):

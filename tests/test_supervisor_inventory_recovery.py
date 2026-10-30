@@ -101,6 +101,29 @@ class NativeDisplayRecoveryTests(unittest.TestCase):
         self.assertEqual(labels, {})
         self.assertFalse(records[0]["native_display_target"]["tty"])
 
+    def test_gui_recovery_keeps_same_native_session_generation(self):
+        records = self.records()
+        records[0]["native_display_target"]["tty"] = "ttys001"
+        known = {SURFACE: {"agent_kind": "codex", "agent_pids": [123]}}
+        with native_fixture():
+            _, missing = tui.native_display_labels(records, {}, {})
+            _, recovered = tui.native_display_labels(records, known, {})
+        proof = missing[SURFACE]["native_identity"]
+        self.assertEqual(recovered[SURFACE]["native_identity"], proof)
+        session = tui.SessionResult(reason="verified", native_identity=proof)
+        self.assertIs(tui.current_session_result(session, recovered[SURFACE]), session)
+
+    def test_gui_disagreement_cannot_inherit_native_session(self):
+        records = self.records()
+        records[0]["native_display_target"]["tty"] = "ttys001"
+        for label in ({"agent_kind": "codex", "agent_pids": [124]},
+                      {"agent_kind": "claude", "agent_pids": [123]},
+                      {"agent_kind": "codex", "agent_pids": [123, 124]},
+                      {"agent_kind": "codex", "agent_pids": [123], "identity_conflicts": [124]}):
+            with self.subTest(label=label), native_fixture():
+                _, labels = tui.native_display_labels(records, {SURFACE: label}, {})
+            self.assertEqual(labels, {SURFACE: label})
+
 
 class QuietSource:
     def maybe_refresh(self, *args, **kwargs):

@@ -59,6 +59,58 @@ def visible_text(payload):
     return "\n".join(core.Grid.from_rpc(payload, "surface-uuid").lines)
 
 
+class CodexNewActivityChromeTests(unittest.TestCase):
+    def payload(self, *, text="New activity · ↓ Back to bottom · esc", row=51,
+                centered=True, style=2):
+        payload = status_payload(PROVIDER_TOKEN_RATE_LIMIT, columns=106)
+        grid = payload['render_grid']
+        grid['row_spans'] = [item for item in grid['row_spans'] if item['row'] != 51]
+        column = (grid['columns'] - len(text)) // 2 if centered else 0
+        grid['row_spans'].append(span(row, column, text, style))
+        return payload
+
+    def test_complete_centered_activity_notice_does_not_supersede_rate_limit(self):
+        for style in (0, 2):
+            with self.subTest(style=style):
+                payload = self.payload(style=style)
+                state = core.classify_grid(core.Grid.from_rpc(payload, 'surface-uuid'))
+                self.assertEqual((state.kind, state.error_type), ('recoverable_error', 'rate_limit'))
+                self.assertIn(51, state.ignored_chrome_rows)
+                expected = core.classify_grid(core.Grid.from_rpc(
+                    status_payload(PROVIDER_TOKEN_RATE_LIMIT, columns=106), 'surface-uuid'))
+                self.assertEqual(state.fingerprint, expected.fingerprint)
+
+    def test_partial_quoted_unplaced_or_extended_notice_remains_output(self):
+        for change in ({'text': 'New activity'}, {'text': '• New activity · ↓ Back to bottom · esc'},
+                       {'text': 'New activity · ↓ Back to bottom · esc extra'},
+                       {'centered': False}, {'row': 49}):
+            with self.subTest(change=change):
+                state = core.classify_grid(core.Grid.from_rpc(self.payload(**change), 'surface-uuid'))
+                self.assertEqual(state.kind, 'error_superseded')
+
+    def test_newer_reply_and_queued_input_keep_blocking_recovery(self):
+        for text, expected in (('• The operation completed.', 'error_superseded'),
+                               ('• Queued follow-up inputs', 'queued_followup'),
+                               ('Working (4s • esc to interrupt)', 'working')):
+            with self.subTest(text=text):
+                payload = self.payload()
+                payload['render_grid']['row_spans'].append(span(50, 0, text))
+                state = core.classify_grid(core.Grid.from_rpc(payload, 'surface-uuid'))
+                self.assertEqual(state.kind, expected)
+
+    def test_user_draft_is_not_submitted_with_activity_notice(self):
+        payload = self.payload()
+        grid = payload['render_grid']
+        prompt = next(item for item in grid['row_spans'] if item['row'] == 54 and item['column'] == 2)
+        prompt.update(text='keep my draft', style_id=0, cell_width=13)
+        grid['cursor']['column'] = 15
+        with tempfile.TemporaryDirectory() as directory:
+            client = FakeClient(payload, visible_text(payload))
+            daemon = armed_daemon(directory, client)
+            daemon.process_once(client)
+            self.assertEqual(client.sent, [])
+
+
 
 
 class CodexProviderRateLimitTests(unittest.TestCase):

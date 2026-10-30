@@ -124,6 +124,65 @@ class NativeEvidenceTests(NativeFixture):
         write(self.task["marker_path"], dict(self.task["marker"], ttl_seconds=100))
         self.assertIsNone(self.observe())
 
+    def test_repeated_native_tail_rechecks_deadline_watermark_and_callback(self):
+        self.append(self.summary)
+        first = self.observe()
+        self.assertIsNotNone(first)
+        expired = self.observe(now=self.now + 600)
+        self.assertEqual(expired["status"], adapter.TIMED_OUT)
+        self.assertEqual(expired["deadline_at"], first["deadline_at"])
+        self.assertIsNone(self.observe(after=self.now - 19))
+        changed = copy.deepcopy(self.attempt)
+        changed["binding"]["report_sha256"] = "0" * 64
+        write(self.attempt_path, changed)
+        self.assertIsNone(self.observe())
+        self.assert_no_receipt()
+
+    def test_repeated_native_tail_rechecks_writer_lock_and_permissions(self):
+        self.append(self.summary)
+        self.assertIsNotNone(self.observe())
+        with self.native.open("rb") as writer:
+            fcntl.flock(writer.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertIsNone(self.observe())
+        self.assertIsNotNone(self.observe())
+        self.native.chmod(0o666)
+        self.assertIsNone(self.observe())
+        self.native.chmod(0o600)
+        self.assertIsNotNone(self.observe())
+        self.assert_no_receipt()
+
+    def test_compact_wait_view_preserves_mixed_user_blocks_and_summary_hash(self):
+        self.append(self.summary)
+        first = self.observe()
+        self.assertEqual(first["native_summary"]["record_sha256"], adapter.snapshot_sha256(self.summary))
+        user = dict(type="user", sessionId=self.identity["session_id"], isSidechain=False,
+                    timestamp=iso(self.now - 15), message={"role": "user", "content": [
+                        {"type": "text", "text": adapter.protocol.DEFAULT_CLAUDE_MESSAGE}]})
+        self.append(user)
+        self.assertIsNotNone(self.observe())
+        # Tool text cannot turn a mixed user message into a plain watchdog.
+        user["message"]["content"].append({"type": "tool_result", "content": "x" * 65536})
+        self.append(user)
+        self.assertIsNone(self.observe())
+        self.assert_no_receipt()
+
+    def test_compact_wait_view_keeps_assistant_identity_and_invalid_records_closed(self):
+        self.append(self.summary)
+        assistant = dict(type="assistant", sessionId=self.identity["session_id"], isSidechain=False,
+                         message={"content": [{"type": "thinking", "thinking": "x" * 65536}]})
+        self.append(assistant)
+        self.assertIsNotNone(self.observe())
+        self.append(dict(assistant, sessionId="foreign-session"))
+        self.assertIsNone(self.observe())
+        self.replace_summary()
+        with self.native.open("ab") as stream:
+            stream.write(b'{"type":"ignored",bad}\n')
+        self.assertIsNone(self.observe())
+        self.replace_summary()
+        self.append(["invalid-native-record"])
+        self.assertIsNone(self.observe())
+        self.assert_no_receipt()
+
     def test_summary_requires_real_identity_and_wait_result(self):
         for changes in (
             {"sessionId": "another-session"}, {"isSidechain": True},
