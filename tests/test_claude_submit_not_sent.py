@@ -256,6 +256,51 @@ class SubmitNotSentTests(unittest.TestCase):
             self.assertEqual(d._claude_submit_owner(r), owner)
             self.assertEqual(r.claude_submit_attempts, 2)
 
+    def test_pre_enter_durable_save_does_not_spend_confirmation_window(self):
+        with tempfile.TemporaryDirectory() as root:
+            d,t,r,e,c = self.setup_case(root)
+            clock = {'now': time.time()}
+            intent_at = clock['now']
+            r.claude_submit_since = intent_at - 120
+            owner = d._claude_submit_owner(r)
+            frame = c.replay(t['workspace_id'],t['surface_id'])
+            save_surface = d._save_claude_surface
+            send_key = c.send_key
+
+            def slow_save(surface_id, runtime):
+                # Large state or a slow disk can delay the durable intent
+                # before the key is sent; that is not confirmation time.
+                if runtime.claude_submit_write_unknown:
+                    clock['now'] += 20
+                return save_surface(surface_id, runtime)
+
+            def slow_key(*args, **kwargs):
+                clock['now'] += 3
+                return send_key(*args, **kwargs)
+
+            with mock.patch.object(w.time, 'time', side_effect=lambda: clock['now']), \
+                    mock.patch.object(c, 'replay', return_value=frame), \
+                    mock.patch.object(d, '_save_claude_surface', side_effect=slow_save), \
+                    mock.patch.object(c, 'send_key', side_effect=slow_key):
+                self.assertTrue(d._send_claude_enter(t,r,c,reason='first',input_check=lambda: True))
+                returned_at = clock['now']
+                self.assertEqual(r.claude_last_submit_at, intent_at)
+                self.assertEqual(r.claude_submit_enter_since, returned_at)
+                self.assertEqual(d._claude_submit_owner(r), owner)
+                clock['now'] += 9
+                with mock.patch.object(d, '_clear_claude_submit') as clear, \
+                        mock.patch.object(c, 'send_key') as key:
+                    self.assertTrue(d._reconcile_claude_submit(t,r,w.ScreenState('empty'),c))
+                    clear.assert_not_called()
+                    key.assert_not_called()
+                self.assertEqual(r.claude_submit_phase, 'enter_sent')
+                # A later successful retry retains the first actual Enter
+                # deadline, even if its own durable save is slow too.
+                self.assertTrue(d._send_claude_enter(t,r,c,reason='retry',input_check=lambda: True))
+                self.assertEqual(r.claude_submit_enter_since, returned_at)
+                self.assertEqual(d._claude_submit_owner(r), owner)
+                self.assertEqual(r.claude_submit_attempts, 2)
+
     def test_known_rejection_retains_original_event_beyond_timeout_and_backs_off(self):
         with tempfile.TemporaryDirectory() as root:
             d,t,r,e,c = self.setup_case(root)

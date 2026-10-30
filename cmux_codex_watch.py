@@ -11991,7 +11991,7 @@ class WatchDaemon:
         runtime.claude_submit_not_sent = False
         runtime.claude_submit_phase = "enter_sent"
         if not runtime.claude_submit_enter_since:
-            runtime.claude_submit_enter_since = runtime.claude_last_submit_at or now
+            runtime.claude_submit_enter_since = now
         runtime.claude_submit_last_attempt_at = now
         runtime.claude_submit_attempts += 1
         runtime.claude_last_event_status = "submitted"
