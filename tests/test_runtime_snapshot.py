@@ -302,6 +302,41 @@ class HealthSnapshotScopeTests(unittest.TestCase):
         self.assertIn("surface:100", result["claude_hook_coverage"]["unregistered"])
         self.assertEqual(result["claude_hook_coverage"]["excluded_live"], ["surface:101"])
 
+    def test_publish_rejects_metadata_after_in_place_authorization_change(self):
+        before = self.publish()
+        self.daemon.config["mode"] = "watch"
+        after = self.publish()
+        self.assertNotEqual(after["config_key"], before["config_key"])
+        self.assertFalse(after["diagnostics"]["config_matches"])
+        self.assertEqual(after["claude_hook_coverage"]["status"], "unknown")
+        for row in after["rows"]:
+            if row["status"] != "paused":
+                self.assertEqual(row["reason_code"], "diagnostic_snapshot_stale")
+
+    def test_refresh_discards_metadata_if_authorization_changes_during_io(self):
+        daemon = self.daemon
+        before = daemon._observation_metadata
+        client = mock.Mock()
+        client.top_all.return_value = {}
+        client.terminal_diagnostics.return_value = {"terminals": []}
+        daemon._native_process_index = mock.Mock()
+        daemon._native_process_index.snapshot.return_value = {}
+
+        def change_config():
+            daemon.config["mode"] = "watch"
+            return {}
+
+        client.tree.side_effect = change_config
+        with mock.patch.object(daemon, "_check_claude_hook_settings"), \
+             mock.patch.object(daemon, "_native_agent_processes", return_value={}), \
+             mock.patch.object(core, "main_surface_records", return_value=[]), \
+             mock.patch.object(core, "display_process_labels", return_value={}), \
+             mock.patch.object(daemon, "_observation_owner_alive", return_value=True), \
+             mock.patch.object(daemon, "_request_health_publish") as publish:
+            daemon._refresh_observation_health(client)
+        self.assertIs(daemon._observation_metadata, before)
+        publish.assert_not_called()
+
     def test_diagnostic_refresh_skips_history_and_keeps_same_health(self):
         daemon = self.daemon
         original = daemon._observation_metadata

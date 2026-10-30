@@ -7201,13 +7201,14 @@ class WatchDaemon:
                 # stays unknown, even when the global inventory is complete.
                 owner = self._observation_owner_alive(runtime)
             owners[sid] = owner
-        if monitoring_config_key(config) != monitoring_config_key(self.config):
+        config_key = monitoring_config_key(config)
+        if config_key != monitoring_config_key(self.config):
             return
         with self._metadata_lock:
             self._observation_metadata = {"records": records, "labels": labels, "terminals": terminals,
                                           "owners": owners, "observed_at": metadata_at,
                                           "hook_inspections": inspections, "inventory_complete": inventory_complete,
-                                          "config_key": monitoring_config_key(config)}
+                                          "config_key": config_key}
         self._request_health_publish()
 
     def _request_health_publish(self):
@@ -7234,7 +7235,8 @@ class WatchDaemon:
         records, labels = metadata.get("records", {}), metadata.get("labels", {})
         terminals, owners = metadata.get("terminals", {}), metadata.get("owners", {})
         metadata_at = float(metadata.get("observed_at") or 0)
-        metadata_matches = metadata.get("config_key") == monitoring_config_key(config)
+        config_key = monitoring_config_key(config)
+        metadata_matches = metadata.get("config_key") == config_key
         now = time.time()
         stale_after = max(30.0, 3 * float(config.get("poll_interval_sec", 1)))
         rows = []
@@ -7254,7 +7256,7 @@ class WatchDaemon:
                 state, list(records.values()), labels, {str(t["surface_id"]): t for t in targets},
                 lambda pid: metadata.get("hook_inspections", {}).get(pid, {}), config,
             )
-        snapshot = {"version": 1, "config_key": monitoring_config_key(config), "rows": rows,
+        snapshot = {"version": 1, "config_key": config_key, "rows": rows,
                     "observed_at": now, "monitored_targets": [
                         {k: t[k] for k in ("surface_id", "workspace_id", "enabled", "paused") if k in t}
                         for t in targets],
