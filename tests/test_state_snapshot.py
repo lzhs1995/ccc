@@ -88,6 +88,29 @@ class SnapshotTests(unittest.TestCase):
         self.assertLess(changed["written_bytes"], full["written_bytes"] / 20)
         self.assertEqual(self.read(), value)
 
+    def test_large_full_snapshot_batches_writes_and_keeps_recovery_records(self):
+        value = {str(i): {"attempt": f"original-{i}", "delivery_status": "unknown",
+                          "text": "中文🧭" * 100} for i in range(700)}
+        with mock.patch.object(snapshot.os, "pwrite", wraps=os.pwrite) as writes:
+            result = self.writer.write(value)
+        self.assertLess(writes.call_count, 10)
+        self.assertEqual(sum(len(call.args[1]) for call in writes.call_args_list),
+                         result["written_bytes"])
+        self.assertEqual(self.read(), value)
+
+    def test_batched_updates_preserve_unchanged_gaps_and_oversized_records(self):
+        value = {str(i): {"attempt": f"original-{i}", "at": 0} for i in range(8)}
+        value["oversized"] = {"text": "x" * (snapshot.WRITE_BATCH_BYTES + 1)}
+        self.writer.write(value)
+        with self.path.open("rb") as reader:
+            original_bytes = reader.read()
+            for key in ("0", "1", "4", "7"):
+                value[key]["at"] = 1
+            self.writer.write(value)
+            reader.seek(0)
+            self.assertEqual(reader.read(), original_bytes)
+        self.assertEqual(self.read(), value)
+
     def test_foreign_replacement_and_deletion_invalidate_cached_snapshot(self):
         self.writer.write(self.original)
         foreign = self.path.with_suffix(".foreign")

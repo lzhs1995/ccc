@@ -23,6 +23,7 @@ import uuid
 
 
 BLOCK_SIZE = 4096
+WRITE_BATCH_BYTES = 1024 * 1024
 _UNSET = object()
 
 
@@ -147,6 +148,26 @@ def _write_at(fd: int, data: bytes, offset: int) -> None:
             raise OSError(errno.EIO, "snapshot write made no progress")
         remaining = remaining[written:]
         offset += written
+
+
+def _write_ranges(fd: int, ranges) -> int:
+    """Batch adjacent slots without writing across unchanged clone regions."""
+    pending, start, written_bytes = bytearray(), 0, 0
+    for offset, data in ranges:
+        if pending and (offset != start + len(pending)
+                        or len(pending) + len(data) > WRITE_BATCH_BYTES):
+            _write_at(fd, pending, start)
+            pending = bytearray()
+        if len(data) > WRITE_BATCH_BYTES:
+            _write_at(fd, data, offset)
+        else:
+            if not pending:
+                start = offset
+            pending.extend(data)
+        written_bytes += len(data)
+    if pending:
+        _write_at(fd, pending, start)
+    return written_bytes
 
 
 def _same_record(left, right):
@@ -327,19 +348,17 @@ class AtomicJSONSnapshot:
             if self._clone_enabled:
                 if not incremental:
                     slots, end = self._layout(entries)
-                    header = b"{" + b" " * (BLOCK_SIZE - 1)
-                    _write_at(destination, header, 0)
-                    written_bytes += len(header)
                     changed = set(entries)
-                for index, (key, (offset, capacity)) in enumerate(slots.items()):
-                    if key in changed:
-                        data = (b"\n" if index == 0 else b",") + entries[key]
-                        data += b" " * (capacity - len(data))
-                        _write_at(destination, data, offset)
-                        written_bytes += len(data)
-                if not incremental or end != self._end:
-                    _write_at(destination, b"\n}\n", end)
-                    written_bytes += 3
+                def ranges():
+                    if not incremental:
+                        yield 0, b"{" + b" " * (BLOCK_SIZE - 1)
+                    for index, (key, (offset, capacity)) in enumerate(slots.items()):
+                        if key in changed:
+                            data = (b"\n" if index == 0 else b",") + entries[key]
+                            yield offset, data + b" " * (capacity - len(data))
+                    if not incremental or end != self._end:
+                        yield end, b"\n}\n"
+                written_bytes = _write_ranges(destination, ranges())
                 size = end + 3
             else:
                 data = b"{" + b",".join(entries[key] for key in sorted(entries)) + b"}\n"
