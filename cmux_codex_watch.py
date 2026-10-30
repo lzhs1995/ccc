@@ -8899,14 +8899,7 @@ class WatchDaemon:
         batch_reconciler = BatchReconciler(self.config_path, self._observation_client())
         batch_reconciler.start()
         last_publish = 0.0
-        previous_switch_interval = sys.getswitchinterval()
         try:
-            # Viewport decoding and metadata work contend with the deadline
-            # thread for the GIL. With dozens of ready workers, CPython's
-            # default 5 ms slice can leave the scheduler waiting hundreds of
-            # milliseconds after a stat/condition wait. Bound each slice in
-            # this daemon only; do not change the user's polling cadence.
-            sys.setswitchinterval(min(previous_switch_interval, 0.001))
             while not self.stop_requested:
                 scheduler.wakeup.clear()
                 if not capabilities_ok and not client.ping():
@@ -8966,7 +8959,6 @@ class WatchDaemon:
                 scheduler.wakeup.wait(scheduler.wait_timeout())
             return 0
         finally:
-            sys.setswitchinterval(previous_switch_interval)
             if self.jev_classifier is not None:
                 self.jev_classifier.stop()
             batch_reconciler.close()
