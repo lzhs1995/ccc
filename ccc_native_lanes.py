@@ -618,7 +618,6 @@ def run_native_lane(initial, flags, lane_cell, commands, results):
     import logging
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
-    sys.setswitchinterval(min(sys.getswitchinterval(), .001))
     daemon = _create_lane_daemon(settings)
     if settings.get("native_sessions_root"):
         from ccc_private_check import PrivateChecks
