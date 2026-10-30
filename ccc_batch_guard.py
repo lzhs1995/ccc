@@ -42,6 +42,9 @@ TURN_INPUT = frozenset({"turn/start", "turn/steer", "review/start", "thread/fork
                         "thread/realtime/start", "thread/goal/set", "thread/compact/start",
                         "thread/rollback", "thread/queue/start", "thread/queue/add", "thread/queue/update",
                         "thread/shellCommand", "thread/inject_items", "command/exec"})
+# Published local toolchain launcher: read-only doctor, then exec the current
+# official CLI symlink. Unknown shell wrappers are still never interpreted.
+TOOLCHAIN_LAUNCHER_SHA256 = "ea6d97bffcd2d80a08ad436e09d9844b29e99d9f0575f16748defeaa24e786db"
 
 
 def core():
@@ -66,6 +69,8 @@ def native_binary(*, entrypoint=None, metadata=None):
         installed = entry.resolve(strict=True)
         wrapper = link.with_name("codex-guard").resolve()
         observed = {}
+        toolchain_link = None
+        toolchain_native = None
 
         def identity(info):
             # Reading can update atime without changing the verified file.
@@ -84,7 +89,13 @@ def native_binary(*, entrypoint=None, metadata=None):
             return raw
 
         candidate = installed
-        if installed == wrapper:
+        if installed == Path.home() / '.local/bin/codex-toolchain-launch':
+            if hashlib.sha256(read_small(installed)).hexdigest() != TOOLCHAIN_LAUNCHER_SHA256:
+                raise ValueError(error)
+            toolchain_link = Path.home() / '.local/bin/codex'
+            toolchain_native = toolchain_link.resolve(strict=True)
+            candidate = toolchain_native
+        elif installed == wrapper:
             record = json.loads(read_small(link))
             value = record.get("native_binary")
             if not isinstance(value, str) or not Path(value).is_absolute():
@@ -125,6 +136,8 @@ def native_binary(*, entrypoint=None, metadata=None):
         for path, (before, raw) in observed.items():
             if identity(path.stat()) != identity(before) or path.read_bytes() != raw:
                 raise ValueError(error)
+        if toolchain_link is not None and toolchain_link.resolve(strict=True) != toolchain_native:
+            raise ValueError(error)
         if entry.resolve(strict=True) != installed:
             raise ValueError(error)
         return str(candidate)
