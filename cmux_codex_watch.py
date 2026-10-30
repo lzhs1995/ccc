@@ -7703,6 +7703,8 @@ class WatchDaemon:
         try:
             tree = client.tree()
             records = display_surface_records(tree, main_surface_records(tree))
+            records = [record for record in records
+                       if record.get("surface_id") == str(target["surface_id"])]
             augmented = display_process_labels(
                 records, labels, top or {}, processes=self._native_agent_processes(wait=False))
             return surface_process_label(augmented, target)
