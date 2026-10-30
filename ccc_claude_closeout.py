@@ -143,6 +143,35 @@ def _native_journal_rows(data):
     return tuple(json.loads(line) for line in data.splitlines())
 
 
+@functools.lru_cache(maxsize=16)
+def _native_wait_records(data):
+    """Keep bounded decoded views for waits, never source proof or decisions.
+
+    Every line is still decoded. Stop summaries remain complete for their
+    record hash; other messages retain identity and exact user-text semantics.
+    Hook recovery continues to use the separate, complete journal decoder.
+    """
+    records = []
+    for line in data.splitlines(keepends=True):
+        row = json.loads(line)
+        if isinstance(row, dict):
+            kind = row.get("type")
+            if kind == "assistant" or (kind == "system" and row.get("subtype") != "stop_hook_summary"):
+                row = {key: row[key] for key in ("type", "isSidechain", "sessionId", "subtype") if key in row}
+            elif kind == "user":
+                message = row.get("message")
+                content = message.get("content") if isinstance(message, Mapping) else None
+                if isinstance(content, list):
+                    blocks = [({"type": block.get("type"), "text": block.get("text")}
+                               if block.get("type") == "text" else {"type": block.get("type")})
+                              if isinstance(block, dict) else None for block in content]
+                    row = {**row, "message": {**message, "content": blocks}}
+            elif kind != "system":
+                row = {}
+        records.append((len(line), row))
+    return tuple(records)
+
+
 def native_event_from_journal(path, accepted):
     """Recover only the exact already-accepted Hook, never synthesize/replay it."""
     data, proof = native_tail(path)
@@ -439,7 +468,7 @@ class CloseoutEvidence:
             rows = []
             selected = None
             offset = source["offset_bytes"]
-            for line, row in zip(data.splitlines(keepends=True), _native_journal_rows(data)):
+            for length, row in _native_wait_records(data):
                 if not isinstance(row, dict):
                     return None
                 if row.get("type") in ("system", "user", "assistant") and row.get("isSidechain") is not True:
@@ -448,7 +477,7 @@ class CloseoutEvidence:
                     rows.append(row)
                     if row.get("type") == "system" and row.get("subtype") == "stop_hook_summary":
                         selected = (len(rows) - 1, row, offset)
-                offset += len(line)
+                offset += length
             if selected is None:
                 return None
             index, row, offset = selected

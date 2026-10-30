@@ -10221,10 +10221,12 @@ class WatchDaemon:
         # Journal replay must revalidate it; it is not release authority.
         migrated_claim_source = self._claude_provider_migrated_claim_source(target, runtime, guard)
         with self.claude_event_ledger._lock:
-            # Most retained claims belong to other sessions. Filter their cheap
-            # identity fields before inspecting a current provider claim.
+            # Only handling StopFailure rows can be pending provider claims.
+            # Keep identity checks before the error-kind membership test.
             pending = any(
                 claim_id != migrated_claim_source
+                and row.get("status") == "handling"
+                and row.get("event_name") == "StopFailure"
                 and row.get("surface_id") == surface_id
                 and row.get("workspace_id") == target.get("workspace_id")
                 and row.get("session_id") == runtime.claude_session_id

@@ -66,6 +66,23 @@ class ProviderGuardTests(unittest.TestCase):
         d._remember_claude_provider_failure(t, r, event, event=event)
         return event
 
+    def test_nonclaim_and_foreign_malformed_error_kinds_do_not_block_current_claim(self):
+        with tempfile.TemporaryDirectory() as root:
+            d, t, r, e, c = self.case(root)
+            claim = dict(self.failure(e, RPM, stamp=time.time()),
+                         session_id=r.claude_session_id, status="handling",
+                         process_generation=r.claude_process_generation)
+            d.claude_event_ledger.events = {
+                "sent": dict(claim, status="sent", error_kind=[]),
+                "ordinary": dict(claim, event_name="Stop", error_kind={}),
+                "foreign": dict(claim, surface_id="other-surface", error_kind=[]),
+            }
+            self.assertEqual(d._claude_provider_guard_reason(t, r, event=e), "")
+            d.claude_event_ledger.events["current"] = claim
+            self.assertEqual(d._claude_provider_guard_reason(t, r, event=e),
+                             "claude_provider_verifying")
+            self.assert_no_input(c)
+
     def restart(self, d, c):
         restarted = w.WatchDaemon(d.config_path, d.state_path, client=c)
         restarted._claude_send_process_identity = mock.Mock(return_value={

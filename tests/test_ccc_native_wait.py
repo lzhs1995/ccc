@@ -151,6 +151,38 @@ class NativeEvidenceTests(NativeFixture):
         self.assertIsNotNone(self.observe())
         self.assert_no_receipt()
 
+    def test_compact_wait_view_preserves_mixed_user_blocks_and_summary_hash(self):
+        self.append(self.summary)
+        first = self.observe()
+        self.assertEqual(first["native_summary"]["record_sha256"], adapter.snapshot_sha256(self.summary))
+        user = dict(type="user", sessionId=self.identity["session_id"], isSidechain=False,
+                    timestamp=iso(self.now - 15), message={"role": "user", "content": [
+                        {"type": "text", "text": adapter.protocol.DEFAULT_CLAUDE_MESSAGE}]})
+        self.append(user)
+        self.assertIsNotNone(self.observe())
+        # Tool text cannot turn a mixed user message into a plain watchdog.
+        user["message"]["content"].append({"type": "tool_result", "content": "x" * 65536})
+        self.append(user)
+        self.assertIsNone(self.observe())
+        self.assert_no_receipt()
+
+    def test_compact_wait_view_keeps_assistant_identity_and_invalid_records_closed(self):
+        self.append(self.summary)
+        assistant = dict(type="assistant", sessionId=self.identity["session_id"], isSidechain=False,
+                         message={"content": [{"type": "thinking", "thinking": "x" * 65536}]})
+        self.append(assistant)
+        self.assertIsNotNone(self.observe())
+        self.append(dict(assistant, sessionId="foreign-session"))
+        self.assertIsNone(self.observe())
+        self.replace_summary()
+        with self.native.open("ab") as stream:
+            stream.write(b'{"type":"ignored",bad}\n')
+        self.assertIsNone(self.observe())
+        self.replace_summary()
+        self.append(["invalid-native-record"])
+        self.assertIsNone(self.observe())
+        self.assert_no_receipt()
+
     def test_summary_requires_real_identity_and_wait_result(self):
         for changes in (
             {"sessionId": "another-session"}, {"isSidechain": True},
