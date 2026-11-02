@@ -1,0 +1,1669 @@
+diff --git a/codex-rs/Cargo.lock b/codex-rs/Cargo.lock
+index 1eb38f3..44f81b8 100644
+--- a/codex-rs/Cargo.lock
++++ b/codex-rs/Cargo.lock
+@@ -1617,6 +1617,15 @@ dependencies = [
+  "shlex",
+ ]
+ 
++[[package]]
++name = "ccc-native-client-foreground"
++version = "0.1.0"
++dependencies = [
++ "libc",
++ "serde_json",
++ "uuid",
++]
++
+ [[package]]
+ name = "ccm"
+ version = "0.5.0"
+@@ -4919,6 +4928,7 @@ dependencies = [
+  "assert_matches",
+  "axum",
+  "base64 0.22.1",
++ "ccc-native-client-foreground",
+  "chrono",
+  "clap",
+  "codex-ansi-escape",
+diff --git a/codex-rs/tui/Cargo.toml b/codex-rs/tui/Cargo.toml
+index 47968b8..25969cb 100644
+--- a/codex-rs/tui/Cargo.toml
++++ b/codex-rs/tui/Cargo.toml
+@@ -138,6 +138,7 @@ codex-windows-sandbox = { workspace = true }
+ tokio-util = { workspace = true, features = ["time"] }
+ 
+ [target.'cfg(unix)'.dependencies]
++ccc-native-client-foreground = { path = "../../native/client-foreground" }
+ libc = { workspace = true }
+ 
+ [target.'cfg(target_os = "macos")'.dependencies]
+diff --git a/codex-rs/tui/src/app.rs b/codex-rs/tui/src/app.rs
+index 093a6af..df9363a 100644
+--- a/codex-rs/tui/src/app.rs
++++ b/codex-rs/tui/src/app.rs
+@@ -244,6 +244,7 @@ mod turn_tips;
+ pub(crate) use new_session::has_launch_setting;
+ mod clipboard;
+ mod footer_selection;
++mod foreground_observation;
+ mod native_history;
+ mod owned_transcript;
+ mod pending_interactive_replay;
+@@ -543,6 +544,7 @@ pub(crate) struct App {
+     terminal_size_tags: crate::terminal_size_telemetry::LaunchTags,
+     pub(crate) app_event_tx: AppEventSender,
+     pub(crate) chat_widget: ChatWidget,
++    foreground: foreground_observation::NativeForeground,
+     workspace_command_runner: Option<WorkspaceCommandRunner>,
+     /// Legacy bootstrap and server-setting inputs; local preferences live in `local_settings`.
+     pub(crate) config: Config,
+@@ -1290,6 +1292,7 @@ impl App {
+ 
+ impl Drop for App {
+     fn drop(&mut self) {
++        self.native_foreground_disconnected();
+         if let Err(err) = self.chat_widget.clear_managed_terminal_title() {
+             tracing::debug!(error = %err, "failed to clear terminal title on app drop");
+         }
+diff --git a/codex-rs/tui/src/app/reconnect.rs b/codex-rs/tui/src/app/reconnect.rs
+index 3713be1..6c81af5 100644
+--- a/codex-rs/tui/src/app/reconnect.rs
++++ b/codex-rs/tui/src/app/reconnect.rs
+@@ -213,6 +213,7 @@ impl App {
+             return false;
+         }
+         if !self.reconnect.offline {
++            self.native_foreground_disconnected();
+             #[cfg(target_os = "windows")]
+             if self.windows_sandbox_setup_is_local()
+                 && let Some(message) = self.chat_widget.initial_user_message.take()
+@@ -324,6 +325,19 @@ impl App {
+             .selected_index_for_present_view(agents_overview::AGENTS_OVERVIEW_VIEW_ID)
+             .and_then(|index| self.agents_overview.visible_thread_ids.get(index).copied());
+         let displayed = self.current_displayed_thread_id();
++        let external_writer = displayed.is_some_and(|id| {
++            self.thread_event_channels.get(&id).is_some_and(|channel| {
++                channel.attachment() == ThreadEventAttachment::ExternalWriter
++            })
++        });
++        let resumed_selection = thread.as_ref().map(|started| {
++            (
++                started.session.thread_id,
++                self.native_foreground_selection_allows_direct_input(started.session.thread_id)
++                    && !external_writer
++                    && !started.blocks_direct_input,
++            )
++        });
+         let mut input = self.chat_widget.capture_thread_input_state();
+         if let Some(input) = input.as_mut() {
+             input.reconnect_pending = true;
+@@ -622,6 +636,11 @@ impl App {
+         {
+             tracing::warn!(%err, "failed to discard input after reconnecting");
+         }
++        if let Some((thread_id, direct_input_allowed)) = resumed_selection
++            && displayed == Some(thread_id)
++        {
++            self.propose_native_foreground_selection(thread_id, direct_input_allowed);
++        }
+         Ok(())
+     }
+ }
+diff --git a/codex-rs/tui/src/app/session_lifecycle.rs b/codex-rs/tui/src/app/session_lifecycle.rs
+index 811d971..0d6eb67 100644
+--- a/codex-rs/tui/src/app/session_lifecycle.rs
++++ b/codex-rs/tui/src/app/session_lifecycle.rs
+@@ -487,6 +487,7 @@ impl App {
+     /// This helper copies every known nickname/role from `AgentNavigationState` into the
+     /// replacement widget so that replayed collab items render agent names immediately.
+     pub(super) fn replace_chat_widget(&mut self, mut chat_widget: ChatWidget) {
++        self.forget_native_foreground_selection();
+         chat_widget.fork_in_progress = self.chat_widget.fork_in_progress;
+         self.pending_right_click_paste = None;
+         self.config_notification_test_pending = None;
+@@ -719,6 +720,8 @@ impl App {
+         }
+         self.refresh_pending_thread_approvals().await;
+ 
++        // Keep the resolved denial even when a cached channel still says Live.
++        self.propose_native_foreground_selection(thread_id, !is_replay_only);
+         Ok(())
+     }
+ 
+diff --git a/codex-rs/tui/src/app/startup.rs b/codex-rs/tui/src/app/startup.rs
+index 85e4dc1..b4eb2fb 100644
+--- a/codex-rs/tui/src/app/startup.rs
++++ b/codex-rs/tui/src/app/startup.rs
+@@ -256,6 +256,9 @@ impl App {
+     ) -> Result<AppExitInfo> {
+         use tokio_stream::StreamExt;
+ 
++        let foreground_startup =
++            super::foreground_observation::StartupForegroundGuard::from_env(&config.codex_home);
++
+         async fn shutdown_on_startup_error(
+             app_server: AppServerSession,
+             error: impl Into<color_eyre::eyre::Report>,
+@@ -277,6 +280,11 @@ impl App {
+         }
+         let (app_event_tx, mut app_event_rx) = unbounded_channel();
+         let app_event_tx = AppEventSender::new(app_event_tx);
++        if let Some(message) = foreground_startup.initialization_warning() {
++            app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
++                history_cell::StartupWarningsCell::new(vec![message]),
++            )));
++        }
+         if let Some(message) = project_config_warning(&config) {
+             app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
+                 history_cell::StartupWarningsCell::new(vec![message]),
+@@ -897,6 +905,7 @@ See the Codex keymap documentation for supported actions and examples."
+             terminal_size_tags: tui.terminal_size_tags.clone(),
+             app_event_tx,
+             chat_widget,
++            foreground: foreground_startup.app_owned(),
+             workspace_command_runner: Some(workspace_command_runner),
+             config,
+             local_settings,
+@@ -1008,6 +1017,7 @@ See the Codex keymap documentation for supported actions and examples."
+             #[cfg(test)]
+             _test_codex_home: None,
+         };
++        app.native_foreground_connected(app_server.backend_id());
+         if tui.is_owned_screen()
+             && app.right_click_paste_environment.wsl
+             && app.right_click_paste_environment.allows(
+@@ -1136,6 +1146,11 @@ See the Codex keymap documentation for supported actions and examples."
+         if let Err(err) = app.render_startup_frame(tui, &app_event_rx) {
+             return shutdown_on_startup_error(app_server, err).await;
+         }
++        app.native_foreground_checkpoint(
++            app_server.backend_id(),
++            app_event_rx.is_empty(),
++            !wait_for_initial_session_configured && pending_startup_draft.is_none(),
++        );
+         let tui_events = tui.event_stream();
+         tokio::pin!(tui_events);
+         tracing::info!(
+@@ -1172,9 +1187,15 @@ See the Codex keymap documentation for supported actions and examples."
+         let mut reconnect = None;
+         let mut waiting_for_initial_session_configured = wait_for_initial_session_configured;
+         let mut waiting_for_initial_session_header = true;
++        let mut native_heartbeat = tokio::time::interval_at(
++            tokio::time::Instant::now() + Duration::from_secs(1),
++            Duration::from_secs(1),
++        );
++        native_heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+ 
+         #[cfg(not(debug_assertions))]
+         let pre_loop_exit_reason = if let Some(latest_version) = upgrade_version {
++            app.before_foreground_mutation("pre_loop_event").await;
+             let control = Box::pin(app.handle_event(
+                 tui,
+                 &mut app_server,
+@@ -1185,7 +1206,14 @@ See the Codex keymap documentation for supported actions and examples."
+             ))
+             .await?;
+             match control {
+-                AppRunControl::Continue => None,
++                AppRunControl::Continue => {
++                    app.native_foreground_checkpoint(
++                        app_server.backend_id(),
++                        app_event_rx.is_empty(),
++                        !waiting_for_initial_session_configured && pending_startup_draft.is_none(),
++                    );
++                    None
++                }
+                 AppRunControl::Exit(exit_reason) => Some(exit_reason),
+             }
+         } else {
+@@ -1210,6 +1238,7 @@ See the Codex keymap documentation for supported actions and examples."
+                     && !app.pending_startup_thread_start
+                     && !app.reconnect.offline
+                 {
++                    app.before_foreground_mutation("backend_closed").await;
+                     app.begin_reconnect();
+                 }
+                 // Reconnect can dismiss an overlay from the server-event path.
+@@ -1223,6 +1252,7 @@ See the Codex keymap documentation for supported actions and examples."
+                     }
+                 }
+                 if app.pending_open_resume_picker {
++                    app.before_foreground_mutation("resume_picker").await;
+                     app.pending_open_resume_picker = false;
+                     match Box::pin(
+                         app.open_resume_picker(tui, backends.session_at_mut(displayed_session)),
+@@ -1234,37 +1264,77 @@ See the Codex keymap documentation for supported actions and examples."
+                         Err(err) if app.recover_transport_error(&err) => {}
+                         Err(err) => break Err(err),
+                     }
++                    app.native_foreground_checkpoint(
++                        initial_owner,
++                        app_event_rx.is_empty(),
++                        !waiting_for_initial_session_configured && pending_startup_draft.is_none(),
++                    );
+                     continue;
+                 }
+-                if let Some(pending) = app.pending_working_directory_change.take() {
++                if app.pending_working_directory_change.is_some() {
++                    app.before_foreground_mutation("working_directory").await;
++                    let pending = app
++                        .pending_working_directory_change
++                        .take()
++                        .expect("checked pending working-directory change");
+                     Box::pin(app.finish_working_directory_change(
+                         tui,
+                         backends.session_at_mut(displayed_session),
+                         pending,
+                     ))
+                     .await;
++                    app.native_foreground_checkpoint(
++                        initial_owner,
++                        app_event_rx.is_empty(),
++                        !waiting_for_initial_session_configured && pending_startup_draft.is_none(),
++                    );
+                     continue;
+                 }
+-                if let Some((mode, name)) = app.pending_start_managed_worktree.take() {
++                if app.pending_start_managed_worktree.is_some() {
++                    app.before_foreground_mutation("worktree_start").await;
++                    let (mode, name) = app
++                        .pending_start_managed_worktree
++                        .take()
++                        .expect("checked pending worktree start");
+                     Box::pin(app.start_managed_worktree(
+                         backends.session_at_mut(displayed_session),
+                         mode,
+                         name,
+                     ))
+                     .await;
++                    app.native_foreground_checkpoint(
++                        initial_owner,
++                        app_event_rx.is_empty(),
++                        !waiting_for_initial_session_configured && pending_startup_draft.is_none(),
++                    );
+                     continue;
+                 }
+                 // Complete the fork and widget attachment on separate fresh loop iterations.
+-                if let Some(attach) = app.pending_managed_worktree_attach.take() {
++                if app.pending_managed_worktree_attach.is_some() {
++                    app.before_foreground_mutation("worktree_attach").await;
++                    let attach = app
++                        .pending_managed_worktree_attach
++                        .take()
++                        .expect("checked pending worktree attachment");
+                     Box::pin(app.attach_working_directory(
+                         tui,
+                         backends.session_at_mut(displayed_session),
+                         *attach,
+                     ))
+                     .await;
++                    app.native_foreground_checkpoint(
++                        initial_owner,
++                        app_event_rx.is_empty(),
++                        !waiting_for_initial_session_configured && pending_startup_draft.is_none(),
++                    );
+                     continue;
+                 }
+-                if let Some(transition) = app.pending_managed_worktree_transition.take() {
++                if app.pending_managed_worktree_transition.is_some() {
++                    app.before_foreground_mutation("worktree_transition").await;
++                    let transition = app
++                        .pending_managed_worktree_transition
++                        .take()
++                        .expect("checked pending worktree transition");
+                     if let Err(error) = Box::pin(app.switch_to_managed_worktree(
+                         tui,
+                         backends.session_at_mut(displayed_session),
+@@ -1274,10 +1344,25 @@ See the Codex keymap documentation for supported actions and examples."
+                     {
+                         app.chat_widget.add_error_message(error.to_string());
+                     }
++                    app.native_foreground_checkpoint(
++                        initial_owner,
++                        app_event_rx.is_empty(),
++                        !waiting_for_initial_session_configured && pending_startup_draft.is_none(),
++                    );
+                     continue;
+                 }
+-                if let Some(created) = app.pending_managed_worktree_created.take() {
++                if app.pending_managed_worktree_created.is_some() {
++                    app.before_foreground_mutation("worktree_complete").await;
++                    let created = app
++                        .pending_managed_worktree_created
++                        .take()
++                        .expect("checked completed worktree");
+                     Box::pin(app.finish_managed_worktree(*created)).await;
++                    app.native_foreground_checkpoint(
++                        initial_owner,
++                        app_event_rx.is_empty(),
++                        !waiting_for_initial_session_configured && pending_startup_draft.is_none(),
++                    );
+                     continue;
+                 }
+                 if app.reconnect.offline && !app.reconnect.failed && reconnect.is_none() {
+@@ -1352,6 +1437,7 @@ See the Codex keymap documentation for supported actions and examples."
+                             None => std::future::pending().await,
+                         }
+                     }, if app.daemon_restart.is_some() => {
++                        app.before_foreground_mutation("daemon_restart_complete").await;
+                         app.daemon_restart = None;
+                         if let Err(err) = result.unwrap_or_else(|err| Err(err.into())) {
+                             app.chat_widget.add_error_message(format!("Could not restart the background server: {err:#}"));
+@@ -1359,6 +1445,7 @@ See the Codex keymap documentation for supported actions and examples."
+                         AppRunControl::Continue
+                     }
+                     Some(event) = app_event_rx.recv() => {
++                        app.before_foreground_mutation("app_event").await;
+                         let is_initial_session_header = matches!(
+                             &event,
+                             AppEvent::InsertHistoryCell(cell)
+@@ -1393,6 +1480,7 @@ See the Codex keymap documentation for supported actions and examples."
+                         waiting_for_initial_session_configured,
+                         app.active_thread_rx.is_some()
+                     ) && !has_pending_app_events && !app.reconnect.offline => {
++                        app.before_foreground_mutation("active_thread_event").await;
+                         if let Some(event) = active {
+                             if let Err(err) = app.handle_active_thread_event(tui, backends.session_at_mut(displayed_session), event).await {
+                                 break Err(err);
+@@ -1404,6 +1492,7 @@ See the Codex keymap documentation for supported actions and examples."
+                     }
+                     event = tui_events.next(), if app.pending_thread_switch_resets == 0
+                         && (app.reconnect.offline || !block_terminal_input_for_pending_startup_events) => {
++                        app.before_foreground_mutation("terminal_event").await;
+                         if let Some(event) = event {
+                             if (matches!(
+                                 &event,
+@@ -1436,6 +1525,7 @@ See the Codex keymap documentation for supported actions and examples."
+                         }
+                     }
+                     (owner, app_server_event) = backends.next_event(paused_backend) => {
++                        app.before_foreground_mutation("backend_event").await;
+                         match app_server_event {
+                             Some(event) if owner != initial_owner || !app.reconnect.offline => {
+                                 if let Some(session) = backends.session(owner) {
+@@ -1457,6 +1547,7 @@ See the Codex keymap documentation for supported actions and examples."
+                         AppRunControl::Continue
+                     }
+                     result = async { match reconnect.as_mut() { Some(future) => future.await, None => std::future::pending().await } }, if reconnect.is_some() && !has_pending_app_events => {
++                        app.before_foreground_mutation("reconnect_complete").await;
+                         reconnect = None;
+                         match result {
+                             Ok(connected) => {
+@@ -1464,6 +1555,7 @@ See the Codex keymap documentation for supported actions and examples."
+                                     break Err(err);
+                                 }
+                                 backends.resume_events(initial_owner);
++                                app.native_foreground_connected(initial_owner);
+                                 waiting_for_initial_session_configured = app.pending_startup_thread_start;
+                                 if app.pending_startup_thread_start {
+                                     spawn_startup_thread_start(
+@@ -1557,6 +1649,10 @@ See the Codex keymap documentation for supported actions and examples."
+                         app.chat_widget.on_commit_tick();
+                         AppRunControl::Continue
+                     }
++                    _ = native_heartbeat.tick(), if app.foreground.heartbeat_enabled() => {
++                        app.native_foreground_heartbeat();
++                        AppRunControl::Continue
++                    }
+                 };
+                 if App::should_stop_waiting_for_initial_session(
+                     waiting_for_initial_session_configured,
+@@ -1593,11 +1689,18 @@ See the Codex keymap documentation for supported actions and examples."
+                             tui.probe_default_colors_after_protected_startup();
+                             terminal_color_probe_pending = false;
+                         }
++                        app.native_foreground_checkpoint(
++                            initial_owner,
++                            app_event_rx.is_empty(),
++                            !waiting_for_initial_session_configured
++                                && pending_startup_draft.is_none(),
++                        );
+                     }
+                     AppRunControl::Exit(reason) => break Ok(reason),
+                 }
+             }
+         };
++        app.withdraw_native_foreground_for_teardown().await;
+         app.chat_widget.mention_usage_mut().flush().await;
+         if let Err(err) = backends.shutdown().await {
+             tracing::warn!(error = %err, "failed to shut down embedded app server");
+diff --git a/codex-rs/tui/src/app/test_support.rs b/codex-rs/tui/src/app/test_support.rs
+index a0efb33..38c3d39 100644
+--- a/codex-rs/tui/src/app/test_support.rs
++++ b/codex-rs/tui/src/app/test_support.rs
+@@ -29,6 +29,7 @@ pub(crate) async fn make_test_app() -> Box<App> {
+         terminal_size_tags: Vec::new(),
+         app_event_tx,
+         chat_widget,
++        foreground: Default::default(),
+         workspace_command_runner: None,
+         launch_cwd: config.cwd.to_path_buf(),
+         runtime_working_directory_override: None,
+diff --git a/codex-rs/tui/src/app/tests.rs b/codex-rs/tui/src/app/tests.rs
+index ae45328..005a521 100644
+--- a/codex-rs/tui/src/app/tests.rs
++++ b/codex-rs/tui/src/app/tests.rs
+@@ -73,6 +73,9 @@ mod unavailable_commands;
+ 
+ #[path = "tests/backend_sessions_tests.rs"]
+ mod backend_sessions;
++#[cfg(unix)]
++#[path = "foreground_observation/tests.rs"]
++mod foreground_observation;
+ #[path = "tests/history_hydration_tests.rs"]
+ mod history_hydration_tests;
+ #[path = "tests/permission_shortcuts_tests.rs"]
+@@ -6401,6 +6404,7 @@ async fn make_test_app() -> Box<App> {
+         terminal_size_tags: Vec::new(),
+         app_event_tx,
+         chat_widget,
++        foreground: Default::default(),
+         workspace_command_runner: None,
+         launch_cwd: config.cwd.to_path_buf(),
+         runtime_working_directory_override: None,
+@@ -6527,6 +6531,7 @@ pub(super) async fn make_test_app_with_channels() -> (
+             terminal_size_tags: Vec::new(),
+             app_event_tx,
+             chat_widget,
++            foreground: Default::default(),
+             workspace_command_runner: None,
+             launch_cwd: config.cwd.to_path_buf(),
+             runtime_working_directory_override: None,
+diff --git a/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs b/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs
+index 787c7e0..a5feb36 100644
+--- a/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs
++++ b/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs
+@@ -371,6 +371,7 @@ pub(super) enum HistoryCapabilities {
+     LegacyDynamicToolsAndHistory,
+     ForkHydrationFails,
+     ReadAfterResumeFails,
++    ResumeFails,
+     ItemsListFails,
+     ItemsAndSummaryTurnsFail,
+     ThreadListFails,
+@@ -611,14 +612,17 @@ pub(super) async fn start_recording_app_server_with_realtime_speech(
+                             id: request_id,
+                             result: serde_json::json!({}),
+                         })
+-                    } else if (matches!(
+-                        history_capabilities,
+-                        HistoryCapabilities::ItemsListFails
+-                            | HistoryCapabilities::ItemsAndSummaryTurnsFail
+-                    ) && (request.method == "thread/items/list"
+-                        || (history_capabilities == HistoryCapabilities::ItemsAndSummaryTurnsFail
+-                            && request.method == "thread/turns/list"
+-                            && params.is_some_and(|params| params["itemsView"] == "summary"))))
++                    } else if (history_capabilities == HistoryCapabilities::ResumeFails
++                        && request.method == "thread/resume")
++                        || (matches!(
++                            history_capabilities,
++                            HistoryCapabilities::ItemsListFails
++                                | HistoryCapabilities::ItemsAndSummaryTurnsFail
++                        ) && (request.method == "thread/items/list"
++                            || (history_capabilities
++                                == HistoryCapabilities::ItemsAndSummaryTurnsFail
++                                && request.method == "thread/turns/list"
++                                && params.is_some_and(|params| params["itemsView"] == "summary"))))
+                         || (history_capabilities == HistoryCapabilities::ReadAfterResumeFails
+                             && request.method == "thread/read"
+                             && request_sink
+diff --git a/codex-rs/tui/src/app/tests/startup.rs b/codex-rs/tui/src/app/tests/startup.rs
+index c6c4848..bca98ea 100644
+--- a/codex-rs/tui/src/app/tests/startup.rs
++++ b/codex-rs/tui/src/app/tests/startup.rs
+@@ -203,7 +203,7 @@ async fn windows_sandbox_setup_completion_requires_matching_pending_mode() -> Re
+     Ok(())
+ }
+ 
+-fn startup_bottom_pane() -> (BottomPane, UnboundedReceiver<AppEvent>) {
++pub(super) fn startup_bottom_pane() -> (BottomPane, UnboundedReceiver<AppEvent>) {
+     let (app_event_tx, app_event_rx) = unbounded_channel();
+     (
+         BottomPane::new(BottomPaneParams {
+diff --git a/codex-rs/tui/src/app/thread_routing.rs b/codex-rs/tui/src/app/thread_routing.rs
+index 07a9869..dc1252b 100644
+--- a/codex-rs/tui/src/app/thread_routing.rs
++++ b/codex-rs/tui/src/app/thread_routing.rs
+@@ -1483,6 +1483,7 @@ impl App {
+         self.chat_widget
+             .set_initial_user_message_submit_suppressed(/*suppressed*/ false);
+         self.chat_widget.submit_initial_user_message_if_pending();
++        self.propose_native_foreground_selection(thread_id, /*direct_input_allowed*/ true);
+         Ok(())
+     }
+ 
+@@ -1615,11 +1616,13 @@ impl App {
+         loop {
+             match rx.try_recv() {
+                 Ok(event) => {
++                    self.before_foreground_event_drain().await;
+                     self.handle_thread_event_now_recovering_file_changes(event)
+                         .await
+                 }
+                 Err(TryRecvError::Empty) => break,
+                 Err(TryRecvError::Disconnected) => {
++                    self.before_foreground_event_drain().await;
+                     disconnected = true;
+                     break;
+                 }
+diff --git a/codex-rs/tui/src/chatwidget/input_flow.rs b/codex-rs/tui/src/chatwidget/input_flow.rs
+index ce5da8c..868e8ff 100644
+--- a/codex-rs/tui/src/chatwidget/input_flow.rs
++++ b/codex-rs/tui/src/chatwidget/input_flow.rs
+@@ -12,6 +12,10 @@ use crate::bottom_pane::slash_commands::SlashCommandItem;
+ use crate::bottom_pane::slash_commands::find_slash_command;
+ 
+ impl ChatWidget {
++    pub(crate) fn accepts_native_direct_input(&self) -> bool {
++        !self.blocks_direct_input
++    }
++
+     pub(crate) fn set_parent_owned_thread(&mut self) {
+         self.cancel_image_submission();
+         self.blocks_direct_input = true;
+diff --git a/codex-rs/tui/src/app/foreground_observation.rs b/codex-rs/tui/src/app/foreground_observation.rs
+new file mode 100644
+index 0000000..fe28a6e
+--- /dev/null
++++ b/codex-rs/tui/src/app/foreground_observation.rs
+@@ -0,0 +1,326 @@
++//! Native foreground authority is committed by the App, never by operation routing.
++
++use super::App;
++use crate::backend_id::BackendId;
++use codex_protocol::ThreadId;
++use std::path::Path;
++
++#[cfg(unix)]
++use ccc_native_client_foreground::ForegroundObserver;
++
++#[derive(Clone, Copy)]
++struct NativeSelection {
++    thread_id: ThreadId,
++    direct_input_allowed: bool,
++}
++
++/// Covers startup returns before App construction and every later error return.
++pub(super) struct StartupForegroundGuard {
++    #[cfg(unix)]
++    observer: ForegroundObserver,
++    enabled: bool,
++    initialization_error: Option<String>,
++}
++
++impl StartupForegroundGuard {
++    pub(super) fn from_env(home: &Path) -> Self {
++        let requested = std::env::var_os("CODEX_CLIENT_THREAD_OBSERVER").as_deref()
++            == Some(std::ffi::OsStr::new("1"));
++        #[cfg(unix)]
++        {
++            Self::from_result(requested, ForegroundObserver::from_env(home))
++        }
++        #[cfg(not(unix))]
++        {
++            let _ = home;
++            Self {
++                enabled: false,
++                initialization_error: requested.then(|| {
++                    "native foreground observation is unavailable on this platform".into()
++                }),
++            }
++        }
++    }
++
++    #[cfg(unix)]
++    pub(super) fn from_result(
++        requested: bool,
++        observer: std::io::Result<ForegroundObserver>,
++    ) -> Self {
++        match observer {
++            Ok(observer) => Self {
++                observer,
++                enabled: requested,
++                initialization_error: None,
++            },
++            Err(error) => Self {
++                observer: ForegroundObserver::disabled(),
++                enabled: false,
++                initialization_error: Some(error.to_string()),
++            },
++        }
++    }
++
++    pub(super) fn initialization_warning(&self) -> Option<String> {
++        self.initialization_error.as_ref().map(|error| {
++            format!("Automatic continuation is unavailable: {error}. Your session remains open.")
++        })
++    }
++
++    pub(super) fn app_owned(&self) -> NativeForeground {
++        NativeForeground {
++            #[cfg(unix)]
++            observer: self.observer.clone(),
++            enabled: self.enabled,
++            changing: true,
++            ..Default::default()
++        }
++    }
++}
++
++impl Drop for StartupForegroundGuard {
++    fn drop(&mut self) {
++        #[cfg(unix)]
++        if self.enabled {
++            let _ = self.observer.revoke();
++        }
++    }
++}
++
++/// A proposal is produced only by completed native display flows. The library
++/// owns the independently committed SID used by the one-second heartbeat.
++pub(super) struct NativeForeground {
++    #[cfg(unix)]
++    observer: ForegroundObserver,
++    enabled: bool,
++    selection: Option<NativeSelection>,
++    connected_owner: Option<BackendId>,
++    connection_published: bool,
++    changing: bool,
++    failure_notice: Option<String>,
++    failure_notice_shown: bool,
++}
++
++impl Default for NativeForeground {
++    fn default() -> Self {
++        Self {
++            #[cfg(unix)]
++            observer: ForegroundObserver::disabled(),
++            enabled: false,
++            selection: None,
++            connected_owner: None,
++            connection_published: false,
++            changing: false,
++            failure_notice: None,
++            failure_notice_shown: false,
++        }
++    }
++}
++
++impl NativeForeground {
++    pub(super) fn heartbeat_enabled(&self) -> bool {
++        self.enabled
++    }
++
++    fn note_failure(&mut self, error: std::io::Error) {
++        self.connection_published = false;
++        if !self.failure_notice_shown {
++            self.failure_notice = Some(format!(
++                "Automatic continuation is unavailable: {error}. Your session remains open."
++            ));
++        }
++    }
++
++    #[cfg(all(unix, test))]
++    pub(super) fn open_enabled(home: &Path) -> std::io::Result<Self> {
++        Ok(Self {
++            observer: ForegroundObserver::open_enabled(home)?,
++            enabled: true,
++            changing: true,
++            ..Default::default()
++        })
++    }
++}
++
++impl App {
++    /// Resolve the event first. This gate must never surround an idle select!.
++    /// A refused withdrawal leaves the selected UI untouched until its last
++    /// positive monotonic lease has drained; normal work can then proceed with
++    /// observation suspended. No error here exits the user's TUI.
++    pub(super) async fn before_foreground_mutation(&mut self, reason: &str) {
++        #[cfg(unix)]
++        if self.foreground.enabled {
++            if self.foreground.observer.before_change(reason).is_err() {
++                self.foreground.connection_published = false;
++                let remaining = self.foreground.observer.remaining_lease();
++                if !remaining.is_zero() {
++                    tokio::time::sleep(remaining).await;
++                }
++                if let Err(retry_error) = self.foreground.observer.before_change(reason) {
++                    self.foreground.note_failure(retry_error);
++                }
++            }
++        }
++        #[cfg(not(unix))]
++        let _ = reason;
++        self.foreground.changing = true;
++    }
++
++    /// Event drains can run after the heartbeat or a presentation-only tick.
++    /// Call this only once an event or receiver closure has actually resolved.
++    pub(super) async fn before_foreground_event_drain(&mut self) {
++        if !self.foreground.changing {
++            self.before_foreground_mutation("active_event_drain").await;
++        }
++    }
++
++    pub(super) fn native_foreground_connected(&mut self, owner: BackendId) {
++        self.foreground.connected_owner = Some(owner);
++        self.foreground.connection_published = false;
++        #[cfg(unix)]
++        if self.foreground.enabled {
++            match self.foreground.observer.connected() {
++                Ok(()) => self.foreground.connection_published = true,
++                Err(error) => self.foreground.note_failure(error),
++            }
++        }
++    }
++
++    /// Transport loss is an external fact, so stop renewal before updating UI
++    /// eligibility even when a null record cannot be stored.
++    pub(super) fn native_foreground_disconnected(&mut self) {
++        self.foreground.connected_owner = None;
++        self.foreground.connection_published = false;
++        #[cfg(unix)]
++        if self.foreground.enabled
++            && let Err(error) = self.foreground.observer.disconnected()
++        {
++            self.foreground.note_failure(error);
++        }
++    }
++
++    pub(super) fn forget_native_foreground_selection(&mut self) {
++        self.foreground.selection = None;
++    }
++
++    pub(super) fn propose_native_foreground_selection(
++        &mut self,
++        thread_id: ThreadId,
++        direct_input_allowed: bool,
++    ) {
++        self.foreground.selection = Some(NativeSelection {
++            thread_id,
++            direct_input_allowed,
++        });
++    }
++
++    pub(super) fn native_foreground_selection_allows_direct_input(
++        &self,
++        thread_id: ThreadId,
++    ) -> bool {
++        self.foreground.selection.is_some_and(|selection| {
++            selection.thread_id == thread_id && selection.direct_input_allowed
++        })
++    }
++
++    fn native_foreground_has_barrier(&self, queue_empty: bool, startup_ready: bool) -> bool {
++        !queue_empty
++            || !startup_ready
++            || self.pending_startup_thread_start
++            || self.pending_thread_switch_resets != 0
++            || self.initial_history_replay_buffer.is_some()
++            || self.backtrack_render_pending
++            || !self.pending_primary_events.is_empty()
++            || self.pending_open_resume_picker
++            || self.pending_working_directory_change.is_some()
++            || self.pending_start_managed_worktree.is_some()
++            || self.pending_managed_worktree_creation
++            || self.pending_managed_worktree_created.is_some()
++            || self.pending_managed_worktree_transition.is_some()
++            || self.pending_managed_worktree_attach.is_some()
++            || self.startup_pending_protected_request
++            || self.has_queued_startup_protected_request()
++            || self.chat_widget.has_pending_protected_request()
++            || self.chat_widget.has_active_view()
++    }
++
++    /// Called after the whole mutable step, including deferred early-continue
++    /// paths, transcript replay/reset processing and startup-input restoration.
++    pub(super) fn native_foreground_checkpoint(
++        &mut self,
++        owner: BackendId,
++        queue_empty: bool,
++        startup_ready: bool,
++    ) {
++        if !self.foreground.changing {
++            return;
++        }
++        let thread = self.foreground.selection.filter(|selection| {
++            selection.direct_input_allowed
++                && self.foreground.connected_owner == Some(owner)
++                && !self.reconnect.offline
++                && !self.reconnect.failed
++                && !self.native_foreground_has_barrier(queue_empty, startup_ready)
++                && self.active_thread_id == Some(selection.thread_id)
++                && self.chat_widget.thread_id() == Some(selection.thread_id)
++                && self
++                    .active_thread_rx
++                    .as_ref()
++                    .is_some_and(|rx| rx.is_empty())
++                && self
++                    .thread_event_channels
++                    .get(&selection.thread_id)
++                    .is_some_and(|channel| {
++                        channel.attachment() == super::ThreadEventAttachment::Live
++                    })
++                && !self.thread_unavailable(selection.thread_id)
++                && !self.agent_navigation.is_parent_owned(selection.thread_id)
++                && !self
++                    .agent_navigation
++                    .get(&selection.thread_id)
++                    .is_some_and(|entry| entry.is_closed)
++                && self.chat_widget.accepts_native_direct_input()
++                && !self.chat_widget.is_external_writer_view()
++        });
++        #[cfg(unix)]
++        if self.foreground.enabled && !self.foreground.observer.is_suspended() {
++            if thread.is_some() && !self.foreground.connection_published {
++                self.native_foreground_connected(owner);
++            }
++            if !self.foreground.observer.is_suspended() {
++                let thread = thread.map(|selection| selection.thread_id.to_string());
++                if let Err(error) = self.foreground.observer.committed(thread.as_deref()) {
++                    self.foreground.note_failure(error);
++                }
++            }
++        }
++        #[cfg(not(unix))]
++        let _ = thread;
++        self.foreground.changing = false;
++        self.show_native_foreground_failure();
++    }
++
++    /// The heartbeat deliberately has no access to active/widget routing IDs.
++    pub(super) fn native_foreground_heartbeat(&mut self) {
++        #[cfg(unix)]
++        if self.foreground.enabled
++            && let Err(error) = self.foreground.observer.heartbeat()
++        {
++            self.foreground.note_failure(error);
++        }
++        self.show_native_foreground_failure();
++    }
++
++    fn show_native_foreground_failure(&mut self) {
++        if let Some(message) = self.foreground.failure_notice.take() {
++            self.foreground.failure_notice_shown = true;
++            self.chat_widget.add_error_message(message);
++        }
++    }
++
++    pub(super) async fn withdraw_native_foreground_for_teardown(&mut self) {
++        self.before_foreground_mutation("teardown").await;
++        self.forget_native_foreground_selection();
++        self.native_foreground_disconnected();
++    }
++}
+diff --git a/codex-rs/tui/src/app/foreground_observation/tests.rs b/codex-rs/tui/src/app/foreground_observation/tests.rs
+new file mode 100644
+index 0000000..84e5529
+--- /dev/null
++++ b/codex-rs/tui/src/app/foreground_observation/tests.rs
+@@ -0,0 +1,767 @@
++//! Actual App attachment, routing and reconnect flows backed by a private file journal.
++
++use super::*;
++use crate::app::foreground_observation::NativeForeground;
++use crate::app::foreground_observation::StartupForegroundGuard;
++use crate::app::tests::disconnect::serve_reconnect_requests;
++use crate::app::tests::session_lifecycle_requests::HistoryCapabilities;
++use crate::app::tests::session_lifecycle_requests::recorded_params;
++use crate::app::tests::session_lifecycle_requests::start_recording_app_server_with_history;
++use crate::backend_id::BackendId;
++use ccc_native_client_foreground::ForegroundObserver;
++use codex_protocol::models::ActivePermissionProfile;
++use std::fs::DirBuilder;
++use std::fs::OpenOptions;
++use std::io::Write;
++use std::os::unix::fs::DirBuilderExt;
++use std::os::unix::fs::OpenOptionsExt;
++use tempfile::TempDir;
++use tokio::net::TcpListener;
++use tokio::task::JoinHandle;
++
++fn observer_clock_ns() -> u64 {
++    let mut stamp = libc::timespec {
++        tv_sec: 0,
++        tv_nsec: 0,
++    };
++    assert_eq!(
++        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut stamp) },
++        0
++    );
++    u64::try_from(stamp.tv_sec).expect("nonnegative monotonic seconds") * 1_000_000_000
++        + u64::try_from(stamp.tv_nsec).expect("nonnegative monotonic nanoseconds")
++}
++
++struct ObservationFiles {
++    home: TempDir,
++}
++
++impl ObservationFiles {
++    fn new() -> Result<Self> {
++        let home = tempfile::tempdir()?;
++        let directory = home.path().join("credential-observations");
++        DirBuilder::new().mode(0o700).create(&directory)?;
++        let mut marker = OpenOptions::new()
++            .write(true)
++            .create_new(true)
++            .mode(0o600)
++            .open(directory.join("enabled-v1"))?;
++        marker.write_all(b"ccc-request-credentials-v1\n")?;
++        Ok(Self { home })
++    }
++
++    fn marker_path(&self) -> PathBuf {
++        self.home.path().join("credential-observations/enabled-v1")
++    }
++
++    fn record_path(&self) -> PathBuf {
++        self.home.path().join(format!(
++            "credential-observations/client-{}-thread.json",
++            std::process::id()
++        ))
++    }
++
++    fn record(&self) -> Result<serde_json::Value> {
++        Ok(serde_json::from_slice(&std::fs::read(self.record_path())?)?)
++    }
++
++    fn assert_clear(&self) -> Result<()> {
++        let record = self.record()?;
++        assert!(record["thread_id"].is_null(), "{record}");
++        assert_eq!(record["control_eligible"], false);
++        Ok(())
++    }
++
++    fn assert_live(&self, thread_id: ThreadId) -> Result<serde_json::Value> {
++        let record = self.record()?;
++        assert_eq!(record["thread_id"], thread_id.to_string());
++        assert_eq!(record["control_eligible"], true);
++        assert_eq!(record["schema"], 2);
++        assert_eq!(record["monotonic_clock"], "clock_monotonic");
++        Ok(record)
++    }
++}
++
++struct ForegroundFixture {
++    app: Box<App>,
++    events: mpsc::UnboundedReceiver<AppEvent>,
++    _ops: mpsc::UnboundedReceiver<Op>,
++    server: AppServerSession,
++    tui: crate::tui::Tui,
++    files: ObservationFiles,
++}
++
++impl ForegroundFixture {
++    async fn new() -> Result<Self> {
++        let (mut app, events, ops) = boxed_future!(make_test_app_with_channels()).await;
++        app.local_settings.tui.show_tooltips = false;
++        app.local_settings.tui.show_server_version_notice = false;
++        let server =
++            boxed_future!(crate::start_embedded_app_server_for_picker(&app.config)).await?;
++        let files = ObservationFiles::new()?;
++        app.foreground = NativeForeground::open_enabled(files.home.path())?;
++        app.native_foreground_connected(server.backend_id());
++        Ok(Self {
++            app,
++            events,
++            _ops: ops,
++            server,
++            tui: crate::tui::test_support::make_test_tui()?,
++            files,
++        })
++    }
++
++    async fn enqueue(&mut self, thread_id: ThreadId, turns: Vec<Turn>) -> Result<()> {
++        self.app.before_foreground_mutation("native_attach").await;
++        boxed_future!(self.app.enqueue_primary_thread_session(
++            test_thread_session(thread_id, self.app.config.cwd.to_path_buf()),
++            turns,
++        ))
++        .await
++    }
++
++    async fn settle_events(&mut self) -> Result<()> {
++        for _ in 0..32 {
++            while let Ok(event) = self.events.try_recv() {
++                self.app.before_foreground_mutation("app_event").await;
++                let control = boxed_future!(self.app.handle_event(
++                    &mut self.tui,
++                    &mut self.server,
++                    event,
++                ))
++                .await?;
++                assert!(matches!(control, AppRunControl::Continue));
++            }
++            boxed_future!(self.app.drain_active_thread_events(&mut self.tui)).await?;
++            if self.events.is_empty()
++                && self
++                    .app
++                    .active_thread_rx
++                    .as_ref()
++                    .is_none_or(|rx| rx.is_empty())
++            {
++                return Ok(());
++            }
++        }
++        color_eyre::eyre::bail!("foreground fixture did not finish its buffered App events")
++    }
++
++    fn checkpoint(&mut self, startup_ready: bool) {
++        self.app.native_foreground_checkpoint(
++            self.server.backend_id(),
++            self.events.is_empty(),
++            startup_ready,
++        );
++    }
++
++    async fn finish(&mut self) -> Result<()> {
++        boxed_future!(self.settle_events()).await?;
++        self.checkpoint(/*startup_ready*/ true);
++        Ok(())
++    }
++}
++
++#[tokio::test]
++async fn startup_commits_after_event_drain_and_actual_draft_restoration() -> Result<()> {
++    let mut fixture = boxed_future!(ForegroundFixture::new()).await?;
++    let thread_id = ThreadId::new();
++    boxed_future!(fixture.enqueue(thread_id, Vec::new())).await?;
++    fixture.files.assert_clear()?;
++    fixture.checkpoint(/*startup_ready*/ false);
++    fixture.files.assert_clear()?;
++    boxed_future!(fixture.settle_events()).await?;
++
++    let (mut startup_pane, _startup_events) = super::startup::startup_bottom_pane();
++    startup_pane.set_composer_text("retained startup draft".into(), Vec::new(), Vec::new());
++    let mut draft = Some(startup_pane.composer_draft_snapshot());
++    let mut submitted = false;
++    fixture
++        .app
++        .before_foreground_mutation("startup_input_ready")
++        .await;
++    fixture
++        .app
++        .chat_widget
++        .restore_startup_input_when_ready(&mut draft, &mut submitted);
++    assert!(draft.is_none());
++    fixture.checkpoint(draft.is_none());
++    fixture.files.assert_live(thread_id)?;
++    assert_eq!(
++        fixture.app.chat_widget.composer_text_with_pending(),
++        "retained startup draft"
++    );
++    fixture.server.shutdown().await?;
++    Ok(())
++}
++
++#[tokio::test]
++async fn delayed_startup_external_writer_or_parent_ownership_never_commits() -> Result<()> {
++    for external_writer in [false, true] {
++        let mut fixture = boxed_future!(ForegroundFixture::new()).await?;
++        let thread_id = ThreadId::new();
++        boxed_future!(fixture.enqueue(thread_id, Vec::new())).await?;
++        fixture.files.assert_clear()?;
++        if external_writer {
++            fixture
++                .app
++                .ensure_thread_channel(thread_id)
++                .mark_external_writer();
++            fixture.app.chat_widget.show_external_writer_thread();
++        } else {
++            fixture.app.mark_primary_thread_parent_owned(thread_id);
++        }
++        boxed_future!(fixture.finish()).await?;
++        fixture.files.assert_clear()?;
++        assert_eq!(fixture.app.active_thread_id, Some(thread_id));
++        fixture.server.shutdown().await?;
++    }
++    Ok(())
++}
++
++#[tokio::test]
++async fn buffered_replay_and_thread_switch_resets_finish_before_publication() -> Result<()> {
++    let mut fixture = boxed_future!(ForegroundFixture::new()).await?;
++    let first = ThreadId::new();
++    boxed_future!(fixture.enqueue(first, Vec::new())).await?;
++    boxed_future!(fixture.finish()).await?;
++    let previous = fixture.files.assert_live(first)?;
++
++    let started = boxed_future!(fixture.server.start_thread(&fixture.app.config)).await?;
++    let second = started.session.thread_id;
++    let mut session = test_thread_session(second, fixture.app.config.cwd.to_path_buf());
++    session.active_permission_profile = None;
++    fixture.app.thread_event_channels.insert(
++        second,
++        ThreadEventChannel::new_with_session(
++            THREAD_EVENT_CHANNEL_CAPACITY,
++            session,
++            vec![test_turn("saved", TurnStatus::Completed, Vec::new())],
++        ),
++    );
++    fixture
++        .app
++        .upsert_agent_picker_thread(second, None, None, /*is_closed*/ false);
++    fixture.app.before_foreground_mutation("switch").await;
++    boxed_future!(
++        fixture
++            .app
++            .select_agent_thread(&mut fixture.tui, &mut fixture.server, second)
++    )
++    .await?;
++    assert!(fixture.app.pending_thread_switch_resets > 0);
++    fixture.checkpoint(/*startup_ready*/ true);
++    fixture.files.assert_clear()?;
++
++    while let Ok(event) = fixture.events.try_recv() {
++        fixture.app.before_foreground_mutation("app_event").await;
++        boxed_future!(
++            fixture
++                .app
++                .handle_event(&mut fixture.tui, &mut fixture.server, event)
++        )
++        .await?;
++        fixture.checkpoint(/*startup_ready*/ true);
++        if fixture.app.pending_thread_switch_resets != 0
++            || fixture.app.initial_history_replay_buffer.is_some()
++            || !fixture.events.is_empty()
++        {
++            fixture.files.assert_clear()?;
++        }
++    }
++    boxed_future!(fixture.finish()).await?;
++    let current = fixture.files.assert_live(second)?;
++    assert_eq!(current["client_epoch"], previous["client_epoch"]);
++    assert!(current["selection_generation"].as_u64() > previous["selection_generation"].as_u64());
++    fixture.server.shutdown().await?;
++    Ok(())
++}
++
++#[tokio::test]
++async fn ineligible_or_incomplete_native_attachments_stay_clear() -> Result<()> {
++    for denial in [
++        "missing-channel",
++        "missing-receiver",
++        "closed",
++        "parent-owned",
++        "blocked-widget",
++        "external-writer",
++        "replay-only",
++        "offline",
++        "failed",
++        "pending-start",
++        "pending-reset",
++        "pending-replay",
++        "missing-proposal",
++        "foreign-owner",
++    ] {
++        let mut fixture = boxed_future!(ForegroundFixture::new()).await?;
++        let thread_id = ThreadId::new();
++        boxed_future!(fixture.enqueue(thread_id, Vec::new())).await?;
++        boxed_future!(fixture.finish()).await?;
++        fixture.files.assert_live(thread_id)?;
++        fixture.app.before_foreground_mutation(denial).await;
++        match denial {
++            "missing-channel" => {
++                fixture.app.thread_event_channels.remove(&thread_id);
++            }
++            "missing-receiver" => fixture.app.active_thread_rx = None,
++            "closed" => fixture.app.mark_agent_picker_thread_closed(thread_id),
++            "parent-owned" => fixture.app.agent_navigation.mark_parent_owned(thread_id),
++            "blocked-widget" => fixture.app.chat_widget.set_parent_owned_thread(),
++            "external-writer" => fixture
++                .app
++                .ensure_thread_channel(thread_id)
++                .mark_external_writer(),
++            "replay-only" => fixture
++                .app
++                .ensure_thread_channel(thread_id)
++                .mark_replay_only(),
++            "offline" => fixture.app.reconnect.offline = true,
++            "failed" => fixture.app.reconnect.failed = true,
++            "pending-start" => fixture.app.pending_startup_thread_start = true,
++            "pending-reset" => fixture.app.pending_thread_switch_resets = 1,
++            "pending-replay" => fixture.app.begin_initial_history_replay_buffer(),
++            "missing-proposal" => fixture.app.forget_native_foreground_selection(),
++            "foreign-owner" => {}
++            _ => unreachable!(),
++        }
++        let owner = if denial == "foreign-owner" {
++            BackendId::new()
++        } else {
++            fixture.server.backend_id()
++        };
++        fixture.app.native_foreground_checkpoint(
++            owner,
++            fixture.events.is_empty(),
++            /*startup_ready*/ true,
++        );
++        fixture.files.assert_clear()?;
++        assert_eq!(fixture.app.active_thread_id, Some(thread_id), "{denial}");
++        fixture.server.shutdown().await?;
++    }
++    Ok(())
++}
++
++#[tokio::test]
++async fn heartbeat_then_ready_active_thread_close_withdraws_before_drain() -> Result<()> {
++    let mut fixture = boxed_future!(ForegroundFixture::new()).await?;
++    let thread_id = ThreadId::new();
++    boxed_future!(fixture.enqueue(thread_id, Vec::new())).await?;
++    boxed_future!(fixture.finish()).await?;
++    let before = fixture.files.assert_live(thread_id)?;
++    fixture.app.native_foreground_heartbeat();
++    boxed_future!(fixture.app.drain_active_thread_events(&mut fixture.tui)).await?;
++    assert_eq!(
++        fixture.files.record()?["selection_generation"],
++        before["selection_generation"]
++    );
++
++    fixture.app.thread_event_channels[&thread_id]
++        .sender
++        .send(ThreadBufferedEvent::Notification(Box::new(
++            ServerNotification::ThreadClosed(codex_app_server_protocol::ThreadClosedNotification {
++                thread_id: thread_id.to_string(),
++            }),
++        )))
++        .await?;
++    fixture.files.assert_live(thread_id)?;
++    assert!(
++        !fixture
++            .app
++            .agent_navigation
++            .get(&thread_id)
++            .unwrap()
++            .is_closed
++    );
++    boxed_future!(fixture.app.drain_active_thread_events(&mut fixture.tui)).await?;
++    fixture.files.assert_clear()?;
++    let exit = std::iter::from_fn(|| fixture.events.try_recv().ok())
++        .find(|event| matches!(event, AppEvent::Exit(_)))
++        .expect("a live primary close must request TUI exit");
++    fixture
++        .app
++        .before_foreground_mutation("resolved_exit")
++        .await;
++    let control = boxed_future!(fixture.app.handle_event(
++        &mut fixture.tui,
++        &mut fixture.server,
++        exit
++    ))
++    .await?;
++    assert!(matches!(control, AppRunControl::Exit(_)));
++    fixture.app.withdraw_native_foreground_for_teardown().await;
++    fixture.files.assert_clear()?;
++    fixture.server.shutdown().await?;
++    Ok(())
++}
++
++async fn reconnect_fixture(
++    fixture: &mut ForegroundFixture,
++    thread_id: ThreadId,
++) -> Result<JoinHandle<Result<Vec<String>>>> {
++    let listener = TcpListener::bind("127.0.0.1:0").await?;
++    let endpoint = crate::resolve_remote_addr(&format!("ws://{}", listener.local_addr()?))?;
++    let cwd = fixture.app.config.cwd.clone();
++    let thread = serde_json::json!({
++        "id": thread_id, "sessionId": thread_id, "preview": "foreground reconnect", "ephemeral": false,
++        "modelProvider": "test-provider", "createdAt": 1, "updatedAt": 2,
++        "status": {"type": "idle"}, "cwd": cwd, "cliVersion": "0.0.0", "source": "cli", "turns": [],
++    });
++    let server = tokio::spawn(async move {
++        let (stream, _) = listener.accept().await?;
++        serve_reconnect_requests(tokio_tungstenite::accept_async(stream).await?, |request| {
++            std::future::ready(Some(match request.method.as_str() {
++                "thread/resume" => {
++                    assert_eq!(request.params.as_ref().unwrap()["threadId"], thread_id.to_string());
++                    serde_json::json!({"result": {"thread": thread.clone(), "model": "gpt-test",
++                        "modelProvider": "test-provider", "cwd": cwd, "approvalPolicy": "never",
++                        "approvalsReviewer": "user", "sandbox": {"type": "readOnly"}, "reasoningEffort": null}})
++                }
++                "thread/read" => serde_json::json!({"result": {"thread": thread.clone()}}),
++                "thread/list" | "thread/loaded/list" | "thread/turns/list" => {
++                    serde_json::json!({"result": {"data": [], "nextCursor": null}})
++                }
++                "thread/goal/get" => serde_json::json!({"result": {"goal": null}}),
++                _ => serde_json::json!({"error": {"code": -32601, "message": "unsupported test request"}}),
++            }))
++        }).await
++    });
++    let owner = fixture.server.backend_id();
++    fixture.app.app_server_target = AppServerTarget::Remote { endpoint };
++    fixture.app.before_foreground_mutation("reconnect").await;
++    assert!(fixture.app.begin_reconnect());
++    fixture.files.assert_clear()?;
++    let connected = tokio::time::timeout(
++        Duration::from_secs(15),
++        boxed_future!(crate::app::reconnect::reconnect(
++            owner,
++            fixture.app.app_server_target.clone(),
++            fixture.app.config.clone(),
++            fixture.app.local_settings.clone(),
++            Some(thread_id),
++            /*remote_cwd*/ None,
++            fixture.server.thread_tool_transport(),
++            crate::app::reconnect::ReconnectPresentation::Conversation,
++        )),
++    )
++    .await??;
++    boxed_future!(fixture.app.finish_reconnect(
++        &mut fixture.tui,
++        &mut fixture.server,
++        &mut fixture.events,
++        connected,
++        CODEX_CLI_VERSION,
++    ))
++    .await?;
++    assert_eq!(fixture.server.backend_id(), owner);
++    fixture.app.native_foreground_connected(owner);
++    boxed_future!(fixture.finish()).await?;
++    Ok(server)
++}
++
++#[tokio::test]
++async fn actual_reconnect_rotates_connection_uuid_with_same_backend_and_sid() -> Result<()> {
++    let mut fixture = boxed_future!(ForegroundFixture::new()).await?;
++    let thread_id = ThreadId::new();
++    boxed_future!(fixture.enqueue(thread_id, Vec::new())).await?;
++    boxed_future!(fixture.finish()).await?;
++    let before = fixture.files.assert_live(thread_id)?;
++    let server = boxed_future!(reconnect_fixture(&mut fixture, thread_id)).await?;
++    let after = fixture.files.assert_live(thread_id)?;
++    assert_eq!(after["client_epoch"], before["client_epoch"]);
++    assert_ne!(after["connection_epoch"], before["connection_epoch"]);
++    assert!(after["selection_generation"].as_u64() > before["selection_generation"].as_u64());
++    fixture.server.shutdown().await?;
++    let methods = tokio::time::timeout(Duration::from_secs(5), server).await???;
++    assert!(methods.iter().any(|method| method == "thread/resume"));
++    Ok(())
++}
++
++#[tokio::test]
++async fn failed_named_profile_verification_denies_a_live_channel_and_survives_reconnect()
++-> Result<()> {
++    let mut fixture = boxed_future!(ForegroundFixture::new()).await?;
++    let (server, requests, proxy) = boxed_future!(start_recording_app_server_with_history(
++        &fixture.app.config,
++        HistoryCapabilities::ResumeFails,
++        /*blocked_thread_list*/ None,
++        /*failed_thread_name*/ None,
++        crate::app_server_session::ThreadParamsMode::Embedded,
++        LoaderOverrides::without_managed_config_for_tests(),
++    ))
++    .await?;
++    fixture.server.shutdown().await?;
++    fixture.server = server;
++    fixture
++        .app
++        .native_foreground_connected(fixture.server.backend_id());
++    let started = boxed_future!(fixture.server.start_thread(&fixture.app.config)).await?;
++    let thread_id = started.session.thread_id;
++    let mut cached = started.session;
++    cached.active_permission_profile = Some(ActivePermissionProfile::new("unverified-named"));
++    let primary = ThreadId::new();
++    boxed_future!(fixture.enqueue(primary, Vec::new())).await?;
++    boxed_future!(fixture.finish()).await?;
++    fixture.files.assert_live(primary)?;
++    fixture.app.thread_event_channels.insert(
++        thread_id,
++        ThreadEventChannel::new_with_session(THREAD_EVENT_CHANNEL_CAPACITY, cached, Vec::new()),
++    );
++    fixture
++        .app
++        .upsert_agent_picker_thread(thread_id, None, None, /*is_closed*/ false);
++    fixture
++        .app
++        .before_foreground_mutation("select_named_profile")
++        .await;
++    boxed_future!(fixture.app.select_agent_thread(
++        &mut fixture.tui,
++        &mut fixture.server,
++        thread_id
++    ))
++    .await?;
++    boxed_future!(fixture.finish()).await?;
++    assert_eq!(fixture.app.active_thread_id, Some(thread_id));
++    assert_eq!(
++        fixture.app.thread_event_channels[&thread_id].attachment(),
++        ThreadEventAttachment::Live
++    );
++    assert_eq!(recorded_params(&requests, "thread/resume").len(), 1);
++    assert!(
++        !fixture
++            .app
++            .native_foreground_selection_allows_direct_input(thread_id)
++    );
++    fixture.files.assert_clear()?;
++
++    let server = boxed_future!(reconnect_fixture(&mut fixture, thread_id)).await?;
++    assert_eq!(
++        fixture.app.thread_event_channels[&thread_id].attachment(),
++        ThreadEventAttachment::Live
++    );
++    assert!(
++        !fixture
++            .app
++            .native_foreground_selection_allows_direct_input(thread_id)
++    );
++    fixture.files.assert_clear()?;
++    fixture.server.shutdown().await?;
++    tokio::time::timeout(Duration::from_secs(5), server).await???;
++    proxy.abort();
++    Ok(())
++}
++
++#[tokio::test]
++async fn refused_clear_and_invalidation_drain_lease_without_mutating_selected_thread() -> Result<()>
++{
++    let mut fixture = boxed_future!(ForegroundFixture::new()).await?;
++    let previous_thread = ThreadId::new();
++    boxed_future!(fixture.enqueue(previous_thread, Vec::new())).await?;
++    boxed_future!(fixture.finish()).await?;
++    let previous = fixture.files.assert_live(previous_thread)?;
++    let original_bytes = std::fs::read(fixture.files.record_path())?;
++    // This invalidates both publication and owned invalidation, retaining the exact positive inode.
++    std::fs::write(fixture.files.marker_path(), b"refused\n")?;
++    let expires_ns = previous["monotonic_expires_ns"].as_u64().unwrap();
++    {
++        let mut gate = boxed_future!(
++            fixture
++                .app
++                .before_foreground_mutation("switch_after_io_failure")
++        );
++        if tokio::time::timeout(Duration::from_millis(50), &mut gate)
++            .await
++            .is_ok()
++        {
++            assert!(observer_clock_ns() >= expires_ns);
++        }
++    }
++    assert_eq!(fixture.app.active_thread_id, Some(previous_thread));
++    assert_eq!(fixture.app.chat_widget.thread_id(), Some(previous_thread));
++    assert_eq!(std::fs::read(fixture.files.record_path())?, original_bytes);
++    let remaining = Duration::from_nanos(expires_ns.saturating_sub(observer_clock_ns()));
++    tokio::time::timeout(
++        remaining + Duration::from_secs(2),
++        fixture
++            .app
++            .before_foreground_mutation("switch_after_io_failure"),
++    )
++    .await?;
++    assert!(observer_clock_ns() >= expires_ns);
++    let next_thread = ThreadId::new();
++    boxed_future!(fixture.app.enqueue_primary_thread_session(
++        test_thread_session(next_thread, fixture.app.config.cwd.to_path_buf()),
++        Vec::new(),
++    ))
++    .await?;
++    boxed_future!(fixture.finish()).await?;
++    assert_eq!(fixture.app.active_thread_id, Some(next_thread));
++    fixture.app.native_foreground_heartbeat();
++    assert_eq!(std::fs::read(fixture.files.record_path())?, original_bytes);
++
++    std::fs::write(fixture.files.marker_path(), b"ccc-request-credentials-v1\n")?;
++    fixture.app.native_foreground_heartbeat();
++    fixture.files.assert_clear()?;
++    fixture.app.before_foreground_mutation("fresh_rearm").await;
++    boxed_future!(fixture.finish()).await?;
++    let recovered = fixture.files.assert_live(next_thread)?;
++    assert_eq!(recovered["client_epoch"], previous["client_epoch"]);
++    assert_ne!(recovered["connection_epoch"], previous["connection_epoch"]);
++    fixture.server.shutdown().await?;
++    Ok(())
++}
++
++#[tokio::test]
++async fn successful_retry_after_refused_withdrawal_uses_a_fresh_connection_epoch() -> Result<()> {
++    let mut fixture = boxed_future!(ForegroundFixture::new()).await?;
++    let thread_id = ThreadId::new();
++    boxed_future!(fixture.enqueue(thread_id, Vec::new())).await?;
++    boxed_future!(fixture.finish()).await?;
++    let before = fixture.files.assert_live(thread_id)?;
++    let marker = fixture.files.marker_path();
++    std::fs::write(&marker, b"refused\n")?;
++    let repair = tokio::spawn(async move {
++        tokio::time::sleep(Duration::from_millis(100)).await;
++        std::fs::write(marker, b"ccc-request-credentials-v1\n")
++    });
++    fixture
++        .app
++        .before_foreground_mutation("recovering_clear")
++        .await;
++    repair.await??;
++    boxed_future!(fixture.finish()).await?;
++    let after = fixture.files.assert_live(thread_id)?;
++    assert_ne!(after["connection_epoch"], before["connection_epoch"]);
++    fixture.server.shutdown().await?;
++    Ok(())
++}
++
++#[tokio::test]
++async fn actual_parked_voice_operation_restores_the_visible_selection() -> Result<()> {
++    let mut fixture = boxed_future!(ForegroundFixture::new()).await?;
++    let voice_owner = ThreadId::new();
++    boxed_future!(fixture.enqueue(voice_owner, Vec::new())).await?;
++    boxed_future!(fixture.finish()).await?;
++    crate::chatwidget::activate_voice_for_thread(&mut fixture.app.chat_widget, voice_owner);
++    let (replacement, _, _, _) =
++        boxed_future!(crate::chatwidget::tests::make_chatwidget_manual_with_sender()).await;
++    fixture
++        .app
++        .before_foreground_mutation("display_new_thread")
++        .await;
++    fixture.app.replace_chat_widget(replacement);
++    let visible = ThreadId::new();
++    boxed_future!(fixture.enqueue(visible, Vec::new())).await?;
++    boxed_future!(fixture.finish()).await?;
++    assert_eq!(fixture.app.voice_owner_thread_id(), Some(voice_owner));
++    fixture.files.assert_live(visible)?;
++
++    fixture
++        .app
++        .before_foreground_mutation("parked_voice_operation")
++        .await;
++    boxed_future!(fixture.app.handle_event(
++        &mut fixture.tui,
++        &mut fixture.server,
++        AppEvent::CodexOp(Op::RealtimeConversationStop {
++            thread_id: voice_owner
++        }),
++    ))
++    .await?;
++    assert_eq!(fixture.app.active_thread_id, Some(visible));
++    assert_eq!(fixture.app.chat_widget.thread_id(), Some(visible));
++    assert!(
++        fixture
++            .app
++            .native_foreground_selection_allows_direct_input(visible)
++    );
++    boxed_future!(fixture.finish()).await?;
++    fixture.files.assert_live(visible)?;
++    fixture.app.native_foreground_heartbeat();
++    fixture.files.assert_live(visible)?;
++    fixture.server.shutdown().await?;
++    Ok(())
++}
++
++#[tokio::test]
++async fn startup_guard_and_teardown_revoke_while_app_clone_remains_alive() -> Result<()> {
++    let mut fixture = boxed_future!(ForegroundFixture::new()).await?;
++    let files = ObservationFiles::new()?;
++    let guard = StartupForegroundGuard::from_result(
++        true,
++        ForegroundObserver::open_enabled(files.home.path()),
++    );
++    fixture.app.foreground = guard.app_owned();
++    fixture
++        .app
++        .native_foreground_connected(fixture.server.backend_id());
++    let thread_id = ThreadId::new();
++    boxed_future!(fixture.enqueue(thread_id, Vec::new())).await?;
++    boxed_future!(fixture.finish()).await?;
++    files.assert_live(thread_id)?;
++    drop(guard);
++    files.assert_clear()?;
++    assert!(files.record()?["connection_epoch"].is_null());
++    fixture.app.native_foreground_heartbeat();
++    files.assert_clear()?;
++    fixture.app.withdraw_native_foreground_for_teardown().await;
++    files.assert_clear()?;
++    assert!(
++        !fixture
++            .app
++            .native_foreground_selection_allows_direct_input(thread_id)
++    );
++    fixture.server.shutdown().await?;
++    Ok(())
++}
++
++#[tokio::test]
++async fn dropping_app_revokes_while_the_startup_guard_still_owns_state() -> Result<()> {
++    let mut fixture = boxed_future!(ForegroundFixture::new()).await?;
++    let files = ObservationFiles::new()?;
++    let guard = StartupForegroundGuard::from_result(
++        true,
++        ForegroundObserver::open_enabled(files.home.path()),
++    );
++    fixture.app.foreground = guard.app_owned();
++    fixture
++        .app
++        .native_foreground_connected(fixture.server.backend_id());
++    let thread_id = ThreadId::new();
++    boxed_future!(fixture.enqueue(thread_id, Vec::new())).await?;
++    boxed_future!(fixture.finish()).await?;
++    files.assert_live(thread_id)?;
++    drop(fixture.app);
++    files.assert_clear()?;
++    assert!(files.record()?["connection_epoch"].is_null());
++    drop(guard);
++    files.assert_clear()?;
++    fixture.server.shutdown().await?;
++    Ok(())
++}
++
++#[tokio::test]
++async fn real_initialization_failure_is_visible_and_ordinary_app_work_continues() -> Result<()> {
++    let mut fixture = boxed_future!(ForegroundFixture::new()).await?;
++    let failed = ObservationFiles::new()?;
++    std::fs::remove_file(failed.marker_path())?;
++    let guard = StartupForegroundGuard::from_result(
++        true,
++        ForegroundObserver::open_enabled(failed.home.path()),
++    );
++    let warning = guard
++        .initialization_warning()
++        .expect("opt-in failure must be visible");
++    fixture.app.foreground = guard.app_owned();
++    assert!(!fixture.app.foreground.heartbeat_enabled());
++    fixture.app.chat_widget.add_error_message(warning.clone());
++    let thread_id = ThreadId::new();
++    boxed_future!(fixture.enqueue(thread_id, Vec::new())).await?;
++    boxed_future!(fixture.finish()).await?;
++    assert_eq!(fixture.app.active_thread_id, Some(thread_id));
++    assert_eq!(fixture.app.chat_widget.thread_id(), Some(thread_id));
++    assert!(warning.contains("Automatic continuation is unavailable"));
++    assert!(!failed.record_path().exists());
++    fixture.server.shutdown().await?;
++    Ok(())
++}

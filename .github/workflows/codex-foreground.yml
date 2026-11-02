@@ -1,0 +1,143 @@
+name: Codex native foreground V187
+
+on:
+  push:
+    branches: [ccc/herdr-native-foreground-v187]
+    paths:
+      - native/client-foreground/**
+      - integrations/codex-foreground/**
+      - .github/workflows/codex-foreground.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codex-foreground-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publisher:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8
+      - name: Real file-backed publisher tests
+        working-directory: native/client-foreground
+        run: cargo test --locked
+
+  tui-macos:
+    needs: publisher
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "none"
+      CARGO_PROFILE_TEST_DEBUG: "none"
+      CARGO_PROFILE_RELEASE_DEBUG: "none"
+      CARGO_BUILD_JOBS: "3"
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          path: ccc
+          persist-credentials: false
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          repository: openai/codex
+          ref: 6aaac694803004a63c6f393d153c96d22521a6b9
+          path: codex
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8
+        with:
+          targets: aarch64-apple-darwin
+          components: rustfmt, clippy, rust-src
+      - name: Verify and apply the exact isolated integration
+        run: python3 ccc/integrations/codex-foreground/apply.py --codex codex
+      - name: Short temporary paths and build identity
+        run: |
+          test "$(uname -m)" = arm64
+          rustc --version
+          mkdir -p /tmp/cfg187
+          echo "TMPDIR=/tmp/cfg187" >> "$GITHUB_ENV"
+          echo "STABLE_GIT_COMMIT=6aaac694803004a63c6f393d153c96d22521a6b9" >> "$GITHUB_ENV"
+      - name: Format the integrated workspace
+        working-directory: codex/codex-rs
+        run: cargo fmt -- --config imports_granularity=Item --check
+      - name: Actual App lifecycle and complete TUI library tests
+        id: candidate-tests
+        continue-on-error: true
+        working-directory: codex/codex-rs
+        shell: bash
+        run: cargo test --locked -p codex-tui --lib 2>&1 | tee "$RUNNER_TEMP/tui-candidate-tests.log"
+      - name: Attribute a failed candidate against the unchanged upstream
+        if: steps.candidate-tests.outcome == 'failure'
+        working-directory: codex
+        shell: bash
+        run: |
+          git reset --hard 6aaac694803004a63c6f393d153c96d22521a6b9
+          cd codex-rs
+          cargo test --locked -p codex-tui --lib 2>&1 | tee "$RUNNER_TEMP/tui-baseline-tests.log"
+      - name: Preserve exact candidate and attribution output
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: codex-tui-test-evidence-v187
+          path: ${{ runner.temp }}/tui-*-tests.log
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Require the candidate suite
+        env:
+          CANDIDATE_RESULT: ${{ steps.candidate-tests.outcome }}
+        run: test "$CANDIDATE_RESULT" = success
+      - name: Release the CI-only test artifacts before release compilation
+        working-directory: codex/codex-rs
+        run: cargo clean
+      - name: Build the native arm64 Codex binary
+        working-directory: codex/codex-rs
+        run: cargo build --locked --release -p codex-cli --bin codex --target aarch64-apple-darwin
+      - name: Package the binary and immutable source manifest
+        env:
+          CCC_COMMIT: ${{ github.sha }}
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib, json, os, shutil, subprocess
+          source = Path("codex/codex-rs/target/aarch64-apple-darwin/release/codex")
+          target = Path(os.environ["RUNNER_TEMP"]) / "codex-foreground-v187"
+          target.mkdir()
+          binary = target / "codex-aarch64-apple-darwin"
+          shutil.copy2(source, binary)
+          version = subprocess.run([str(binary), "--version"], text=True, capture_output=True, check=True).stdout.strip()
+          integration = json.loads(Path("ccc/integrations/codex-foreground/manifest.json").read_bytes())
+          test_log = Path(os.environ["RUNNER_TEMP"]) / "tui-candidate-tests.log"
+          shutil.copy2(test_log, target / test_log.name)
+          manifest = dict(schema="ccc-native-codex-artifact-v187", ccc_commit=os.environ["CCC_COMMIT"],
+                          upstream_commit=integration["upstream_commit"], upstream_tree=integration["upstream_tree"],
+                          patch_sha256=integration["patch"]["sha256"], native_files=integration["native_files"],
+                          binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
+                          binary_bytes=binary.stat().st_size, version=version, target="aarch64-apple-darwin",
+                          rustc_version=subprocess.run(["rustc", "--version"], text=True, capture_output=True, check=True).stdout.strip(),
+                          actions_run_id=os.environ["GITHUB_RUN_ID"], actions_run_attempt=os.environ["GITHUB_RUN_ATTEMPT"],
+                          tui_test_log_sha256=hashlib.sha256(test_log.read_bytes()).hexdigest(),
+                          integration_manifest_sha256=hashlib.sha256(Path("ccc/integrations/codex-foreground/manifest.json").read_bytes()).hexdigest(),
+                          full_tui_library_tests_passed=True,
+                          runtime_installed=False)
+          (target / "BUILD-MANIFEST.json").write_text(json.dumps(manifest, indent=2) + "\n")
+          print(json.dumps(manifest, indent=2))
+          PY
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: codex-native-foreground-aarch64-apple-darwin-v187
+          path: ${{ runner.temp }}/codex-foreground-v187/*
+          if-no-files-found: error
+          retention-days: 7

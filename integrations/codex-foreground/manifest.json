@@ -1,0 +1,78 @@
+{
+  "schema": "ccc-codex-foreground-integration-v187",
+  "upstream_commit": "6aaac694803004a63c6f393d153c96d22521a6b9",
+  "upstream_tree": "d0caeb3c076fbeade281c18295fada090c52cf8f",
+  "upstream_version": "0.164.0",
+  "toolchain": "1.99.1",
+  "patch": {
+    "path": "integration.patch",
+    "sha256": "08dfab07b2e4ad015f6f9816657ee11633aa5042f159f437f2c05b0dcd4e4515"
+  },
+  "patched_files": {
+    "codex-rs/Cargo.lock": {
+      "before_sha256": "7ec2bfabf3b967c00409b85489076f8df3849745d3e469473d88288322adeb4a",
+      "after_sha256": "82c26d7cb04f384df0a7010831fba8816347dbc099c0180c8767e8b3b47fa779"
+    },
+    "codex-rs/tui/Cargo.toml": {
+      "before_sha256": "1eb18f1181bf947cee297f229517e66f687f491cb7068979fc20f60b476b4ca8",
+      "after_sha256": "20ae0372d5c1c736d20ed8d47c96a8e88f5202020995a5202a932d8622cb9a75"
+    },
+    "codex-rs/tui/src/app.rs": {
+      "before_sha256": "55c095968b151680f9a7ad40fa5656f3e5d97611f355cb4a2a4291c5d82e5dde",
+      "after_sha256": "39e37ff1265b577a7d1ae48515f436b683ecfa90615663380874c10d4a7d1510"
+    },
+    "codex-rs/tui/src/app/foreground_observation.rs": {
+      "before_sha256": null,
+      "after_sha256": "6e63d1216616d1f5e4d7460db3962844094e4df5862a0f685ced1901890ecea6"
+    },
+    "codex-rs/tui/src/app/foreground_observation/tests.rs": {
+      "before_sha256": null,
+      "after_sha256": "5ab7cfc35a1648e721fa25dbd4a600053798a80a31e9c5e635355eae768e58b7"
+    },
+    "codex-rs/tui/src/app/reconnect.rs": {
+      "before_sha256": "d3fb4b068703fd129b7099b66a5926a8ffc605d17ae11844764d0feb6dcb8718",
+      "after_sha256": "b683f075f37a4a9eaf5c2b2dfe7a5c2f6d5a41b1ddd98066b7c0286c5ab79f7a"
+    },
+    "codex-rs/tui/src/app/session_lifecycle.rs": {
+      "before_sha256": "e4c2b150408d1bb730e7beb01c99759da7c01b1ac4bbbd37b1a17c8367dc1471",
+      "after_sha256": "764159e5558caa18e57c91d443cee4d2868313463613eef5ed74fff55892cf35"
+    },
+    "codex-rs/tui/src/app/startup.rs": {
+      "before_sha256": "c6b74ded6e33e1a95a61bcc5a3e1d4c0325071e8d16fb89ba41c3025066aa788",
+      "after_sha256": "142507d7c8ca036ecf597ecce03674a62413df1ad8bad1d5e4debdd91c36852c"
+    },
+    "codex-rs/tui/src/app/test_support.rs": {
+      "before_sha256": "15f41be5ae05e24390e6be2647ec253281e254bcd31706a0d52cdb6993ef2424",
+      "after_sha256": "6876e0de480c74f99bd31d2a954bfa68a29c782e74c0460455ef38a8f8689200"
+    },
+    "codex-rs/tui/src/app/tests.rs": {
+      "before_sha256": "a1d1e1cfa2ebd20f37d0891f3c6c60061f3fea7d3b3f515a7b394144217856ed",
+      "after_sha256": "bd37ef8bcdae37c2025d2d92173e16c2ff2ea8cdf6b68059e915c4790a419e2d"
+    },
+    "codex-rs/tui/src/app/tests/session_lifecycle_requests.rs": {
+      "before_sha256": "3bc0efc84fd28423b68ddc20fedfd8a5e31538915cfb9762bc4933bc92b5628b",
+      "after_sha256": "a4fce6be5a8627679cb774514f2f119f408c09248a2f40bec02179e594b32cd2"
+    },
+    "codex-rs/tui/src/app/tests/startup.rs": {
+      "before_sha256": "cc6703e546163d1f82c970fdf79c177809b184741e057676e9df3c3be4b66c96",
+      "after_sha256": "0c00aab8cc48801907509041c7bcb53e17737d8d3fcf3e23efcfcd43ce2cbe5c"
+    },
+    "codex-rs/tui/src/app/thread_routing.rs": {
+      "before_sha256": "92da606c25a4cdbc3ca046f37140360d096b0d9cfa1a68e187516a52a0d1d874",
+      "after_sha256": "2ae45f081f7faa4a9f2c1e3a01d8e1b2ac0a73e1a8f30b2658b5ec9da8ad676c"
+    },
+    "codex-rs/tui/src/chatwidget/input_flow.rs": {
+      "before_sha256": "77f64f0668ccbc6236fae2372d5328ad6ba30d322b883ed5b0ffc226ddf66350",
+      "after_sha256": "ade15203917de2724f793b6e2b9137a30df00461ba3f2e799c5f85720d857e89"
+    }
+  },
+  "native_files": {
+    "native/client-foreground/Cargo.toml": "819748bc86df16a2d435c767ab4e6c73a78713d36f1ee5667edd2879ea9eef72",
+    "native/client-foreground/src/lib.rs": "b4932069660cbf812b33f76b357c3f7e7d25b89a06c9e4032a4499fee9de3fc6",
+    "native/client-foreground/src/tests.rs": "ca91f4f30269d4135bc8fe18600170518b60d1f188e025da2dc68f27e7a657d7"
+  },
+  "publisher_lock_sha256": "ecfa24c8f97f20e99c43fd5afb181152d100ace32968a175690a214560954aef",
+  "expected_app_foreground_tests": 13,
+  "schema2_lease_ms": 5000,
+  "runtime_installed": false
+}
