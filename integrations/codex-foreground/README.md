@@ -16,3 +16,9 @@ passing tests, producing a binary and installing or adopting it are separate
 steps. The workflow performs no installation and sends no agent input.
 
 The integration manifest is generated only after the App changes are frozen.
+
+The upstream release tag changes 166 local package versions from `0.0.0` to
+`0.164.0` without refreshing `Cargo.lock`. This integration includes that exact
+version refresh. CI also runs upstream's `cargo update --workspace` procedure
+and verifies the complete resulting lock hash for candidate and baseline before
+running `--locked` tests. Registry and Git dependencies keep their original pins.

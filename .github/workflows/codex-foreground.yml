@@ -73,6 +73,14 @@ jobs:
       - name: Format the integrated workspace
         working-directory: codex/codex-rs
         run: cargo fmt -- --config imports_granularity=Item --check
+      - name: Verify the pinned release dependency graph
+        working-directory: codex/codex-rs
+        shell: bash
+        run: |
+          # Upstream rust-release.yml refreshes workspace versions at release tags.
+          cargo update --workspace 2>&1 | tee "$RUNNER_TEMP/release-candidate-lock.log"
+          cp Cargo.lock "$RUNNER_TEMP/release-candidate.lock"
+          python3 ../../ccc/integrations/codex-foreground/verify_release_lock.py --codex .. --kind candidate
       - name: Actual App lifecycle and complete TUI library tests
         id: candidate-tests
         continue-on-error: true
@@ -86,13 +94,19 @@ jobs:
         run: |
           git reset --hard 6aaac694803004a63c6f393d153c96d22521a6b9
           cd codex-rs
+          cargo update --workspace 2>&1 | tee "$RUNNER_TEMP/release-baseline-lock.log"
+          cp Cargo.lock "$RUNNER_TEMP/release-baseline.lock"
+          python3 ../../ccc/integrations/codex-foreground/verify_release_lock.py --codex .. --kind baseline
           cargo test --locked -p codex-tui --lib 2>&1 | tee "$RUNNER_TEMP/tui-baseline-tests.log"
       - name: Preserve exact candidate and attribution output
         if: always()
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
         with:
           name: codex-tui-test-evidence-v187
-          path: ${{ runner.temp }}/tui-*-tests.log
+          path: |
+            ${{ runner.temp }}/tui-*-tests.log
+            ${{ runner.temp }}/release-*.lock
+            ${{ runner.temp }}/release-*-lock.log
           if-no-files-found: ignore
           retention-days: 7
       - name: Require the candidate suite
@@ -130,6 +144,8 @@ jobs:
                           actions_run_id=os.environ["GITHUB_RUN_ID"], actions_run_attempt=os.environ["GITHUB_RUN_ATTEMPT"],
                           tui_test_log_sha256=hashlib.sha256(test_log.read_bytes()).hexdigest(),
                           integration_manifest_sha256=hashlib.sha256(Path("ccc/integrations/codex-foreground/manifest.json").read_bytes()).hexdigest(),
+                          cargo_lock_sha256=hashlib.sha256(Path("codex/codex-rs/Cargo.lock").read_bytes()).hexdigest(),
+                          external_dependency_upgrades=0,
                           full_tui_library_tests_passed=True,
                           runtime_installed=False)
           (target / "BUILD-MANIFEST.json").write_text(json.dumps(manifest, indent=2) + "\n")
