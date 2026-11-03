@@ -1,3 +1,4 @@
+import hashlib
 from pathlib import Path
 import tempfile
 import unittest
@@ -6,20 +7,10 @@ from unittest.mock import patch
 import ccc_batch_guard as guard
 
 LAUNCHER = '''#!/bin/bash
-# 只读启动检查；最终 exec 官方签名 Codex，保持原 PID、参数与会话。
-set -u
-codex_toolchain_python="/opt/homebrew/opt/python@3.14/bin/python3.14"
-codex_toolchain_doctor="/Users/lzhs/.agents/skills/codex-toolchain-recovery/scripts/toolchain_doctor.py"
-codex_toolchain_report="/Users/lzhs/.local/state/codex-toolchain/startup-latest.json"
-if [[ "${1:-}" == "--doctor-only" ]]; then
-  exec "$codex_toolchain_python" -BE "$codex_toolchain_doctor" --output "$codex_toolchain_report"
-fi
-if [[ -t 0 && -t 1 ]]; then
-  /Users/lzhs/.local/bin/codex-terminal-recover --before-launch
-fi
-"$codex_toolchain_python" -BE "$codex_toolchain_doctor" --startup --output "$codex_toolchain_report" >&2 || true
-exec /Users/lzhs/.local/bin/codex "$@"
+# Synthetic wrapper fixture; it is read and hashed, never executed.
+exec "$HOME/.local/bin/codex" "$@"
 '''
+LAUNCHER_SHA256 = hashlib.sha256(LAUNCHER.encode()).hexdigest()
 
 class ToolchainEntryTests(unittest.TestCase):
     def setUp(self):
@@ -39,11 +30,15 @@ class ToolchainEntryTests(unittest.TestCase):
         self.entry = self.home / 'installed-codex'
         self.entry.symlink_to(self.wrapper)
 
-    def resolve(self):
-        with patch.object(Path, 'home', return_value=self.home):
+    def resolve(self, *, trusted_fixture=True):
+        # Replace only the expected digest for this one resolver invocation.
+        # Hashing, file rereads, symlink fences and native-magic checks remain real.
+        expected = LAUNCHER_SHA256 if trusted_fixture else guard.TOOLCHAIN_LAUNCHER_SHA256
+        with patch.object(Path, 'home', return_value=self.home), \
+             patch.object(guard, 'TOOLCHAIN_LAUNCHER_SHA256', expected):
             return guard.native_binary(entrypoint=self.entry)
 
-    def test_published_wrapper_uses_current_native_and_ignores_old_guard_metadata(self):
+    def test_trusted_wrapper_uses_current_native_and_ignores_old_guard_metadata(self):
         app = self.home / 'Library/Application Support/cmux-codex-continue'
         app.mkdir(parents=True)
         (app / 'codex-launcher.json').write_text('{"native_binary":"/stale/codex"}')
@@ -51,11 +46,21 @@ class ToolchainEntryTests(unittest.TestCase):
 
     def test_changed_wrapper_is_rejected_without_executing_shell(self):
         for body in (LAUNCHER + 'echo changed\n', LAUNCHER.replace('"$@"', '$(id)'),
-                     '#!/bin/bash\nexec /Users/lzhs/.local/bin/codex "$@"\n'):
+                     '#!/bin/bash\nexec codex "$@"\n'):
             with self.subTest(body=body):
                 self.wrapper.write_text(body)
                 with self.assertRaisesRegex(RuntimeError, 'cannot be proved'):
                     self.resolve()
+
+    def test_synthetic_wrapper_is_untrusted_without_fixture_digest(self):
+        published_digest = guard.TOOLCHAIN_LAUNCHER_SHA256
+        self.assertNotEqual(LAUNCHER_SHA256, published_digest)
+        with self.assertRaisesRegex(RuntimeError, 'cannot be proved'):
+            self.resolve(trusted_fixture=False)
+        self.assertEqual(self.resolve(), str(self.native))
+        self.assertEqual(guard.TOOLCHAIN_LAUNCHER_SHA256, published_digest)
+        with self.assertRaisesRegex(RuntimeError, 'cannot be proved'):
+            self.resolve(trusted_fixture=False)
 
     def test_missing_native_or_unknown_leaf_script_is_rejected(self):
         self.alias.unlink()
