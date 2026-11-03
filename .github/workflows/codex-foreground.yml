@@ -48,6 +48,8 @@ jobs:
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
       # Match the pinned upstream full-test runner's 8 MiB stack.
       RUST_MIN_STACK: "8388608"
+      # Preserve frozen assertions; CI must never approve new snapshots.
+      INSTA_UPDATE: "no"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
@@ -63,6 +65,11 @@ jobs:
         with:
           targets: aarch64-apple-darwin
           components: rustfmt, clippy, rust-src
+      - name: Install the pinned upstream test runner
+        uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
+        with:
+          tool: nextest
+          version: 0.9.103
       - name: Verify and apply the exact isolated integration
         run: python3 ccc/integrations/codex-foreground/apply.py --codex codex
       - name: Short temporary paths and build identity
@@ -75,31 +82,71 @@ jobs:
       - name: Format the integrated workspace
         working-directory: codex/codex-rs
         run: cargo fmt -- --config imports_granularity=Item --check
-      - name: Verify the pinned release dependency graph
+      - name: Prepare explicit candidate test-version setup
         working-directory: codex/codex-rs
         shell: bash
         run: |
-          # Upstream rust-release.yml refreshes workspace versions at release tags.
-          cargo update --workspace 2>&1 | tee "$RUNNER_TEMP/release-candidate-lock.log"
-          cp Cargo.lock "$RUNNER_TEMP/release-candidate.lock"
+          set -euo pipefail
           python3 ../../ccc/integrations/codex-foreground/verify_release_lock.py --codex .. --kind candidate
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib, os
+          manifest = Path("Cargo.toml")
+          raw = manifest.read_bytes()
+          assert hashlib.sha256(raw).hexdigest() == "11ce75d44b3fdc2cf92770ba0dd9e642a214dbf230fb2ef609d0805049f0887f"
+          before = b'[workspace.package]\nversion = "0.164.0"'
+          assert raw.count(before) == 1
+          saved = Path(os.environ["RUNNER_TEMP"])
+          (saved / "candidate-workspace-release.toml").write_bytes(raw)
+          (saved / "candidate-release-before-test.lock").write_bytes(Path("Cargo.lock").read_bytes())
+          manifest.write_bytes(raw.replace(before, b'[workspace.package]\nversion = "0.0.0"', 1))
+          PY
+          cargo update --workspace 2>&1 | tee "$RUNNER_TEMP/test-candidate-lock.log"
+          cp Cargo.lock "$RUNNER_TEMP/test-candidate.lock"
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib
+          assert hashlib.sha256(Path("Cargo.lock").read_bytes()).hexdigest() == "82c26d7cb04f384df0a7010831fba8816347dbc099c0180c8767e8b3b47fa779"
+          PY
       - name: Actual App lifecycle and complete TUI library tests
         id: candidate-tests
         continue-on-error: true
         working-directory: codex/codex-rs
         shell: bash
-        run: cargo test --locked -p codex-tui --lib 2>&1 | tee "$RUNNER_TEMP/tui-candidate-tests.log"
-      - name: Attribute a failed candidate against the unchanged upstream
+        run: |
+          set -euo pipefail
+          cargo nextest run --locked -p codex-tui --lib --no-fail-fast 2>&1 | tee "$RUNNER_TEMP/tui-candidate-tests.log"
+          cp target/nextest/default/junit.xml "$RUNNER_TEMP/tui-candidate-tests.xml"
+      - name: Attribute against upstream with the same explicit test-version setup
         if: steps.candidate-tests.outcome == 'failure'
         working-directory: codex
         shell: bash
         run: |
+          set -euo pipefail
           git reset --hard 6aaac694803004a63c6f393d153c96d22521a6b9
           cd codex-rs
-          cargo update --workspace 2>&1 | tee "$RUNNER_TEMP/release-baseline-lock.log"
-          cp Cargo.lock "$RUNNER_TEMP/release-baseline.lock"
-          python3 ../../ccc/integrations/codex-foreground/verify_release_lock.py --codex .. --kind baseline
-          cargo test --locked -p codex-tui --lib 2>&1 | tee "$RUNNER_TEMP/tui-baseline-tests.log"
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib, os
+          manifest = Path("Cargo.toml")
+          raw = manifest.read_bytes()
+          assert hashlib.sha256(raw).hexdigest() == "11ce75d44b3fdc2cf92770ba0dd9e642a214dbf230fb2ef609d0805049f0887f"
+          before = b'[workspace.package]\nversion = "0.164.0"'
+          assert raw.count(before) == 1
+          saved = Path(os.environ["RUNNER_TEMP"])
+          (saved / "baseline-workspace-release.toml").write_bytes(raw)
+          (saved / "baseline-release-before-test.lock").write_bytes(Path("Cargo.lock").read_bytes())
+          manifest.write_bytes(raw.replace(before, b'[workspace.package]\nversion = "0.0.0"', 1))
+          PY
+          cargo update --workspace 2>&1 | tee "$RUNNER_TEMP/test-baseline-lock.log"
+          cp Cargo.lock "$RUNNER_TEMP/test-baseline.lock"
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib
+          assert hashlib.sha256(Path("Cargo.lock").read_bytes()).hexdigest() == "7ec2bfabf3b967c00409b85489076f8df3849745d3e469473d88288322adeb4a"
+          PY
+          cargo nextest run --locked -p codex-tui --lib --no-fail-fast 2>&1 | tee "$RUNNER_TEMP/tui-baseline-tests.log"
+          cp target/nextest/default/junit.xml "$RUNNER_TEMP/tui-baseline-tests.xml"
       - name: Preserve exact candidate and attribution output
         if: always()
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
@@ -107,14 +154,63 @@ jobs:
           name: codex-tui-test-evidence-v187
           path: |
             ${{ runner.temp }}/tui-*-tests.log
+            ${{ runner.temp }}/tui-*-tests.xml
             ${{ runner.temp }}/release-*.lock
             ${{ runner.temp }}/release-*-lock.log
+            ${{ runner.temp }}/test-*.lock
+            ${{ runner.temp }}/test-*-lock.log
+            ${{ runner.temp }}/*-workspace-release.toml
+            ${{ runner.temp }}/*-release-before-test.lock
           if-no-files-found: ignore
           retention-days: 7
       - name: Require the candidate suite
         env:
           CANDIDATE_RESULT: ${{ steps.candidate-tests.outcome }}
         run: test "$CANDIDATE_RESULT" = success
+      - name: Restore and verify the exact release graph after test success
+        working-directory: codex/codex-rs
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp "$RUNNER_TEMP/candidate-workspace-release.toml" Cargo.toml
+          cp "$RUNNER_TEMP/candidate-release-before-test.lock" Cargo.lock
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib
+          assert hashlib.sha256(Path("Cargo.toml").read_bytes()).hexdigest() == "11ce75d44b3fdc2cf92770ba0dd9e642a214dbf230fb2ef609d0805049f0887f"
+          PY
+          python3 ../../ccc/integrations/codex-foreground/verify_release_lock.py --codex .. --kind candidate
+          cargo update --workspace 2>&1 | tee "$RUNNER_TEMP/release-candidate-lock.log"
+          cp Cargo.lock "$RUNNER_TEMP/release-candidate.lock"
+          python3 ../../ccc/integrations/codex-foreground/verify_release_lock.py --codex .. --kind candidate
+      - name: Verify the actual foreground lifecycle at the release version
+        working-directory: codex/codex-rs
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo nextest run --locked -p codex-tui --lib --no-fail-fast \
+            -E 'test(app::tests::foreground_observation::)' 2>&1 | tee "$RUNNER_TEMP/tui-release-foreground-tests.log"
+          cp target/nextest/default/junit.xml "$RUNNER_TEMP/tui-release-foreground-tests.xml"
+          python3 - <<'PY'
+          from pathlib import Path
+          import json, os, xml.etree.ElementTree as ET
+          root = ET.parse(Path(os.environ["RUNNER_TEMP"]) / "tui-release-foreground-tests.xml").getroot()
+          cases = root.findall(".//testcase")
+          expected = json.loads(Path("../../ccc/integrations/codex-foreground/manifest.json").read_bytes())["expected_app_foreground_tests"]
+          assert len(cases) == expected, (len(cases), expected)
+          assert all(case.find("failure") is None and case.find("error") is None and case.find("skipped") is None for case in cases)
+          PY
+      - name: Preserve release-version lifecycle and graph evidence
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: codex-tui-release-evidence-v187
+          path: |
+            ${{ runner.temp }}/tui-release-foreground-tests.*
+            ${{ runner.temp }}/release-candidate.lock
+            ${{ runner.temp }}/release-candidate-lock.log
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Release the CI-only test artifacts before release compilation
         working-directory: codex/codex-rs
         run: cargo clean
@@ -137,6 +233,8 @@ jobs:
           integration = json.loads(Path("ccc/integrations/codex-foreground/manifest.json").read_bytes())
           test_log = Path(os.environ["RUNNER_TEMP"]) / "tui-candidate-tests.log"
           shutil.copy2(test_log, target / test_log.name)
+          release_test_log = Path(os.environ["RUNNER_TEMP"]) / "tui-release-foreground-tests.log"
+          shutil.copy2(release_test_log, target / release_test_log.name)
           manifest = dict(schema="ccc-native-codex-artifact-v187", ccc_commit=os.environ["CCC_COMMIT"],
                           upstream_commit=integration["upstream_commit"], upstream_tree=integration["upstream_tree"],
                           patch_sha256=integration["patch"]["sha256"], native_files=integration["native_files"],
@@ -149,6 +247,10 @@ jobs:
                           cargo_lock_sha256=hashlib.sha256(Path("codex/codex-rs/Cargo.lock").read_bytes()).hexdigest(),
                           external_dependency_upgrades=0,
                           full_tui_library_tests_passed=True,
+                          full_tui_library_test_version=integration["test_version_setup"]["version"],
+                          release_foreground_tests_passed=True,
+                          release_foreground_tests=integration["expected_app_foreground_tests"],
+                          release_foreground_test_log_sha256=hashlib.sha256(release_test_log.read_bytes()).hexdigest(),
                           runtime_installed=False)
           (target / "BUILD-MANIFEST.json").write_text(json.dumps(manifest, indent=2) + "\n")
           print(json.dumps(manifest, indent=2))

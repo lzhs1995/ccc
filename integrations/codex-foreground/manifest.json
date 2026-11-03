@@ -6,7 +6,7 @@
   "toolchain": "1.99.1",
   "patch": {
     "path": "integration.patch",
-    "sha256": "a72b0f56da56d1b78c86690eb0073ae3be37e2061de2fef91aa9aa53c1e22c8d"
+    "sha256": "9970ff7db887e69700aaa4c6bffd414a74c443a80dde31d373269a6bb18d42a8"
   },
   "patched_files": {
     "codex-rs/Cargo.lock": {
@@ -27,7 +27,7 @@
     },
     "codex-rs/tui/src/app/foreground_observation/tests.rs": {
       "before_sha256": null,
-      "after_sha256": "2ecac859be78eec02139a51138c54130623e6d5596f0c888a40cfe093943de7a"
+      "after_sha256": "395a9b152371d4ed31462f3a850074a76b9c3d839428cfa109f3c99a3d089230"
     },
     "codex-rs/tui/src/app/reconnect.rs": {
       "before_sha256": "d3fb4b068703fd129b7099b66a5926a8ffc605d17ae11844764d0feb6dcb8718",
@@ -83,5 +83,15 @@
     "to_version": "0.164.0",
     "external_dependency_upgrades": 0,
     "upstream_procedure": ".github/workflows/rust-release.yml:610 cargo update --workspace"
+  },
+  "test_version_setup": {
+    "workspace_release_manifest_sha256": "11ce75d44b3fdc2cf92770ba0dd9e642a214dbf230fb2ef609d0805049f0887f",
+    "version": "0.0.0",
+    "baseline_lock_sha256": "7ec2bfabf3b967c00409b85489076f8df3849745d3e469473d88288322adeb4a",
+    "candidate_lock_sha256": "82c26d7cb04f384df0a7010831fba8816347dbc099c0180c8767e8b3b47fa779",
+    "external_dependency_upgrades": 0,
+    "runner": "nextest0.9.103",
+    "assertion_changes": 0,
+    "snapshot_changes": 0
   }
 }

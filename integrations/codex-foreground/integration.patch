@@ -2367,10 +2367,10 @@ index 0000000..fe28a6e
 +}
 diff --git a/codex-rs/tui/src/app/foreground_observation/tests.rs b/codex-rs/tui/src/app/foreground_observation/tests.rs
 new file mode 100644
-index 0000000..9db2ac0
+index 0000000..39e1886
 --- /dev/null
 +++ b/codex-rs/tui/src/app/foreground_observation/tests.rs
-@@ -0,0 +1,768 @@
+@@ -0,0 +1,772 @@
 +//! Actual App attachment, routing and reconnect flows backed by a private file journal.
 +
 +use super::*;
@@ -2962,6 +2962,8 @@ index 0000000..9db2ac0
 +    )
 +    .await?;
 +    assert!(observer_clock_ns() >= expires_ns);
++    boxed_future!(fixture.app.store_active_thread_receiver()).await;
++    boxed_future!(fixture.app.reset_thread_event_state()).await;
 +    let next_thread = ThreadId::new();
 +    boxed_future!(fixture.app.enqueue_primary_thread_session(
 +        test_thread_session(next_thread, fixture.app.config.cwd.to_path_buf()),
@@ -3023,6 +3025,8 @@ index 0000000..9db2ac0
 +        .app
 +        .before_foreground_mutation("display_new_thread")
 +        .await;
++    boxed_future!(fixture.app.store_active_thread_receiver()).await;
++    boxed_future!(fixture.app.reset_thread_event_state()).await;
 +    fixture.app.replace_chat_widget(replacement);
 +    let visible = ThreadId::new();
 +    boxed_future!(fixture.enqueue(visible, Vec::new())).await?;

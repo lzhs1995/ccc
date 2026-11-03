@@ -18,7 +18,11 @@ steps. The workflow performs no installation and sends no agent input.
 The integration manifest is generated only after the App changes are frozen.
 
 The upstream release tag changes 166 local package versions from `0.0.0` to
-`0.164.0` without refreshing `Cargo.lock`. This integration includes that exact
-version refresh. CI also runs upstream's `cargo update --workspace` procedure
-and verifies the complete resulting lock hash for candidate and baseline before
-running `--locked` tests. Registry and Git dependencies keep their original pins.
+`0.164.0` without refreshing `Cargo.lock`, while its frozen snapshots expect
+`0.0.0`. This integration retains the exact release version refresh. CI explicitly
+sets the test version to `0.0.0` for candidate and baseline, verifies each complete
+test lock, and runs all TUI library assertions with upstream's pinned nextest
+0.9.103 runner. It does not update assertions or snapshots. After success, it
+restores and verifies the exact release manifest and lock, tests all 13 native
+foreground lifecycle cases at `0.164.0`, and performs the locked release build.
+Registry and Git dependencies keep their original pins throughout.
