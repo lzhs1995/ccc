@@ -1,0 +1,123 @@
+name: Codex native foreground V187 release build
+
+on:
+  push:
+    branches: [ccc/herdr-native-foreground-v187]
+    paths:
+      - .github/workflows/codex-foreground-build.yml
+      - .github/scripts/codex_foreground_build_evidence.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: codex-foreground-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-macos:
+    runs-on: macos-15
+    timeout-minutes: 240
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_RELEASE_DEBUG: "none"
+      CARGO_BUILD_JOBS: "3"
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      STABLE_GIT_COMMIT: 6aaac694803004a63c6f393d153c96d22521a6b9
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          path: ccc
+          persist-credentials: false
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          repository: openai/codex
+          ref: 6aaac694803004a63c6f393d153c96d22521a6b9
+          path: codex
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8
+        with:
+          toolchain: "1.99.1"
+          targets: aarch64-apple-darwin
+          components: rustfmt, clippy, rust-src
+      - name: Verify and apply the exact already-tested integration
+        run: python3 ccc/integrations/codex-foreground/apply.py --codex codex
+      - name: Authenticate the original full and release-version test evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 ccc/.github/scripts/codex_foreground_build_evidence.py --ccc ccc --codex codex --output "$RUNNER_TEMP/verified-evidence"
+      - name: Verify native build architecture and release graph
+        run: |
+          test "$(uname -m)" = arm64
+          rustc --version
+          (cd codex/codex-rs && rustc --version)
+          mkdir -p /tmp/cfg187release
+          echo "TMPDIR=/tmp/cfg187release" >> "$GITHUB_ENV"
+          python3 ccc/integrations/codex-foreground/verify_release_lock.py --codex codex --kind candidate
+      - name: Build the already-tested native arm64 release
+        working-directory: codex/codex-rs
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release -p codex-cli --bin codex --target aarch64-apple-darwin 2>&1 | tee "$RUNNER_TEMP/native-release-build.log"
+      - name: Package the binary and authenticated source and test manifest
+        env:
+          CCC_COMMIT: ${{ github.sha }}
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib, json, os, shutil, subprocess
+          sha = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+          temporary = Path(os.environ["RUNNER_TEMP"])
+          evidence = temporary / "verified-evidence"
+          proof = json.loads((evidence / "VERIFIED-TEST-EVIDENCE.json").read_bytes())
+          integration_path = Path("ccc/integrations/codex-foreground/manifest.json")
+          integration = json.loads(integration_path.read_bytes())
+          subprocess.run(["python3", "ccc/integrations/codex-foreground/verify_release_lock.py", "--codex", "codex", "--kind", "candidate"], check=True)
+          assert proof["integration_manifest_sha256"] == sha(integration_path)
+          source = Path("codex/codex-rs/target/aarch64-apple-darwin/release/codex")
+          target = temporary / "codex-foreground-v187-r5"
+          target.mkdir()
+          binary = target / "codex-aarch64-apple-darwin"
+          shutil.copy2(source, binary)
+          version = subprocess.run([str(binary), "--version"], text=True, capture_output=True, check=True).stdout.strip()
+          assert version == "codex-cli 0.164.0", version
+          for path in [evidence / "VERIFIED-TEST-EVIDENCE.json", evidence / "full/tui-candidate-tests.log", evidence / "release/tui-release-foreground-tests.log"]:
+              shutil.copy2(path, target / path.name)
+          manifest = dict(schema="ccc-native-codex-artifact-v187-r5", ccc_commit=os.environ["CCC_COMMIT"],
+                          test_source_commit=proof["test_source_commit"], test_run_id=proof["test_run_id"],
+                          test_run_attempt=proof["test_run_attempt"], test_artifacts=proof["artifacts"],
+                          upstream_commit=integration["upstream_commit"], upstream_tree=integration["upstream_tree"],
+                          patch_sha256=integration["patch"]["sha256"], native_files=integration["native_files"],
+                          binary_sha256=sha(binary), binary_bytes=binary.stat().st_size, version=version,
+                          target="aarch64-apple-darwin", rustc_version=subprocess.run(["rustc", "--version"], cwd="codex/codex-rs", text=True, capture_output=True, check=True).stdout.strip(),
+                          actions_run_id=os.environ["GITHUB_RUN_ID"], actions_run_attempt=os.environ["GITHUB_RUN_ATTEMPT"],
+                          integration_manifest_sha256=sha(integration_path), cargo_lock_sha256=sha(Path("codex/codex-rs/Cargo.lock")),
+                          full_tui_library_tests_passed=proof["full_tui_library_tests_passed"], full_tui_library_tests=proof["full_tui_library_tests"],
+                          full_tui_library_test_version=proof["full_tui_library_test_version"],
+                          release_foreground_tests_passed=proof["release_foreground_tests_passed"], release_foreground_tests=proof["release_foreground_tests"],
+                          tui_test_log_sha256=sha(evidence / "full/tui-candidate-tests.log"),
+                          release_foreground_test_log_sha256=sha(evidence / "release/tui-release-foreground-tests.log"),
+                          test_evidence_sha256=sha(evidence / "VERIFIED-TEST-EVIDENCE.json"),
+                          external_dependency_upgrades=0, test_runner_reexecuted=False, runtime_installed=False)
+          (target / "BUILD-MANIFEST.json").write_text(json.dumps(manifest, indent=2) + "\n")
+          print(json.dumps(manifest, indent=2))
+          PY
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: codex-native-foreground-aarch64-apple-darwin-v187-r5
+          path: ${{ runner.temp }}/codex-foreground-v187-r5/*
+          if-no-files-found: error
+          retention-days: 7
+      - name: Preserve release-build outcome and reused evidence
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: codex-native-foreground-release-build-evidence-v187-r5
+          path: |
+            ${{ runner.temp }}/native-release-build.log
+            ${{ runner.temp }}/verified-evidence/VERIFIED-TEST-EVIDENCE.json
+          if-no-files-found: ignore
+          retention-days: 7
