@@ -157,6 +157,98 @@ class ObservationTimingTests(unittest.TestCase):
                 self.assertEqual(methods["fresh_authorization"].call_count, 2 if source == "native" else 1)
                 self.daemon._record_state.assert_called_once()
 
+    def test_working_frames_skip_empty_recovery_but_keep_fresh_base_guards(self):
+        for source in ("periodic", "native"):
+            for kind in ("working", "menu"):
+                with self.subTest(source=source, kind=kind):
+                    _, methods = self.reconcile_costs(kind=kind)
+                    self.assertIsNone(self.observe(source))
+                    methods["runtime_guards"].assert_called_once()
+                    methods["fresh_authorization"].assert_called()
+                    for name in ("claude_submit", "deferred_stop", "hook_gap_fallback"):
+                        methods[name].assert_not_called()
+                        self.assertNotIn(name, self.runtime.observation_timings["reconcile_detail_calls"])
+                    self.assertIsNone(self.runtime.claude_deferred_event)
+                    self.assertEqual(self.runtime.claude_submit_phase, "none")
+
+    def test_refreshed_working_frame_also_skips_empty_recovery(self):
+        for source in ("periodic", "native"):
+            with self.subTest(source=source):
+                _, methods = self.reconcile_costs(kind="working", retry=True)
+                self.assertIsNone(self.observe(source))
+                methods["runtime_guards"].assert_called_once()
+                self.daemon._refresh_workspace.assert_called_once()
+                for name in ("claude_submit", "deferred_stop", "hook_gap_fallback"):
+                    methods[name].assert_not_called()
+
+    def test_retained_unknown_transaction_keeps_guarded_handled_return(self):
+        self.runtime.claude_submit_phase = "text_written"
+        self.runtime.claude_submit_event_id = "original-input"
+        self.runtime.claude_submit_write_unknown = True
+        for source in ("periodic", "native"):
+            with self.subTest(source=source):
+                _, methods = self.reconcile_costs(kind="working")
+                methods["claude_submit"].side_effect = self.cost(10, True)
+                self.assertIsNone(self.observe(source))
+                methods["claude_submit"].assert_called_once()
+                methods["deferred_stop"].assert_not_called()
+                methods["hook_gap_fallback"].assert_not_called()
+                self.assertEqual(self.runtime.claude_submit_event_id, "original-input")
+                self.assertTrue(self.runtime.claude_submit_write_unknown)
+
+    def test_retained_stop_and_partial_candidate_keep_original_methods(self):
+        self.runtime.claude_deferred_event = {"event_id": "original-stop"}
+        self.runtime.claude_fallback_candidate_generation = "original-generation"
+        for source in ("periodic", "native"):
+            with self.subTest(source=source):
+                _, methods = self.reconcile_costs(kind="working")
+                self.assertIsNone(self.observe(source))
+                methods["deferred_stop"].assert_called_once()
+                methods["hook_gap_fallback"].assert_called_once()
+                self.assertEqual(self.runtime.claude_deferred_event, {"event_id": "original-stop"})
+                self.assertEqual(self.runtime.claude_fallback_candidate_generation, "original-generation")
+
+    def test_orphan_budget_keeps_original_reconciler_on_working_frame(self):
+        self.runtime.claude_orphan_enter_count = 2
+        _, methods = self.reconcile_costs(kind="working")
+        self.assertIsNone(self.observe())
+        methods["claude_submit"].assert_called_once()
+        self.assertEqual(self.runtime.claude_orphan_enter_count, 2)
+
+    def test_base_guard_label_keeps_original_recovery_chain(self):
+        _, methods = self.reconcile_costs(kind="working")
+        held = core.ScreenState("claude_waiting_supervisor", message_kind="claude")
+        methods["runtime_guards"].side_effect = self.cost(4, held)
+        methods["context_guard"].side_effect = lambda _, __, state: state
+        methods["codex_queue_recovery"].side_effect = lambda _, __, state, *args: state
+        methods["claude_submit"].side_effect = self.cost(10, True)
+        self.assertIsNone(self.observe())
+        methods["claude_submit"].assert_called_once()
+        self.assertEqual(methods["claude_submit"].call_args.args[2].kind, held.kind)
+        methods["deferred_stop"].assert_not_called()
+        methods["hook_gap_fallback"].assert_not_called()
+
+    def test_codex_labeled_frame_cannot_skip_a_retained_claude_wait(self):
+        for source in ("periodic", "native"):
+            with self.subTest(source=source):
+                self.runtime.claude_supervisor_wait = {"task_id": "original-wait"}
+                _, methods = self.reconcile_costs(kind="working", claude=False)
+                methods["claude_submit"].side_effect = self.cost(10, True)
+                self.assertIsNone(self.observe(source))
+                methods["claude_submit"].assert_called_once()
+                methods["deferred_stop"].assert_not_called()
+                self.assertEqual(self.runtime.claude_supervisor_wait, {"task_id": "original-wait"})
+
+    def test_retained_wait_keeps_original_methods_even_on_claude_working_frame(self):
+        for source in ("periodic", "native"):
+            with self.subTest(source=source):
+                self.runtime.claude_supervisor_wait = {"task_id": "original-wait"}
+                _, methods = self.reconcile_costs(kind="working")
+                self.assertIsNone(self.observe(source))
+                for name in ("claude_submit", "deferred_stop", "hook_gap_fallback"):
+                    methods[name].assert_called_once()
+                self.assertEqual(self.runtime.claude_supervisor_wait, {"task_id": "original-wait"})
+
     def test_reconcile_details_accumulate_main_and_refresh_retry_once_each(self):
         for source in ("periodic", "native"):
             with self.subTest(source=source):

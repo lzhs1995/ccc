@@ -170,13 +170,20 @@ def _retryable_completed_message(message):
     normalized = " ".join(message.lower().split())
     compact = re.sub(r'\s+', '', normalized)
     structured = structured_error_type(message)
+    status_4xx = set(re.findall(
+        r'(?:unexpected\s+status(?:\s+code)?|unknown\s+status\s+code|http(?:/\d(?:\.\d)?)?|last\s+status)\s*[:=]?\s*(400|401|403)\b',
+        normalized))
     prefix = compact.lstrip('■⚠└')
     if prefix.startswith(('documentation:', 'example:', 'quoted:', 'sample:')):
         return False
     if (structured in PROVIDER_BLOCKED
             or ('"error":{' in compact and '"insufficient_quota"' in compact)
             or 'invalid_encrypted_content' in normalized
-            or (structured != 'upstream_invalid' and re.search(r'(?:unexpected\s+status(?:\s+code)?|unknown\s+status\s+code|http(?:/\d(?:\.\d)?)?|last\s+status)\s*[:=]?\s*(?:400|401|403)\b', normalized))
+            # The specific resource remedy also applies under an HTTP 400
+            # envelope. An authentication status remains a veto, even when
+            # another status or a resource message precedes it.
+            or status_4xx & {'401', '403'}
+            or ('400' in status_4xx and structured not in {'upstream_invalid', 'resource_mismatch'})
             or '401' in normalized and any(x in normalized for x in (
                 '额度已用尽', 'remainquota', 'insufficient_quota', 'quota exceeded'))):
         return False

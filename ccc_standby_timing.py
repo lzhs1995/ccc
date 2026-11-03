@@ -33,7 +33,7 @@ def _serialized(value):
     return (json.dumps(value, sort_keys=True, separators=(',', ':')) + '\n').encode()
 
 
-def _read(path):
+def _read_raw(path):
     path = Path(path)
     if path.resolve(strict=True) != path:
         raise ValueError('activation timing evidence path changed')
@@ -47,6 +47,11 @@ def _read(path):
     fields = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
     if fields(before) != fields(after) or fields(after) != fields(path.lstat()):
         raise ValueError('activation timing evidence changed during read')
+    return raw
+
+
+def _read(path):
+    raw = _read_raw(path)
     return json.loads(raw), raw
 
 

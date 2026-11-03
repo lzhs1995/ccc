@@ -452,10 +452,11 @@ def native_display_labels(records, classified, top):
 
     needs_tty = any(record.get("native_display_target")
                     and not record["native_display_target"].get("tty")
-                    and core.surface_process_label(classified, record).get("agent_kind", "unknown") == "unknown"
+                    and core.surface_process_label(classified, record).get("agent_kind", "unknown")
+                        in {"unknown", "codex", "claude"}
                     for record in records)
     if not needs_tty:
-        return records, native.display_process_labels(records, classified, top)
+        return records, native.display_process_labels(records, classified, top, verify_classified=True)
     try:
         processes = scope.scan(reader=native.display_process)
         groups = {}
@@ -483,7 +484,8 @@ def native_display_labels(records, classified, top):
                     # display_process_labels rechecks this exact process and TTY.
                     record = {**record, "native_display_target": {**target, "tty": names[0]}}
             result.append(record)
-        return result, native.display_process_labels(result, classified, top, processes=processes)
+        return result, native.display_process_labels(result, classified, top, processes=processes,
+                                                     verify_classified=True)
     except (OSError, ValueError, RuntimeError, KeyError, TypeError):
         return records, dict(classified)
 
@@ -1527,11 +1529,12 @@ class SessionResolver:
             # taking down the whole refresh for one malformed record.  Skip the
             # bad entry instead: that surface resolves to 未测量 and the rest of
             # the table still gets ids.
-            runtime_copy = {
-                key: dict(value)
-                for key, value in runtimes.items()
-                if isinstance(value, Mapping)
-            }
+            runtime_copy = {}
+            for item in payload:
+                key = str(item.get("surface_id") or "")
+                value = runtimes.get(key)
+                if isinstance(value, Mapping):
+                    runtime_copy[key] = dict(value)
             worker = threading.Thread(
                 target=self._resolve_once, args=(payload, runtime_copy, token),
                 name="session-resolver", daemon=True,
@@ -3271,7 +3274,6 @@ class SupervisorModel:
     def refresh(self, *, force: bool = False) -> None:
         self.config = self.store.load()
         self.network_state = self.network.snapshot(self.config.get("network_guard", {}))
-        self.runtime = core.load_json(self.config_path.parent / "state.json", {})
         self.hook_config = core.ClaudeHookSettingsManager().inspect()
         # Kicks off a background ctl read when the cached snapshot is due; it
         # never joins the worker, so a slow or wedged ctl cannot stall a redraw.
@@ -3284,7 +3286,10 @@ class SupervisorModel:
         if not force and now - self.last_top_refresh < 5:
             self._refresh_batch_snapshots()
             return
-        self.last_top_refresh = now
+        # Runtime only feeds the rows rebuilt below. Avoid parsing archived
+        # history on the intervening keyboard/status-only refreshes.
+        self.runtime = core.load_json(self.config_path.parent / "state.json", {})
+        self.last_top_refresh = time.monotonic()
         try:
             if not self._control_ready:
                 self._control_socket.configure(self.client.capabilities())
@@ -5318,7 +5323,7 @@ def batch_preparation_progress(batch, *, now=None):
             {'private_check': '空目录短答50', 'access_check': '旧节费50'}.get(batch.get('startup_mode'), '原B50'))
     wait = batch.get('wait') if isinstance(batch.get('wait'), dict) else {}
     phase = wait.get('message') or {
-        'complete': '首任务已全数启动', 'running': '准备中', 'waiting': '等待准备',
+        'complete': '首任务已全数启动（任务结果未核验）', 'running': '准备中', 'waiting': '等待准备',
         'workspace_closed': '工作区已关闭', 'cancelled': '已取消',
         'needs_attention': '部分原会话待处理',
     }.get(batch.get('status'), batch.get('status') or '状态未知')
@@ -5328,7 +5333,7 @@ def batch_preparation_progress(batch, *, now=None):
               + (f" 命名 {named}/{total}" if named is not None else '')
               + f" 首任务 {batch.get('started', 0)}/{total}")
     if batch.get('failed'):
-        result += f" | 待处理 {batch['failed']}"
+        result += f" | 启动待处理 {batch['failed']}"
     at = batch.get('last_progress_at')
     if type(at) in {int, float} and 0 < at < float('inf'):
         age = max(0, int((time.time() if now is None else now) - at))

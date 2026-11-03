@@ -89,7 +89,7 @@ class RefuseInput:
     def top(self, *args):
         return {}
 
-    def replay(self, *args):
+    def replay(self, *args, **kwargs):
         return self.payload
 
 

@@ -131,14 +131,45 @@ def native_tail(path):
                   "bytes_read": len(data), "sha256": hashlib.sha256(data).hexdigest()}
 
 
-@functools.lru_cache(maxsize=1)
+@functools.lru_cache(maxsize=4)
 def _native_journal_rows(data):
     """Reuse decoding only for identical freshly authenticated tail bytes.
 
     Never cache source proof, wait decisions or task identity. The caller still
     performs native_tail on every observation, including lock/stat validation.
+    Keep a few active tails so observations of different peers do not evict
+    each other and repeatedly decode the same multi-megabyte native records.
     """
     return tuple(json.loads(line) for line in data.splitlines())
+
+
+@functools.lru_cache(maxsize=16)
+def _native_wait_records(data):
+    """Keep bounded decoded views for waits, never source proof or decisions.
+
+    Every line is still decoded. Stop summaries remain complete for their
+    record hash; other messages retain identity and exact user-text semantics.
+    Hook recovery continues to use the separate, complete journal decoder.
+    """
+    records = []
+    for line in data.splitlines(keepends=True):
+        row = json.loads(line)
+        if isinstance(row, dict):
+            kind = row.get("type")
+            if kind == "assistant" or (kind == "system" and row.get("subtype") != "stop_hook_summary"):
+                row = {key: row[key] for key in ("type", "isSidechain", "sessionId", "subtype") if key in row}
+            elif kind == "user":
+                message = row.get("message")
+                content = message.get("content") if isinstance(message, Mapping) else None
+                if isinstance(content, list):
+                    blocks = [({"type": block.get("type"), "text": block.get("text")}
+                               if block.get("type") == "text" else {"type": block.get("type")})
+                              if isinstance(block, dict) else None for block in content]
+                    row = {**row, "message": {**message, "content": blocks}}
+            elif kind != "system":
+                row = {}
+        records.append((len(line), row))
+    return tuple(records)
 
 
 def native_event_from_journal(path, accepted):
@@ -437,8 +468,7 @@ class CloseoutEvidence:
             rows = []
             selected = None
             offset = source["offset_bytes"]
-            for line in data.splitlines(keepends=True):
-                row = json.loads(line)
+            for length, row in _native_wait_records(data):
                 if not isinstance(row, dict):
                     return None
                 if row.get("type") in ("system", "user", "assistant") and row.get("isSidechain") is not True:
@@ -447,7 +477,7 @@ class CloseoutEvidence:
                     rows.append(row)
                     if row.get("type") == "system" and row.get("subtype") == "stop_hook_summary":
                         selected = (len(rows) - 1, row, offset)
-                offset += len(line)
+                offset += length
             if selected is None:
                 return None
             index, row, offset = selected

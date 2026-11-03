@@ -43,10 +43,45 @@ class ProviderGuardTests(unittest.TestCase):
                 "event_name": "StopFailure", "event_id": event_id, "agent_pid": 1234,
                 "synthetic_fallback": False, "created_at": stamp or time.time() - 10}
 
+    def test_foreign_history_is_skipped_but_current_pending_claim_blocks(self):
+        with tempfile.TemporaryDirectory() as root:
+            d, t, r, e, c = self.case(root)
+            claim = self.failure(e, RPM, stamp=time.time())
+            d.claude_event_ledger.events = {
+                str(i): dict(claim, surface_id='other-surface', status='handling')
+                for i in range(1000)}
+            with mock.patch.object(d.claude_event_ledger, 'provider_claim_pending',
+                                   wraps=d.claude_event_ledger.provider_claim_pending) as pending:
+                self.assertEqual(d._claude_provider_guard_reason(t, r, event=e), '')
+                pending.assert_not_called()
+                d.claude_event_ledger.events['current-claim'] = dict(
+                    claim, session_id=r.claude_session_id, status='handling',
+                    process_generation=r.claude_process_generation)
+                self.assertEqual(d._claude_provider_guard_reason(t, r, event=e),
+                                 'claude_provider_verifying')
+                pending.assert_called_once()
+
     def hold(self, d, t, r, e, text=AUTH, *, stamp=None):
         event = self.failure(e, text, stamp=stamp)
         d._remember_claude_provider_failure(t, r, event, event=event)
         return event
+
+    def test_nonclaim_and_foreign_malformed_error_kinds_do_not_block_current_claim(self):
+        with tempfile.TemporaryDirectory() as root:
+            d, t, r, e, c = self.case(root)
+            claim = dict(self.failure(e, RPM, stamp=time.time()),
+                         session_id=r.claude_session_id, status="handling",
+                         process_generation=r.claude_process_generation)
+            d.claude_event_ledger.events = {
+                "sent": dict(claim, status="sent", error_kind=[]),
+                "ordinary": dict(claim, event_name="Stop", error_kind={}),
+                "foreign": dict(claim, surface_id="other-surface", error_kind=[]),
+            }
+            self.assertEqual(d._claude_provider_guard_reason(t, r, event=e), "")
+            d.claude_event_ledger.events["current"] = claim
+            self.assertEqual(d._claude_provider_guard_reason(t, r, event=e),
+                             "claude_provider_verifying")
+            self.assert_no_input(c)
 
     def restart(self, d, c):
         restarted = w.WatchDaemon(d.config_path, d.state_path, client=c)
@@ -282,6 +317,52 @@ class ProviderGuardTests(unittest.TestCase):
                 self.assertEqual(bool(r2.claude_deferred_event), status in {"handling", "provider_retry_wait"})
                 self.assert_no_input(c)
 
+    def test_later_send_retires_only_original_retry_and_does_not_repark_after_restart(self):
+        with tempfile.TemporaryDirectory() as root:
+            d, t, r, e, c = self.case(root)
+            event = self.failure(e, RPM, stamp=time.time() - 100)
+            event["process_generation"] = r.claude_process_generation
+            d.claude_event_ledger.mark(event, "provider_retry_wait")
+            guard = d._remember_claude_provider_failure(t, r, event, event=event)
+            before_guard = copy.deepcopy(guard)
+            r.last_send_at = time.time() - 1
+            d._sync_claude_provider_guard(t["surface_id"], r)
+            state = w.ScreenState("claude_stopped", message_kind="claude")
+            with mock.patch.object(w.time, "time", return_value=guard["retry_after"] + 1), \
+                    mock.patch.object(d.logger, "info") as info:
+                d._maybe_send_deferred_claude_stop(t, r, state, c)
+                d._sync_claude_provider_guard(t["surface_id"], r)
+                d._maybe_send_deferred_claude_stop(t, r, state, c)
+            self.assertIsNone(r.claude_deferred_event)
+            self.assertEqual(d.claude_event_ledger.status_of(event["event_id"]), "deferred_cleared")
+            self.assertEqual(d.claude_event_ledger.provider_guard(t["surface_id"]), before_guard)
+            releases = [call for call in info.call_args_list if "deferred stop released" in call.args[0]]
+            self.assertEqual(len(releases), 1)
+            d.save()
+            restarted, restored = self.restart(d, c)
+            self.assertIsNone(restored.claude_deferred_event)
+            self.assert_no_input(c)
+
+    def test_retry_cleanup_preserves_delivery_archives_and_foreign_generations(self):
+        for protection in ("provider_native_receipt", "provider_superseded_submission", "foreign_generation"):
+            with self.subTest(protection=protection), tempfile.TemporaryDirectory() as root:
+                d, t, r, e, c = self.case(root)
+                event = self.failure(e, RPM, stamp=time.time() - 100)
+                event["process_generation"] = r.claude_process_generation
+                d.claude_event_ledger.mark(event, "provider_retry_wait")
+                d._remember_claude_provider_failure(t, r, event, event=event)
+                d._sync_claude_provider_guard(t["surface_id"], r)
+                r.last_send_at = time.time() - 1
+                row = d.claude_event_ledger.events[event["event_id"]]
+                if protection == "foreign_generation":
+                    row["process_generation"] = "other-generation"
+                else:
+                    row[protection] = {"original": "immutable"}
+                before = copy.deepcopy(row)
+                d._clear_claude_deferred(r, reason="covered_by_later_send")
+                self.assertEqual(d.claude_event_ledger.events[event["event_id"]], before)
+                self.assert_no_input(c)
+
     def test_pending_unknown_and_reserved_are_not_reopened_by_a_provider_error(self):
         for unknown in (False, True):
             with self.subTest(unknown=unknown), tempfile.TemporaryDirectory() as root:
@@ -324,13 +405,13 @@ class ProviderGuardTests(unittest.TestCase):
                         inside.update(transport=True, replayed=False)
                     self.guard_transport(c, before)
                     raw_replay = c.replay
-                    def replay(*args):
+                    def replay(*args, **kwargs):
                         if inside["transport"]:
                             inside["replayed"] = True
                             if boundary == "replay":
                                 c.payload = claude_grid_payload(lines=[text])
                                 c._base_payload = copy.deepcopy(c.payload)
-                        return raw_replay(*args)
+                        return raw_replay(*args, **kwargs)
                     def late(*args):
                         if inside["transport"] and inside["replayed"]:
                             self.hold(d, t, r, e, text)
@@ -362,13 +443,13 @@ class ProviderGuardTests(unittest.TestCase):
                 inside = {"transport": False, "replayed": False}
                 self.guard_transport(c, lambda kind: inside.update(transport=True, replayed=False))
                 raw_replay = c.replay
-                def replay(*args):
+                def replay(*args, **kwargs):
                     if inside["transport"]:
                         inside["replayed"] = True
                         if boundary == "replay":
                             c.payload = claude_grid_payload(lines=[AUTH])
                             c._base_payload = copy.deepcopy(c.payload)
-                    return raw_replay(*args)
+                    return raw_replay(*args, **kwargs)
                 def late(*args):
                     if inside["transport"] and inside["replayed"]:
                         self.hold(d, t, r, e)
@@ -776,6 +857,66 @@ class ProviderGuardTests(unittest.TestCase):
             self.assertEqual(d._claude_provider_guard_reason(t, r, state), "claude_provider_retry_wait")
             self.assertEqual((r.claude_provider_guard["status"], r.claude_provider_guard["retry_count"]), ("retry_wait", 1))
             self.assertNotIn("invalid", r.claude_provider_guard)
+
+    def released_echo_case(self, root):
+        d, t, r, e, c = self.case(root)
+        self.hold(d, t, r, e)
+        prompt, path = self.native_prompt(root, e)
+        with mock.patch.object(w.dispatch_recovery, "native_path", return_value=path):
+            self.assertTrue(d._release_claude_provider_guard(
+                t["surface_id"], r, prompt, reason="native_human_prompt"))
+        self.assertIsNone(r.claude_submit_event_id)
+        self.assertGreater(r.claude_provider_guard["release_created_at"], 0)
+        return d, t, r, e, c, w.ScreenState("idle", watchdog_echo=True)
+
+    def test_released_echo_without_submit_id_does_not_manufacture_stale_event(self):
+        with tempfile.TemporaryDirectory() as root:
+            d, t, r, e, c, state = self.released_echo_case(root)
+            self.assertNotIn("", d.claude_event_ledger.events)
+            self.assertEqual(d._claude_provider_guard_reason(t, r, state), "")
+            self.assertIsNone(r.claude_submit_event_id)
+
+    def test_released_echo_blocks_only_orphan_recovery_without_spending_input(self):
+        with tempfile.TemporaryDirectory() as root:
+            d, t, r, e, c, _ = self.released_echo_case(root)
+            state = w.ScreenState("composer_busy", watchdog_echo=True, message_kind="claude")
+            r.claude_orphan_enter_count = 2
+            self.assertEqual(d._claude_provider_guard_reason(t, r, state), "")
+            self.assertEqual(d._claude_provider_guard_reason(
+                t, r, state, orphan_recovery=True), "claude_provider_event_superseded")
+            self.assertTrue(d._recover_orphan_watchdog_submit(t, r, state, c))
+            self.assertEqual(r.claude_orphan_enter_count, 2)
+            self.assertIsNone(r.claude_submit_event_id)
+            self.assert_no_input(c)
+
+    def test_released_echo_still_refuses_a_real_stale_submit_event(self):
+        with tempfile.TemporaryDirectory() as root:
+            d, t, r, e, c, state = self.released_echo_case(root)
+            r.claude_submit_event_id = "old-submit"
+            d.claude_event_ledger.events["old-submit"] = dict(
+                e, event_id="old-submit", completed=False,
+                created_at=r.claude_provider_guard["release_created_at"] - 1)
+            self.assertEqual(d._claude_provider_guard_reason(t, r, state),
+                             "claude_provider_event_superseded")
+
+    def test_released_echo_still_refuses_a_current_pending_provider_claim(self):
+        with tempfile.TemporaryDirectory() as root:
+            d, t, r, e, c, state = self.released_echo_case(root)
+            pending = self.failure(e, RPM, stamp=time.time(), event_id="current-claim")
+            d.claude_event_ledger.events["current-claim"] = dict(
+                pending, session_id=r.claude_session_id, status="handling",
+                process_generation=r.claude_process_generation)
+            self.assertEqual(d._claude_provider_guard_reason(t, r, state),
+                             "claude_provider_verifying")
+
+    def test_released_echo_allows_a_genuine_new_submit_event(self):
+        with tempfile.TemporaryDirectory() as root:
+            d, t, r, e, c, state = self.released_echo_case(root)
+            r.claude_submit_event_id = "new-submit"
+            d.claude_event_ledger.events["new-submit"] = dict(
+                e, event_id="new-submit", created_at=time.time())
+            self.assertEqual(d._claude_provider_guard_reason(t, r, state), "")
+
     def consume(self, d, r, attempt, stamp, *, surface="surface-uuid", generation="generation-a"):
         """Credit one identity-bound durable submission to a recorded attempt."""
         guard = dict(r.claude_provider_guard)

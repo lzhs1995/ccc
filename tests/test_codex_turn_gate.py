@@ -5,7 +5,8 @@ import unittest
 from unittest.mock import Mock
 from unittest.mock import patch
 
-from tests.test_codex_status_chrome import status_payload, visible_text, ERRORS
+from tests import test_codex_status_chrome as status_fixture
+from tests.test_codex_status_chrome import PROVIDER_TOKEN_RATE_LIMIT, status_payload, visible_text, ERRORS
 from tests.test_watch import FakeClient, armed_daemon
 import cmux_codex_watch as core
 
@@ -117,6 +118,32 @@ class CodexTurnGateTests(unittest.TestCase):
                 self.turn.return_value = {**self.finished, "error": error}
                 self.daemon.process_once(self.client)
                 self.assertEqual(self.client.sent, [])
+
+    def test_scrolled_error_needs_native_eof_when_binding_is_unavailable(self):
+        payload = status_fixture.CodexNewActivityChromeTests().payload()
+        state = core.classify_grid(core.Grid.from_rpc(payload, 'surface-uuid'))
+        self.assertEqual(state.kind, 'recoverable_error')
+        self.turn.return_value = None
+        target = self.daemon.config['targets'][0]
+        with patch.object(self.daemon, '_current_blocked_goal', return_value=None):
+            self.assertFalse(self.daemon._codex_turn_ready(
+                target, core.TargetRuntime(), state))
+        self.assertEqual(self.client.sent, [])
+
+    def test_scrolled_error_uses_latest_native_failure_not_hidden_reply(self):
+        payload = status_fixture.CodexNewActivityChromeTests().payload()
+        state = core.classify_grid(core.Grid.from_rpc(payload, 'surface-uuid'))
+        target = self.daemon.config['targets'][0]
+        ended = {**self.finished, 'signature': (1, 100, 1),
+                 'terminal_tail': {'offset': 50, 'end': 100, 'sha256': 'a' * 64}}
+        for error, allowed in ((None, False),
+                               ({'message': PROVIDER_TOKEN_RATE_LIMIT}, True)):
+            with self.subTest(error=error):
+                self.turn.return_value = {**ended, 'error': error}
+                with patch.object(self.daemon, '_current_blocked_goal', return_value=None):
+                    self.assertEqual(self.daemon._codex_turn_ready(
+                        target, core.TargetRuntime(), state), allowed)
+        self.assertEqual(self.client.sent, [])
 
     def test_one_submission_per_failed_turn_even_if_banner_changes(self):
         self.daemon.process_once(self.client)

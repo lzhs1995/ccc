@@ -116,7 +116,8 @@ def record(path, **value):
 
 
 def monitor(fd, parent, expected_birth, journal, *, timeout=STALL_SECONDS,
-            grace=TERM_GRACE_SECONDS, birth=process_birth, channels=(b'M', b'H')):
+            grace=TERM_GRACE_SECONDS, birth=process_birth, channels=(b'M', b'H'),
+            python_stacks=False):
     """Only our still-live original parent can be signalled, never a PID reuse."""
     last_identity_log = float('-inf')
     def same_parent():
@@ -194,6 +195,25 @@ def monitor(fd, parent, expected_birth, journal, *, timeout=STALL_SECONDS,
             if not read_progress(0):
                 return 0
             continue
+        if python_stacks:
+            # Only this parent's startup can enable the signal handler. Never
+            # send USR1 to a legacy daemon where its default action is fatal.
+            try:
+                os.kill(parent, signal.SIGUSR1)
+            except ProcessLookupError:
+                return 0
+            python_stacks = False  # At most one diagnostic per parent instance.
+            record(journal, event='python_stack_requested', parent_pid=parent,
+                   parent_birth=expected_birth)
+            # The C handler does not need the GIL. Keep the existing shutdown
+            # budget; a diagnostic is never a new liveness heartbeat.
+            if not read_progress(0.2):
+                return 0
+            state = same_parent()
+            if state is False:
+                return 0
+            if state is None:
+                continue
         try:
             os.kill(parent, signal.SIGTERM)
         except ProcessLookupError:
@@ -230,21 +250,62 @@ class LivenessGuard:
         self.process = None
         self.fd = None
         self.last = {}
+        self.stack_file = None
+
+    def _register_python_stacks(self, generation):
+        if (not hasattr(signal, 'SIGUSR1')
+                or signal.getsignal(signal.SIGUSR1) != signal.SIG_DFL):
+            return False
+        path = self.journal.with_name('daemon-stack-{}-{}-{}.log'.format(
+            os.getpid(), *generation))
+        stream = None
+        try:
+            # ObservationProgress also runs in isolated native interpreters.
+            # faulthandler is process-wide and must be loaded only by the guard.
+            import faulthandler
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            stream = os.fdopen(fd, 'wb')
+            faulthandler.register(signal.SIGUSR1, file=stream, all_threads=True)
+        except (ImportError, OSError, RuntimeError, ValueError) as error:
+            if stream is not None:
+                stream.close()
+            record(self.journal, event='python_stack_registration_unavailable',
+                   parent_pid=os.getpid(), parent_birth=generation,
+                   error=str(error))
+            return False
+        self.stack_file = stream
+        identity = os.fstat(stream.fileno())
+        record(self.journal, event='python_stack_handler_registered',
+               parent_pid=os.getpid(), parent_birth=generation,
+               signal='SIGUSR1', stack_path=str(path),
+               device=identity.st_dev, inode=identity.st_ino)
+        return True
+
+    def _close_python_stacks(self):
+        if self.stack_file is not None:
+            import faulthandler
+            faulthandler.unregister(signal.SIGUSR1)
+            self.stack_file.close()
+            self.stack_file = None
 
     def start(self):
         generation = process_birth(os.getpid())
         if not generation:
             raise RuntimeError('cannot authenticate liveness watchdog parent')
+        python_stacks = self._register_python_stacks(generation)
         read_fd, write_fd = os.pipe()
         try:
             child = subprocess.Popen([
                 sys.executable, '-B', str(Path(__file__).resolve()),
                 '--fd', str(read_fd), '--parent', str(os.getpid()),
-                '--birth', json.dumps(generation), '--journal', str(self.journal)],
+                '--birth', json.dumps(generation), '--journal', str(self.journal),
+                *(['--python-stacks'] if python_stacks else [])],
                 pass_fds=(read_fd,), stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL, close_fds=True)
         except BaseException:
             os.close(write_fd)
+            self._close_python_stacks()
             raise
         finally:
             os.close(read_fd)
@@ -286,6 +347,7 @@ class LivenessGuard:
             except subprocess.TimeoutExpired:
                 self.process.terminate()
                 self.process.wait(timeout=2)
+        self._close_python_stacks()
 
 
 def main():
@@ -294,9 +356,11 @@ def main():
     parser.add_argument('--parent', type=int, required=True)
     parser.add_argument('--birth', required=True)
     parser.add_argument('--journal', type=Path, required=True)
+    parser.add_argument('--python-stacks', action='store_true')
     args = parser.parse_args()
     return monitor(args.fd, args.parent, json.loads(args.birth), args.journal,
-                   timeout=retry_timeout(args.journal), channels=(b'M', b'H', b'O'))
+                   timeout=retry_timeout(args.journal), channels=(b'M', b'H', b'O'),
+                   python_stacks=args.python_stacks)
 
 
 if __name__ == '__main__':

@@ -368,6 +368,7 @@ class FakeClient:
         self.sent_text = []
         self.sent_keys = []
         self.replays = []
+        self.replay_options = []
         self.reads = []
         self._base_payload = copy.deepcopy(payload)
         self._submit_echo = False
@@ -390,10 +391,11 @@ class FakeClient:
         self.reads.append((workspace_id, surface_id))
         return self.text
 
-    def replay(self, workspace_id, surface_id):
+    def replay(self, workspace_id, surface_id, *, live=None, timeout=12.0):
         if not workspace_id or not surface_id:
             raise IncompatibleError("terminal.replay requires workspace_id and surface_id")
         self.replays.append((workspace_id, surface_id))
+        self.replay_options.append({"live": live, "timeout": timeout})
         if self._submit_echo and isinstance(self.payload, dict):
             payload = copy.deepcopy(self._base_payload)
             grid = payload.get("render_grid", {})
@@ -429,8 +431,9 @@ class PerSurfaceClient(FakeClient):
         self.reads.append((workspace_id, surface_id))
         return self.texts[surface_id]
 
-    def replay(self, workspace_id, surface_id):
+    def replay(self, workspace_id, surface_id, *, live=None, timeout=12.0):
         self.replays.append((workspace_id, surface_id))
+        self.replay_options.append({"live": live, "timeout": timeout})
         return self.payloads[surface_id]
 
 
@@ -4185,7 +4188,7 @@ class WatchTests(unittest.TestCase):
                 self.busy = busy
                 self.replay_count = 0
 
-            def replay(self, workspace_id, surface_id):
+            def replay(self, workspace_id, surface_id, *, live=None, timeout=12.0):
                 self.replays.append((workspace_id, surface_id))
                 self.replay_count += 1
                 return self.busy if self.replay_count >= 2 else self.stopped
@@ -6309,7 +6312,7 @@ class DeferredStopTests(unittest.TestCase):
                 self.working = working
                 self.frames = 0
 
-            def replay(self, workspace_id, surface_id):
+            def replay(self, workspace_id, surface_id, *, live=None, timeout=12.0):
                 self.replays.append((workspace_id, surface_id))
                 self.frames += 1
                 return self.working if self.frames >= 2 else self.stopped
@@ -6849,12 +6852,12 @@ class Surface36ReplayTests(unittest.TestCase):
             self.safe = False
             self.frames = 0
 
-        def replay(self, workspace_id, surface_id):
+        def replay(self, workspace_id, surface_id, *, live=None, timeout=12.0):
             if self.safe:
                 # Delegate so the base class still simulates the watchdog echo
                 # after send_text; without it the submit readback fails and the
                 # send looks transient rather than successful.
-                return super().replay(workspace_id, surface_id)
+                return super().replay(workspace_id, surface_id, live=live, timeout=timeout)
             self.replays.append((workspace_id, surface_id))
             self.frames += 1
             # Frame 1 stopped, frame 2 working: the double-frame preflight sees

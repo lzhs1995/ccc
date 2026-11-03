@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -122,6 +123,42 @@ class DirectBatchTests(unittest.TestCase):
 
 
 class DisabledLauncherTests(unittest.TestCase):
+    def test_native_package_read_accepts_atime_but_rejects_identity_changes(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve() / 'package space'
+            (root / 'bin').mkdir(parents=True)
+            binary = root / 'bin/codex'
+            binary.write_bytes(b'\x7fELFfixture')
+            binary.chmod(0o700)
+            manifest = root / 'codex-package.json'
+            manifest.write_text(json.dumps(
+                {'layoutVersion': 1, 'variant': 'codex', 'entrypoint': 'bin/codex'}))
+            entry = root / 'managed-codex'
+            entry.write_text('#!/bin/sh\nexport CODEX_CLIENT_THREAD_OBSERVER=1\nexec "'
+                             + str(binary) + '" "$@"\n')
+            original_stat = Path.stat
+            fields = ('st_dev', 'st_ino', 'st_size', 'st_mode', 'st_uid', 'st_gid', 'st_nlink',
+                      'st_mtime_ns', 'st_ctime_ns', 'st_atime_ns')
+            for changed in ('st_atime_ns', 'st_mtime_ns', 'st_ctime_ns', 'st_ino', 'st_mode'):
+                with self.subTest(changed=changed):
+                    calls = []
+                    def changed_after_read(path, *args, **kwargs):
+                        info = original_stat(path, *args, **kwargs)
+                        if path != manifest:
+                            return info
+                        observed = SimpleNamespace(**{name: getattr(info, name) for name in fields})
+                        if calls:
+                            setattr(observed, changed, getattr(observed, changed) + 1)
+                        calls.append(observed)
+                        return observed
+                    with patch.object(Path, 'stat', changed_after_read):
+                        if changed == 'st_atime_ns':
+                            self.assertEqual(resolve_native_binary(entrypoint=entry), str(binary))
+                        else:
+                            with self.assertRaises(RuntimeError):
+                                resolve_native_binary(entrypoint=entry)
+
     def test_managed_double_quote_entry_and_injection_rejection(self):
         import tempfile
         with tempfile.TemporaryDirectory() as temp:

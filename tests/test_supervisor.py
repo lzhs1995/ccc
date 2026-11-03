@@ -4071,6 +4071,22 @@ class SessionResolverTests(unittest.TestCase):
         self.assertIn("lstart=", " ".join(calls[0]))
         self.assertEqual(len(resolver.snapshot()), 5)
 
+    def test_runtime_copy_visits_only_current_surface_ids(self):
+        class CurrentLookupOnly(dict):
+            def items(self):
+                raise AssertionError('archived runtime scan')
+
+        original = {"state": "working"}
+        runtimes = CurrentLookupOnly(live=original, archived={"state": "delivery_unknown"})
+        seen = []
+        resolver = self._resolver()
+        resolver._resolve_once = lambda surfaces, rows, token: seen.append(rows)
+        self.assertTrue(resolver.maybe_refresh([{"surface_id": "live"}], runtimes, force=True))
+        self.assertTrue(resolver.wait_for_refresh(1))
+        self.assertEqual(seen, [{"live": original}])
+        self.assertIsNot(seen[0]["live"], original)
+        self.assertEqual(runtimes["archived"], {"state": "delivery_unknown"})
+
     def test_the_single_ps_carries_lstart_so_generation_needs_no_extra_call(self):
         import cmux_supervisor_tui as tui
 
