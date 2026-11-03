@@ -46,6 +46,8 @@ jobs:
       CARGO_PROFILE_RELEASE_DEBUG: "none"
       CARGO_BUILD_JOBS: "3"
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      # Match the pinned upstream full-test runner's 8 MiB stack.
+      RUST_MIN_STACK: "8388608"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:

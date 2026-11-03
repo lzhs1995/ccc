@@ -2367,10 +2367,10 @@ index 0000000..fe28a6e
 +}
 diff --git a/codex-rs/tui/src/app/foreground_observation/tests.rs b/codex-rs/tui/src/app/foreground_observation/tests.rs
 new file mode 100644
-index 0000000..84e5529
+index 0000000..9db2ac0
 --- /dev/null
 +++ b/codex-rs/tui/src/app/foreground_observation/tests.rs
-@@ -0,0 +1,767 @@
+@@ -0,0 +1,768 @@
 +//! Actual App attachment, routing and reconnect flows backed by a private file journal.
 +
 +use super::*;
@@ -2383,6 +2383,7 @@ index 0000000..84e5529
 +use crate::backend_id::BackendId;
 +use ccc_native_client_foreground::ForegroundObserver;
 +use codex_protocol::models::ActivePermissionProfile;
++use pretty_assertions::assert_eq;
 +use std::fs::DirBuilder;
 +use std::fs::OpenOptions;
 +use std::io::Write;

@@ -6,7 +6,7 @@
   "toolchain": "1.99.1",
   "patch": {
     "path": "integration.patch",
-    "sha256": "182ed21b6dfbdceafdf5183dd4420cd27b77bb21eac9ccdfb24963c324ff03c5"
+    "sha256": "a72b0f56da56d1b78c86690eb0073ae3be37e2061de2fef91aa9aa53c1e22c8d"
   },
   "patched_files": {
     "codex-rs/Cargo.lock": {
@@ -27,7 +27,7 @@
     },
     "codex-rs/tui/src/app/foreground_observation/tests.rs": {
       "before_sha256": null,
-      "after_sha256": "5ab7cfc35a1648e721fa25dbd4a600053798a80a31e9c5e635355eae768e58b7"
+      "after_sha256": "2ecac859be78eec02139a51138c54130623e6d5596f0c888a40cfe093943de7a"
     },
     "codex-rs/tui/src/app/reconnect.rs": {
       "before_sha256": "d3fb4b068703fd129b7099b66a5926a8ffc605d17ae11844764d0feb6dcb8718",
