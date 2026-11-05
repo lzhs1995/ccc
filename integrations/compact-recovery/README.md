@@ -9,3 +9,5 @@ Source SHA256: 7013d28d993ccdc5119873acde2a2c3c38e818647cac0e17f849e10ae073a4c5.
 Only pushes affecting the exact candidate branch and paths trigger the schema job. Manual dispatch is available when registered. No old test success is imported as evidence for the candidate.
 
 The compatibility revision preserves the original empty compact response's treatment of unknown fields and adds a regression test. The earlier schema generation evidence remains separate; this source requires a new schema generation and complete build.
+
+The second schema-generation source restores the existing compact-start response compatibility and adds a regression test; generated protocol files are not manually edited.

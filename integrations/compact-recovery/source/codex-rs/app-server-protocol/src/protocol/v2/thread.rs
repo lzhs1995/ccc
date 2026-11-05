@@ -1225,12 +1225,21 @@ mod compact_recovery_tests {
     use super::ThreadCompactStartResponse;
 
     #[test]
-    fn legacy_empty_compact_response_keeps_extra_field_compatibility() {
-        let response: ThreadCompactStartResponse =
-            serde_json::from_value(serde_json::json!({"futureField": true})).unwrap();
+    fn legacy_compact_start_response_accepts_unknown_fields_without_relaxing_recovery() {
+        let response: ThreadCompactStartResponse = serde_json::from_value(serde_json::json!({
+            "futureServerField": {"nested": true}
+        }))
+        .unwrap();
         assert_eq!(
             serde_json::to_value(response).unwrap(),
             serde_json::json!({})
+        );
+        assert!(
+            serde_json::from_value::<ThreadCompactRecoveryParams>(serde_json::json!({
+                "threadId": "original",
+                "futureServerField": {"nested": true}
+            }))
+            .is_err()
         );
     }
 

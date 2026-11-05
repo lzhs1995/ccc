@@ -1,18 +1,29 @@
 {
-  "schema": "ccc-native-compatible-schema-root-review-v1",
-  "scope": "R4 source plus restoring legacy empty response compatibility and one regression test",
-  "review_kind": "solo_self_review",
-  "original_source_owner_review_sha256": "7bca17fb09d3adfda65e925b90f41b0005ffdcf2a420b6a5ebb988d136ec629b",
-  "original_source_sha256": "35c84c4a875e7388c2a66823ce03e07442a7ae2f6c113787beb967bfc7c63310",
-  "changed_implementation_member": "codex-rs/app-server-protocol/src/protocol/v2/thread.rs",
-  "recovery_params_unknown_field_refusal_retained": true,
-  "original_r4_source_and_receipts_unchanged": true,
-  "full_build_passed": false,
+  "schema": "ccc-native-combined-source-owner-review-v1",
+  "scope": "Restore old ThreadCompactStartResponse unknown-field compatibility; one real regression case retains strict new recovery params. Schema generation only.",
+  "prior_owner_review": "/Users/lzhs/Documents/Herdr会话恢复/compat-20261104/herdr-180-300-audit-20261105/candidate/combined-freeze-r4-format/schema-bundle/OWNER-REVIEW.json",
+  "prior_owner_review_sha256": "7bca17fb09d3adfda65e925b90f41b0005ffdcf2a420b6a5ebb988d136ec629b",
+  "changed_members": [
+    "codex-rs/app-server-protocol/src/protocol/v2/thread.rs"
+  ],
+  "delta_sha256": "6652c2700ea285cc8487915481fcb74250ca1d7c5951f6844a73dbbb2283654d",
+  "overlay_members": 62,
+  "complete_source_members": 9457,
+  "full_source_sha256": "97907f664f19cded25dcb9360eb007c18a351d2bfb50eb5e6faa90faec9342b8",
+  "full_source_basis": "Every actual r4 full-source member rehashed; virtual substitution of only thread.rs. No new physical full tree or complete new-tree cleanapply claimed; original CI performs full reconstruction/hash check.",
+  "single_member_original_preimage_apply_verified": true,
+  "new_case": {
+    "package": "codex-app-server-protocol",
+    "binary": "codex_app_server_protocol",
+    "name": "protocol::v2::thread::compact_recovery_tests::legacy_compact_start_response_accepts_unknown_fields_without_relaxing_recovery",
+    "role": "protocol",
+    "new": true
+  },
+  "new_case_executed": false,
+  "all_native_tui17_unchanged": true,
+  "full_compile_tests_passed": false,
   "real_recovery_passed": false,
   "production_mutations": 0,
-  "formatted_revision_of": {
-    "path": "/Users/lzhs/Documents/Herdr\u4f1a\u8bdd\u6062\u590d/compat-20261104/herdr-180-300-audit-20261105/root-schema-compatibility-r5/RESULT.json",
-    "sha256": "46f4b39903a8597c17f63e53eaaa9b2e44be199a13dccb2fdb950ebe9f7fb603"
-  },
-  "formatter_only_after_compatibility_fix": true
+  "generated_schema_modified": false,
+  "coordinator_review_before_dispatch": true
 }

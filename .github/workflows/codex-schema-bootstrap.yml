@@ -31,7 +31,7 @@ jobs:
       CARGO_BUILD_JOBS: "3"
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
       INSTA_UPDATE: "no"
-      BOOTSTRAP_SHA256: ${{ inputs.manifest_sha256 || 'c6bb394e19fb29435b50276fce7a38fbaf711bc54dbfe89b4a8c621d0d143582' }}
+      BOOTSTRAP_SHA256: ${{ inputs.manifest_sha256 || 'fe9b9b031cc23364a1035608c8bae5fb3f8f323390005fffccacea995d2ea668' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
