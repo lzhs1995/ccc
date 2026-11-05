@@ -11,3 +11,6 @@ Patch SHA256: `3a18fdb4c86a77acfe2471bb6610db3f283281e9d4e75c890f8d3a105f661966`
 Complete candidate source SHA256: `754fee71803818259fc27038fca672ed14979c633199bd971c3a6e9b3855857e` (2959 files, from 2957 upstream files).
 
 After CI, the downloaded artifact still needs exact run and digest validation and a private real TUI recovery/release test. Simulated-agent tests do not establish actual AGY account authentication or physical power-loss recovery. Production adoption and restart remain separate steps.
+
+
+Run 42001597263 compiled the server and unit binary and passed the exact 3656 nonignored tests (11 ignored), but failed its final full-source identity gate. The original run did not retain the after-source inventory, so the changed paths are unknown. The next run records and compares complete source manifests and differences after fetch, server compilation, unit compilation, test listing and tests; it still rejects every changed or added file. Nextest storage is now explicitly outside the source tree. A real 0.9.146 reuse experiment found that the default store created only empty directories and did not change the file manifest, so store relocation is isolation hardening, not a proven root-cause fix.

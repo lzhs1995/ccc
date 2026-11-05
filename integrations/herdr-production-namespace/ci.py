@@ -78,6 +78,22 @@ def source_manifest(root):
     return {"files": rows, "sha256": digest}
 
 
+def source_checkpoint(source, expected, output, phase):
+    actual = source_manifest(source)
+    before = {row["path"]: row for row in expected["files"]}
+    after = {row["path"]: row for row in actual["files"]}
+    difference = {"phase": phase, "expected_sha256": expected["sha256"],
+                  "actual_sha256": actual["sha256"],
+                  "added": [after[key] for key in sorted(after.keys() - before.keys())],
+                  "removed": [before[key] for key in sorted(before.keys() - after.keys())],
+                  "changed": [{"before": before[key], "after": after[key]}
+                              for key in sorted(before.keys() & after.keys())
+                              if before[key] != after[key]]}
+    save(output / ("SOURCE-" + phase + ".json"), actual)
+    save(output / ("SOURCE-DIFF-" + phase + ".json"), difference)
+    require(actual == expected, "frozen source changed at " + phase + "; see saved SOURCE-DIFF")
+
+
 def download(pin, destination):
     with urllib.request.urlopen(pin["url"], timeout=120) as response, destination.open("xb") as stream:
         shutil.copyfileobj(response, stream)
@@ -154,7 +170,7 @@ def require_junit(path, expected):
             "junit_sha256": sha(path)}
 
 
-def run_units(source, output, env, unit, messages, expected):
+def run_units(source, output, env, unit, messages, expected, expected_source):
     target = Path(env["CARGO_TARGET_DIR"])
     metadata = json.loads(run(["cargo", "+1.99.0", "metadata", "--locked", "--offline",
                               "--format-version", "1", "--filter-platform", "aarch64-apple-darwin"], source, env))
@@ -184,7 +200,8 @@ def run_units(source, output, env, unit, messages, expected):
         "binary_metadata_sha256": sha(output / "binaries-metadata.json")})
     config = output / "nextest.toml"
     junit = output / "unit.xml"
-    config.write_text('[profile.default]\nretries = 0\n[profile.default.junit]\npath = '
+    config.write_text('[store]\ndir = ' + json.dumps(str(output / "nextest-store"))
+                      + '\n[profile.default]\nretries = 0\n[profile.default.junit]\npath = '
                       + json.dumps(str(junit)) + "\n")
     reuse = ["--cargo-metadata", str(output / "cargo-metadata.json"), "--binaries-metadata",
              str(output / "binaries-metadata.json"), "--config-file", str(config), "--user-config-file", "none"]
@@ -196,6 +213,7 @@ def run_units(source, output, env, unit, messages, expected):
         XDG_CACHE_HOME=str(private / ".cache"), TMPDIR=env["TMPDIR"])
     listing = json.loads(run(["cargo-nextest", "nextest", "list", *reuse, "--message-format", "json"], source, test_env))
     save(output / "LIST.json", listing)
+    source_checkpoint(source, expected_source, output, "after-list")
     require_case_set(listing, expected, unit["path"])
     require(sha(unit["path"]) == unit["sha256"], "unit bytes changed before tests")
     run(["cargo-nextest", "nextest", "run", *reuse, "--test-threads", "2", "--no-fail-fast",
@@ -205,6 +223,7 @@ def run_units(source, output, env, unit, messages, expected):
     require(sha(unit["path"]) == unit["sha256"], "unit bytes changed during tests")
     save(output / "UNIT-RESULT.json", {"passed": True, **result, "unit_binary_sha256": unit["sha256"],
                                       "cargo_build_invoked_by_nextest": False})
+    source_checkpoint(source, expected_source, output, "after-tests")
     return result
 
 
@@ -259,11 +278,13 @@ def main():
         env["ZIG"] = str(zig / "zig")
         require(run([env["ZIG"], "version"], output, env) == "0.16.0", "Zig version differs")
         run(["cargo", "+1.99.0", "fetch", "--locked", "--target", "aarch64-apple-darwin"], source, env, output / "fetch.log")
+        source_checkpoint(source, expected_source, output, "after-fetch")
         server, _ = compile_target(source, output, env, False)
+        source_checkpoint(source, expected_source, output, "after-server")
         unit, messages = compile_target(source, output, env, True)
+        source_checkpoint(source, expected_source, output, "after-unit")
         expected = json.loads((bundle / "EXPECTED-CASES.json").read_bytes())
-        tests = run_units(source, output, env, unit, messages, expected)
-        require(source_manifest(source) == expected_source, "build or tests modified frozen source")
+        tests = run_units(source, output, env, unit, messages, expected, expected_source)
         require(sha(server["path"]) == server["sha256"], "server artifact changed")
         package = output / "package"
         package.mkdir()
