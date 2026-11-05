@@ -1,0 +1,15 @@
+{
+  "schema": "ccc-original-private-source-transport-v1",
+  "manifest_sha256": "1f9c5285a15437226c0544db1f0c03789e19833920999ccffa6a625c01595d54",
+  "members": 473,
+  "source_members": 472,
+  "cipher": "AES-256-GCM",
+  "nonce_bytes": 12,
+  "aad": "{\"member_count\":473,\"native_attempt\":1,\"native_head\":\"996025e9a2527ed9a1f03049e60c40c2ab94c145\",\"native_run\":42035343213,\"schema\":\"ccc-private-shared-fixture-aes256gcm-v1\",\"source_manifest_sha256\":\"1f9c5285a15437226c0544db1f0c03789e19833920999ccffa6a625c01595d54\"}",
+  "archive_sha256": "b1904386dcc81479cb11226063afe3af34192e9865ab260838c205ec5efa301a",
+  "ciphertext_sha256": "181504fa384c4b752debad73ebbf4c9f81b49da0864fe8ef349169e32177f4d0",
+  "ciphertext_bytes": 3478606,
+  "extracted_source_bytes": 13564924,
+  "secret_name": "CCC_SHARED_GOAL_FIXTURE_INPUT_KEY_20261106",
+  "plaintext_publication": false
+}
