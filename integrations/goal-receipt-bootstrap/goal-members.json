@@ -9,20 +9,20 @@
     {
       "path": "codex-rs/app-server/src/message_processor.rs",
       "before_sha256": "b7084f8132482c8a051f94036a1e4944a15e9186fb4cbfec28491b420d8a3e79",
-      "after_sha256": "82f762500b3867d7deb2739a8462c36807a359a9b36b77844a5d7fe7184f704e",
-      "bytes": 83980
+      "after_sha256": "da808291fa836ae91b01105f62773f07fa639f121d6bb616d192f4f7e5bbf426",
+      "bytes": 84022
     },
     {
       "path": "codex-rs/app-server/src/request_processors/thread_goal_processor.rs",
       "before_sha256": "835fac66bc2ae9eb0e29b7a5a3da09cfea11cf2ca3dbd0384a296ce54db9b3e6",
-      "after_sha256": "87d01f7e71b3b45541c3ae7a5060b9ab3aca85994933ac751c36367d8330e3af",
-      "bytes": 23985
+      "after_sha256": "87f560b239979b824f6e7960e0004b153b1e120345adb93c37f174323d4c84c2",
+      "bytes": 24390
     },
     {
       "path": "codex-rs/app-server/tests/suite/v2/thread_goal_empty_responses.rs",
       "before_sha256": "79b80bdc39a4c8bb021bd0120aaf181ba3f37716dbb5af9b3a2d614dbf1f27ad",
-      "after_sha256": "faffa30dd75d11d8c702ae60ba94a5ff0f2ae84c4556e1d8f60b9998610b90bc",
-      "bytes": 10894
+      "after_sha256": "1ab5a6ad1edfd58259238981d86f26bd299c636f9ac559c96b16b1ae7d751c70",
+      "bytes": 11489
     },
     {
       "path": "codex-rs/app-server-protocol/src/protocol/common.rs",
@@ -39,14 +39,14 @@
     {
       "path": "codex-rs/core/src/session/turn_input.rs",
       "before_sha256": "eeeff7f21e0ba0b714e3b50c27cf351f2431aab754f078a362f259a227914cfc",
-      "after_sha256": "f590359f555f82cc2bfe5fa5e0fa108e9fdda07a119eb7060244500da7b3a813",
-      "bytes": 39420
+      "after_sha256": "274e28bf2ce47b9a842701ffc2905967e0c682c36e826c8421bc614d5a9027d7",
+      "bytes": 39816
     },
     {
       "path": "codex-rs/core/src/session/turn_input_tests.rs",
       "before_sha256": "1e96d4ec3b0738b878116fd3003d23eb70b46f6a5bc051cd1738bb78838a913f",
-      "after_sha256": "de50f20416956afd1ff68dde2bf1482c490caf58b54511d52732bcd0a3dc8d70",
-      "bytes": 41763
+      "after_sha256": "dc1619edb8eae261a15a16aa40e149a7e5d930f33f38f861ba68b581dbed0171",
+      "bytes": 42476
     },
     {
       "path": "codex-rs/ext/goal/Cargo.toml",
@@ -57,26 +57,26 @@
     {
       "path": "codex-rs/ext/goal/src/api.rs",
       "before_sha256": "a08bb505652ff41540fcea628ab6bdda2fb8011c21450d10f0f240ae6ddfc157",
-      "after_sha256": "9afd6820a2651eb409f9ca9404ceac1289cc38d61052f91c6a10ff27520d938c",
-      "bytes": 15811
+      "after_sha256": "e5c5b83ba271620e5e505690bb161166e2fd9c463ab885add3c21d8278dad88e",
+      "bytes": 15942
     },
     {
       "path": "codex-rs/ext/goal/src/runtime.rs",
       "before_sha256": "47f687fc6fb1931b98a52984d2f4b50bdb2a1538bde1e94bf4523cc22592946d",
-      "after_sha256": "7dae473fa13310be38542305c20d06a6e9976daca54fe3333dfab8cb784167c6",
-      "bytes": 37533
+      "after_sha256": "4495f66d68ed3794222d16787a347c12842c9221d08b5a3ba513692ba7ffbd0b",
+      "bytes": 38156
     },
     {
       "path": "codex-rs/ext/goal/tests/goal_extension_backend.rs",
       "before_sha256": "638c29ffb360a09d2270cb16bc2b3bf7f781582b35e51da61febf857d85841d5",
-      "after_sha256": "6f7c62db3736d02ceabebcb88cef0c4cb3f9271fc8a1f0093167c3ab8c81cc54",
-      "bytes": 79884
+      "after_sha256": "123fe84cc069ce29f0bfa2a4b1587e2f950012621b2adfb1953d81a763756fee",
+      "bytes": 80613
     },
     {
       "path": "codex-rs/protocol/src/goal_recovery.rs",
       "before_sha256": null,
-      "after_sha256": "a677d794ed49e926176ad1b2e4c86bc4ffa5a2e83b468817ceaa683e93ccd827",
-      "bytes": 1741
+      "after_sha256": "72037f8f90cf93e6141245f82f8ac367c513b95b0fa58bc0ad0dfd129f1048fb",
+      "bytes": 1750
     },
     {
       "path": "codex-rs/protocol/src/lib.rs",
@@ -99,8 +99,8 @@
     {
       "path": "codex-rs/state/src/runtime/goal_recovery.rs",
       "before_sha256": null,
-      "after_sha256": "b57647b8841b24d49c0e3cd1fcd4c29de2bb5430a908ee8c8da913897a4f19c6",
-      "bytes": 17322
+      "after_sha256": "f60fd91120ce9603751a2e50b87642d8e40cf5e447b3e02c99ce02b4b109137c",
+      "bytes": 20850
     },
     {
       "path": "codex-rs/state/src/runtime/goals.rs",
@@ -109,6 +109,6 @@
       "bytes": 55825
     }
   ],
-  "patch_sha256": "e3fd5dfea88a88728ad0663b2f81ad42ea334c2946246b28228bd038d28b8728",
+  "patch_sha256": "4acc51836420be2d3056afe66372c1f6fdb2c655dc0346f00e84ee13e9d6cb62",
   "status": "SOURCE_ONLY_UNCOMPILED"
 }

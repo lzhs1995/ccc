@@ -1,9 +1,12 @@
-use codex_app_server_protocol::{ThreadGoalRecoverParams, ThreadGoalRecoverResponse, ThreadGoalRecoveryReadParams, ThreadGoalRecoveryReadResponse};
 use super::thread_input::DIRECT_INPUT_TO_MULTI_AGENT_V2_SUBAGENT_ERROR;
 use super::thread_input::can_accept_direct_input;
 use super::thread_input::ensure_direct_input_allowed;
 use super::*;
 use codex_app_server_protocol::ThreadGoalMutationOrigin;
+use codex_app_server_protocol::ThreadGoalRecoverParams;
+use codex_app_server_protocol::ThreadGoalRecoverResponse;
+use codex_app_server_protocol::ThreadGoalRecoveryReadParams;
+use codex_app_server_protocol::ThreadGoalRecoveryReadResponse;
 use codex_core::context::UserGoalUpdate;
 use codex_goal_extension::GoalObjectiveUpdate;
 use codex_goal_extension::GoalService;
@@ -69,16 +72,26 @@ impl ThreadGoalRequestProcessor {
         let _guard = self.thread_state_manager.lock_goal_resume(thread_id).await;
         // Recovery is for this already loaded native client; never load another
         // writer or infer a root from a child/closed rollout.
-        let thread = self.thread_manager.get_thread(thread_id).await
+        let thread = self
+            .thread_manager
+            .get_thread(thread_id)
+            .await
             .map_err(|error| invalid_request(format!("live Goal thread required: {error}")))?;
         ensure_direct_input_allowed(thread.as_ref()).await?;
-        let state = self.state_db_for_materialized_thread(thread_id, GoalAccess::Mutate).await?;
-        self.config_manager.check_thread_model_provider(thread.config().await.as_ref())
-            .await.map_err(|error| config_load_error(&error))?;
+        let state = self
+            .state_db_for_materialized_thread(thread_id, GoalAccess::Mutate)
+            .await?;
+        self.config_manager
+            .check_thread_model_provider(thread.config().await.as_ref())
+            .await
+            .map_err(|error| config_load_error(&error))?;
         // The snapshot/read call supplies the token's exact native generation.
         // Do not reconcile a rollout here: that could mutate the expected Goal.
         let _ = state;
-        let receipt = self.goal_service.recover_goal_with_receipt(params).await
+        let receipt = self
+            .goal_service
+            .recover_goal_with_receipt(params)
+            .await
             .map_err(goal_service_error)?;
         Ok(Some(ThreadGoalRecoverResponse { receipt }.into()))
     }
@@ -89,19 +102,31 @@ impl ThreadGoalRequestProcessor {
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
         let thread_id = parse_thread_id_for_request(&params.thread_id)?;
         // Pure existing-store read. No resume, goal mutation, admission or replay.
-        let state = self.state_db_for_materialized_thread(thread_id, GoalAccess::Read).await?;
-        let snapshot = state.thread_goals().goal_recovery_snapshot(&params.thread_id).await
+        let state = self
+            .state_db_for_materialized_thread(thread_id, GoalAccess::Read)
+            .await?;
+        let snapshot = state
+            .thread_goals()
+            .goal_recovery_snapshot(&params.thread_id)
+            .await
             .map_err(|error| internal_error(error.to_string()))?;
         let receipt = match params.attempt_id {
-            Some(token) => state.thread_goals().read_goal_recovery(&params.thread_id, &token).await
+            Some(token) => state
+                .thread_goals()
+                .read_goal_recovery(&params.thread_id, &token)
+                .await
                 .map_err(|error| internal_error(error.to_string()))?,
             None => None,
         };
-        Ok(Some(ThreadGoalRecoveryReadResponse {
-            capability: "goal-recovery-receipt-v1".to_string(),
-            runtime_id: self.goal_service.goal_recovery_runtime_id(thread_id),
-            snapshot, receipt,
-        }.into()))
+        Ok(Some(
+            ThreadGoalRecoveryReadResponse {
+                capability: "goal-recovery-receipt-v1".to_string(),
+                runtime_id: self.goal_service.goal_recovery_runtime_id(thread_id),
+                snapshot,
+                receipt,
+            }
+            .into(),
+        ))
     }
 
     pub(crate) async fn thread_goal_set(

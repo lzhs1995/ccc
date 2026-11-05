@@ -184,52 +184,107 @@ async fn conditional_goal_receipt_binds_real_admission_and_duplicate_is_read_onl
     use codex_app_server_protocol::ThreadGoalRecoverResponse;
     use codex_app_server_protocol::ThreadGoalRecoveryReadResponse;
     use codex_protocol::goal_recovery::GoalRecoveryPhase;
-    let scripts = (1..=6).map(|turn| {
-        let id = format!("receipt-response-{turn}");
-        let mut empty = responses::ev_assistant_message(&format!("receipt-empty-{turn}"), "");
-        empty["item"]["phase"] = json!("final_answer");
-        responses::sse(vec![responses::ev_response_created(&id), empty, responses::ev_completed(&id)])
-    }).collect();
+    let scripts = (1..=6)
+        .map(|turn| {
+            let id = format!("receipt-response-{turn}");
+            let mut empty = responses::ev_assistant_message(&format!("receipt-empty-{turn}"), "");
+            empty["item"]["phase"] = json!("final_answer");
+            responses::sse(vec![
+                responses::ev_response_created(&id),
+                empty,
+                responses::ev_completed(&id),
+            ])
+        })
+        .collect();
     let server = create_mock_responses_server_sequence(scripts).await;
     let codex_home = TempDir::new()?;
-    MockResponsesConfig::new(&server.uri()).with_model("gpt-5.4").enable_feature(Feature::Goals).write(codex_home.path())?;
-    let mut mcp = TestAppServer::builder().with_codex_home(codex_home.path())
-        .without_managed_config().build_initialized().await?;
-    let id = mcp.send_thread_start_request_with_auto_env(ThreadStartParams::default()).await?;
+    MockResponsesConfig::new(&server.uri())
+        .with_model("gpt-5.4")
+        .enable_feature(Feature::Goals)
+        .write(codex_home.path())?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_managed_config()
+        .build_initialized()
+        .await?;
+    let id = mcp
+        .send_thread_start_request_with_auto_env(ThreadStartParams::default())
+        .await?;
     let ThreadStartResponse { thread, .. } = mcp.read_response(id).await?;
-    let id = mcp.send_raw_request("thread/goal/set", Some(json!({"threadId":thread.id,"objective":"Finish the receipt work"}))).await?;
+    let id = mcp
+        .send_raw_request(
+            "thread/goal/set",
+            Some(json!({"threadId":thread.id,"objective":"Finish the receipt work"})),
+        )
+        .await?;
     let _: ThreadGoalSetResponse = mcp.read_response(id).await?;
     let mut previous = String::new();
     for _ in 0..3 {
-        let _: serde_json::Value = timeout(Duration::from_secs(30), mcp.read_notification("turn/started")).await??;
-        let completed: TurnCompletedNotification = timeout(Duration::from_secs(30), mcp.read_notification("turn/completed")).await??;
+        let _: serde_json::Value = timeout(
+            Duration::from_secs(30),
+            mcp.read_notification("turn/started"),
+        )
+        .await??;
+        let completed: TurnCompletedNotification = timeout(
+            Duration::from_secs(30),
+            mcp.read_notification("turn/completed"),
+        )
+        .await??;
         previous = completed.turn.id;
     }
     timeout(Duration::from_secs(30), async {
         loop {
-            let notification: ThreadGoalUpdatedNotification = mcp.read_notification("thread/goal/updated").await?;
-            if notification.goal.status == ThreadGoalStatus::Blocked { return Ok::<_,anyhow::Error>(()); }
+            let notification: ThreadGoalUpdatedNotification =
+                mcp.read_notification("thread/goal/updated").await?;
+            if notification.goal.status == ThreadGoalStatus::Blocked {
+                return Ok::<_, anyhow::Error>(());
+            }
         }
-    }).await??;
-    let id = mcp.send_raw_request("thread/goal/recovery/read", Some(json!({"threadId":thread.id,"attemptId":null}))).await?;
+    })
+    .await??;
+    let id = mcp
+        .send_raw_request(
+            "thread/goal/recovery/read",
+            Some(json!({"threadId":thread.id,"attemptId":null})),
+        )
+        .await?;
     let snapshot: ThreadGoalRecoveryReadResponse = mcp.read_response(id).await?;
     assert_eq!(snapshot.capability, "goal-recovery-receipt-v1");
     let goal = snapshot.snapshot.expect("existing blocked Goal");
     let params = json!({"threadId":thread.id,"attemptId":"one-original-native-attempt",
         "expectedRuntimeId":snapshot.runtime_id.expect("live runtime"),"expectedPreviousTurnId":previous,
         "expectedGoalId":goal.goal_id,"expectedGoalRevision":goal.revision});
-    let id = mcp.send_raw_request("thread/goal/recover", Some(params.clone())).await?;
+    let id = mcp
+        .send_raw_request("thread/goal/recover", Some(params.clone()))
+        .await?;
     let first: ThreadGoalRecoverResponse = mcp.read_response(id).await?;
     assert_eq!(first.receipt.phase, GoalRecoveryPhase::Started);
-    let started: serde_json::Value = timeout(Duration::from_secs(30),mcp.read_notification("turn/started")).await??;
+    let started: serde_json::Value = timeout(
+        Duration::from_secs(30),
+        mcp.read_notification("turn/started"),
+    )
+    .await??;
     assert_eq!(started["turn"]["id"], json!(first.receipt.turn_id));
-    let id = mcp.send_raw_request("thread/goal/recover", Some(params)).await?;
+    let id = mcp
+        .send_raw_request("thread/goal/recover", Some(params))
+        .await?;
     let duplicate: ThreadGoalRecoverResponse = mcp.read_response(id).await?;
-    assert_eq!(duplicate.receipt,first.receipt);
-    let id = mcp.send_raw_request("thread/goal/recovery/read",Some(json!({"threadId":thread.id,"attemptId":"one-original-native-attempt"}))).await?;
+    assert_eq!(duplicate.receipt, first.receipt);
+    let id = mcp
+        .send_raw_request(
+            "thread/goal/recovery/read",
+            Some(json!({"threadId":thread.id,"attemptId":"one-original-native-attempt"})),
+        )
+        .await?;
     let read: ThreadGoalRecoveryReadResponse = mcp.read_response(id).await?;
-    assert_eq!(read.receipt,Some(first.receipt));
-    for _ in 0..3 { let _: TurnCompletedNotification = timeout(Duration::from_secs(30),mcp.read_notification("turn/completed")).await??; }
+    assert_eq!(read.receipt, Some(first.receipt));
+    for _ in 0..3 {
+        let _: TurnCompletedNotification = timeout(
+            Duration::from_secs(30),
+            mcp.read_notification("turn/completed"),
+        )
+        .await??;
+    }
     server.verify().await;
     Ok(())
 }

@@ -1140,13 +1140,20 @@ async fn steer_preserves_request_origin(
 }
 
 fn goal_receipt_request(session: &Session) -> TurnInputRequest {
-    let mut request = TurnInputRequest::new(SubmittedTurnInput::ResponseItem(user_message("internal Goal continuation")))
-        .on_start(TurnStartOptions { turn_trigger: Some("goal".to_string()), ..Default::default() });
+    let mut request = TurnInputRequest::new(SubmittedTurnInput::ResponseItem(user_message(
+        "internal Goal continuation",
+    )))
+    .on_start(TurnStartOptions {
+        turn_trigger: Some("goal".to_string()),
+        ..Default::default()
+    });
     request.goal_recovery = Some(codex_protocol::goal_recovery::GoalRecoveryRequest {
-        thread_id: session.thread_id().to_string(), attempt_id: "native-core-test".to_string(),
+        thread_id: session.thread_id().to_string(),
+        attempt_id: "native-core-test".to_string(),
         expected_runtime_id: "00000000-0000-4000-8000-000000000001".to_string(),
         expected_previous_turn_id: "00000000-0000-4000-8000-000000000002".to_string(),
-        expected_goal_id: "goal-original".to_string(), expected_goal_revision: 1,
+        expected_goal_id: "goal-original".to_string(),
+        expected_goal_revision: 1,
     });
     request
 }
@@ -1155,9 +1162,18 @@ fn goal_receipt_request(session: &Session) -> TurnInputRequest {
 async fn goal_receipt_cannot_use_start_or_steer_to_bypass_idle_admission() {
     let (session, _ctx) = make_session_and_context().await;
     let session = Arc::new(session);
-    let result = handle(&session, goal_receipt_request(&session), TurnInputMode::StartOrSteer,
-        "00000000-0000-4000-8000-000000000003".to_string()).await;
-    assert!(matches!(result, Err(CodexErr::InvalidRequest(_))));
+    let result = handle(
+        &session,
+        goal_receipt_request(&session),
+        TurnInputMode::StartOrSteer,
+        "00000000-0000-4000-8000-000000000003".to_string(),
+    )
+    .await;
+    let error = result.expect_err("Goal receipt must reject non-idle admission mode");
+    assert!(matches!(
+        error.details(),
+        CodexErrorDetails::InvalidRequest(_)
+    ));
     assert!(session.active_turn.lock().await.is_none());
 }
 
@@ -1165,10 +1181,22 @@ async fn goal_receipt_cannot_use_start_or_steer_to_bypass_idle_admission() {
 async fn goal_receipt_stale_previous_turn_does_not_create_active_task() {
     let (session, _ctx) = make_session_and_context().await;
     let session = Arc::new(session);
-    session.state.lock().await.last_started_turn_id = Some("00000000-0000-4000-8000-000000000099".to_string());
-    let result = handle(&session, goal_receipt_request(&session), TurnInputMode::StartIfIdle,
-        "00000000-0000-4000-8000-000000000003".to_string()).await.unwrap();
-    assert_eq!(result, TurnInputSubmission::NotSubmitted { reason: NotSubmittedReason::Superseded });
+    session.state.lock().await.last_started_turn_id =
+        Some("00000000-0000-4000-8000-000000000099".to_string());
+    let result = handle(
+        &session,
+        goal_receipt_request(&session),
+        TurnInputMode::StartIfIdle,
+        "00000000-0000-4000-8000-000000000003".to_string(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        result,
+        TurnInputSubmission::NotSubmitted {
+            reason: NotSubmittedReason::Superseded
+        }
+    );
     assert!(session.active_turn.lock().await.is_none());
 }
 
@@ -1177,10 +1205,20 @@ async fn goal_receipt_for_foreign_thread_is_rejected_before_reservation() {
     let (session, _ctx) = make_session_and_context().await;
     let session = Arc::new(session);
     let mut request = goal_receipt_request(&session);
-    request.goal_recovery.as_mut().unwrap().thread_id = "00000000-0000-4000-8000-000000000077".to_string();
-    let result = handle(&session, request, TurnInputMode::StartIfIdle,
-        "00000000-0000-4000-8000-000000000003".to_string()).await;
-    assert!(matches!(result, Err(CodexErr::InvalidRequest(_))));
+    request.goal_recovery.as_mut().unwrap().thread_id =
+        "00000000-0000-4000-8000-000000000077".to_string();
+    let result = handle(
+        &session,
+        request,
+        TurnInputMode::StartIfIdle,
+        "00000000-0000-4000-8000-000000000003".to_string(),
+    )
+    .await;
+    let error = result.expect_err("foreign Goal thread must be rejected before reservation");
+    assert!(matches!(
+        error.details(),
+        CodexErrorDetails::InvalidRequest(_)
+    ));
     assert!(session.active_turn.lock().await.is_none());
 }
 
@@ -1190,9 +1228,25 @@ async fn goal_receipt_missing_durable_database_never_releases_reserved_task() {
     session.services.state_db = None;
     let session = Arc::new(session);
     let request = goal_receipt_request(&session);
-    session.state.lock().await.last_started_turn_id = Some(request.goal_recovery.as_ref().unwrap().expected_previous_turn_id.clone());
-    let result = handle(&session, request, TurnInputMode::StartIfIdle,
-        "00000000-0000-4000-8000-000000000003".to_string()).await;
-    assert!(matches!(result, Err(CodexErr::InvalidRequest(_))));
+    session.state.lock().await.last_started_turn_id = Some(
+        request
+            .goal_recovery
+            .as_ref()
+            .unwrap()
+            .expected_previous_turn_id
+            .clone(),
+    );
+    let result = handle(
+        &session,
+        request,
+        TurnInputMode::StartIfIdle,
+        "00000000-0000-4000-8000-000000000003".to_string(),
+    )
+    .await;
+    let error = result.expect_err("Goal receipt without durable database must be rejected");
+    assert!(matches!(
+        error.details(),
+        CodexErrorDetails::InvalidRequest(_)
+    ));
     assert!(session.active_turn.lock().await.is_none());
 }

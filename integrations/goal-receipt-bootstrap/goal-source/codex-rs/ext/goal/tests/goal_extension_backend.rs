@@ -2346,38 +2346,97 @@ async fn committed_goal_clear_survives_recovery_fence_cleanup_failure() -> anyho
     committed_goal_mutation_survives_recovery_fence_cleanup_failure(true).await
 }
 
-async fn committed_goal_mutation_survives_recovery_fence_cleanup_failure(clear: bool) -> anyhow::Result<()> {
+async fn committed_goal_mutation_survives_recovery_fence_cleanup_failure(
+    clear: bool,
+) -> anyhow::Result<()> {
     let state = test_runtime().await?;
     let thread_id = test_thread_id()?;
     seed_thread_metadata(state.as_ref(), thread_id).await?;
-    let goal = state.thread_goals().replace_thread_goal(thread_id, "original", codex_state::ThreadGoalStatus::Blocked, Some(1000)).await?;
-    let snapshot = state.thread_goals().goal_recovery_snapshot(&thread_id.to_string()).await?.unwrap();
+    let goal = state
+        .thread_goals()
+        .replace_thread_goal(
+            thread_id,
+            "original",
+            codex_state::ThreadGoalStatus::Blocked,
+            Some(1000),
+        )
+        .await?;
+    let snapshot = state
+        .thread_goals()
+        .goal_recovery_snapshot(&thread_id.to_string())
+        .await?
+        .unwrap();
     let request = codex_protocol::goal_recovery::GoalRecoveryRequest {
-        thread_id: thread_id.to_string(), attempt_id: "failure-cleanup-original".to_string(),
-        expected_runtime_id: ThreadId::new().to_string(), expected_previous_turn_id: ThreadId::new().to_string(),
-        expected_goal_id: goal.goal_id, expected_goal_revision: snapshot.revision,
+        thread_id: thread_id.to_string(),
+        attempt_id: "failure-cleanup-original".to_string(),
+        expected_runtime_id: ThreadId::new().to_string(),
+        expected_previous_turn_id: ThreadId::new().to_string(),
+        expected_goal_id: goal.goal_id,
+        expected_goal_revision: snapshot.revision,
     };
     state.thread_goals().begin_goal_recovery(&request).await?;
-    let pool = state.sqlite().open_read_write_pool(&state.sqlite().goals_db_path()).await?;
+    let pool = state
+        .sqlite()
+        .open_read_write_pool(&state.sqlite().goals_db_path())
+        .await?;
     sqlx::query("CREATE TRIGGER reject_fence_cleanup BEFORE UPDATE OF fence_active ON thread_goal_recovery_receipts WHEN NEW.fence_active = 0 BEGIN SELECT RAISE(ABORT, 'injected cleanup failure'); END")
         .execute(&pool).await?;
     let service = GoalService::new();
     if clear {
-        assert!(service.clear_thread_goal(&state, thread_id, async { Ok(()) }).await?);
-        assert!(state.thread_goals().get_thread_goal(thread_id).await?.is_none());
+        assert!(
+            service
+                .clear_thread_goal(&state, thread_id, async { Ok(()) })
+                .await?
+        );
+        assert!(
+            state
+                .thread_goals()
+                .get_thread_goal(thread_id)
+                .await?
+                .is_none()
+        );
     } else {
-        let outcome = service.set_thread_goal(&state, GoalSetRequest {
-            thread_id, objective: GoalObjectiveUpdate::Keep, status: Some(ThreadGoalStatus::Paused),
-            token_budget: GoalTokenBudgetUpdate::Keep, max_goal_token_budget: None,
-        }, async { Ok(()) }).await?;
+        let outcome = service
+            .set_thread_goal(
+                &state,
+                GoalSetRequest {
+                    thread_id,
+                    objective: GoalObjectiveUpdate::Keep,
+                    status: Some(ThreadGoalStatus::Paused),
+                    token_budget: GoalTokenBudgetUpdate::Keep,
+                    max_goal_token_budget: None,
+                },
+                async { Ok(()) },
+            )
+            .await?;
         assert_eq!(outcome.goal.status, ThreadGoalStatus::Paused);
-        assert_eq!(state.thread_goals().get_thread_goal(thread_id).await?.unwrap().status, codex_state::ThreadGoalStatus::Paused);
+        assert_eq!(
+            state
+                .thread_goals()
+                .get_thread_goal(thread_id)
+                .await?
+                .unwrap()
+                .status,
+            codex_state::ThreadGoalStatus::Paused
+        );
     }
     // Original success survives; the failed cleanup conservatively leaves only
     // automatic work fenced. It must not fabricate acknowledgement or retry.
-    let receipt = state.thread_goals().read_goal_recovery(&request.thread_id, &request.attempt_id).await?.unwrap();
-    assert_eq!(receipt.phase, codex_protocol::goal_recovery::GoalRecoveryPhase::Intent);
-    assert!(state.thread_goals().has_goal_recovery_fence(&request.thread_id).await?);
+    let receipt = state
+        .thread_goals()
+        .read_goal_recovery(&request.thread_id, &request.attempt_id)
+        .await?
+        .unwrap();
+    assert_eq!(
+        receipt.phase,
+        codex_protocol::goal_recovery::GoalRecoveryPhase::Intent
+    );
+    assert!(
+        state
+            .thread_goals()
+            .has_goal_recovery_fence(&request.thread_id)
+            .await?
+    );
     pool.close().await;
     Ok(())
 }

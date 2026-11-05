@@ -1387,7 +1387,9 @@ impl MessageProcessor {
                 self.thread_goal_processor.thread_goal_recover(params).await
             }
             ClientRequest::ThreadGoalRecoveryRead { params, .. } => {
-                self.thread_goal_processor.thread_goal_recovery_read(params).await
+                self.thread_goal_processor
+                    .thread_goal_recovery_read(params)
+                    .await
             }
             ClientRequest::ThreadGoalSet { params, .. } => {
                 self.thread_goal_processor

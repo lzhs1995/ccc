@@ -236,7 +236,9 @@ pub(super) async fn handle(
 ) -> CodexResult<TurnInputSubmission> {
     let request = request.into();
     if request.request.goal_recovery.is_some() && !matches!(mode, TurnInputMode::StartIfIdle) {
-        return Err(CodexErr::InvalidRequest("Goal receipt requires original automatic idle admission".to_string()));
+        return Err(CodexErr::InvalidRequest(
+            "Goal receipt requires original automatic idle admission".to_string(),
+        ));
     }
     let explicit_user_input = request.request.goal_recovery.is_none()
         && matches!(&request.request.input, SubmittedTurnInput::UserInput { content, .. } if !content.is_empty());
@@ -286,10 +288,21 @@ pub(super) async fn handle(
         }
     };
     // Link this request's trace to the accepted turn, which may have an older trace.
-    if explicit_user_input && matches!(&result, Ok(TurnInputSubmission::Started { .. } | TurnInputSubmission::Steered { .. })) {
+    if explicit_user_input
+        && matches!(
+            &result,
+            Ok(TurnInputSubmission::Started { .. } | TurnInputSubmission::Steered { .. })
+        )
+    {
         if let Some(db) = session.state_db() {
-            if let Err(error) = db.thread_goals().supersede_goal_recovery_fences(
-                &session.thread_id().to_string(), "accepted_explicit_user_input").await {
+            if let Err(error) = db
+                .thread_goals()
+                .supersede_goal_recovery_fences(
+                    &session.thread_id().to_string(),
+                    "accepted_explicit_user_input",
+                )
+                .await
+            {
                 // Accepted human input remains accepted even if this cleanup fails.
                 // The conservative automatic-work fence remains until explicit read/repair.
                 tracing::warn!(%error, "cannot clear superseded Goal recovery automatic fence");
@@ -494,14 +507,19 @@ async fn start_if_idle(
     } = request;
     let origin = UserInputOrigin::from_turn_trigger(start.turn_trigger.as_deref());
     let expected_previous_turn_id = if let Some(binding) = goal_recovery.as_ref() {
-        if kind != TurnStartKind::Automatic || start.turn_trigger.as_deref() != Some("goal")
+        if kind != TurnStartKind::Automatic
+            || start.turn_trigger.as_deref() != Some("goal")
             || !matches!(&input, SubmittedTurnInput::ResponseItem(_))
             || binding.thread_id != session.thread_id().to_string()
         {
-            return Err(CodexErr::InvalidRequest("Goal recovery binding is not this automatic Goal request".to_string()));
+            return Err(CodexErr::InvalidRequest(
+                "Goal recovery binding is not this automatic Goal request".to_string(),
+            ));
         }
         Some(binding.expected_previous_turn_id.clone())
-    } else { expected_previous_turn_id };
+    } else {
+        expected_previous_turn_id
+    };
     if session.input_queue.has_trigger_turn_mailbox_items().await {
         return Ok(TurnInputSubmission::NotSubmitted {
             reason: NotSubmittedReason::PendingTriggerTurn,
@@ -608,14 +626,24 @@ async fn start_if_idle(
     let recovery_store = if let Some(binding) = goal_recovery.as_ref() {
         let Some(db) = session.state_db() else {
             session.clear_reserved_idle_turn(&turn_state).await;
-            return Err(CodexErr::InvalidRequest("durable Goal database unavailable".to_string()));
+            return Err(CodexErr::InvalidRequest(
+                "durable Goal database unavailable".to_string(),
+            ));
         };
-        if let Err(error) = db.thread_goals().admit_goal_recovery(binding, &submission_id).await {
+        if let Err(error) = db
+            .thread_goals()
+            .admit_goal_recovery(binding, &submission_id)
+            .await
+        {
             session.clear_reserved_idle_turn(&turn_state).await;
-            return Err(CodexErr::InvalidRequest(format!("Goal admission persistence UNKNOWN: {error}")));
+            return Err(CodexErr::InvalidRequest(format!(
+                "Goal admission persistence UNKNOWN: {error}"
+            )));
         }
         Some(db)
-    } else { None };
+    } else {
+        None
+    };
     let mut task_input = merge_additional_context_input(session, additional_context).await;
     let sender_messages = capture_sender_user_messages(session, &mut input).await;
     match kind {
@@ -661,7 +689,11 @@ async fn start_if_idle(
         .start_task(Arc::clone(&turn_context), task_input, RegularTask::new())
         .await;
     if let (Some(db), Some(binding)) = (recovery_store, goal_recovery.as_ref()) {
-        if let Err(error) = db.thread_goals().mark_goal_recovery_started(binding, &submission_id).await {
+        if let Err(error) = db
+            .thread_goals()
+            .mark_goal_recovery_started(binding, &submission_id)
+            .await
+        {
             // The task may already be running. Keep Admitted/UNKNOWN and its
             // automatic-work fence; no false not-sent result and no new input.
             tracing::warn!(%error, "Goal task released but durable Started receipt unavailable");

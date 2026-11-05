@@ -9351,7 +9351,7 @@
     {
       "path": "codex-rs/app-server/src/message_processor.rs",
       "kind": "file",
-      "sha256": "82f762500b3867d7deb2739a8462c36807a359a9b36b77844a5d7fe7184f704e",
+      "sha256": "da808291fa836ae91b01105f62773f07fa639f121d6bb616d192f4f7e5bbf426",
       "executable": false
     },
     {
@@ -9759,7 +9759,7 @@
     {
       "path": "codex-rs/app-server/src/request_processors/thread_goal_processor.rs",
       "kind": "file",
-      "sha256": "87d01f7e71b3b45541c3ae7a5060b9ab3aca85994933ac751c36367d8330e3af",
+      "sha256": "87f560b239979b824f6e7960e0004b153b1e120345adb93c37f174323d4c84c2",
       "executable": false
     },
     {
@@ -11007,7 +11007,7 @@
     {
       "path": "codex-rs/app-server/tests/suite/v2/thread_goal_empty_responses.rs",
       "kind": "file",
-      "sha256": "faffa30dd75d11d8c702ae60ba94a5ff0f2ae84c4556e1d8f60b9998610b90bc",
+      "sha256": "1ab5a6ad1edfd58259238981d86f26bd299c636f9ac559c96b16b1ae7d751c70",
       "executable": false
     },
     {
@@ -19053,13 +19053,13 @@
     {
       "path": "codex-rs/core/src/session/turn_input.rs",
       "kind": "file",
-      "sha256": "f590359f555f82cc2bfe5fa5e0fa108e9fdda07a119eb7060244500da7b3a813",
+      "sha256": "274e28bf2ce47b9a842701ffc2905967e0c682c36e826c8421bc614d5a9027d7",
       "executable": false
     },
     {
       "path": "codex-rs/core/src/session/turn_input_tests.rs",
       "kind": "file",
-      "sha256": "de50f20416956afd1ff68dde2bf1482c490caf58b54511d52732bcd0a3dc8d70",
+      "sha256": "dc1619edb8eae261a15a16aa40e149a7e5d930f33f38f861ba68b581dbed0171",
       "executable": false
     },
     {
@@ -24879,7 +24879,7 @@
     {
       "path": "codex-rs/ext/goal/src/api.rs",
       "kind": "file",
-      "sha256": "9afd6820a2651eb409f9ca9404ceac1289cc38d61052f91c6a10ff27520d938c",
+      "sha256": "e5c5b83ba271620e5e505690bb161166e2fd9c463ab885add3c21d8278dad88e",
       "executable": false
     },
     {
@@ -24915,7 +24915,7 @@
     {
       "path": "codex-rs/ext/goal/src/runtime.rs",
       "kind": "file",
-      "sha256": "7dae473fa13310be38542305c20d06a6e9976daca54fe3333dfab8cb784167c6",
+      "sha256": "4495f66d68ed3794222d16787a347c12842c9221d08b5a3ba513692ba7ffbd0b",
       "executable": false
     },
     {
@@ -24963,7 +24963,7 @@
     {
       "path": "codex-rs/ext/goal/tests/goal_extension_backend.rs",
       "kind": "file",
-      "sha256": "6f7c62db3736d02ceabebcb88cef0c4cb3f9271fc8a1f0093167c3ab8c81cc54",
+      "sha256": "123fe84cc069ce29f0bfa2a4b1587e2f950012621b2adfb1953d81a763756fee",
       "executable": false
     },
     {
@@ -31581,7 +31581,7 @@
     {
       "path": "codex-rs/protocol/src/goal_recovery.rs",
       "kind": "file",
-      "sha256": "a677d794ed49e926176ad1b2e4c86bc4ffa5a2e83b468817ceaa683e93ccd827",
+      "sha256": "72037f8f90cf93e6141245f82f8ac367c513b95b0fa58bc0ad0dfd129f1048fb",
       "executable": false
     },
     {
@@ -34875,7 +34875,7 @@
     {
       "path": "codex-rs/state/src/runtime/goal_recovery.rs",
       "kind": "file",
-      "sha256": "b57647b8841b24d49c0e3cd1fcd4c29de2bb5430a908ee8c8da913897a4f19c6",
+      "sha256": "f60fd91120ce9603751a2e50b87642d8e40cf5e447b3e02c99ce02b4b109137c",
       "executable": false
     },
     {
@@ -56784,5 +56784,5 @@
       "executable": false
     }
   ],
-  "sha256": "3bc2048d8b074acbcf3ce253034db6e96bb390e7e6a8cb0a10d1e377ba2ab3df"
+  "sha256": "9de87c6223a86332252611d12db74a969d3354b941cdcba6bd0daa6dc3a7115e"
 }

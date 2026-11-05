@@ -281,8 +281,11 @@ impl GoalService {
 
         // An explicit successful Goal mutation supersedes only the automatic
         // fence. Existing receipt/turn/UNKNOWN evidence is never rewritten.
-        if let Err(error) = state_db.thread_goals().supersede_goal_recovery_fences(
-            &thread_id.to_string(), "explicit_goal_mutation").await {
+        if let Err(error) = state_db
+            .thread_goals()
+            .supersede_goal_recovery_fences(&thread_id.to_string(), "explicit_goal_mutation")
+            .await
+        {
             // The original mutation is already committed. A cleanup failure
             // cannot turn that success into an error/retry or skip its original
             // events/options/runtime projection. Keep the conservative fence.
@@ -337,8 +340,11 @@ impl GoalService {
             .map_err(|err| {
                 GoalServiceError::Internal(format!("failed to clear thread goal: {err}"))
             })?;
-        if let Err(error) = state_db.thread_goals().supersede_goal_recovery_fences(
-            &thread_id.to_string(), "explicit_goal_mutation").await {
+        if let Err(error) = state_db
+            .thread_goals()
+            .supersede_goal_recovery_fences(&thread_id.to_string(), "explicit_goal_mutation")
+            .await
+        {
             // The original mutation is already committed. A cleanup failure
             // cannot turn that success into an error/retry or skip its original
             // events/options/runtime projection. Keep the conservative fence.
@@ -361,7 +367,8 @@ impl GoalService {
     }
 
     pub fn goal_recovery_runtime_id(&self, thread_id: ThreadId) -> Option<String> {
-        self.runtime_for_thread(thread_id).filter(|runtime| runtime.is_enabled())
+        self.runtime_for_thread(thread_id)
+            .filter(|runtime| runtime.is_enabled())
             .map(|runtime| runtime.goal_recovery_runtime_id().to_string())
     }
 
@@ -371,9 +378,13 @@ impl GoalService {
     ) -> Result<codex_protocol::goal_recovery::GoalRecoveryReceipt, GoalServiceError> {
         let thread_id = ThreadId::try_from(request.thread_id.clone())
             .map_err(|error| GoalServiceError::InvalidRequest(error.to_string()))?;
-        let runtime = self.runtime_for_thread(thread_id)
-            .ok_or_else(|| GoalServiceError::InvalidRequest("live Goal recovery runtime absent".to_string()))?;
-        runtime.recover_goal_with_receipt(request).await.map_err(GoalServiceError::Internal)
+        let runtime = self.runtime_for_thread(thread_id).ok_or_else(|| {
+            GoalServiceError::InvalidRequest("live Goal recovery runtime absent".to_string())
+        })?;
+        runtime
+            .recover_goal_with_receipt(request)
+            .await
+            .map_err(GoalServiceError::Internal)
     }
 
     pub(crate) fn register_runtime(&self, runtime: &Arc<GoalRuntimeHandle>) {
