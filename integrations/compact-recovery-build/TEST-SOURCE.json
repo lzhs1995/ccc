@@ -37065,7 +37065,7 @@
     {
       "path": "codex-rs/tui/src/app/foreground_observation/tests.rs",
       "kind": "file",
-      "sha256": "faf0d2692a414e19159706ee956f9b2129174cb93f5cac22bf81f3bfca6ccbda",
+      "sha256": "f6e9663f968f5a80726ec33e915630bcf8bf1531dc8eba0332b164461959613c",
       "executable": false
     },
     {
@@ -56766,5 +56766,5 @@
       "executable": false
     }
   ],
-  "sha256": "df0af272252da9952b5a5db35eeb4be700b43e38e31d4a7ed939abdd391efa7d"
+  "sha256": "176e13f28d686fffac343a7dbec7386574d1f30df0608dbe65b1656819f9007d"
 }

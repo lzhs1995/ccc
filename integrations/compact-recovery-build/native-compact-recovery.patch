@@ -18887,10 +18887,9 @@ index 6687d05..94a1f37 100644
              AppEvent::ConfirmDaemonRestart => self.confirm_daemon_restart(),
              AppEvent::RunDaemonRestart => {
 diff --git a/codex-rs/tui/src/app/foreground_observation/tests.rs b/codex-rs/tui/src/app/foreground_observation/tests.rs
-index 39e1886..db01d07 100644
 --- a/codex-rs/tui/src/app/foreground_observation/tests.rs
 +++ b/codex-rs/tui/src/app/foreground_observation/tests.rs
-@@ -770,3 +770,520 @@ async fn real_initialization_failure_is_visible_and_ordinary_app_work_continues(
+@@ -770,3 +770,524 @@
      fixture.server.shutdown().await?;
      Ok(())
  }
@@ -19143,7 +19142,9 @@ index 39e1886..db01d07 100644
 +
 +#[tokio::test]
 +async fn non_draw_events_and_terminal_eof_still_withdraw_before_handling() -> Result<()> {
-+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
++    use crossterm::event::KeyCode;
++    use crossterm::event::KeyEvent;
++    use crossterm::event::KeyModifiers;
 +    for event in [
 +        Some(TuiEvent::Key(KeyEvent::new(
 +            KeyCode::Char('x'),
@@ -19246,7 +19247,9 @@ index 39e1886..db01d07 100644
 +
 +#[tokio::test]
 +async fn held_ascii_draw_waits_for_original_lock_before_flushing_input() -> Result<()> {
-+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
++    use crossterm::event::KeyCode;
++    use crossterm::event::KeyEvent;
++    use crossterm::event::KeyModifiers;
 +    use std::os::fd::AsRawFd;
 +    let mut fixture = boxed_future!(ForegroundFixture::new()).await?;
 +    let thread_id = ThreadId::new();

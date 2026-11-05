@@ -1019,7 +1019,9 @@ async fn animation_draws_retain_original_generation_under_native_shared_lock() -
 
 #[tokio::test]
 async fn non_draw_events_and_terminal_eof_still_withdraw_before_handling() -> Result<()> {
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::KeyCode;
+    use crossterm::event::KeyEvent;
+    use crossterm::event::KeyModifiers;
     for event in [
         Some(TuiEvent::Key(KeyEvent::new(
             KeyCode::Char('x'),
@@ -1122,7 +1124,9 @@ async fn draw_with_pending_input_or_transition_still_withdraws() -> Result<()> {
 
 #[tokio::test]
 async fn held_ascii_draw_waits_for_original_lock_before_flushing_input() -> Result<()> {
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::KeyCode;
+    use crossterm::event::KeyEvent;
+    use crossterm::event::KeyModifiers;
     use std::os::fd::AsRawFd;
     let mut fixture = boxed_future!(ForegroundFixture::new()).await?;
     let thread_id = ThreadId::new();

@@ -4,9 +4,9 @@
   "upstream_commit": "6aaac694803004a63c6f393d153c96d22521a6b9",
   "upstream_tree": "d0caeb3c076fbeade281c18295fada090c52cf8f",
   "owner_review": "OWNER-REVIEW.json",
-  "owner_review_sha256": "28d8bb73d297c750e72f5bb5e5b6f0343aca3d520b6fd0563706b7b5af1f4d3e",
+  "owner_review_sha256": "e7a477ad51d8ab191abd3674d4ad306d585a55d2e8080cb070f4c1bb3d5c9acb",
   "overlay_patch": "native-compact-recovery.patch",
-  "overlay_patch_sha256": "0cf4dbe6a8c174359ae8e4be24e8874b47b298df3ada96d581e2c4ff445e9560",
+  "overlay_patch_sha256": "ff51b3459977d79814d7b8bbf45fc861e9e2a5880b1de41290f667b828205665",
   "overlay": {
     "codex-rs/Cargo.lock": {
       "source": "source/codex-rs/Cargo.lock",
@@ -256,7 +256,7 @@
     "codex-rs/tui/src/app/foreground_observation/tests.rs": {
       "source": "source/codex-rs/tui/src/app/foreground_observation/tests.rs",
       "before_sha256": "395a9b152371d4ed31462f3a850074a76b9c3d839428cfa109f3c99a3d089230",
-      "after_sha256": "faf0d2692a414e19159706ee956f9b2129174cb93f5cac22bf81f3bfca6ccbda"
+      "after_sha256": "f6e9663f968f5a80726ec33e915630bcf8bf1531dc8eba0332b164461959613c"
     },
     "codex-rs/tui/src/app/startup.rs": {
       "source": "source/codex-rs/tui/src/app/startup.rs",
@@ -379,8 +379,8 @@
       "after_sha256": "f412c8df6910b0cc0d45ecaa1976971d72ca8810b873645c1da3922dfe72b07e"
     }
   },
-  "full_release_source_manifest_sha256": "c83499a8c9d742e3b203546b9249160037faa38a52b7fce0e54adb8230d52c17",
-  "full_test_source_manifest_sha256": "df0af272252da9952b5a5db35eeb4be700b43e38e31d4a7ed939abdd391efa7d",
+  "full_release_source_manifest_sha256": "a549b808a9a26ce72d995cfe38bc24528b9c88a28db93c9e19c98a686a911940",
+  "full_test_source_manifest_sha256": "176e13f28d686fffac343a7dbec7386574d1f30df0608dbe65b1656819f9007d",
   "release_cargo_manifest_sha256": "11ce75d44b3fdc2cf92770ba0dd9e642a214dbf230fb2ef609d0805049f0887f",
   "release_cargo_lock_sha256": "57082b573e682fae144ea44fa15297e3fcf0cfecbb0f32fe491a28839b8caea0",
   "test_cargo_manifest_sha256": "f68b00f9afaefe023edee94111659f0f583113ca7855115a1a892e054ded8f95",
