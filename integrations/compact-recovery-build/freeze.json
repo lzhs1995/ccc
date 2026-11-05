@@ -4,24 +4,24 @@
   "upstream_commit": "6aaac694803004a63c6f393d153c96d22521a6b9",
   "upstream_tree": "d0caeb3c076fbeade281c18295fada090c52cf8f",
   "owner_review": "OWNER-REVIEW.json",
-  "owner_review_sha256": "88da1fba1f4284e62a5cdd511e638bc866fd0720a25476df5a6fe472ddbe222d",
+  "owner_review_sha256": "8ee79c8ce456467a960b17e48e70b072b611d16ebbbf6b8944ff7f51255ec777",
   "overlay_patch": "native-compact-recovery.patch",
-  "overlay_patch_sha256": "d98f062a3401f25f4e54fe2adecf68196715d825aafb310edce6406ae2c16d4c",
+  "overlay_patch_sha256": "fb8531bc092d5055990edaa303be6dfcf46203bd2890d7e9949fbc1a9cd5464a",
   "overlay": {
     "codex-rs/Cargo.lock": {
       "source": "source/codex-rs/Cargo.lock",
       "before_sha256": "f3c527ff5bd5f8dc63e16847f7e669bd1b247e0b6e1d91d0202510c5a3fc14bd",
-      "after_sha256": "57082b573e682fae144ea44fa15297e3fcf0cfecbb0f32fe491a28839b8caea0"
+      "after_sha256": "750606cb2edea76b132b4d3f61685a44a9825875deb12c093b0b24cc19d88a13"
     },
     "codex-rs/app-server-protocol/src/protocol/common.rs": {
       "source": "source/codex-rs/app-server-protocol/src/protocol/common.rs",
       "before_sha256": "bbc1bfee01178986dd4a7b59047ddb85bf4081c60fc36905da8fad61b79b472d",
-      "after_sha256": "adc77ebd7e49a3ca0ad81743e14403a700949b4c7cfd497b0c77b5dba7c731c8"
+      "after_sha256": "e5de4d23e72b3242e919724e85e2c4363c549ea6a844cdafed287bdfecab03c5"
     },
     "codex-rs/app-server-protocol/src/protocol/v2/thread.rs": {
       "source": "source/codex-rs/app-server-protocol/src/protocol/v2/thread.rs",
       "before_sha256": "8fe95c7e0d8d6d26ac9e8f5af3256a755c57c5c6c4a217310b0dd51fc7de05fc",
-      "after_sha256": "895e4168eaed77171c1d02957d8dd6371e782bc81fd4ea29ef5b2099bc2ef6ed"
+      "after_sha256": "e804239d3484833ccd27f52ee7378ad5436270e448c14af6acdf8ad4f5d1a1bd"
     },
     "codex-rs/app-server/Cargo.toml": {
       "source": "source/codex-rs/app-server/Cargo.toml",
@@ -31,7 +31,7 @@
     "codex-rs/app-server/src/message_processor.rs": {
       "source": "source/codex-rs/app-server/src/message_processor.rs",
       "before_sha256": "e8e5fcccc04e699c0f9394d4586e25e9560b3f1a4a1ee066692adf93139443c2",
-      "after_sha256": "b7084f8132482c8a051f94036a1e4944a15e9186fb4cbfec28491b420d8a3e79"
+      "after_sha256": "da808291fa836ae91b01105f62773f07fa639f121d6bb616d192f4f7e5bbf426"
     },
     "codex-rs/app-server/src/request_processors.rs": {
       "source": "source/codex-rs/app-server/src/request_processors.rs",
@@ -191,7 +191,7 @@
     "codex-rs/ext/goal/Cargo.toml": {
       "source": "source/codex-rs/ext/goal/Cargo.toml",
       "before_sha256": "e03430bf9732d45b9aaebe6969d4a90e63daf348107f4b74bf227dfb38e33454",
-      "after_sha256": "7989521fdd9eff2a8d51180d1ee1a6223418557e84ce51abbf78505b26eda489"
+      "after_sha256": "aa2419323ff9d7fabf7effdf2c07fdf4564c830f57aa05c69c2152437a5e5662"
     },
     "codex-rs/ext/goal/src/accounting.rs": {
       "source": "source/codex-rs/ext/goal/src/accounting.rs",
@@ -211,12 +211,12 @@
     "codex-rs/ext/goal/src/runtime.rs": {
       "source": "source/codex-rs/ext/goal/src/runtime.rs",
       "before_sha256": "9fd31e79fd06f68e192b799631cfd544b8e685dd7aa4b98b96a02da9e8ff9ea8",
-      "after_sha256": "47f687fc6fb1931b98a52984d2f4b50bdb2a1538bde1e94bf4523cc22592946d"
+      "after_sha256": "4495f66d68ed3794222d16787a347c12842c9221d08b5a3ba513692ba7ffbd0b"
     },
     "codex-rs/ext/goal/tests/goal_extension_backend.rs": {
       "source": "source/codex-rs/ext/goal/tests/goal_extension_backend.rs",
       "before_sha256": "f52ba92f013e599c34e0c74016aa9caaca20461559e06b387c33550f6df479ba",
-      "after_sha256": "638c29ffb360a09d2270cb16bc2b3bf7f781582b35e51da61febf857d85841d5"
+      "after_sha256": "123fe84cc069ce29f0bfa2a4b1587e2f950012621b2adfb1953d81a763756fee"
     },
     "codex-rs/protocol/src/compact_recovery.rs": {
       "source": "source/codex-rs/protocol/src/compact_recovery.rs",
@@ -226,7 +226,7 @@
     "codex-rs/protocol/src/lib.rs": {
       "source": "source/codex-rs/protocol/src/lib.rs",
       "before_sha256": "d9f0092741662665b16eaa73b4dbba1fcec8772c64b7be7d0d68f05c2766ea74",
-      "after_sha256": "ec278ded73304413a60df620e4f924d9dc12e1bb622275224f11dbf9c6e57a18"
+      "after_sha256": "7e73e0b0b568c79e62b87eebe5ce9cc1142e09aab4c48668eafb9e4c9fc3e217"
     },
     "codex-rs/protocol/src/protocol.rs": {
       "source": "source/codex-rs/protocol/src/protocol.rs",
@@ -321,17 +321,17 @@
     "codex-rs/app-server-protocol/schema/json/ClientRequest.json": {
       "source": "source/codex-rs/app-server-protocol/schema/json/ClientRequest.json",
       "before_sha256": "9b89e2459362d20cec67a429ef9430fe6b0e9fb8bd87d445d4c9a6acccd87450",
-      "after_sha256": "e3b3b76b2c901c42cd0ca8b8bc3b8593195e932b2df274a5dc305286e207917c"
+      "after_sha256": "f17eff2aa5c4d3eb08a2fc3bd13f0d4a09a3c80a9c7be1efb9cec8ffa0bf76f5"
     },
     "codex-rs/app-server-protocol/schema/json/codex_app_server_protocol.schemas.json": {
       "source": "source/codex-rs/app-server-protocol/schema/json/codex_app_server_protocol.schemas.json",
       "before_sha256": "5f633ad1f0a07459a5f63ed5604f8a61e0366ac5c36a15d648b44c8de4ffafb1",
-      "after_sha256": "3ea756f2386a42ff08588ef125a1fca8f2b6025fd25020942ac27daf7928861b"
+      "after_sha256": "5dd21ce6fb18464089aef9b0bb6e5c1a00e0bbe59c67fa1de2ff7f52b1dcd4f7"
     },
     "codex-rs/app-server-protocol/schema/json/codex_app_server_protocol.v2.schemas.json": {
       "source": "source/codex-rs/app-server-protocol/schema/json/codex_app_server_protocol.v2.schemas.json",
       "before_sha256": "705a08b903fecb9457a6c888040b16ff20be4bc74682ee3896c61cb27ce43060",
-      "after_sha256": "13a00363911aafdba04f20576f736f12662233dc39bfeb1a513c6395bbc021ee"
+      "after_sha256": "75e857c0ddca8dc5b0da0c2463cb59d5cdc209d8f89cb51d30f15f59c291728d"
     },
     "codex-rs/app-server-protocol/schema/json/v2/ThreadCompactRecoveryParams.json": {
       "source": "source/codex-rs/app-server-protocol/schema/json/v2/ThreadCompactRecoveryParams.json",
@@ -346,17 +346,17 @@
     "codex-rs/app-server-protocol/schema/precomputed/app-server-exports-experimental.json.zst": {
       "source": "source/codex-rs/app-server-protocol/schema/precomputed/app-server-exports-experimental.json.zst",
       "before_sha256": "f495e030e03320a63b7d65f769b42bc5252f68b0bdbb422bd6d076cabd0e45c1",
-      "after_sha256": "64c2a9ce62f06f25f5234d1d16aebbb6d120fab26f624fd68340826adb9e3521"
+      "after_sha256": "1985128fdd617c576bfed721b5b577aa8304ba53d152cdf6483fafdb1cd85b3f"
     },
     "codex-rs/app-server-protocol/schema/precomputed/app-server-exports-stable.json.zst": {
       "source": "source/codex-rs/app-server-protocol/schema/precomputed/app-server-exports-stable.json.zst",
       "before_sha256": "48cab452e7b87e44e0acf892b8926ab25a019857e44b8f68819aa034ff407296",
-      "after_sha256": "475a678062c00aa81cfcac94c7aa5c6a39b48589a86c5e1a758b7f87eea94092"
+      "after_sha256": "7cd4fef23555db723a62115c36febeb0e8355fd5a4d64cb92b2420ebf767a530"
     },
     "codex-rs/app-server-protocol/schema/typescript/ClientRequest.ts": {
       "source": "source/codex-rs/app-server-protocol/schema/typescript/ClientRequest.ts",
       "before_sha256": "d52eab2b624ee8bab88a121f78a5465faaa6a2701bbd0d2979dc7e5937741b36",
-      "after_sha256": "ed8091232523bb3430c348fac8aa252c8943641107cb04894002ad45e5fb5611"
+      "after_sha256": "f0b44c980ee3c140fb73399002f249d92d42390aeaf1abf933e0d483061f6702"
     },
     "codex-rs/app-server-protocol/schema/typescript/v2/ThreadCompactRecoveryParams.ts": {
       "source": "source/codex-rs/app-server-protocol/schema/typescript/v2/ThreadCompactRecoveryParams.ts",
@@ -371,7 +371,7 @@
     "codex-rs/app-server-protocol/schema/typescript/v2/index.ts": {
       "source": "source/codex-rs/app-server-protocol/schema/typescript/v2/index.ts",
       "before_sha256": "d9565cae649b76039200f803de2be7c8e1ad85ade2f78dbab9ea230592fd4f5c",
-      "after_sha256": "69424f840d8c05cb89f7f29c3dbc0cf090f302cb5de4b316e2e6ead98ca1d7bc"
+      "after_sha256": "b568ab6266ab600923fa7c121d15ed83e85689ee561c5354abe957c150fee3f0"
     },
     "codex-rs/tui/src/app/right_click_paste.rs": {
       "source": "source/codex-rs/tui/src/app/right_click_paste.rs",
@@ -382,14 +382,124 @@
       "source": "source/codex-rs/tui/src/pets/mod.rs",
       "before_sha256": "009c46d63d6ad360a8692cfe7a993282e323add081516c1e7626a904f0c322b9",
       "after_sha256": "e029c4c4f6c4632d4feb5383d40ec0785059e8c8f2bcc0b2b0b532431183ab11"
+    },
+    "codex-rs/app-server/src/request_processors/thread_goal_processor.rs": {
+      "source": "source/codex-rs/app-server/src/request_processors/thread_goal_processor.rs",
+      "before_sha256": "835fac66bc2ae9eb0e29b7a5a3da09cfea11cf2ca3dbd0384a296ce54db9b3e6",
+      "after_sha256": "87f560b239979b824f6e7960e0004b153b1e120345adb93c37f174323d4c84c2"
+    },
+    "codex-rs/app-server/tests/suite/v2/thread_goal_empty_responses.rs": {
+      "source": "source/codex-rs/app-server/tests/suite/v2/thread_goal_empty_responses.rs",
+      "before_sha256": "79b80bdc39a4c8bb021bd0120aaf181ba3f37716dbb5af9b3a2d614dbf1f27ad",
+      "after_sha256": "1ab5a6ad1edfd58259238981d86f26bd299c636f9ac559c96b16b1ae7d751c70"
+    },
+    "codex-rs/core/src/session/turn_input.rs": {
+      "source": "source/codex-rs/core/src/session/turn_input.rs",
+      "before_sha256": "eeeff7f21e0ba0b714e3b50c27cf351f2431aab754f078a362f259a227914cfc",
+      "after_sha256": "274e28bf2ce47b9a842701ffc2905967e0c682c36e826c8421bc614d5a9027d7"
+    },
+    "codex-rs/core/src/session/turn_input_tests.rs": {
+      "source": "source/codex-rs/core/src/session/turn_input_tests.rs",
+      "before_sha256": "1e96d4ec3b0738b878116fd3003d23eb70b46f6a5bc051cd1738bb78838a913f",
+      "after_sha256": "dc1619edb8eae261a15a16aa40e149a7e5d930f33f38f861ba68b581dbed0171"
+    },
+    "codex-rs/ext/goal/src/api.rs": {
+      "source": "source/codex-rs/ext/goal/src/api.rs",
+      "before_sha256": "a08bb505652ff41540fcea628ab6bdda2fb8011c21450d10f0f240ae6ddfc157",
+      "after_sha256": "e5c5b83ba271620e5e505690bb161166e2fd9c463ab885add3c21d8278dad88e"
+    },
+    "codex-rs/protocol/src/goal_recovery.rs": {
+      "source": "source/codex-rs/protocol/src/goal_recovery.rs",
+      "before_sha256": null,
+      "after_sha256": "72037f8f90cf93e6141245f82f8ac367c513b95b0fa58bc0ad0dfd129f1048fb"
+    },
+    "codex-rs/protocol/src/turn_input.rs": {
+      "source": "source/codex-rs/protocol/src/turn_input.rs",
+      "before_sha256": "93b69518afdfe5cae66eae6c6a36410f72a445c5734b0aba20a53a4f265712aa",
+      "after_sha256": "f3aa56e0f5532f8eeba527151ecb2ecc59a11dc356edda3fbb6ac6a0e5ca4a13"
+    },
+    "codex-rs/state/goals_migrations/0003_goal_recovery_receipts.sql": {
+      "source": "source/codex-rs/state/goals_migrations/0003_goal_recovery_receipts.sql",
+      "before_sha256": null,
+      "after_sha256": "2356423e070050aafab309b7262c65d03b0c2290a2f3f9dbdf9de334ca7c59fb"
+    },
+    "codex-rs/state/src/runtime/goal_recovery.rs": {
+      "source": "source/codex-rs/state/src/runtime/goal_recovery.rs",
+      "before_sha256": null,
+      "after_sha256": "f60fd91120ce9603751a2e50b87642d8e40cf5e447b3e02c99ce02b4b109137c"
+    },
+    "codex-rs/state/src/runtime/goals.rs": {
+      "source": "source/codex-rs/state/src/runtime/goals.rs",
+      "before_sha256": "03ecc9fb926ba081e520c7781b02676a0b82ec1fe5356f99261863fee1817b61",
+      "after_sha256": "f50c9e560189d47c159b628f91d1efd3387baf5a933c23c489ec1f9fe2117152"
+    },
+    "codex-rs/app-server-protocol/schema/json/v2/ThreadGoalRecoverParams.json": {
+      "source": "source/codex-rs/app-server-protocol/schema/json/v2/ThreadGoalRecoverParams.json",
+      "before_sha256": null,
+      "after_sha256": "eb1632cb6e16654bb7ab1a0948fa08b466bf9bfbffc8a8c9c457b8d3d155a052"
+    },
+    "codex-rs/app-server-protocol/schema/json/v2/ThreadGoalRecoverResponse.json": {
+      "source": "source/codex-rs/app-server-protocol/schema/json/v2/ThreadGoalRecoverResponse.json",
+      "before_sha256": null,
+      "after_sha256": "fe3dae781d334e89e57b1cbb7e680b965b919ab182a0899474daf107d484e78b"
+    },
+    "codex-rs/app-server-protocol/schema/json/v2/ThreadGoalRecoveryReadParams.json": {
+      "source": "source/codex-rs/app-server-protocol/schema/json/v2/ThreadGoalRecoveryReadParams.json",
+      "before_sha256": null,
+      "after_sha256": "8c2c87b74dc21eb147a64426c737d10946069f1905351435fc872f60a88d5c41"
+    },
+    "codex-rs/app-server-protocol/schema/json/v2/ThreadGoalRecoveryReadResponse.json": {
+      "source": "source/codex-rs/app-server-protocol/schema/json/v2/ThreadGoalRecoveryReadResponse.json",
+      "before_sha256": null,
+      "after_sha256": "424f96e63503ef3a171ad5096f6720a7eaab5f00a6225767470b6b05daf3c371"
+    },
+    "codex-rs/app-server-protocol/schema/typescript/GoalRecoveryPhase.ts": {
+      "source": "source/codex-rs/app-server-protocol/schema/typescript/GoalRecoveryPhase.ts",
+      "before_sha256": null,
+      "after_sha256": "fd5287e0868a25b412a64b39057b231b6d727dcc47f44502a83b0d67703203e7"
+    },
+    "codex-rs/app-server-protocol/schema/typescript/GoalRecoveryReceipt.ts": {
+      "source": "source/codex-rs/app-server-protocol/schema/typescript/GoalRecoveryReceipt.ts",
+      "before_sha256": null,
+      "after_sha256": "0976fa1bd30516c72f50a36e5efaeb1bfe92b1ccf4ef9de88c43acb576277f48"
+    },
+    "codex-rs/app-server-protocol/schema/typescript/GoalRecoveryRequest.ts": {
+      "source": "source/codex-rs/app-server-protocol/schema/typescript/GoalRecoveryRequest.ts",
+      "before_sha256": null,
+      "after_sha256": "eb8e307f37da3a596b554006dbf5b3b4ede45b672bdbb338d7bfe55d2f446e68"
+    },
+    "codex-rs/app-server-protocol/schema/typescript/GoalRecoverySnapshot.ts": {
+      "source": "source/codex-rs/app-server-protocol/schema/typescript/GoalRecoverySnapshot.ts",
+      "before_sha256": null,
+      "after_sha256": "b288440189647d2f6aaf59667817b8930d4e3b8fd7d552975f9737188c3ee843"
+    },
+    "codex-rs/app-server-protocol/schema/typescript/index.ts": {
+      "source": "source/codex-rs/app-server-protocol/schema/typescript/index.ts",
+      "before_sha256": "2751d0880d15af751d07edc20c748192c849b1bb122e79136bcb9339dee07d17",
+      "after_sha256": "6ae4578de27195c61aea6f208d731690ec3b145be767c73441d8a90c80b51449"
+    },
+    "codex-rs/app-server-protocol/schema/typescript/v2/ThreadGoalRecoverResponse.ts": {
+      "source": "source/codex-rs/app-server-protocol/schema/typescript/v2/ThreadGoalRecoverResponse.ts",
+      "before_sha256": null,
+      "after_sha256": "7acda90d87155df8ba6288272261164691eca9676b6d6ff8f9c16abe677634eb"
+    },
+    "codex-rs/app-server-protocol/schema/typescript/v2/ThreadGoalRecoveryReadParams.ts": {
+      "source": "source/codex-rs/app-server-protocol/schema/typescript/v2/ThreadGoalRecoveryReadParams.ts",
+      "before_sha256": null,
+      "after_sha256": "fa37946644b2596703dd3717c150953f2b21180e8daaccd08bed85cb5603b8d3"
+    },
+    "codex-rs/app-server-protocol/schema/typescript/v2/ThreadGoalRecoveryReadResponse.ts": {
+      "source": "source/codex-rs/app-server-protocol/schema/typescript/v2/ThreadGoalRecoveryReadResponse.ts",
+      "before_sha256": null,
+      "after_sha256": "c8ea050ec9962884a37b5804915c6478612af48695ac12a6c4a19b04d6454452"
     }
   },
-  "full_release_source_manifest_sha256": "9f8f1a1ca3c884d76d1d0e3bd29811d667147a3bc3998e73c9b3e513c66f48a2",
-  "full_test_source_manifest_sha256": "2d5c9ee81e2c47014f9353d70eeea54f46a737c0e40a7788a4b65a797754e036",
+  "full_release_source_manifest_sha256": "9fc26034e72e4b99aa6576a706491d298e0c7eda8750368f0de391c75587084b",
+  "full_test_source_manifest_sha256": "b8bf5129201c88dda5f44ab295533dcc6f2712edb736a9f32e4ab3dcee86e7da",
   "release_cargo_manifest_sha256": "11ce75d44b3fdc2cf92770ba0dd9e642a214dbf230fb2ef609d0805049f0887f",
-  "release_cargo_lock_sha256": "57082b573e682fae144ea44fa15297e3fcf0cfecbb0f32fe491a28839b8caea0",
+  "release_cargo_lock_sha256": "750606cb2edea76b132b4d3f61685a44a9825875deb12c093b0b24cc19d88a13",
   "test_cargo_manifest_sha256": "f68b00f9afaefe023edee94111659f0f583113ca7855115a1a892e054ded8f95",
-  "test_cargo_lock_sha256": "53b2404883a2f65f1252dc78ae1c91b23812a21b008931313ec291ae0d32be95",
+  "test_cargo_lock_sha256": "5ddf4a6b65dc2fb1db901859681f55fb169a4e614b717de478e89fd5c9b84283",
   "native_cargo_manifest_sha256": "7c6e58565448517aeeb40b4a88d94b862e1898a7d700c29947e2169d5571893d",
   "native_cargo_lock_sha256": "c9b1729b3545ba4ec2cc3177f8833088849b09234a450f5064a367bb692d8344",
   "required_cases": [
@@ -1140,6 +1250,97 @@
       "name": "app::tests::foreground_observation::draw_never_treats_an_uncommitted_proposal_as_live_selection",
       "role": "tui",
       "new": true
+    },
+    {
+      "package": "codex-state",
+      "binary": "codex_state",
+      "name": "runtime::goals::recovery::tests::recovery_token_exact_duplicate_never_creates_second_intent",
+      "role": "goal_receipt",
+      "new": true
+    },
+    {
+      "package": "codex-state",
+      "binary": "codex_state",
+      "name": "runtime::goals::recovery::tests::admitted_mapping_is_unknown_until_post_release_commit",
+      "role": "goal_receipt",
+      "new": true
+    },
+    {
+      "package": "codex-state",
+      "binary": "codex_state",
+      "name": "runtime::goals::recovery::tests::stale_usage_revision_refuses_admission_without_changing_goal",
+      "role": "goal_receipt",
+      "new": true
+    },
+    {
+      "package": "codex-state",
+      "binary": "codex_state",
+      "name": "runtime::goals::recovery::tests::admitted_receipt_survives_normal_usage_and_goal_replacement",
+      "role": "goal_receipt",
+      "new": true
+    },
+    {
+      "package": "codex-state",
+      "binary": "codex_state",
+      "name": "runtime::goals::recovery::tests::admission_transaction_failure_rolls_back_goal_activation",
+      "role": "goal_receipt",
+      "new": true
+    },
+    {
+      "package": "codex-state",
+      "binary": "codex_state",
+      "name": "runtime::goals::recovery::tests::post_release_write_failure_keeps_admitted_and_rejects_false_not_sent",
+      "role": "goal_receipt",
+      "new": true
+    },
+    {
+      "package": "codex-core",
+      "binary": "codex_core",
+      "name": "session::turn_input::tests::goal_receipt_cannot_use_start_or_steer_to_bypass_idle_admission",
+      "role": "goal_receipt",
+      "new": true
+    },
+    {
+      "package": "codex-core",
+      "binary": "codex_core",
+      "name": "session::turn_input::tests::goal_receipt_stale_previous_turn_does_not_create_active_task",
+      "role": "goal_receipt",
+      "new": true
+    },
+    {
+      "package": "codex-core",
+      "binary": "codex_core",
+      "name": "session::turn_input::tests::goal_receipt_for_foreign_thread_is_rejected_before_reservation",
+      "role": "goal_receipt",
+      "new": true
+    },
+    {
+      "package": "codex-app-server",
+      "binary": "all",
+      "name": "suite::v2::thread_goal_empty_responses::conditional_goal_receipt_binds_real_admission_and_duplicate_is_read_only",
+      "role": "goal_receipt",
+      "new": true
+    },
+    {
+      "package": "codex-core",
+      "binary": "codex_core",
+      "name": "session::turn_input::tests::goal_receipt_missing_durable_database_never_releases_reserved_task",
+      "role": "goal_receipt",
+      "new": true
+    },
+    {
+      "package": "codex-goal-extension",
+      "binary": "goal_extension_backend",
+      "name": "committed_goal_set_survives_recovery_fence_cleanup_failure",
+      "role": "goal_receipt",
+      "new": true
+    },
+    {
+      "package": "codex-goal-extension",
+      "binary": "goal_extension_backend",
+      "name": "committed_goal_clear_survives_recovery_fence_cleanup_failure",
+      "role": "goal_receipt",
+      "new": true
     }
   ],
   "schema_export_argv": [
@@ -1155,7 +1356,7 @@
     "ChatgptAuthTokensRefreshParams.json": "03b7a734b8b3180d9cb477b33564385d29b22a2528165a614891f13849060503",
     "ChatgptAuthTokensRefreshResponse.json": "06d6b30436fc962d80b5d7920f8f323de12a052214d9148c5f0dfbaedd5eec6c",
     "ClientNotification.json": "706cf248d75027c84a3c63348d0ed507182e8eba40069dd17541793de029145a",
-    "ClientRequest.json": "abfb86cd6dff43a343498f3be7d951571cde91cfdc79f3fa28f91989a0f44ced",
+    "ClientRequest.json": "a5f8de03565bb4a6f5ff1c082d837a7d413607cbb13801f3a406dd6e7c978661",
     "CommandExecutionRequestApprovalParams.json": "c9728280b8f3204fd729d0fb3d1ca7bb05b1150de26b3653f7163e6a9bd941e7",
     "CommandExecutionRequestApprovalResponse.json": "6d0767113e22f311381809b6b236b0dde2b99b01992879c26bf7b1ea0e003cb7",
     "CurrentTimeReadParams.json": "2e1a0e6b766f9a31fa937c957cf0b3c0505e8b01503d559b41022a4d523d4c95",
@@ -1191,8 +1392,8 @@
     "ServerRequest.json": "3d7bc481f84dc042984a74420e65c5a8d3c423f37a91b7d5df2365c903a12ac6",
     "ToolRequestUserInputParams.json": "fda15b62e7446105b59c8ed85c908abed2a47db70653e57c92c47a2f204fa77a",
     "ToolRequestUserInputResponse.json": "5073b245f741fa8ce62ec52e4dd1809b7831f9c4284c279a78abc9b171f8e3f2",
-    "codex_app_server_protocol.schemas.json": "570d5ce49761ba12285f5ffd6aeb9e522ecae5435f5b7a32a82134c1d8418bf0",
-    "codex_app_server_protocol.v2.schemas.json": "95a6eb53aeb6af2f759cea78779b037c28261d6cf104cb421ecda8398157abdc",
+    "codex_app_server_protocol.schemas.json": "8ced5947fa80d3b66e5773cf69f4c48031e57b5c03d4b30182df08fb1d974b92",
+    "codex_app_server_protocol.v2.schemas.json": "5f7b13ca4b91d2bb52a6234bb0bbc6f468a8dc0cf7e29551051bfe834481f13b",
     "v1/InitializeParams.json": "b55124e7c0f36a1789396daa5578217a92be67f053903696236686e59f6f212e",
     "v1/InitializeResponse.json": "62ad689c2cb6379913c1d72749cfd8de5089d35760214123518eb92eef11acc9",
     "v2/AccountLoginCompletedNotification.json": "d81e8821fd5a4a9ad118dfc3506ea156d32dcb18da388b336501bbc6a5ccb4a6",
@@ -1469,6 +1670,10 @@
     "v2/ThreadGoalClearedNotification.json": "ad6c2cf53970e45cae55d36dbddd84ecc7b34837846616493efa7b132a35a051",
     "v2/ThreadGoalGetParams.json": "1a5de89b3c5c49528af404a65411a73ef05dc7c9c49c3f00c90d9926dfe34137",
     "v2/ThreadGoalGetResponse.json": "f610000963194731c96ce2b45e46722ca700f1b6ccc1fc55a2fd95e526018fd9",
+    "v2/ThreadGoalRecoverParams.json": "eb1632cb6e16654bb7ab1a0948fa08b466bf9bfbffc8a8c9c457b8d3d155a052",
+    "v2/ThreadGoalRecoverResponse.json": "fe3dae781d334e89e57b1cbb7e680b965b919ab182a0899474daf107d484e78b",
+    "v2/ThreadGoalRecoveryReadParams.json": "8c2c87b74dc21eb147a64426c737d10946069f1905351435fc872f60a88d5c41",
+    "v2/ThreadGoalRecoveryReadResponse.json": "424f96e63503ef3a171ad5096f6720a7eaab5f00a6225767470b6b05daf3c371",
     "v2/ThreadGoalSetParams.json": "36c1f1935e1a352865512433aae44c9fffde4a7fa3db127449da088a8a212287",
     "v2/ThreadGoalSetResponse.json": "b1c61b6068b3b73dd3d97b38f8a269593f8f7added4643bfdb2016315b71ad8e",
     "v2/ThreadGoalUpdatedNotification.json": "52010479c7efcc6dc749e2d9bf1e27c134453d92a1f0b367193d8125eec1fedc",
@@ -1610,5 +1815,24 @@
     "v2/WindowsWorldWritableWarningNotification.json": "bfa34d4890c8121a04412b8d53314a13adf98289fdd948857fd97b808dcbe79e"
   },
   "historical_test_passes_reused": false,
-  "production_installed": false
+  "production_installed": false,
+  "acceptance_contract": {
+    "name": "compact-recovery-plus-goal-receipt-v1",
+    "required": 115,
+    "workspace": 81,
+    "standalone_native": 34,
+    "experimental_schema_files": 464
+  },
+  "goal_artifact_adoption": {
+    "run_id": 42029307026,
+    "run_attempt": 1,
+    "head_sha": "45bf50b187edd2d58afc5e88fb4f7bd38404d92e",
+    "artifact_id": 13416961228,
+    "artifact_bytes": 6340566,
+    "artifact_sha256": "21ae74406e2aaec885da09ad0255cd7abffaa0981ab300ccc9155eed1c2c9d37",
+    "independent_adoption_sha256": "44a9b79fe3dba10de1b80e5a5917d78982ebd01a7d3cb5c8ee47a5bda44623ee",
+    "actual_format_zero_changes": true,
+    "actual_release_test_check_passed": true,
+    "all_schema_bytes_match_reviewed_candidate": true
+  }
 }

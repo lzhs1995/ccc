@@ -1383,6 +1383,14 @@ impl MessageProcessor {
                     .thread_set_name(request_id.clone(), params)
                     .await
             }
+            ClientRequest::ThreadGoalRecover { params, .. } => {
+                self.thread_goal_processor.thread_goal_recover(params).await
+            }
+            ClientRequest::ThreadGoalRecoveryRead { params, .. } => {
+                self.thread_goal_processor
+                    .thread_goal_recovery_read(params)
+                    .await
+            }
             ClientRequest::ThreadGoalSet { params, .. } => {
                 self.thread_goal_processor
                     .thread_goal_set(request_id.clone(), params)

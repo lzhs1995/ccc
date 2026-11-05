@@ -2267,3 +2267,28 @@ pub struct ContextCompactedNotification {
     pub thread_id: String,
     pub turn_id: String,
 }
+
+/// Versioned conditional Goal admission. It never queues a user prompt.
+pub use codex_protocol::goal_recovery::GoalRecoveryRequest as ThreadGoalRecoverParams;
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadGoalRecoverResponse {
+    pub receipt: codex_protocol::goal_recovery::GoalRecoveryReceipt,
+}
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export_to = "v2/")]
+pub struct ThreadGoalRecoveryReadParams {
+    pub thread_id: String,
+    pub attempt_id: Option<String>,
+}
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadGoalRecoveryReadResponse {
+    pub capability: String,
+    pub runtime_id: Option<String>,
+    pub snapshot: Option<codex_protocol::goal_recovery::GoalRecoverySnapshot>,
+    pub receipt: Option<codex_protocol::goal_recovery::GoalRecoveryReceipt>,
+}

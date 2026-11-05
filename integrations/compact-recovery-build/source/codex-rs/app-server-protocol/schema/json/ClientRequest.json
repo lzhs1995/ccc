@@ -1676,6 +1676,40 @@
       },
       "type": "object"
     },
+    "GoalRecoveryRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "attemptId": {
+          "type": "string"
+        },
+        "expectedGoalId": {
+          "type": "string"
+        },
+        "expectedGoalRevision": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "expectedPreviousTurnId": {
+          "type": "string"
+        },
+        "expectedRuntimeId": {
+          "description": "Native runtime identity returned by the read endpoint; never caller-invented.",
+          "type": "string"
+        },
+        "threadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "attemptId",
+        "expectedGoalId",
+        "expectedGoalRevision",
+        "expectedPreviousTurnId",
+        "expectedRuntimeId",
+        "threadId"
+      ],
+      "type": "object"
+    },
     "HookMigration": {
       "properties": {
         "name": {
@@ -4721,6 +4755,24 @@
       ],
       "type": "string"
     },
+    "ThreadGoalRecoveryReadParams": {
+      "additionalProperties": false,
+      "properties": {
+        "attemptId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "threadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "threadId"
+      ],
+      "type": "object"
+    },
     "ThreadGoalSetParams": {
       "properties": {
         "objective": {
@@ -6533,6 +6585,54 @@
         "params"
       ],
       "title": "Thread/name/setRequest",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "enum": [
+            "thread/goal/recover"
+          ],
+          "title": "Thread/goal/recoverRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/GoalRecoveryRequest"
+        }
+      },
+      "required": [
+        "id",
+        "method",
+        "params"
+      ],
+      "title": "Thread/goal/recoverRequest",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "enum": [
+            "thread/goal/recovery/read"
+          ],
+          "title": "Thread/goal/recovery/readRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/ThreadGoalRecoveryReadParams"
+        }
+      },
+      "required": [
+        "id",
+        "method",
+        "params"
+      ],
+      "title": "Thread/goal/recovery/readRequest",
       "type": "object"
     },
     {

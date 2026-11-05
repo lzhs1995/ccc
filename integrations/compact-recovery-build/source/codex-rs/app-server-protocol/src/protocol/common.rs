@@ -625,6 +625,16 @@ client_request_definitions! {
         serialization: thread_id(params.thread_id),
         response: v2::ThreadPredictionRequestResponse,
     },
+    ThreadGoalRecover => "thread/goal/recover" {
+        params: v2::ThreadGoalRecoverParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadGoalRecoverResponse,
+    },
+    ThreadGoalRecoveryRead => "thread/goal/recovery/read" {
+        params: v2::ThreadGoalRecoveryReadParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadGoalRecoveryReadResponse,
+    },
     ThreadGoalSet => "thread/goal/set" {
         params: v2::ThreadGoalSetParams,
         serialization: thread_id(params.thread_id),

@@ -1,20 +1,26 @@
 {
-  "scope": "r7 plus two test-only corrections and explicit CI helper binaries",
-  "base_freeze_sha256": "b68174b928d435565b4c9ec29829e7b15d1beef88d57e856a04ef4c253790f8a",
-  "failed_run_preserved": 42008554023,
-  "before_source_members": 9461,
-  "after_source_members": 9461,
-  "changed_existing_tests": [
-    "codex-rs/tui/src/app/foreground_observation/tests.rs",
-    "codex-rs/tui/src/pets/mod.rs"
-  ],
-  "product_runtime_delta": false,
-  "cargo_graph_changed": false,
-  "schema_changed": false,
-  "required_cases": 102,
-  "full_build_passed": false,
-  "real_180_300_passed": false,
-  "production_installed": false,
-  "patch_preimage_and_apply_verified": true,
-  "review_kind": "solo_self_review"
+  "status": "SOURCE_FROZEN_FOR_ROOT_REVIEW_NOT_BUILT",
+  "review_kind": "solo_self_review",
+  "scope": "native r8 plus exact Goal r2 using independently accepted actual remote format/schema/check output",
+  "goal_build": {
+    "run_id": 42029307026,
+    "run_attempt": 1,
+    "head_sha": "45bf50b187edd2d58afc5e88fb4f7bd38404d92e",
+    "artifact_id": 13416961228,
+    "artifact_bytes": 6340566,
+    "artifact_sha256": "21ae74406e2aaec885da09ad0255cd7abffaa0981ab300ccc9155eed1c2c9d37",
+    "independent_adoption_sha256": "44a9b79fe3dba10de1b80e5a5917d78982ebd01a7d3cb5c8ee47a5bda44623ee",
+    "actual_format_zero_changes": true,
+    "actual_release_test_check_passed": true,
+    "all_schema_bytes_match_reviewed_candidate": true
+  },
+  "r8_freeze_sha256": "5de4d3a33d6bd11874ce7b03b3a6931321f38182b881f240b542b4090cd46313",
+  "source_members": 9475,
+  "overlay_members": 97,
+  "required_cases": 115,
+  "schema_files": 464,
+  "combined_native_tests_passed": false,
+  "full_ci_passed": false,
+  "real_fixture_passed": false,
+  "production_installed": false
 }

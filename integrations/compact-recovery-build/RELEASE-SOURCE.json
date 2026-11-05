@@ -1125,7 +1125,7 @@
     {
       "path": "codex-rs/Cargo.lock",
       "kind": "file",
-      "sha256": "57082b573e682fae144ea44fa15297e3fcf0cfecbb0f32fe491a28839b8caea0",
+      "sha256": "750606cb2edea76b132b4d3f61685a44a9825875deb12c093b0b24cc19d88a13",
       "executable": false
     },
     {
@@ -1863,7 +1863,7 @@
     {
       "path": "codex-rs/app-server-protocol/schema/json/ClientRequest.json",
       "kind": "file",
-      "sha256": "e3b3b76b2c901c42cd0ca8b8bc3b8593195e932b2df274a5dc305286e207917c",
+      "sha256": "f17eff2aa5c4d3eb08a2fc3bd13f0d4a09a3c80a9c7be1efb9cec8ffa0bf76f5",
       "executable": false
     },
     {
@@ -2031,13 +2031,13 @@
     {
       "path": "codex-rs/app-server-protocol/schema/json/codex_app_server_protocol.schemas.json",
       "kind": "file",
-      "sha256": "3ea756f2386a42ff08588ef125a1fca8f2b6025fd25020942ac27daf7928861b",
+      "sha256": "5dd21ce6fb18464089aef9b0bb6e5c1a00e0bbe59c67fa1de2ff7f52b1dcd4f7",
       "executable": false
     },
     {
       "path": "codex-rs/app-server-protocol/schema/json/codex_app_server_protocol.v2.schemas.json",
       "kind": "file",
-      "sha256": "13a00363911aafdba04f20576f736f12662233dc39bfeb1a513c6395bbc021ee",
+      "sha256": "75e857c0ddca8dc5b0da0c2463cb59d5cdc209d8f89cb51d30f15f59c291728d",
       "executable": false
     },
     {
@@ -3271,6 +3271,30 @@
       "executable": false
     },
     {
+      "path": "codex-rs/app-server-protocol/schema/json/v2/ThreadGoalRecoverParams.json",
+      "kind": "file",
+      "executable": false,
+      "sha256": "eb1632cb6e16654bb7ab1a0948fa08b466bf9bfbffc8a8c9c457b8d3d155a052"
+    },
+    {
+      "path": "codex-rs/app-server-protocol/schema/json/v2/ThreadGoalRecoverResponse.json",
+      "kind": "file",
+      "executable": false,
+      "sha256": "fe3dae781d334e89e57b1cbb7e680b965b919ab182a0899474daf107d484e78b"
+    },
+    {
+      "path": "codex-rs/app-server-protocol/schema/json/v2/ThreadGoalRecoveryReadParams.json",
+      "kind": "file",
+      "executable": false,
+      "sha256": "8c2c87b74dc21eb147a64426c737d10946069f1905351435fc872f60a88d5c41"
+    },
+    {
+      "path": "codex-rs/app-server-protocol/schema/json/v2/ThreadGoalRecoveryReadResponse.json",
+      "kind": "file",
+      "executable": false,
+      "sha256": "424f96e63503ef3a171ad5096f6720a7eaab5f00a6225767470b6b05daf3c371"
+    },
+    {
       "path": "codex-rs/app-server-protocol/schema/json/v2/ThreadGoalSetParams.json",
       "kind": "file",
       "sha256": "36c1f1935e1a352865512433aae44c9fffde4a7fa3db127449da088a8a212287",
@@ -3753,13 +3777,13 @@
     {
       "path": "codex-rs/app-server-protocol/schema/precomputed/app-server-exports-experimental.json.zst",
       "kind": "file",
-      "sha256": "64c2a9ce62f06f25f5234d1d16aebbb6d120fab26f624fd68340826adb9e3521",
+      "sha256": "1985128fdd617c576bfed721b5b577aa8304ba53d152cdf6483fafdb1cd85b3f",
       "executable": false
     },
     {
       "path": "codex-rs/app-server-protocol/schema/precomputed/app-server-exports-stable.json.zst",
       "kind": "file",
-      "sha256": "475a678062c00aa81cfcac94c7aa5c6a39b48589a86c5e1a758b7f87eea94092",
+      "sha256": "7cd4fef23555db723a62115c36febeb0e8355fd5a4d64cb92b2420ebf767a530",
       "executable": false
     },
     {
@@ -3819,7 +3843,7 @@
     {
       "path": "codex-rs/app-server-protocol/schema/typescript/ClientRequest.ts",
       "kind": "file",
-      "sha256": "ed8091232523bb3430c348fac8aa252c8943641107cb04894002ad45e5fb5611",
+      "sha256": "f0b44c980ee3c140fb73399002f249d92d42390aeaf1abf933e0d483061f6702",
       "executable": false
     },
     {
@@ -3983,6 +4007,30 @@
       "kind": "file",
       "sha256": "826b48e6b10984ac6b27ef6ca0becc1aa9d4709e0b693de93ecff750a57a54c8",
       "executable": false
+    },
+    {
+      "path": "codex-rs/app-server-protocol/schema/typescript/GoalRecoveryPhase.ts",
+      "kind": "file",
+      "executable": false,
+      "sha256": "fd5287e0868a25b412a64b39057b231b6d727dcc47f44502a83b0d67703203e7"
+    },
+    {
+      "path": "codex-rs/app-server-protocol/schema/typescript/GoalRecoveryReceipt.ts",
+      "kind": "file",
+      "executable": false,
+      "sha256": "0976fa1bd30516c72f50a36e5efaeb1bfe92b1ccf4ef9de88c43acb576277f48"
+    },
+    {
+      "path": "codex-rs/app-server-protocol/schema/typescript/GoalRecoveryRequest.ts",
+      "kind": "file",
+      "executable": false,
+      "sha256": "eb8e307f37da3a596b554006dbf5b3b4ede45b672bdbb338d7bfe55d2f446e68"
+    },
+    {
+      "path": "codex-rs/app-server-protocol/schema/typescript/GoalRecoverySnapshot.ts",
+      "kind": "file",
+      "executable": false,
+      "sha256": "b288440189647d2f6aaf59667817b8930d4e3b8fd7d552975f9737188c3ee843"
     },
     {
       "path": "codex-rs/app-server-protocol/schema/typescript/ImageDetail.ts",
@@ -4329,7 +4377,7 @@
     {
       "path": "codex-rs/app-server-protocol/schema/typescript/index.ts",
       "kind": "file",
-      "sha256": "2751d0880d15af751d07edc20c748192c849b1bb122e79136bcb9339dee07d17",
+      "sha256": "6ae4578de27195c61aea6f208d731690ec3b145be767c73441d8a90c80b51449",
       "executable": false
     },
     {
@@ -7441,6 +7489,24 @@
       "executable": false
     },
     {
+      "path": "codex-rs/app-server-protocol/schema/typescript/v2/ThreadGoalRecoverResponse.ts",
+      "kind": "file",
+      "executable": false,
+      "sha256": "7acda90d87155df8ba6288272261164691eca9676b6d6ff8f9c16abe677634eb"
+    },
+    {
+      "path": "codex-rs/app-server-protocol/schema/typescript/v2/ThreadGoalRecoveryReadParams.ts",
+      "kind": "file",
+      "executable": false,
+      "sha256": "fa37946644b2596703dd3717c150953f2b21180e8daaccd08bed85cb5603b8d3"
+    },
+    {
+      "path": "codex-rs/app-server-protocol/schema/typescript/v2/ThreadGoalRecoveryReadResponse.ts",
+      "kind": "file",
+      "executable": false,
+      "sha256": "c8ea050ec9962884a37b5804915c6478612af48695ac12a6c4a19b04d6454452"
+    },
+    {
       "path": "codex-rs/app-server-protocol/schema/typescript/v2/ThreadGoalSetParams.ts",
       "kind": "file",
       "sha256": "0f6628f08fbe8b2adc0b4cab51d3e4728b41cccfeb2a4b005214efa71c6bc08e",
@@ -8277,7 +8343,7 @@
     {
       "path": "codex-rs/app-server-protocol/schema/typescript/v2/index.ts",
       "kind": "file",
-      "sha256": "69424f840d8c05cb89f7f29c3dbc0cf090f302cb5de4b316e2e6ead98ca1d7bc",
+      "sha256": "b568ab6266ab600923fa7c121d15ed83e85689ee561c5354abe957c150fee3f0",
       "executable": false
     },
     {
@@ -8331,7 +8397,7 @@
     {
       "path": "codex-rs/app-server-protocol/src/protocol/common.rs",
       "kind": "file",
-      "sha256": "adc77ebd7e49a3ca0ad81743e14403a700949b4c7cfd497b0c77b5dba7c731c8",
+      "sha256": "e5de4d23e72b3242e919724e85e2c4363c549ea6a844cdafed287bdfecab03c5",
       "executable": false
     },
     {
@@ -8625,7 +8691,7 @@
     {
       "path": "codex-rs/app-server-protocol/src/protocol/v2/thread.rs",
       "kind": "file",
-      "sha256": "895e4168eaed77171c1d02957d8dd6371e782bc81fd4ea29ef5b2099bc2ef6ed",
+      "sha256": "e804239d3484833ccd27f52ee7378ad5436270e448c14af6acdf8ad4f5d1a1bd",
       "executable": false
     },
     {
@@ -9351,7 +9417,7 @@
     {
       "path": "codex-rs/app-server/src/message_processor.rs",
       "kind": "file",
-      "sha256": "b7084f8132482c8a051f94036a1e4944a15e9186fb4cbfec28491b420d8a3e79",
+      "sha256": "da808291fa836ae91b01105f62773f07fa639f121d6bb616d192f4f7e5bbf426",
       "executable": false
     },
     {
@@ -9759,7 +9825,7 @@
     {
       "path": "codex-rs/app-server/src/request_processors/thread_goal_processor.rs",
       "kind": "file",
-      "sha256": "835fac66bc2ae9eb0e29b7a5a3da09cfea11cf2ca3dbd0384a296ce54db9b3e6",
+      "sha256": "87f560b239979b824f6e7960e0004b153b1e120345adb93c37f174323d4c84c2",
       "executable": false
     },
     {
@@ -11007,7 +11073,7 @@
     {
       "path": "codex-rs/app-server/tests/suite/v2/thread_goal_empty_responses.rs",
       "kind": "file",
-      "sha256": "79b80bdc39a4c8bb021bd0120aaf181ba3f37716dbb5af9b3a2d614dbf1f27ad",
+      "sha256": "1ab5a6ad1edfd58259238981d86f26bd299c636f9ac559c96b16b1ae7d751c70",
       "executable": false
     },
     {
@@ -19053,13 +19119,13 @@
     {
       "path": "codex-rs/core/src/session/turn_input.rs",
       "kind": "file",
-      "sha256": "eeeff7f21e0ba0b714e3b50c27cf351f2431aab754f078a362f259a227914cfc",
+      "sha256": "274e28bf2ce47b9a842701ffc2905967e0c682c36e826c8421bc614d5a9027d7",
       "executable": false
     },
     {
       "path": "codex-rs/core/src/session/turn_input_tests.rs",
       "kind": "file",
-      "sha256": "1e96d4ec3b0738b878116fd3003d23eb70b46f6a5bc051cd1738bb78838a913f",
+      "sha256": "dc1619edb8eae261a15a16aa40e149a7e5d930f33f38f861ba68b581dbed0171",
       "executable": false
     },
     {
@@ -24861,7 +24927,7 @@
     {
       "path": "codex-rs/ext/goal/Cargo.toml",
       "kind": "file",
-      "sha256": "7989521fdd9eff2a8d51180d1ee1a6223418557e84ce51abbf78505b26eda489",
+      "sha256": "aa2419323ff9d7fabf7effdf2c07fdf4564c830f57aa05c69c2152437a5e5662",
       "executable": false
     },
     {
@@ -24879,7 +24945,7 @@
     {
       "path": "codex-rs/ext/goal/src/api.rs",
       "kind": "file",
-      "sha256": "a08bb505652ff41540fcea628ab6bdda2fb8011c21450d10f0f240ae6ddfc157",
+      "sha256": "e5c5b83ba271620e5e505690bb161166e2fd9c463ab885add3c21d8278dad88e",
       "executable": false
     },
     {
@@ -24915,7 +24981,7 @@
     {
       "path": "codex-rs/ext/goal/src/runtime.rs",
       "kind": "file",
-      "sha256": "47f687fc6fb1931b98a52984d2f4b50bdb2a1538bde1e94bf4523cc22592946d",
+      "sha256": "4495f66d68ed3794222d16787a347c12842c9221d08b5a3ba513692ba7ffbd0b",
       "executable": false
     },
     {
@@ -24963,7 +25029,7 @@
     {
       "path": "codex-rs/ext/goal/tests/goal_extension_backend.rs",
       "kind": "file",
-      "sha256": "638c29ffb360a09d2270cb16bc2b3bf7f781582b35e51da61febf857d85841d5",
+      "sha256": "123fe84cc069ce29f0bfa2a4b1587e2f950012621b2adfb1953d81a763756fee",
       "executable": false
     },
     {
@@ -31579,6 +31645,12 @@
       "executable": false
     },
     {
+      "path": "codex-rs/protocol/src/goal_recovery.rs",
+      "kind": "file",
+      "executable": false,
+      "sha256": "72037f8f90cf93e6141245f82f8ac367c513b95b0fa58bc0ad0dfd129f1048fb"
+    },
+    {
       "path": "codex-rs/protocol/src/guardian_transcript.rs",
       "kind": "file",
       "sha256": "2fa9592904d0cb4623c57588f3e13ae741f072086d579e96f63a71332d8d834a",
@@ -31599,7 +31671,7 @@
     {
       "path": "codex-rs/protocol/src/lib.rs",
       "kind": "file",
-      "sha256": "ec278ded73304413a60df620e4f924d9dc12e1bb622275224f11dbf9c6e57a18",
+      "sha256": "7e73e0b0b568c79e62b87eebe5ce9cc1142e09aab4c48668eafb9e4c9fc3e217",
       "executable": false
     },
     {
@@ -31953,7 +32025,7 @@
     {
       "path": "codex-rs/protocol/src/turn_input.rs",
       "kind": "file",
-      "sha256": "93b69518afdfe5cae66eae6c6a36410f72a445c5734b0aba20a53a4f265712aa",
+      "sha256": "f3aa56e0f5532f8eeba527151ecb2ecc59a11dc356edda3fbb6ac6a0e5ca4a13",
       "executable": false
     },
     {
@@ -34297,6 +34369,12 @@
       "executable": false
     },
     {
+      "path": "codex-rs/state/goals_migrations/0003_goal_recovery_receipts.sql",
+      "kind": "file",
+      "executable": false,
+      "sha256": "2356423e070050aafab309b7262c65d03b0c2290a2f3f9dbdf9de334ca7c59fb"
+    },
+    {
       "path": "codex-rs/state/logs_migrations/0001_logs.sql",
       "kind": "file",
       "sha256": "3ac717a6db0fc2d138f485ea4e5798f1367d5c2811db87a80ddd8b7bf8526ca0",
@@ -34861,9 +34939,15 @@
       "executable": false
     },
     {
+      "path": "codex-rs/state/src/runtime/goal_recovery.rs",
+      "kind": "file",
+      "executable": false,
+      "sha256": "f60fd91120ce9603751a2e50b87642d8e40cf5e447b3e02c99ce02b4b109137c"
+    },
+    {
       "path": "codex-rs/state/src/runtime/goals.rs",
       "kind": "file",
-      "sha256": "03ecc9fb926ba081e520c7781b02676a0b82ec1fe5356f99261863fee1817b61",
+      "sha256": "f50c9e560189d47c159b628f91d1efd3387baf5a933c23c489ec1f9fe2117152",
       "executable": false
     },
     {
@@ -56766,5 +56850,5 @@
       "executable": false
     }
   ],
-  "sha256": "9f8f1a1ca3c884d76d1d0e3bd29811d667147a3bc3998e73c9b3e513c66f48a2"
+  "sha256": "9fc26034e72e4b99aa6576a706491d298e0c7eda8750368f0de391c75587084b"
 }

@@ -58,3 +58,5 @@ pub mod turn_input;
 pub mod user_input;
 
 pub mod compact_recovery;
+
+pub mod goal_recovery;

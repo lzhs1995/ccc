@@ -57,6 +57,7 @@ struct GoalRuntimeInner {
     tools_available_for_thread: bool,
     tools_visible_for_thread: bool,
     goal_state_lock: Arc<Semaphore>,
+    recovery_runtime_id: String,
     #[cfg(test)]
     recovery_post_commit: std::sync::Mutex<Option<Arc<RecoveryPostCommitPause>>>,
 }
@@ -113,6 +114,7 @@ impl GoalRuntimeHandle {
                 tools_available_for_thread: config.tools_available_for_thread,
                 tools_visible_for_thread: config.tools_visible_for_thread,
                 goal_state_lock: Arc::new(Semaphore::new(/*permits*/ 1)),
+                recovery_runtime_id: ThreadId::new().to_string(),
                 #[cfg(test)]
                 recovery_post_commit: std::sync::Mutex::new(None),
             }),
@@ -487,6 +489,117 @@ impl GoalRuntimeHandle {
         Ok(())
     }
 
+    pub fn goal_recovery_runtime_id(&self) -> &str {
+        &self.inner.recovery_runtime_id
+    }
+
+    /// The owned worker retains the original Goal permit even if the RPC caller
+    /// disconnects. Dropping a response never cancels/retries the admitted input.
+    pub async fn recover_goal_with_receipt(
+        &self,
+        request: codex_protocol::goal_recovery::GoalRecoveryRequest,
+    ) -> Result<codex_protocol::goal_recovery::GoalRecoveryReceipt, String> {
+        let runtime = self.clone();
+        tokio::spawn(async move { runtime.recover_goal_once(request).await })
+            .await
+            .map_err(|error| format!("Goal receipt worker UNKNOWN: {error}"))?
+    }
+
+    async fn recover_goal_once(
+        &self,
+        request: codex_protocol::goal_recovery::GoalRecoveryRequest,
+    ) -> Result<codex_protocol::goal_recovery::GoalRecoveryReceipt, String> {
+        let _permit = self.goal_state_permit().await?;
+        let store = self.inner.state_dbs.thread_goals();
+        if let Some(receipt) = store
+            .read_goal_recovery(&request.thread_id, &request.attempt_id)
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            if receipt.request != request {
+                return Err("attempt token changed".to_string());
+            }
+            return Ok(receipt);
+        }
+        if request.thread_id != self.thread_id().to_string()
+            || request.expected_runtime_id != self.inner.recovery_runtime_id
+            || !self.tools_available()
+        {
+            return Err("Goal recovery runtime identity/capability changed".to_string());
+        }
+        let manager = self
+            .inner
+            .thread_manager
+            .upgrade()
+            .ok_or("thread manager unavailable")?;
+        let thread = manager
+            .get_thread(self.inner.thread_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let (receipt, created) = store
+            .begin_goal_recovery(&request)
+            .await
+            .map_err(|error| error.to_string())?;
+        if !created {
+            return Ok(receipt);
+        }
+        let goal = store
+            .get_thread_goal(self.thread_id())
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or("Goal disappeared after durable intent; UNKNOWN")?;
+        let start_options = thread
+            .thread_extension_data()
+            .get::<TurnStartOptions>()
+            .map(|options| options.as_ref().clone())
+            .unwrap_or_default();
+        let item = continuation_steering_item(
+            &protocol_goal_from_state(goal),
+            thread.config().await.update_plan_enabled,
+        );
+        let mut input =
+            TurnInputRequest::new(TurnInput::ResponseItem(item)).on_start(TurnStartOptions {
+                turn_trigger: Some("goal".to_string()),
+                ..start_options
+            });
+        input.goal_recovery = Some(request.clone());
+        // The native Goal stop path takes the same permit, so even a fast task
+        // cannot finish accounting before this single admission is identified.
+        match thread.start_turn_if_idle(input).await {
+            Ok(StartIfIdleSubmission::Started { turn_id, .. }) => {
+                self.inner.accounting_state.reset_empty_responses();
+                self.inner
+                    .accounting_state
+                    .mark_goal_continuation(turn_id.clone());
+                // Preserve normal Goal UI/rollout projection. This event is not
+                // the durable receipt; the native store remains authoritative.
+                if let Ok(Some(goal)) = store.get_thread_goal(self.thread_id()).await {
+                    self.inner.event_emitter.thread_goal_updated(
+                        format!("goal-recovery:{}", request.attempt_id),
+                        Some(turn_id),
+                        protocol_goal_from_state(goal),
+                    );
+                }
+            }
+            Ok(StartIfIdleSubmission::NotSubmitted { reason }) => {
+                store
+                    .reject_goal_recovery(&request, &format!("{reason:?}"))
+                    .await
+                    .map_err(|error| format!("Goal rejection persistence UNKNOWN: {error}"))?;
+            }
+            Err(error) => {
+                // Persistence/admission may have committed. Never convert this
+                // into Rejected, and never submit another turn under this token.
+                tracing::warn!(%error, "Goal receipt admission outcome UNKNOWN; read original token");
+            }
+        }
+        store
+            .read_goal_recovery(&request.thread_id, &request.attempt_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or("durable Goal intent disappeared".to_string())
+    }
+
     pub(crate) async fn continue_if_idle(&self) -> Result<(), String> {
         if !self.tools_available() {
             self.inner.accounting_state.clear_active_goal();
@@ -496,6 +609,18 @@ impl GoalRuntimeHandle {
         // change the goal after we read it but before the continuation launches.
         let _goal_state_permit = self.goal_state_permit().await?;
 
+        // A release with a missing durable acknowledgement cannot silently
+        // become another automatic Goal turn. Ordinary explicit input remains usable.
+        if self
+            .inner
+            .state_dbs
+            .thread_goals()
+            .has_goal_recovery_fence(&self.thread_id().to_string())
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            return Ok(());
+        }
         if self
             .inner
             .state_dbs

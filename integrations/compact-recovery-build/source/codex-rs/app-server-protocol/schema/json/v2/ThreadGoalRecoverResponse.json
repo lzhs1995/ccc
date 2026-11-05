@@ -1,0 +1,115 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "GoalRecoveryPhase": {
+      "oneOf": [
+        {
+          "description": "No task release is implied. After cancellation this remains UNKNOWN.",
+          "enum": [
+            "intent"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The mapping and Goal activation committed before task release. A crash can occur before or after release: this alone is not Started.",
+          "enum": [
+            "admitted"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Core observed release, and this post-release observation committed.",
+          "enum": [
+            "started"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Core definitively declined before committing admission.",
+          "enum": [
+            "rejected"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "GoalRecoveryReceipt": {
+      "properties": {
+        "admittedGoalRevision": {
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "phase": {
+          "$ref": "#/definitions/GoalRecoveryPhase"
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "request": {
+          "$ref": "#/definitions/GoalRecoveryRequest"
+        },
+        "turnId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "phase",
+        "request"
+      ],
+      "type": "object"
+    },
+    "GoalRecoveryRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "attemptId": {
+          "type": "string"
+        },
+        "expectedGoalId": {
+          "type": "string"
+        },
+        "expectedGoalRevision": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "expectedPreviousTurnId": {
+          "type": "string"
+        },
+        "expectedRuntimeId": {
+          "description": "Native runtime identity returned by the read endpoint; never caller-invented.",
+          "type": "string"
+        },
+        "threadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "attemptId",
+        "expectedGoalId",
+        "expectedGoalRevision",
+        "expectedPreviousTurnId",
+        "expectedRuntimeId",
+        "threadId"
+      ],
+      "type": "object"
+    }
+  },
+  "properties": {
+    "receipt": {
+      "$ref": "#/definitions/GoalRecoveryReceipt"
+    }
+  },
+  "required": [
+    "receipt"
+  ],
+  "title": "ThreadGoalRecoverResponse",
+  "type": "object"
+}

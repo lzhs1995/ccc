@@ -27,7 +27,7 @@ BASE_MANIFEST = "7d8017754da19290801c5f956a7700158987e2e9865db5eff1d802386ba0225
 BASE_APPLY = "7fc0b229ae1d7c318fae5513ca5459817f88bd415abf0623fdaf88862fde98d5"
 BASE_PATCH = "9970ff7db887e69700aaa4c6bffd414a74c443a80dde31d373269a6bb18d42a8"
 PACKAGES = ("codex-core", "codex-api", "codex-protocol", "codex-app-server-protocol",
-            "codex-app-server", "codex-tui", "codex-goal-extension")
+            "codex-app-server", "codex-tui", "codex-goal-extension", "codex-state")
 NATIVE_PACKAGE = "ccc-native-client-foreground"
 ROLES = {"core": "codex-core", "api": "codex-app-server", "tui": "codex-tui",
          "protocol": "codex-app-server-protocol", "goal": "codex-goal-extension",
@@ -67,6 +67,35 @@ def checked_path(root, name):
 def require_sha(value):
     if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
         raise ValueError("unfrozen SHA256")
+
+
+# Explicit new profile. An old 102/460 freeze is never silently widened.
+GOAL_MERGE_PROFILE = {
+    "name": "compact-recovery-plus-goal-receipt-v1", "required": 115,
+    "workspace": 81, "standalone_native": 34, "experimental_schema_files": 464,
+}
+GOAL_MERGE_CASES_SHA256 = "db41f83e0c9d5b6398fea2305be821975e934bd39d1b0ebffba6c806cf25fe46"
+GOAL_MERGE_SCHEMA_SHA256 = "c871eb9663a19b533908d0d48e9b2520a040f2728e6108c53ddb4f96355d56cf"
+
+
+def require_goal_merge_contract(value):
+    if value.get("acceptance_contract") != GOAL_MERGE_PROFILE:
+        raise ValueError("exact Goal merge acceptance profile required")
+    cases = value.get("required_cases", [])
+    native = [row for row in cases if row.get("package") == NATIVE_PACKAGE]
+    workspace = [row for row in cases if row.get("package") != NATIVE_PACKAGE]
+    if len(cases) != 115 or len(workspace) != 81 or len(native) != 34:
+        raise ValueError("Goal merge case split differs")
+    if hashlib.sha256(canonical(cases)).hexdigest() != GOAL_MERGE_CASES_SHA256:
+        raise ValueError("exact original102 plus Goal13 cases differ")
+    if len(value.get("generated_schema_files", {})) != 464:
+        raise ValueError("Goal merge experimental schema count differs")
+    if hashlib.sha256(canonical(value["generated_schema_files"])).hexdigest() != GOAL_MERGE_SCHEMA_SHA256:
+        raise ValueError("exact reviewed Goal schema map differs")
+    if value.get("schema_export_argv") != ["app-server", "generate-json-schema", "--experimental"]:
+        raise ValueError("Goal merge requires original experimental464 export")
+    if "codex-state" not in PACKAGES:
+        raise ValueError("real state package not selected")
 
 
 def load_freeze(path, expected):
@@ -315,6 +344,7 @@ def main():
     parser.add_argument("--validate-only", action="store_true")
     args = parser.parse_args()
     manifest = load_freeze(args.freeze, args.freeze_sha256)
+    require_goal_merge_contract(manifest)
     if args.validate_only:
         print(json.dumps({"manifest_valid": True, "compiled": False, "production_installed": False}))
         return

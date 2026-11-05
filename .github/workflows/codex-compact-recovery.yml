@@ -2,7 +2,7 @@ name: Isolated Codex compact recovery candidate
 
 on:
   push:
-    branches: [ccc/compact-recovery-20261105-r4]
+    branches: [ccc/compact-goal-recovery-20261105-r9]
     paths:
       - .github/workflows/codex-compact-recovery.yml
       - integrations/compact-recovery-build/**
@@ -35,7 +35,7 @@ jobs:
       RUST_MIN_STACK: "8388608"
       INSTA_UPDATE: "no"
       STABLE_GIT_COMMIT: 6aaac694803004a63c6f393d153c96d22521a6b9
-      FREEZE_SHA256: ${{ inputs.freeze_sha256 || '5de4d3a33d6bd11874ce7b03b3a6931321f38182b881f240b542b4090cd46313' }}
+      FREEZE_SHA256: ${{ inputs.freeze_sha256 || 'ac04b248df2eee7ae8f73a6f873b7053610fa2bc639c0779729cac344f2db194' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
@@ -65,6 +65,7 @@ jobs:
         run: |
           python3 -BE ccc/integrations/compact-recovery-build/test_preparation.py
           python3 -BE ccc/integrations/compact-recovery-build/test_v8_preparation.py
+          python3 -BE ccc/integrations/compact-recovery-build/test_merge_contract.py
       - name: Verify source, run fresh tests, build and export actual schema
         run: >-
           python3 ccc/integrations/compact-recovery-build/ci.py

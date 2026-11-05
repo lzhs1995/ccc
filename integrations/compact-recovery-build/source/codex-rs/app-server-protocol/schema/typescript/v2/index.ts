@@ -517,6 +517,9 @@ export type { ThreadGoalClearedNotification } from "./ThreadGoalClearedNotificat
 export type { ThreadGoalGetParams } from "./ThreadGoalGetParams";
 export type { ThreadGoalGetResponse } from "./ThreadGoalGetResponse";
 export type { ThreadGoalMutationOrigin } from "./ThreadGoalMutationOrigin";
+export type { ThreadGoalRecoverResponse } from "./ThreadGoalRecoverResponse";
+export type { ThreadGoalRecoveryReadParams } from "./ThreadGoalRecoveryReadParams";
+export type { ThreadGoalRecoveryReadResponse } from "./ThreadGoalRecoveryReadResponse";
 export type { ThreadGoalSetParams } from "./ThreadGoalSetParams";
 export type { ThreadGoalSetResponse } from "./ThreadGoalSetResponse";
 export type { ThreadGoalStatus } from "./ThreadGoalStatus";
