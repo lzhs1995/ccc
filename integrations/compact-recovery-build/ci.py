@@ -165,14 +165,17 @@ def run_native_tests(root, output, manifest):
     require_native_dependency_subset((native / "Cargo.lock").read_bytes(),
                                      (root / "codex-rs/Cargo.lock").read_bytes())
     config = output / "native-nextest.toml"
-    config.write_text('[profile.default]\nretries = 0\n[profile.default.junit]\npath = "junit.xml"\n')
+    # nextest 0.9.103 stores reports relative to its workspace, independently
+    # of Cargo --target-dir. Bind the report to this absolute evidence path.
+    junit = output / "native-junit-current.xml"
+    config.write_text('[profile.default]\nretries = 0\n[profile.default.junit]\npath = '
+                      + json.dumps(str(junit)) + "\n")
     target = output / "native-target"
     # This is a path dependency outside codex-rs workspace membership. Select
     # its actual manifest and preserve a separate JUnit result.
     prefix = ["cargo", "nextest", "run", "--manifest-path", str(native / "Cargo.toml"),
               "--target-dir", str(target), "--locked", "--no-fail-fast", "--retries", "0", "--config-file", str(config)]
     run([*prefix, "--lib"], native, output / "native-libraries.log")
-    junit = target / "nextest/default/junit.xml"
     shutil.copyfile(junit, output / "native-libraries.xml")
     all_tests = check_junit(output / "native-libraries.xml")
     cases = [r for r in manifest["required_cases"] if r["package"] == NATIVE_PACKAGE]
