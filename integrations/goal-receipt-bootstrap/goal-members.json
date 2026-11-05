@@ -1,0 +1,114 @@
+{
+  "members": [
+    {
+      "path": "codex-rs/Cargo.lock",
+      "before_sha256": "57082b573e682fae144ea44fa15297e3fcf0cfecbb0f32fe491a28839b8caea0",
+      "after_sha256": "750606cb2edea76b132b4d3f61685a44a9825875deb12c093b0b24cc19d88a13",
+      "bytes": 407766
+    },
+    {
+      "path": "codex-rs/app-server/src/message_processor.rs",
+      "before_sha256": "b7084f8132482c8a051f94036a1e4944a15e9186fb4cbfec28491b420d8a3e79",
+      "after_sha256": "82f762500b3867d7deb2739a8462c36807a359a9b36b77844a5d7fe7184f704e",
+      "bytes": 83980
+    },
+    {
+      "path": "codex-rs/app-server/src/request_processors/thread_goal_processor.rs",
+      "before_sha256": "835fac66bc2ae9eb0e29b7a5a3da09cfea11cf2ca3dbd0384a296ce54db9b3e6",
+      "after_sha256": "87d01f7e71b3b45541c3ae7a5060b9ab3aca85994933ac751c36367d8330e3af",
+      "bytes": 23985
+    },
+    {
+      "path": "codex-rs/app-server/tests/suite/v2/thread_goal_empty_responses.rs",
+      "before_sha256": "79b80bdc39a4c8bb021bd0120aaf181ba3f37716dbb5af9b3a2d614dbf1f27ad",
+      "after_sha256": "faffa30dd75d11d8c702ae60ba94a5ff0f2ae84c4556e1d8f60b9998610b90bc",
+      "bytes": 10894
+    },
+    {
+      "path": "codex-rs/app-server-protocol/src/protocol/common.rs",
+      "before_sha256": "adc77ebd7e49a3ca0ad81743e14403a700949b4c7cfd497b0c77b5dba7c731c8",
+      "after_sha256": "e5de4d23e72b3242e919724e85e2c4363c549ea6a844cdafed287bdfecab03c5",
+      "bytes": 175507
+    },
+    {
+      "path": "codex-rs/app-server-protocol/src/protocol/v2/thread.rs",
+      "before_sha256": "895e4168eaed77171c1d02957d8dd6371e782bc81fd4ea29ef5b2099bc2ef6ed",
+      "after_sha256": "e804239d3484833ccd27f52ee7378ad5436270e448c14af6acdf8ad4f5d1a1bd",
+      "bytes": 87877
+    },
+    {
+      "path": "codex-rs/core/src/session/turn_input.rs",
+      "before_sha256": "eeeff7f21e0ba0b714e3b50c27cf351f2431aab754f078a362f259a227914cfc",
+      "after_sha256": "f590359f555f82cc2bfe5fa5e0fa108e9fdda07a119eb7060244500da7b3a813",
+      "bytes": 39420
+    },
+    {
+      "path": "codex-rs/core/src/session/turn_input_tests.rs",
+      "before_sha256": "1e96d4ec3b0738b878116fd3003d23eb70b46f6a5bc051cd1738bb78838a913f",
+      "after_sha256": "de50f20416956afd1ff68dde2bf1482c490caf58b54511d52732bcd0a3dc8d70",
+      "bytes": 41763
+    },
+    {
+      "path": "codex-rs/ext/goal/Cargo.toml",
+      "before_sha256": "7989521fdd9eff2a8d51180d1ee1a6223418557e84ce51abbf78505b26eda489",
+      "after_sha256": "aa2419323ff9d7fabf7effdf2c07fdf4564c830f57aa05c69c2152437a5e5662",
+      "bytes": 1086
+    },
+    {
+      "path": "codex-rs/ext/goal/src/api.rs",
+      "before_sha256": "a08bb505652ff41540fcea628ab6bdda2fb8011c21450d10f0f240ae6ddfc157",
+      "after_sha256": "9afd6820a2651eb409f9ca9404ceac1289cc38d61052f91c6a10ff27520d938c",
+      "bytes": 15811
+    },
+    {
+      "path": "codex-rs/ext/goal/src/runtime.rs",
+      "before_sha256": "47f687fc6fb1931b98a52984d2f4b50bdb2a1538bde1e94bf4523cc22592946d",
+      "after_sha256": "7dae473fa13310be38542305c20d06a6e9976daca54fe3333dfab8cb784167c6",
+      "bytes": 37533
+    },
+    {
+      "path": "codex-rs/ext/goal/tests/goal_extension_backend.rs",
+      "before_sha256": "638c29ffb360a09d2270cb16bc2b3bf7f781582b35e51da61febf857d85841d5",
+      "after_sha256": "6f7c62db3736d02ceabebcb88cef0c4cb3f9271fc8a1f0093167c3ab8c81cc54",
+      "bytes": 79884
+    },
+    {
+      "path": "codex-rs/protocol/src/goal_recovery.rs",
+      "before_sha256": null,
+      "after_sha256": "a677d794ed49e926176ad1b2e4c86bc4ffa5a2e83b468817ceaa683e93ccd827",
+      "bytes": 1741
+    },
+    {
+      "path": "codex-rs/protocol/src/lib.rs",
+      "before_sha256": "ec278ded73304413a60df620e4f924d9dc12e1bb622275224f11dbf9c6e57a18",
+      "after_sha256": "7e73e0b0b568c79e62b87eebe5ce9cc1142e09aab4c48668eafb9e4c9fc3e217",
+      "bytes": 1562
+    },
+    {
+      "path": "codex-rs/protocol/src/turn_input.rs",
+      "before_sha256": "93b69518afdfe5cae66eae6c6a36410f72a445c5734b0aba20a53a4f265712aa",
+      "after_sha256": "f3aa56e0f5532f8eeba527151ecb2ecc59a11dc356edda3fbb6ac6a0e5ca4a13",
+      "bytes": 12261
+    },
+    {
+      "path": "codex-rs/state/goals_migrations/0003_goal_recovery_receipts.sql",
+      "before_sha256": null,
+      "after_sha256": "2356423e070050aafab309b7262c65d03b0c2290a2f3f9dbdf9de334ca7c59fb",
+      "bytes": 1597
+    },
+    {
+      "path": "codex-rs/state/src/runtime/goal_recovery.rs",
+      "before_sha256": null,
+      "after_sha256": "b57647b8841b24d49c0e3cd1fcd4c29de2bb5430a908ee8c8da913897a4f19c6",
+      "bytes": 17322
+    },
+    {
+      "path": "codex-rs/state/src/runtime/goals.rs",
+      "before_sha256": "03ecc9fb926ba081e520c7781b02676a0b82ec1fe5356f99261863fee1817b61",
+      "after_sha256": "f50c9e560189d47c159b628f91d1efd3387baf5a933c23c489ec1f9fe2117152",
+      "bytes": 55825
+    }
+  ],
+  "patch_sha256": "e3fd5dfea88a88728ad0663b2f81ad42ea334c2946246b28228bd038d28b8728",
+  "status": "SOURCE_ONLY_UNCOMPILED"
+}

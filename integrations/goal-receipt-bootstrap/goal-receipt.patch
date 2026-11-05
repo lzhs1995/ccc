@@ -1,0 +1,957 @@
+--- a/codex-rs/Cargo.lock
++++ b/codex-rs/Cargo.lock
+@@ -3582,6 +3582,7 @@
+  "pretty_assertions",
+  "serde",
+  "serde_json",
++ "sqlx",
+  "tempfile",
+  "tokio",
+  "tracing",
+--- a/codex-rs/app-server/src/message_processor.rs
++++ b/codex-rs/app-server/src/message_processor.rs
+@@ -1383,6 +1383,12 @@
+                     .thread_set_name(request_id.clone(), params)
+                     .await
+             }
++            ClientRequest::ThreadGoalRecover { params, .. } => {
++                self.thread_goal_processor.thread_goal_recover(params).await
++            }
++            ClientRequest::ThreadGoalRecoveryRead { params, .. } => {
++                self.thread_goal_processor.thread_goal_recovery_read(params).await
++            }
+             ClientRequest::ThreadGoalSet { params, .. } => {
+                 self.thread_goal_processor
+                     .thread_goal_set(request_id.clone(), params)
+--- a/codex-rs/app-server/src/request_processors/thread_goal_processor.rs
++++ b/codex-rs/app-server/src/request_processors/thread_goal_processor.rs
+@@ -1,3 +1,4 @@
++use codex_app_server_protocol::{ThreadGoalRecoverParams, ThreadGoalRecoverResponse, ThreadGoalRecoveryReadParams, ThreadGoalRecoveryReadResponse};
+ use super::thread_input::DIRECT_INPUT_TO_MULTI_AGENT_V2_SUBAGENT_ERROR;
+ use super::thread_input::can_accept_direct_input;
+ use super::thread_input::ensure_direct_input_allowed;
+@@ -55,6 +56,52 @@
+             config_manager,
+             writer_locks,
+         }
++    }
++
++    pub(crate) async fn thread_goal_recover(
++        &self,
++        params: ThreadGoalRecoverParams,
++    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
++        if !self.config.features.enabled(Feature::Goals) {
++            return Err(invalid_request("goals feature is disabled"));
++        }
++        let thread_id = parse_thread_id_for_request(&params.thread_id)?;
++        let _guard = self.thread_state_manager.lock_goal_resume(thread_id).await;
++        // Recovery is for this already loaded native client; never load another
++        // writer or infer a root from a child/closed rollout.
++        let thread = self.thread_manager.get_thread(thread_id).await
++            .map_err(|error| invalid_request(format!("live Goal thread required: {error}")))?;
++        ensure_direct_input_allowed(thread.as_ref()).await?;
++        let state = self.state_db_for_materialized_thread(thread_id, GoalAccess::Mutate).await?;
++        self.config_manager.check_thread_model_provider(thread.config().await.as_ref())
++            .await.map_err(|error| config_load_error(&error))?;
++        // The snapshot/read call supplies the token's exact native generation.
++        // Do not reconcile a rollout here: that could mutate the expected Goal.
++        let _ = state;
++        let receipt = self.goal_service.recover_goal_with_receipt(params).await
++            .map_err(goal_service_error)?;
++        Ok(Some(ThreadGoalRecoverResponse { receipt }.into()))
++    }
++
++    pub(crate) async fn thread_goal_recovery_read(
++        &self,
++        params: ThreadGoalRecoveryReadParams,
++    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
++        let thread_id = parse_thread_id_for_request(&params.thread_id)?;
++        // Pure existing-store read. No resume, goal mutation, admission or replay.
++        let state = self.state_db_for_materialized_thread(thread_id, GoalAccess::Read).await?;
++        let snapshot = state.thread_goals().goal_recovery_snapshot(&params.thread_id).await
++            .map_err(|error| internal_error(error.to_string()))?;
++        let receipt = match params.attempt_id {
++            Some(token) => state.thread_goals().read_goal_recovery(&params.thread_id, &token).await
++                .map_err(|error| internal_error(error.to_string()))?,
++            None => None,
++        };
++        Ok(Some(ThreadGoalRecoveryReadResponse {
++            capability: "goal-recovery-receipt-v1".to_string(),
++            runtime_id: self.goal_service.goal_recovery_runtime_id(thread_id),
++            snapshot, receipt,
++        }.into()))
+     }
+ 
+     pub(crate) async fn thread_goal_set(
+--- a/codex-rs/app-server/tests/suite/v2/thread_goal_empty_responses.rs
++++ b/codex-rs/app-server/tests/suite/v2/thread_goal_empty_responses.rs
+@@ -176,3 +176,60 @@
+     server.verify().await;
+     Ok(())
+ }
++
++/// A real app-server/Core round trip: the conditional request's durable turn
++/// must match the actual first new turn notification. Generic Goal activity is insufficient.
++#[tokio::test]
++async fn conditional_goal_receipt_binds_real_admission_and_duplicate_is_read_only() -> Result<()> {
++    use codex_app_server_protocol::ThreadGoalRecoverResponse;
++    use codex_app_server_protocol::ThreadGoalRecoveryReadResponse;
++    use codex_protocol::goal_recovery::GoalRecoveryPhase;
++    let scripts = (1..=6).map(|turn| {
++        let id = format!("receipt-response-{turn}");
++        let mut empty = responses::ev_assistant_message(&format!("receipt-empty-{turn}"), "");
++        empty["item"]["phase"] = json!("final_answer");
++        responses::sse(vec![responses::ev_response_created(&id), empty, responses::ev_completed(&id)])
++    }).collect();
++    let server = create_mock_responses_server_sequence(scripts).await;
++    let codex_home = TempDir::new()?;
++    MockResponsesConfig::new(&server.uri()).with_model("gpt-5.4").enable_feature(Feature::Goals).write(codex_home.path())?;
++    let mut mcp = TestAppServer::builder().with_codex_home(codex_home.path())
++        .without_managed_config().build_initialized().await?;
++    let id = mcp.send_thread_start_request_with_auto_env(ThreadStartParams::default()).await?;
++    let ThreadStartResponse { thread, .. } = mcp.read_response(id).await?;
++    let id = mcp.send_raw_request("thread/goal/set", Some(json!({"threadId":thread.id,"objective":"Finish the receipt work"}))).await?;
++    let _: ThreadGoalSetResponse = mcp.read_response(id).await?;
++    let mut previous = String::new();
++    for _ in 0..3 {
++        let _: serde_json::Value = timeout(Duration::from_secs(30), mcp.read_notification("turn/started")).await??;
++        let completed: TurnCompletedNotification = timeout(Duration::from_secs(30), mcp.read_notification("turn/completed")).await??;
++        previous = completed.turn.id;
++    }
++    timeout(Duration::from_secs(30), async {
++        loop {
++            let notification: ThreadGoalUpdatedNotification = mcp.read_notification("thread/goal/updated").await?;
++            if notification.goal.status == ThreadGoalStatus::Blocked { return Ok::<_,anyhow::Error>(()); }
++        }
++    }).await??;
++    let id = mcp.send_raw_request("thread/goal/recovery/read", Some(json!({"threadId":thread.id,"attemptId":null}))).await?;
++    let snapshot: ThreadGoalRecoveryReadResponse = mcp.read_response(id).await?;
++    assert_eq!(snapshot.capability, "goal-recovery-receipt-v1");
++    let goal = snapshot.snapshot.expect("existing blocked Goal");
++    let params = json!({"threadId":thread.id,"attemptId":"one-original-native-attempt",
++        "expectedRuntimeId":snapshot.runtime_id.expect("live runtime"),"expectedPreviousTurnId":previous,
++        "expectedGoalId":goal.goal_id,"expectedGoalRevision":goal.revision});
++    let id = mcp.send_raw_request("thread/goal/recover", Some(params.clone())).await?;
++    let first: ThreadGoalRecoverResponse = mcp.read_response(id).await?;
++    assert_eq!(first.receipt.phase, GoalRecoveryPhase::Started);
++    let started: serde_json::Value = timeout(Duration::from_secs(30),mcp.read_notification("turn/started")).await??;
++    assert_eq!(started["turn"]["id"], json!(first.receipt.turn_id));
++    let id = mcp.send_raw_request("thread/goal/recover", Some(params)).await?;
++    let duplicate: ThreadGoalRecoverResponse = mcp.read_response(id).await?;
++    assert_eq!(duplicate.receipt,first.receipt);
++    let id = mcp.send_raw_request("thread/goal/recovery/read",Some(json!({"threadId":thread.id,"attemptId":"one-original-native-attempt"}))).await?;
++    let read: ThreadGoalRecoveryReadResponse = mcp.read_response(id).await?;
++    assert_eq!(read.receipt,Some(first.receipt));
++    for _ in 0..3 { let _: TurnCompletedNotification = timeout(Duration::from_secs(30),mcp.read_notification("turn/completed")).await??; }
++    server.verify().await;
++    Ok(())
++}
+--- a/codex-rs/app-server-protocol/src/protocol/common.rs
++++ b/codex-rs/app-server-protocol/src/protocol/common.rs
+@@ -624,6 +624,16 @@
+         params: v2::ThreadPredictionRequestParams,
+         serialization: thread_id(params.thread_id),
+         response: v2::ThreadPredictionRequestResponse,
++    },
++    ThreadGoalRecover => "thread/goal/recover" {
++        params: v2::ThreadGoalRecoverParams,
++        serialization: thread_id(params.thread_id),
++        response: v2::ThreadGoalRecoverResponse,
++    },
++    ThreadGoalRecoveryRead => "thread/goal/recovery/read" {
++        params: v2::ThreadGoalRecoveryReadParams,
++        serialization: thread_id(params.thread_id),
++        response: v2::ThreadGoalRecoveryReadResponse,
+     },
+     ThreadGoalSet => "thread/goal/set" {
+         params: v2::ThreadGoalSetParams,
+--- a/codex-rs/app-server-protocol/src/protocol/v2/thread.rs
++++ b/codex-rs/app-server-protocol/src/protocol/v2/thread.rs
+@@ -2267,3 +2267,28 @@
+     pub thread_id: String,
+     pub turn_id: String,
+ }
++
++/// Versioned conditional Goal admission. It never queues a user prompt.
++pub use codex_protocol::goal_recovery::GoalRecoveryRequest as ThreadGoalRecoverParams;
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct ThreadGoalRecoverResponse {
++    pub receipt: codex_protocol::goal_recovery::GoalRecoveryReceipt,
++}
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase", deny_unknown_fields)]
++#[ts(export_to = "v2/")]
++pub struct ThreadGoalRecoveryReadParams {
++    pub thread_id: String,
++    pub attempt_id: Option<String>,
++}
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct ThreadGoalRecoveryReadResponse {
++    pub capability: String,
++    pub runtime_id: Option<String>,
++    pub snapshot: Option<codex_protocol::goal_recovery::GoalRecoverySnapshot>,
++    pub receipt: Option<codex_protocol::goal_recovery::GoalRecoveryReceipt>,
++}
+--- a/codex-rs/core/src/session/turn_input.rs
++++ b/codex-rs/core/src/session/turn_input.rs
+@@ -235,6 +235,11 @@
+     submission_id: String,
+ ) -> CodexResult<TurnInputSubmission> {
+     let request = request.into();
++    if request.request.goal_recovery.is_some() && !matches!(mode, TurnInputMode::StartIfIdle) {
++        return Err(CodexErr::InvalidRequest("Goal receipt requires original automatic idle admission".to_string()));
++    }
++    let explicit_user_input = request.request.goal_recovery.is_none()
++        && matches!(&request.request.input, SubmittedTurnInput::UserInput { content, .. } if !content.is_empty());
+     let result = match mode {
+         TurnInputMode::StartOrSteer => start_or_steer(session, request, submission_id).await,
+         TurnInputMode::StartIfIdle => {
+@@ -281,6 +286,16 @@
+         }
+     };
+     // Link this request's trace to the accepted turn, which may have an older trace.
++    if explicit_user_input && matches!(&result, Ok(TurnInputSubmission::Started { .. } | TurnInputSubmission::Steered { .. })) {
++        if let Some(db) = session.state_db() {
++            if let Err(error) = db.thread_goals().supersede_goal_recovery_fences(
++                &session.thread_id().to_string(), "accepted_explicit_user_input").await {
++                // Accepted human input remains accepted even if this cleanup fails.
++                // The conservative automatic-work fence remains until explicit read/repair.
++                tracing::warn!(%error, "cannot clear superseded Goal recovery automatic fence");
++            }
++        }
++    }
+     if let Ok(
+         TurnInputSubmission::Started { turn_id, .. } | TurnInputSubmission::Steered { turn_id, .. },
+     ) = &result
+@@ -474,9 +489,19 @@
+         start,
+         additional_context,
+         responsesapi_client_metadata,
++        goal_recovery,
+         ..
+     } = request;
+     let origin = UserInputOrigin::from_turn_trigger(start.turn_trigger.as_deref());
++    let expected_previous_turn_id = if let Some(binding) = goal_recovery.as_ref() {
++        if kind != TurnStartKind::Automatic || start.turn_trigger.as_deref() != Some("goal")
++            || !matches!(&input, SubmittedTurnInput::ResponseItem(_))
++            || binding.thread_id != session.thread_id().to_string()
++        {
++            return Err(CodexErr::InvalidRequest("Goal recovery binding is not this automatic Goal request".to_string()));
++        }
++        Some(binding.expected_previous_turn_id.clone())
++    } else { expected_previous_turn_id };
+     if session.input_queue.has_trigger_turn_mailbox_items().await {
+         return Ok(TurnInputSubmission::NotSubmitted {
+             reason: NotSubmittedReason::PendingTriggerTurn,
+@@ -578,6 +603,19 @@
+         .maybe_emit_model_warnings_for_turn(turn_context.as_ref())
+         .await;
+ 
++    // Nothing may release this native task until the exact mapping and Goal
++    // activation have committed. A failed/lost commit stays UNKNOWN, never retried.
++    let recovery_store = if let Some(binding) = goal_recovery.as_ref() {
++        let Some(db) = session.state_db() else {
++            session.clear_reserved_idle_turn(&turn_state).await;
++            return Err(CodexErr::InvalidRequest("durable Goal database unavailable".to_string()));
++        };
++        if let Err(error) = db.thread_goals().admit_goal_recovery(binding, &submission_id).await {
++            session.clear_reserved_idle_turn(&turn_state).await;
++            return Err(CodexErr::InvalidRequest(format!("Goal admission persistence UNKNOWN: {error}")));
++        }
++        Some(db)
++    } else { None };
+     let mut task_input = merge_additional_context_input(session, additional_context).await;
+     let sender_messages = capture_sender_user_messages(session, &mut input).await;
+     match kind {
+@@ -622,6 +660,13 @@
+     session
+         .start_task(Arc::clone(&turn_context), task_input, RegularTask::new())
+         .await;
++    if let (Some(db), Some(binding)) = (recovery_store, goal_recovery.as_ref()) {
++        if let Err(error) = db.thread_goals().mark_goal_recovery_started(binding, &submission_id).await {
++            // The task may already be running. Keep Admitted/UNKNOWN and its
++            // automatic-work fence; no false not-sent result and no new input.
++            tracing::warn!(%error, "Goal task released but durable Started receipt unavailable");
++        }
++    }
+     Ok(TurnInputSubmission::Started {
+         turn_id: submission_id,
+         root_turn_id: turn_context.root_turn_id(),
+--- a/codex-rs/core/src/session/turn_input_tests.rs
++++ b/codex-rs/core/src/session/turn_input_tests.rs
+@@ -1138,3 +1138,61 @@
+     );
+     session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+ }
++
++fn goal_receipt_request(session: &Session) -> TurnInputRequest {
++    let mut request = TurnInputRequest::new(SubmittedTurnInput::ResponseItem(user_message("internal Goal continuation")))
++        .on_start(TurnStartOptions { turn_trigger: Some("goal".to_string()), ..Default::default() });
++    request.goal_recovery = Some(codex_protocol::goal_recovery::GoalRecoveryRequest {
++        thread_id: session.thread_id().to_string(), attempt_id: "native-core-test".to_string(),
++        expected_runtime_id: "00000000-0000-4000-8000-000000000001".to_string(),
++        expected_previous_turn_id: "00000000-0000-4000-8000-000000000002".to_string(),
++        expected_goal_id: "goal-original".to_string(), expected_goal_revision: 1,
++    });
++    request
++}
++
++#[tokio::test]
++async fn goal_receipt_cannot_use_start_or_steer_to_bypass_idle_admission() {
++    let (session, _ctx) = make_session_and_context().await;
++    let session = Arc::new(session);
++    let result = handle(&session, goal_receipt_request(&session), TurnInputMode::StartOrSteer,
++        "00000000-0000-4000-8000-000000000003".to_string()).await;
++    assert!(matches!(result, Err(CodexErr::InvalidRequest(_))));
++    assert!(session.active_turn.lock().await.is_none());
++}
++
++#[tokio::test]
++async fn goal_receipt_stale_previous_turn_does_not_create_active_task() {
++    let (session, _ctx) = make_session_and_context().await;
++    let session = Arc::new(session);
++    session.state.lock().await.last_started_turn_id = Some("00000000-0000-4000-8000-000000000099".to_string());
++    let result = handle(&session, goal_receipt_request(&session), TurnInputMode::StartIfIdle,
++        "00000000-0000-4000-8000-000000000003".to_string()).await.unwrap();
++    assert_eq!(result, TurnInputSubmission::NotSubmitted { reason: NotSubmittedReason::Superseded });
++    assert!(session.active_turn.lock().await.is_none());
++}
++
++#[tokio::test]
++async fn goal_receipt_for_foreign_thread_is_rejected_before_reservation() {
++    let (session, _ctx) = make_session_and_context().await;
++    let session = Arc::new(session);
++    let mut request = goal_receipt_request(&session);
++    request.goal_recovery.as_mut().unwrap().thread_id = "00000000-0000-4000-8000-000000000077".to_string();
++    let result = handle(&session, request, TurnInputMode::StartIfIdle,
++        "00000000-0000-4000-8000-000000000003".to_string()).await;
++    assert!(matches!(result, Err(CodexErr::InvalidRequest(_))));
++    assert!(session.active_turn.lock().await.is_none());
++}
++
++#[tokio::test]
++async fn goal_receipt_missing_durable_database_never_releases_reserved_task() {
++    let (mut session, _ctx) = make_session_and_context().await;
++    session.services.state_db = None;
++    let session = Arc::new(session);
++    let request = goal_receipt_request(&session);
++    session.state.lock().await.last_started_turn_id = Some(request.goal_recovery.as_ref().unwrap().expected_previous_turn_id.clone());
++    let result = handle(&session, request, TurnInputMode::StartIfIdle,
++        "00000000-0000-4000-8000-000000000003".to_string()).await;
++    assert!(matches!(result, Err(CodexErr::InvalidRequest(_))));
++    assert!(session.active_turn.lock().await.is_none());
++}
+--- a/codex-rs/ext/goal/Cargo.toml
++++ b/codex-rs/ext/goal/Cargo.toml
+@@ -34,5 +34,6 @@
+ chrono = { workspace = true }
+ codex-utils-absolute-path = { workspace = true }
+ pretty_assertions = { workspace = true }
++sqlx = { workspace = true }
+ tempfile = { workspace = true }
+ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+--- a/codex-rs/ext/goal/src/api.rs
++++ b/codex-rs/ext/goal/src/api.rs
+@@ -279,6 +279,15 @@
+                 .map(|goal| (goal, Some(previous_goal)))?
+         };
+ 
++        // An explicit successful Goal mutation supersedes only the automatic
++        // fence. Existing receipt/turn/UNKNOWN evidence is never rewritten.
++        if let Err(error) = state_db.thread_goals().supersede_goal_recovery_fences(
++            &thread_id.to_string(), "explicit_goal_mutation").await {
++            // The original mutation is already committed. A cleanup failure
++            // cannot turn that success into an error/retry or skip its original
++            // events/options/runtime projection. Keep the conservative fence.
++            tracing::warn!(%error, "committed Goal mutation retained unresolved recovery fence");
++        }
+         if let Some(runtime) = runtime.as_ref() {
+             runtime.clear_pending_turn_start_options().await;
+         }
+@@ -328,6 +337,13 @@
+             .map_err(|err| {
+                 GoalServiceError::Internal(format!("failed to clear thread goal: {err}"))
+             })?;
++        if let Err(error) = state_db.thread_goals().supersede_goal_recovery_fences(
++            &thread_id.to_string(), "explicit_goal_mutation").await {
++            // The original mutation is already committed. A cleanup failure
++            // cannot turn that success into an error/retry or skip its original
++            // events/options/runtime projection. Keep the conservative fence.
++            tracing::warn!(%error, "committed Goal mutation retained unresolved recovery fence");
++        }
+         let cleared = cleared_goal.is_some();
+         if cleared && let Some(runtime) = runtime.as_ref() {
+             runtime.clear_pending_turn_start_options().await;
+@@ -342,6 +358,22 @@
+         }
+ 
+         Ok(cleared)
++    }
++
++    pub fn goal_recovery_runtime_id(&self, thread_id: ThreadId) -> Option<String> {
++        self.runtime_for_thread(thread_id).filter(|runtime| runtime.is_enabled())
++            .map(|runtime| runtime.goal_recovery_runtime_id().to_string())
++    }
++
++    pub async fn recover_goal_with_receipt(
++        &self,
++        request: codex_protocol::goal_recovery::GoalRecoveryRequest,
++    ) -> Result<codex_protocol::goal_recovery::GoalRecoveryReceipt, GoalServiceError> {
++        let thread_id = ThreadId::try_from(request.thread_id.clone())
++            .map_err(|error| GoalServiceError::InvalidRequest(error.to_string()))?;
++        let runtime = self.runtime_for_thread(thread_id)
++            .ok_or_else(|| GoalServiceError::InvalidRequest("live Goal recovery runtime absent".to_string()))?;
++        runtime.recover_goal_with_receipt(request).await.map_err(GoalServiceError::Internal)
+     }
+ 
+     pub(crate) fn register_runtime(&self, runtime: &Arc<GoalRuntimeHandle>) {
+--- a/codex-rs/ext/goal/src/runtime.rs
++++ b/codex-rs/ext/goal/src/runtime.rs
+@@ -57,6 +57,7 @@
+     tools_available_for_thread: bool,
+     tools_visible_for_thread: bool,
+     goal_state_lock: Arc<Semaphore>,
++    recovery_runtime_id: String,
+     #[cfg(test)]
+     recovery_post_commit: std::sync::Mutex<Option<Arc<RecoveryPostCommitPause>>>,
+ }
+@@ -113,6 +114,7 @@
+                 tools_available_for_thread: config.tools_available_for_thread,
+                 tools_visible_for_thread: config.tools_visible_for_thread,
+                 goal_state_lock: Arc::new(Semaphore::new(/*permits*/ 1)),
++                recovery_runtime_id: ThreadId::new().to_string(),
+                 #[cfg(test)]
+                 recovery_post_commit: std::sync::Mutex::new(None),
+             }),
+@@ -487,6 +489,79 @@
+         Ok(())
+     }
+ 
++
++    pub fn goal_recovery_runtime_id(&self) -> &str {
++        &self.inner.recovery_runtime_id
++    }
++
++    /// The owned worker retains the original Goal permit even if the RPC caller
++    /// disconnects. Dropping a response never cancels/retries the admitted input.
++    pub async fn recover_goal_with_receipt(
++        &self,
++        request: codex_protocol::goal_recovery::GoalRecoveryRequest,
++    ) -> Result<codex_protocol::goal_recovery::GoalRecoveryReceipt, String> {
++        let runtime = self.clone();
++        tokio::spawn(async move { runtime.recover_goal_once(request).await })
++            .await.map_err(|error| format!("Goal receipt worker UNKNOWN: {error}"))?
++    }
++
++    async fn recover_goal_once(
++        &self,
++        request: codex_protocol::goal_recovery::GoalRecoveryRequest,
++    ) -> Result<codex_protocol::goal_recovery::GoalRecoveryReceipt, String> {
++        let _permit = self.goal_state_permit().await?;
++        let store = self.inner.state_dbs.thread_goals();
++        if let Some(receipt) = store.read_goal_recovery(&request.thread_id, &request.attempt_id)
++            .await.map_err(|error| error.to_string())? {
++            if receipt.request != request { return Err("attempt token changed".to_string()); }
++            return Ok(receipt);
++        }
++        if request.thread_id != self.thread_id().to_string()
++            || request.expected_runtime_id != self.inner.recovery_runtime_id
++            || !self.tools_available() {
++            return Err("Goal recovery runtime identity/capability changed".to_string());
++        }
++        let manager = self.inner.thread_manager.upgrade().ok_or("thread manager unavailable")?;
++        let thread = manager.get_thread(self.inner.thread_id).await.map_err(|error| error.to_string())?;
++        let (receipt, created) = store.begin_goal_recovery(&request).await.map_err(|error| error.to_string())?;
++        if !created { return Ok(receipt); }
++        let goal = store.get_thread_goal(self.thread_id()).await.map_err(|error| error.to_string())?
++            .ok_or("Goal disappeared after durable intent; UNKNOWN")?;
++        let start_options = thread.thread_extension_data().get::<TurnStartOptions>()
++            .map(|options| options.as_ref().clone()).unwrap_or_default();
++        let item = continuation_steering_item(&protocol_goal_from_state(goal), thread.config().await.update_plan_enabled);
++        let mut input = TurnInputRequest::new(TurnInput::ResponseItem(item)).on_start(TurnStartOptions {
++            turn_trigger: Some("goal".to_string()), ..start_options
++        });
++        input.goal_recovery = Some(request.clone());
++        // The native Goal stop path takes the same permit, so even a fast task
++        // cannot finish accounting before this single admission is identified.
++        match thread.start_turn_if_idle(input).await {
++            Ok(StartIfIdleSubmission::Started { turn_id, .. }) => {
++                self.inner.accounting_state.reset_empty_responses();
++                self.inner.accounting_state.mark_goal_continuation(turn_id.clone());
++                // Preserve normal Goal UI/rollout projection. This event is not
++                // the durable receipt; the native store remains authoritative.
++                if let Ok(Some(goal)) = store.get_thread_goal(self.thread_id()).await {
++                    self.inner.event_emitter.thread_goal_updated(
++                        format!("goal-recovery:{}", request.attempt_id),
++                        Some(turn_id), protocol_goal_from_state(goal));
++                }
++            }
++            Ok(StartIfIdleSubmission::NotSubmitted { reason }) => {
++                store.reject_goal_recovery(&request, &format!("{reason:?}"))
++                    .await.map_err(|error| format!("Goal rejection persistence UNKNOWN: {error}"))?;
++            }
++            Err(error) => {
++                // Persistence/admission may have committed. Never convert this
++                // into Rejected, and never submit another turn under this token.
++                tracing::warn!(%error, "Goal receipt admission outcome UNKNOWN; read original token");
++            }
++        }
++        store.read_goal_recovery(&request.thread_id, &request.attempt_id)
++            .await.map_err(|error| error.to_string())?.ok_or("durable Goal intent disappeared".to_string())
++    }
++
+     pub(crate) async fn continue_if_idle(&self) -> Result<(), String> {
+         if !self.tools_available() {
+             self.inner.accounting_state.clear_active_goal();
+@@ -496,6 +571,12 @@
+         // change the goal after we read it but before the continuation launches.
+         let _goal_state_permit = self.goal_state_permit().await?;
+ 
++        // A release with a missing durable acknowledgement cannot silently
++        // become another automatic Goal turn. Ordinary explicit input remains usable.
++        if self.inner.state_dbs.thread_goals().has_goal_recovery_fence(&self.thread_id().to_string())
++            .await.map_err(|error| error.to_string())? {
++            return Ok(());
++        }
+         if self
+             .inner
+             .state_dbs
+--- a/codex-rs/ext/goal/tests/goal_extension_backend.rs
++++ b/codex-rs/ext/goal/tests/goal_extension_backend.rs
+@@ -2335,3 +2335,49 @@
+     assert_eq!(after.status, codex_state::ThreadGoalStatus::BudgetLimited);
+     Ok(())
+ }
++
++#[tokio::test]
++async fn committed_goal_set_survives_recovery_fence_cleanup_failure() -> anyhow::Result<()> {
++    committed_goal_mutation_survives_recovery_fence_cleanup_failure(false).await
++}
++
++#[tokio::test]
++async fn committed_goal_clear_survives_recovery_fence_cleanup_failure() -> anyhow::Result<()> {
++    committed_goal_mutation_survives_recovery_fence_cleanup_failure(true).await
++}
++
++async fn committed_goal_mutation_survives_recovery_fence_cleanup_failure(clear: bool) -> anyhow::Result<()> {
++    let state = test_runtime().await?;
++    let thread_id = test_thread_id()?;
++    seed_thread_metadata(state.as_ref(), thread_id).await?;
++    let goal = state.thread_goals().replace_thread_goal(thread_id, "original", codex_state::ThreadGoalStatus::Blocked, Some(1000)).await?;
++    let snapshot = state.thread_goals().goal_recovery_snapshot(&thread_id.to_string()).await?.unwrap();
++    let request = codex_protocol::goal_recovery::GoalRecoveryRequest {
++        thread_id: thread_id.to_string(), attempt_id: "failure-cleanup-original".to_string(),
++        expected_runtime_id: ThreadId::new().to_string(), expected_previous_turn_id: ThreadId::new().to_string(),
++        expected_goal_id: goal.goal_id, expected_goal_revision: snapshot.revision,
++    };
++    state.thread_goals().begin_goal_recovery(&request).await?;
++    let pool = state.sqlite().open_read_write_pool(&state.sqlite().goals_db_path()).await?;
++    sqlx::query("CREATE TRIGGER reject_fence_cleanup BEFORE UPDATE OF fence_active ON thread_goal_recovery_receipts WHEN NEW.fence_active = 0 BEGIN SELECT RAISE(ABORT, 'injected cleanup failure'); END")
++        .execute(&pool).await?;
++    let service = GoalService::new();
++    if clear {
++        assert!(service.clear_thread_goal(&state, thread_id, async { Ok(()) }).await?);
++        assert!(state.thread_goals().get_thread_goal(thread_id).await?.is_none());
++    } else {
++        let outcome = service.set_thread_goal(&state, GoalSetRequest {
++            thread_id, objective: GoalObjectiveUpdate::Keep, status: Some(ThreadGoalStatus::Paused),
++            token_budget: GoalTokenBudgetUpdate::Keep, max_goal_token_budget: None,
++        }, async { Ok(()) }).await?;
++        assert_eq!(outcome.goal.status, ThreadGoalStatus::Paused);
++        assert_eq!(state.thread_goals().get_thread_goal(thread_id).await?.unwrap().status, codex_state::ThreadGoalStatus::Paused);
++    }
++    // Original success survives; the failed cleanup conservatively leaves only
++    // automatic work fenced. It must not fabricate acknowledgement or retry.
++    let receipt = state.thread_goals().read_goal_recovery(&request.thread_id, &request.attempt_id).await?.unwrap();
++    assert_eq!(receipt.phase, codex_protocol::goal_recovery::GoalRecoveryPhase::Intent);
++    assert!(state.thread_goals().has_goal_recovery_fence(&request.thread_id).await?);
++    pool.close().await;
++    Ok(())
++}
+--- /dev/null
++++ b/codex-rs/protocol/src/goal_recovery.rs
+@@ -0,0 +1,48 @@
++//! Conditional Goal admission receipts. A receipt is not model/tool progress.
++use schemars::JsonSchema;
++use serde::{Deserialize, Serialize};
++use ts_rs::TS;
++
++#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
++#[serde(rename_all = "camelCase", deny_unknown_fields)]
++pub struct GoalRecoveryRequest {
++    pub thread_id: String,
++    pub attempt_id: String,
++    /// Native runtime identity returned by the read endpoint; never caller-invented.
++    pub expected_runtime_id: String,
++    pub expected_previous_turn_id: String,
++    pub expected_goal_id: String,
++    pub expected_goal_revision: i64,
++}
++
++#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
++#[serde(rename_all = "snake_case")]
++pub enum GoalRecoveryPhase {
++    /// No task release is implied. After cancellation this remains UNKNOWN.
++    Intent,
++    /// The mapping and Goal activation committed before task release.
++    /// A crash can occur before or after release: this alone is not Started.
++    Admitted,
++    /// Core observed release, and this post-release observation committed.
++    Started,
++    /// Core definitively declined before committing admission.
++    Rejected,
++}
++
++#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++pub struct GoalRecoveryReceipt {
++    pub request: GoalRecoveryRequest,
++    pub phase: GoalRecoveryPhase,
++    pub turn_id: Option<String>,
++    pub admitted_goal_revision: Option<i64>,
++    pub reason: Option<String>,
++}
++
++#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++pub struct GoalRecoverySnapshot {
++    pub goal_id: String,
++    pub revision: i64,
++    pub status: String,
++}
+--- a/codex-rs/protocol/src/lib.rs
++++ b/codex-rs/protocol/src/lib.rs
+@@ -58,3 +58,5 @@
+ pub mod user_input;
+ 
+ pub mod compact_recovery;
++
++pub mod goal_recovery;
+--- a/codex-rs/protocol/src/turn_input.rs
++++ b/codex-rs/protocol/src/turn_input.rs
+@@ -64,6 +64,8 @@
+     pub additional_context: BTreeMap<String, AdditionalContextEntry>,
+     pub responsesapi_client_metadata: ResponsesApiClientMetadataUpdate,
+     pub trace: Option<W3cTraceContext>,
++    /// Single-use native admission binding; never inherited by later turns.
++    pub goal_recovery: Option<crate::goal_recovery::GoalRecoveryRequest>,
+ }
+ 
+ /// An optional replacement followed by a patch to the turn's client metadata.
+@@ -121,6 +123,7 @@
+             additional_context: BTreeMap::new(),
+             responsesapi_client_metadata: ResponsesApiClientMetadataUpdate::default(),
+             trace: None,
++            goal_recovery: None,
+         }
+     }
+ 
+--- /dev/null
++++ b/codex-rs/state/goals_migrations/0003_goal_recovery_receipts.sql
+@@ -0,0 +1,33 @@
++-- Revision survives Goal deletion/replacement and is advanced by every writer,
++-- including an older binary that does not understand recovery receipts.
++CREATE TABLE thread_goal_revisions (
++    thread_id TEXT PRIMARY KEY NOT NULL,
++    revision INTEGER NOT NULL CHECK(revision > 0)
++);
++INSERT INTO thread_goal_revisions(thread_id, revision)
++SELECT thread_id, 1 FROM thread_goals;
++CREATE TRIGGER goal_revision_insert AFTER INSERT ON thread_goals BEGIN
++  INSERT INTO thread_goal_revisions(thread_id, revision) VALUES(NEW.thread_id, 1)
++  ON CONFLICT(thread_id) DO UPDATE SET revision = revision + 1;
++END;
++CREATE TRIGGER goal_revision_update AFTER UPDATE ON thread_goals BEGIN
++  UPDATE thread_goal_revisions SET revision = revision + 1 WHERE thread_id = NEW.thread_id;
++END;
++CREATE TRIGGER goal_revision_delete AFTER DELETE ON thread_goals BEGIN
++  UPDATE thread_goal_revisions SET revision = revision + 1 WHERE thread_id = OLD.thread_id;
++END;
++CREATE TABLE thread_goal_recovery_receipts (
++    attempt_id TEXT PRIMARY KEY NOT NULL,
++    thread_id TEXT NOT NULL,
++    goal_id TEXT NOT NULL,
++    request_json TEXT NOT NULL,
++    phase TEXT NOT NULL CHECK(phase IN ('intent','admitted','started','rejected')),
++    turn_id TEXT,
++    admitted_goal_revision INTEGER,
++    reason TEXT,
++    fence_active INTEGER NOT NULL DEFAULT 1 CHECK(fence_active IN (0,1)),
++    CHECK((phase IN ('intent','rejected') AND turn_id IS NULL)
++       OR (phase IN ('admitted','started') AND turn_id IS NOT NULL))
++);
++CREATE UNIQUE INDEX unique_goal_recovery_active_fence
++ON thread_goal_recovery_receipts(thread_id) WHERE fence_active = 1;
+--- /dev/null
++++ b/codex-rs/state/src/runtime/goal_recovery.rs
+@@ -0,0 +1,254 @@
++//! Durable conditional Goal receipts on the existing Goal database.
++//! All writes use a separate EXTRA connection. No transaction/commit is retried:
++//! cancellation or a lost commit response is UNKNOWN and requires read-only lookup.
++use super::GoalStore;
++use anyhow::{Context, bail, ensure};
++use codex_protocol::goal_recovery::{GoalRecoveryPhase, GoalRecoveryReceipt, GoalRecoveryRequest, GoalRecoverySnapshot};
++use sqlx::{ConnectOptions, Connection, Row, SqliteConnection};
++use sqlx::sqlite::{SqliteRow, SqliteSynchronous};
++
++fn validate(request: &GoalRecoveryRequest) -> anyhow::Result<()> {
++    ensure!(!request.attempt_id.is_empty() && request.attempt_id.len() <= 128
++        && request.attempt_id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-'), "invalid attempt token");
++    codex_protocol::ThreadId::try_from(request.thread_id.clone())?;
++    uuid::Uuid::parse_str(&request.expected_previous_turn_id)?;
++    uuid::Uuid::parse_str(&request.expected_runtime_id)?;
++    ensure!(!request.expected_goal_id.is_empty() && request.expected_goal_revision > 0, "invalid Goal fence");
++    Ok(())
++}
++
++fn decode(row: &SqliteRow) -> anyhow::Result<GoalRecoveryReceipt> {
++    let phase: String = row.try_get("phase")?;
++    Ok(GoalRecoveryReceipt {
++        request: serde_json::from_str(&row.try_get::<String, _>("request_json")?)?,
++        phase: match phase.as_str() {
++            "intent" => GoalRecoveryPhase::Intent,
++            "admitted" => GoalRecoveryPhase::Admitted,
++            "started" => GoalRecoveryPhase::Started,
++            "rejected" => GoalRecoveryPhase::Rejected,
++            _ => bail!("invalid persisted Goal receipt phase"),
++        },
++        turn_id: row.try_get("turn_id")?,
++        admitted_goal_revision: row.try_get("admitted_goal_revision")?,
++        reason: row.try_get("reason")?,
++    })
++}
++
++impl GoalStore {
++    async fn recovery_connection(&self) -> anyhow::Result<SqliteConnection> {
++        // Inherit the exact native Goal database path, but never create/recover a
++        // different database and never change the ordinary pool's sync policy.
++        let options = self.pool.connect_options().as_ref().clone()
++            .create_if_missing(false).synchronous(SqliteSynchronous::Extra);
++        let mut connection = options.connect().await?;
++        let synchronous: i64 = sqlx::query_scalar("PRAGMA synchronous").fetch_one(&mut connection).await?;
++        ensure!(synchronous == 3, "Goal receipt connection is not synchronous EXTRA");
++        Ok(connection)
++    }
++
++    pub async fn goal_recovery_snapshot(&self, thread_id: &str) -> anyhow::Result<Option<GoalRecoverySnapshot>> {
++        let row = sqlx::query("SELECT g.goal_id, g.status, r.revision FROM thread_goals g JOIN thread_goal_revisions r USING(thread_id) WHERE g.thread_id = ?")
++            .bind(thread_id).fetch_optional(self.pool.as_ref()).await?;
++        row.map(|row| Ok(GoalRecoverySnapshot { goal_id: row.try_get("goal_id")?, status: row.try_get("status")?, revision: row.try_get("revision")? })).transpose()
++    }
++
++    /// Pure lookup. It never upgrades Intent/Admitted to Started from nearby activity.
++    pub async fn read_goal_recovery(&self, thread_id: &str, attempt_id: &str) -> anyhow::Result<Option<GoalRecoveryReceipt>> {
++        let row = sqlx::query("SELECT * FROM thread_goal_recovery_receipts WHERE thread_id = ? AND attempt_id = ?")
++            .bind(thread_id).bind(attempt_id).fetch_optional(self.pool.as_ref()).await?;
++        row.as_ref().map(decode).transpose()
++    }
++
++    /// Returns created=false for an existing exact token; the caller must not submit again.
++    pub async fn begin_goal_recovery(&self, request: &GoalRecoveryRequest) -> anyhow::Result<(GoalRecoveryReceipt, bool)> {
++        validate(request)?;
++        let encoded = serde_json::to_string(request)?;
++        let mut connection = self.recovery_connection().await?;
++        let mut tx = connection.begin_with("BEGIN IMMEDIATE").await?;
++        if let Some(row) = sqlx::query("SELECT * FROM thread_goal_recovery_receipts WHERE attempt_id = ?")
++            .bind(&request.attempt_id).fetch_optional(&mut *tx).await? {
++            let receipt = decode(&row)?;
++            ensure!(receipt.request == *request, "attempt token is already bound to another request");
++            tx.rollback().await?;
++            return Ok((receipt, false));
++        }
++        let snapshot = sqlx::query("SELECT g.goal_id, g.status, r.revision FROM thread_goals g JOIN thread_goal_revisions r USING(thread_id) WHERE g.thread_id = ?")
++            .bind(&request.thread_id).fetch_optional(&mut *tx).await?.context("Goal absent")?;
++        ensure!(snapshot.try_get::<String, _>("goal_id")? == request.expected_goal_id
++            && snapshot.try_get::<String, _>("status")? == "blocked"
++            && snapshot.try_get::<i64, _>("revision")? == request.expected_goal_revision, "Goal snapshot superseded");
++        sqlx::query("INSERT INTO thread_goal_recovery_receipts(attempt_id, thread_id, goal_id, request_json, phase) VALUES(?, ?, ?, ?, 'intent')")
++            .bind(&request.attempt_id).bind(&request.thread_id).bind(&request.expected_goal_id).bind(encoded).execute(&mut *tx).await?;
++        tx.commit().await?;
++        Ok((GoalRecoveryReceipt { request: request.clone(), phase: GoalRecoveryPhase::Intent,
++            turn_id: None, admitted_goal_revision: None, reason: None }, true))
++    }
++
++    /// Called only from Core with its real reserved idle turn, before start_task.
++    pub async fn admit_goal_recovery(&self, request: &GoalRecoveryRequest, turn_id: &str) -> anyhow::Result<()> {
++        validate(request)?;
++        uuid::Uuid::parse_str(turn_id)?;
++        let mut connection = self.recovery_connection().await?;
++        let mut tx = connection.begin_with("BEGIN IMMEDIATE").await?;
++        let row = sqlx::query("SELECT * FROM thread_goal_recovery_receipts WHERE attempt_id = ?")
++            .bind(&request.attempt_id).fetch_optional(&mut *tx).await?.context("missing original Goal intent")?;
++        let receipt = decode(&row)?;
++        ensure!(receipt.request == *request && receipt.phase == GoalRecoveryPhase::Intent
++            && row.try_get::<i64, _>("fence_active")? == 1, "Goal intent already consumed or superseded");
++        let result = sqlx::query("UPDATE thread_goals SET status = 'active', updated_at_ms = MAX(updated_at_ms + 1, ?) WHERE thread_id = ? AND goal_id = ? AND status = 'blocked' AND (token_budget IS NULL OR tokens_used < token_budget) AND EXISTS(SELECT 1 FROM thread_goal_revisions r WHERE r.thread_id = thread_goals.thread_id AND r.revision = ?) AND NOT EXISTS(SELECT 1 FROM thread_goal_continuation_deferrals d WHERE d.thread_id = thread_goals.thread_id)")
++            .bind(chrono::Utc::now().timestamp_millis()).bind(&request.thread_id).bind(&request.expected_goal_id).bind(request.expected_goal_revision)
++            .execute(&mut *tx).await?;
++        ensure!(result.rows_affected() == 1, "Goal admission snapshot/budget/deferral changed");
++        let revision: i64 = sqlx::query_scalar("SELECT revision FROM thread_goal_revisions WHERE thread_id = ?")
++            .bind(&request.thread_id).fetch_one(&mut *tx).await?;
++        sqlx::query("UPDATE thread_goal_recovery_receipts SET phase = 'admitted', turn_id = ?, admitted_goal_revision = ? WHERE attempt_id = ? AND phase = 'intent'")
++            .bind(turn_id).bind(revision).bind(&request.attempt_id).execute(&mut *tx).await?;
++        tx.commit().await?;
++        Ok(())
++    }
++
++    /// Post-release evidence only. Failure leaves Admitted/UNKNOWN and the fence.
++    pub async fn mark_goal_recovery_started(&self, request: &GoalRecoveryRequest, turn_id: &str) -> anyhow::Result<()> {
++        let mut connection = self.recovery_connection().await?;
++        let mut tx = connection.begin_with("BEGIN IMMEDIATE").await?;
++        let result = sqlx::query("UPDATE thread_goal_recovery_receipts SET phase = 'started', fence_active = 0 WHERE attempt_id = ? AND thread_id = ? AND request_json = ? AND phase = 'admitted' AND turn_id = ?")
++            .bind(&request.attempt_id).bind(&request.thread_id).bind(serde_json::to_string(request)?).bind(turn_id).execute(&mut *tx).await?;
++        ensure!(result.rows_affected() == 1, "post-release receipt binding changed");
++        tx.commit().await?;
++        Ok(())
++    }
++
++    /// Only a definite pre-admission NotSubmitted may reach this method.
++    pub async fn reject_goal_recovery(&self, request: &GoalRecoveryRequest, reason: &str) -> anyhow::Result<()> {
++        let mut connection = self.recovery_connection().await?;
++        let mut tx = connection.begin_with("BEGIN IMMEDIATE").await?;
++        let result = sqlx::query("UPDATE thread_goal_recovery_receipts SET phase = 'rejected', reason = ?, fence_active = 0 WHERE attempt_id = ? AND thread_id = ? AND request_json = ? AND phase = 'intent'")
++            .bind(reason).bind(&request.attempt_id).bind(&request.thread_id).bind(serde_json::to_string(request)?).execute(&mut *tx).await?;
++        ensure!(result.rows_affected() == 1, "cannot reject a potentially admitted request");
++        tx.commit().await?;
++        Ok(())
++    }
++
++    pub async fn has_goal_recovery_fence(&self, thread_id: &str) -> anyhow::Result<bool> {
++        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM thread_goal_recovery_receipts WHERE thread_id = ? AND fence_active = 1)")
++            .bind(thread_id).fetch_one(self.pool.as_ref()).await.map_err(Into::into)
++    }
++
++    /// A later accepted user Goal mutation may proceed. Preserve receipt phase and
++    /// turn binding: this clears its automatic-work fence, never fabricates an ACK.
++    pub async fn supersede_goal_recovery_fences(&self, thread_id: &str, reason: &str) -> anyhow::Result<()> {
++        if !self.has_goal_recovery_fence(thread_id).await? { return Ok(()); }
++        let mut connection = self.recovery_connection().await?;
++        let mut tx = connection.begin_with("BEGIN IMMEDIATE").await?;
++        sqlx::query("UPDATE thread_goal_recovery_receipts SET fence_active = 0, reason = ? WHERE thread_id = ? AND fence_active = 1")
++            .bind(reason).bind(thread_id).execute(&mut *tx).await?;
++        tx.commit().await?;
++        Ok(())
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::SqliteConfig;
++    use crate::StateRuntime;
++    use crate::ThreadGoalStatus;
++    use codex_utils_absolute_path::test_support::PathExt;
++
++    async fn fixture() -> (Arc<StateRuntime>, GoalRecoveryRequest) {
++        let root = crate::runtime::test_support::unique_temp_dir();
++        let state = StateRuntime::init(SqliteConfig::new_for_testing(root.as_path().abs()), "test".to_string()).await.unwrap();
++        let thread = codex_protocol::ThreadId::new();
++        let metadata = crate::runtime::test_support::test_thread_metadata(&root, thread, root.join("workspace"));
++        state.upsert_thread(&metadata).await.unwrap();
++        let goal = state.thread_goals().replace_thread_goal(thread, "keep objective and budget", ThreadGoalStatus::Blocked, Some(1000)).await.unwrap();
++        let snapshot = state.thread_goals().goal_recovery_snapshot(&thread.to_string()).await.unwrap().unwrap();
++        let request = GoalRecoveryRequest { thread_id: thread.to_string(), attempt_id: "original-token".to_string(),
++            expected_runtime_id: uuid::Uuid::new_v4().to_string(), expected_previous_turn_id: uuid::Uuid::new_v4().to_string(),
++            expected_goal_id: goal.goal_id, expected_goal_revision: snapshot.revision };
++        (state, request)
++    }
++    use std::sync::Arc;
++
++    #[tokio::test]
++    async fn recovery_token_exact_duplicate_never_creates_second_intent() {
++        let (state, request) = fixture().await;
++        let store = state.thread_goals();
++        assert!(store.begin_goal_recovery(&request).await.unwrap().1);
++        assert!(!store.begin_goal_recovery(&request).await.unwrap().1);
++        let mut changed = request.clone(); changed.expected_previous_turn_id = uuid::Uuid::new_v4().to_string();
++        assert!(store.begin_goal_recovery(&changed).await.is_err());
++        assert_eq!(store.read_goal_recovery(&request.thread_id, &request.attempt_id).await.unwrap().unwrap().phase, GoalRecoveryPhase::Intent);
++    }
++
++    #[tokio::test]
++    async fn admitted_mapping_is_unknown_until_post_release_commit() {
++        let (state, request) = fixture().await;
++        let store = state.thread_goals();
++        let connection = store.recovery_connection().await.unwrap();
++        drop(connection); // opening verifies the actual connection PRAGMA.
++        store.begin_goal_recovery(&request).await.unwrap();
++        let turn = uuid::Uuid::new_v4().to_string();
++        store.admit_goal_recovery(&request, &turn).await.unwrap();
++        let admitted = store.read_goal_recovery(&request.thread_id, &request.attempt_id).await.unwrap().unwrap();
++        assert_eq!(admitted.phase, GoalRecoveryPhase::Admitted);
++        assert_eq!(admitted.turn_id.as_deref(), Some(turn.as_str()));
++        assert!(store.has_goal_recovery_fence(&request.thread_id).await.unwrap());
++        assert!(!store.begin_goal_recovery(&request).await.unwrap().1);
++        store.mark_goal_recovery_started(&request, &turn).await.unwrap();
++        assert!(!store.has_goal_recovery_fence(&request.thread_id).await.unwrap());
++        assert_eq!(store.read_goal_recovery(&request.thread_id, &request.attempt_id).await.unwrap().unwrap().phase, GoalRecoveryPhase::Started);
++        let goal = store.get_thread_goal(codex_protocol::ThreadId::try_from(request.thread_id.clone()).unwrap()).await.unwrap().unwrap();
++        assert_eq!(goal.objective, "keep objective and budget");
++        assert_eq!(goal.token_budget, Some(1000)); assert_eq!(goal.tokens_used, 0);
++    }
++
++    #[tokio::test]
++    async fn stale_usage_revision_refuses_admission_without_changing_goal() {
++        let (state, request) = fixture().await;
++        let store = state.thread_goals();
++        store.begin_goal_recovery(&request).await.unwrap();
++        sqlx::query("UPDATE thread_goals SET tokens_used = tokens_used + 1 WHERE thread_id = ?")
++            .bind(&request.thread_id).execute(store.pool.as_ref()).await.unwrap();
++        assert!(store.admit_goal_recovery(&request, &uuid::Uuid::new_v4().to_string()).await.is_err());
++        assert_eq!(store.goal_recovery_snapshot(&request.thread_id).await.unwrap().unwrap().status, "blocked");
++        assert_eq!(store.read_goal_recovery(&request.thread_id, &request.attempt_id).await.unwrap().unwrap().phase, GoalRecoveryPhase::Intent);
++    }
++
++    #[tokio::test]
++    async fn admitted_receipt_survives_normal_usage_and_goal_replacement() {
++        let (state, request) = fixture().await;
++        let store = state.thread_goals(); let turn = uuid::Uuid::new_v4().to_string();
++        store.begin_goal_recovery(&request).await.unwrap(); store.admit_goal_recovery(&request, &turn).await.unwrap();
++        sqlx::query("UPDATE thread_goals SET tokens_used = tokens_used + 1 WHERE thread_id = ?")
++            .bind(&request.thread_id).execute(store.pool.as_ref()).await.unwrap();
++        store.mark_goal_recovery_started(&request, &turn).await.unwrap();
++        let before = store.read_goal_recovery(&request.thread_id, &request.attempt_id).await.unwrap();
++        store.replace_thread_goal(codex_protocol::ThreadId::try_from(request.thread_id.clone()).unwrap(), "new objective", ThreadGoalStatus::Blocked, None).await.unwrap();
++        assert_eq!(store.read_goal_recovery(&request.thread_id, &request.attempt_id).await.unwrap(), before);
++    }
++
++    #[tokio::test]
++    async fn admission_transaction_failure_rolls_back_goal_activation() {
++        let (state, request) = fixture().await;
++        let store = state.thread_goals(); store.begin_goal_recovery(&request).await.unwrap();
++        sqlx::query("CREATE TRIGGER fail_admit BEFORE UPDATE OF phase ON thread_goal_recovery_receipts WHEN NEW.phase = 'admitted' BEGIN SELECT RAISE(ABORT, 'injected receipt write failure'); END")
++            .execute(store.pool.as_ref()).await.unwrap();
++        assert!(store.admit_goal_recovery(&request, &uuid::Uuid::new_v4().to_string()).await.is_err());
++        assert_eq!(store.goal_recovery_snapshot(&request.thread_id).await.unwrap().unwrap().status, "blocked");
++        assert_eq!(store.read_goal_recovery(&request.thread_id, &request.attempt_id).await.unwrap().unwrap().phase, GoalRecoveryPhase::Intent);
++    }
++
++    #[tokio::test]
++    async fn post_release_write_failure_keeps_admitted_and_rejects_false_not_sent() {
++        let (state, request) = fixture().await;
++        let store = state.thread_goals(); let turn = uuid::Uuid::new_v4().to_string();
++        store.begin_goal_recovery(&request).await.unwrap(); store.admit_goal_recovery(&request, &turn).await.unwrap();
++        sqlx::query("CREATE TRIGGER fail_started BEFORE UPDATE OF phase ON thread_goal_recovery_receipts WHEN NEW.phase = 'started' BEGIN SELECT RAISE(ABORT, 'injected post-release failure'); END")
++            .execute(store.pool.as_ref()).await.unwrap();
++        assert!(store.mark_goal_recovery_started(&request, &turn).await.is_err());
++        assert!(store.reject_goal_recovery(&request, "not sent").await.is_err());
++        assert_eq!(store.read_goal_recovery(&request.thread_id, &request.attempt_id).await.unwrap().unwrap().phase, GoalRecoveryPhase::Admitted);
++        assert!(store.has_goal_recovery_fence(&request.thread_id).await.unwrap());
++    }
++}
+--- a/codex-rs/state/src/runtime/goals.rs
++++ b/codex-rs/state/src/runtime/goals.rs
+@@ -3,6 +3,9 @@
+ use crate::sqlite::SqlitePoolWriteExt;
+ use crate::sqlite::SqliteWriteQueryExt;
+ use uuid::Uuid;
++
++#[path = "goal_recovery.rs"]
++mod recovery;
+ 
+ #[derive(Clone)]
+ pub struct GoalStore {

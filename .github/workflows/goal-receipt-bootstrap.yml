@@ -1,0 +1,83 @@
+name: Isolated Goal receipt format schema and check
+
+on:
+  push:
+    branches: [ccc/goal-receipt-bootstrap-20261105]
+    paths:
+      - .github/workflows/goal-receipt-bootstrap.yml
+      - integrations/goal-receipt-bootstrap/**
+  workflow_dispatch:
+    inputs:
+      manifest_sha256:
+        description: Reviewed bootstrap manifest SHA256
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: goal-receipt-bootstrap-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  source-schema-check:
+    runs-on: macos-15
+    timeout-minutes: 240
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "none"
+      CARGO_PROFILE_TEST_DEBUG: "none"
+      CARGO_BUILD_JOBS: "3"
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      CARGO_TERM_COLOR: "never"
+      INSTA_UPDATE: "no"
+      BOOTSTRAP_SHA256: ${{ inputs.manifest_sha256 || '535925ae9dabddcd0c6b1a3b0e9f929d072244024ffa8c47d329296cfaeb5bbc' }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          path: ccc
+          persist-credentials: false
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          repository: lzhs1995/ccc
+          ref: a0f7fa7216673009375405ca99ca5c0a4b8a997f
+          path: ccc-base
+          persist-credentials: false
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          repository: openai/codex
+          ref: 6aaac694803004a63c6f393d153c96d22521a6b9
+          path: codex
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8
+        with:
+          toolchain: "1.99.1"
+          targets: aarch64-apple-darwin
+          components: rustfmt
+      - name: Validate source package and runner negative controls
+        working-directory: ccc/integrations/goal-receipt-bootstrap
+        run: python3 -B -m unittest -v test_goal_bootstrap
+      - name: Generate actual format/schema candidates and check both locked graphs
+        run: >-
+          python3 -B ccc/integrations/goal-receipt-bootstrap/goal_bootstrap.py
+          --ccc-base ccc-base --codex codex
+          --manifest ccc/integrations/goal-receipt-bootstrap/bootstrap.json
+          --manifest-sha256 "$BOOTSTRAP_SHA256"
+          --output "$RUNNER_TEMP/goal-receipt-bootstrap"
+      - name: Preserve source pins, raw logs, actual schemas and format differences
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: goal-receipt-bootstrap-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/goal-receipt-bootstrap/*.json
+            ${{ runner.temp }}/goal-receipt-bootstrap/*.log
+            ${{ runner.temp }}/goal-receipt-bootstrap/*.lock
+            ${{ runner.temp }}/goal-receipt-bootstrap/*.patch
+            ${{ runner.temp }}/goal-receipt-bootstrap/*.diff
+            ${{ runner.temp }}/goal-receipt-bootstrap/original-r7-schema/
+            ${{ runner.temp }}/goal-receipt-bootstrap/generated-schema/
+            ${{ runner.temp }}/goal-receipt-bootstrap/formatted-goal-source/
+          if-no-files-found: warn
+          retention-days: 14

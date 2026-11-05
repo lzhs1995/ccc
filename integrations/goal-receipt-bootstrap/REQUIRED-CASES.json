@@ -1,0 +1,71 @@
+{
+  "status": "SOURCE_ONLY_NOT_RUN",
+  "cases": [
+    {
+      "package": "codex-state",
+      "test": "runtime::goals::recovery::tests::recovery_token_exact_duplicate_never_creates_second_intent"
+    },
+    {
+      "package": "codex-state",
+      "test": "runtime::goals::recovery::tests::admitted_mapping_is_unknown_until_post_release_commit"
+    },
+    {
+      "package": "codex-state",
+      "test": "runtime::goals::recovery::tests::stale_usage_revision_refuses_admission_without_changing_goal"
+    },
+    {
+      "package": "codex-state",
+      "test": "runtime::goals::recovery::tests::admitted_receipt_survives_normal_usage_and_goal_replacement"
+    },
+    {
+      "package": "codex-state",
+      "test": "runtime::goals::recovery::tests::admission_transaction_failure_rolls_back_goal_activation"
+    },
+    {
+      "package": "codex-state",
+      "test": "runtime::goals::recovery::tests::post_release_write_failure_keeps_admitted_and_rejects_false_not_sent"
+    },
+    {
+      "package": "codex-core",
+      "test": "session::turn_input::tests::goal_receipt_cannot_use_start_or_steer_to_bypass_idle_admission"
+    },
+    {
+      "package": "codex-core",
+      "test": "session::turn_input::tests::goal_receipt_stale_previous_turn_does_not_create_active_task"
+    },
+    {
+      "package": "codex-core",
+      "test": "session::turn_input::tests::goal_receipt_for_foreign_thread_is_rejected_before_reservation"
+    },
+    {
+      "package": "codex-app-server",
+      "test": "suite::v2::thread_goal_empty_responses::conditional_goal_receipt_binds_real_admission_and_duplicate_is_read_only"
+    },
+    {
+      "package": "codex-core",
+      "test": "session::turn_input::tests::goal_receipt_missing_durable_database_never_releases_reserved_task"
+    },
+    {
+      "package": "codex-goal-extension",
+      "target": "goal_extension_backend",
+      "test": "committed_goal_set_survives_recovery_fence_cleanup_failure"
+    },
+    {
+      "package": "codex-goal-extension",
+      "target": "goal_extension_backend",
+      "test": "committed_goal_clear_survives_recovery_fence_cleanup_failure"
+    }
+  ],
+  "schema_required": [
+    "thread/goal/recover",
+    "thread/goal/recovery/read",
+    "GoalRecoveryRequest",
+    "GoalRecoveryReceipt",
+    "GoalRecoveryPhase",
+    "GoalRecoverySnapshot",
+    "ThreadGoalRecoverResponse",
+    "ThreadGoalRecoveryReadParams",
+    "ThreadGoalRecoveryReadResponse"
+  ],
+  "none_of_these_rust_cases_passed_yet": true
+}
