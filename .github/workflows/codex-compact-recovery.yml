@@ -61,6 +61,10 @@ jobs:
       - uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532
         with:
           tool: nextest@0.9.103
+      - name: Verify preparation and official V8 download failure controls
+        run: |
+          python3 -BE ccc/integrations/compact-recovery-build/test_preparation.py
+          python3 -BE ccc/integrations/compact-recovery-build/test_v8_preparation.py
       - name: Verify source, run fresh tests, build and export actual schema
         run: >-
           python3 ccc/integrations/compact-recovery-build/ci.py

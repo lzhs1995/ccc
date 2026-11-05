@@ -7,6 +7,8 @@ and expected exported schemas. Never downloads or reuses historical test passes.
 import argparse
 from collections import Counter
 import hashlib
+import importlib
+import inspect
 import json
 import os
 from pathlib import Path
@@ -214,6 +216,95 @@ def require_github_runner():
         raise ValueError("full builds are permitted only on the explicit GitHub macOS arm64 runner")
 
 
+V8_SOURCE_PINS = {
+    "scripts/codex_package/__init__.py": "e2140b37ed4d66a3758079a0961ee4d7dc01328f892d2b53a98582427bce341b",
+    "scripts/codex_package/targets.py": "aa0b4f6652b27b512ffe759c9e2609909e90ea076716625b5a941e52f38ff2ed",
+    "scripts/codex_package/v8.py": "a6ec2a955af2e99e8823aeaf8ea079aa8af170f7758fd639dfec7cc7bf91f238",
+    "third_party/v8/rusty_v8_152_2_0_release_manifests.sha256": "1dd7c7f7d3d91af7f06a2846bddc6a1da7725acc67ecd7ab2c7dfc980dd8c6d4",
+}
+
+
+def prepare_v8_artifacts(root, output, expected_source):
+    """Use the exact official verifier, with cache writes outside frozen source."""
+    overrides = sorted(k for k in os.environ if k.startswith("RUSTY_V8_")
+                       or k in ("V8_FROM_SOURCE", "V8_FORCE_DEBUG"))
+    if overrides:
+        raise ValueError("unreviewed V8 overrides: " + ", ".join(overrides))
+    if full_source(root) != expected_source:
+        raise ValueError("assembled source changed before V8 artifact preparation")
+    source_pins = {name: sha(checked_path(root, name)) for name in V8_SOURCE_PINS}
+    if source_pins != V8_SOURCE_PINS:
+        raise ValueError("official V8 fetcher or trust root changed")
+    if any(n == "codex_package" or n.startswith("codex_package.") for n in sys.modules):
+        raise ValueError("unreviewed preloaded package helper")
+    cache = output / "v8-artifacts"
+    if cache.resolve().is_relative_to(root.resolve()) or cache.exists() or cache.is_symlink():
+        raise ValueError("V8 artifacts require a fresh cache outside assembled source")
+    cache.mkdir()
+    old_path, old_bytecode = sys.path[:], sys.dont_write_bytecode
+    old_repo = os.environ.get("CODEX_REPO_ROOT")
+    try:
+        sys.dont_write_bytecode = True
+        sys.path.insert(0, str(root / "scripts"))
+        os.environ["CODEX_REPO_ROOT"] = str(root)
+        targets = importlib.import_module("codex_package.targets")
+        helper = importlib.import_module("codex_package.v8")
+        for module, name in ((targets, "targets.py"), (helper, "v8.py")):
+            if Path(module.__file__).resolve() != root / "scripts/codex_package" / name:
+                raise ValueError("V8 helper import escaped verified source")
+        version = helper.resolved_v8_crate_version()
+        if version != "152.2.0":
+            raise ValueError("V8 version differs from the frozen original lock")
+        spec = targets.TARGET_SPECS["aarch64-apple-darwin"]
+        # Do not call resolve_codex_v8_cargo_env: its override fast path is not proof.
+        pair = helper.fetch_codex_v8_artifacts(spec, cache_root=cache)
+        profile = "ptrcomp_sandbox_release_aarch64-apple-darwin"
+        directory = cache / ("rusty-v8-" + version + "-" + spec.target)
+        checksums = directory / ("rusty_v8_" + profile + ".sha256")
+        expected_paths = [directory / ("librusty_v8_" + profile + ".a.gz"),
+                          directory / ("src_binding_" + profile + ".rs")]
+        if [pair.archive, pair.binding] != expected_paths:
+            raise ValueError("official V8 pair paths differ")
+        for path in [checksums, *expected_paths]:
+            if path.is_symlink() or not path.is_file() or not path.resolve().is_relative_to(cache.resolve()):
+                raise ValueError("V8 artifact path escaped private cache")
+        helper.verify_release_checksum_manifest(checksums, version=version, remove_invalid=False)
+        expected = helper.load_checksums(checksums, {p.name for p in expected_paths})
+        if any(sha(path) != expected[path.name] for path in expected_paths):
+            raise ValueError("downloaded V8 pair differs from official manifest")
+        if full_source(root) != expected_source:
+            raise ValueError("V8 preparation modified frozen source")
+        base_url = "https://github.com/openai/codex/releases/download/rusty-v8-v" + version
+        receipt = {"schema": "ccc-official-v8-artifact-preparation-v1", "passed": True,
+                   "version": version, "target": spec.target, "profile": "ptrcomp_sandbox_release",
+                   "assembled_source_sha256": expected_source["sha256"],
+                   "official_source_pins": source_pins,
+                   "function": "codex_package.v8.fetch_codex_v8_artifacts",
+                   "function_source_sha256": hashlib.sha256(inspect.getsource(helper.fetch_codex_v8_artifacts).encode()).hexdigest(),
+                   "trusted_manifest_file": str(root / "third_party/v8/rusty_v8_152_2_0_release_manifests.sha256"),
+                   "release_manifest": {"path": str(checksums), "sha256": sha(checksums),
+                                        "bytes": checksums.stat().st_size, "url": base_url + "/" + checksums.name},
+                   "artifacts": [{"path": str(p), "sha256": sha(p), "bytes": p.stat().st_size,
+                                  "url": base_url + "/" + p.name} for p in expected_paths],
+                   "cargo_lock_sha256": sha(root / "codex-rs/Cargo.lock"),
+                   "source_build_requested": False, "external_graph_changed": False}
+        shutil.copyfile(checksums, output / "V8-RELEASE-CHECKSUMS.log")
+        write_json(output / "V8-ARTIFACTS.json", receipt)
+    finally:
+        sys.path[:] = old_path
+        sys.dont_write_bytecode = old_bytecode
+        if old_repo is None:
+            os.environ.pop("CODEX_REPO_ROOT", None)
+        else:
+            os.environ["CODEX_REPO_ROOT"] = old_repo
+        for name in list(sys.modules):
+            if name == "codex_package" or name.startswith("codex_package."):
+                del sys.modules[name]
+    os.environ["RUSTY_V8_ARCHIVE"] = str(pair.archive)
+    os.environ["RUSTY_V8_SRC_BINDING_PATH"] = str(pair.binding)
+    return receipt
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ccc", type=Path, required=True)
@@ -301,6 +392,7 @@ def main():
         shutil.copyfile(cargo_lock, output / "test-Cargo.lock")
         package_args = [part for p in PACKAGES for part in ("-p", p)]
         workspace_cases = [r for r in manifest["required_cases"] if r["package"] != NATIVE_PACKAGE]
+        prepare_v8_artifacts(root, output, test_source)
         # These unit suites launch real auxiliary executables. --lib does not build them.
         run(["cargo", "build", "--locked", "-p", "codex-rmcp-client", "--bin", "test_stdio_server",
              "-p", "codex-code-mode-host", "--bin", "codex-code-mode-host"], workspace,
@@ -377,6 +469,7 @@ def main():
                  "actions_run_attempt": os.environ["GITHUB_RUN_ATTEMPT"], "ccc_commit": os.environ["GITHUB_SHA"],
                  "fresh_test_result_sha256": sha(output / "FRESH-TEST-RESULT.json"),
                  "actual_schema_manifest_sha256": sha(output / "ACTUAL-SCHEMA.json"),
+                 "v8_artifacts_receipt_sha256": sha(output / "V8-ARTIFACTS.json"),
                  "compiled_and_tested": True, "real_180_300_fixture_passed": False,
                  "production_installed": False}
         write_json(package / "BUILD-MANIFEST.json", build)
