@@ -301,12 +301,28 @@ def main():
         shutil.copyfile(cargo_lock, output / "test-Cargo.lock")
         package_args = [part for p in PACKAGES for part in ("-p", p)]
         workspace_cases = [r for r in manifest["required_cases"] if r["package"] != NATIVE_PACKAGE]
+        # These unit suites launch real auxiliary executables. --lib does not build them.
+        run(["cargo", "build", "--locked", "-p", "codex-rmcp-client", "--bin", "test_stdio_server",
+             "-p", "codex-code-mode-host", "--bin", "codex-code-mode-host"], workspace,
+            output / "build-test-helpers.log")
+        helper_pins = {}
+        for name in ("test_stdio_server", "codex-code-mode-host"):
+            binary = workspace / "target/debug" / name
+            if not binary.is_file() or not os.access(binary, os.X_OK):
+                raise ValueError("required actual test helper missing: " + name)
+            os.environ["CARGO_BIN_EXE_" + name] = str(binary)
+            helper_pins[name] = {"path": str(binary), "sha256": sha(binary)}
+        write_json(output / "TEST-HELPERS.json", helper_pins)
         run(["cargo", "nextest", "run", "--locked", "--no-run", *package_args], workspace,
             output / "compile-affected-test-targets.log")
-        run(["cargo", "nextest", "run", "--locked", "--no-fail-fast", "--retries", "0", "--lib", *package_args], workspace,
-            output / "affected-libraries.log")
         junit = workspace / "target/nextest/default/junit.xml"
-        shutil.copyfile(junit, output / "affected-libraries.xml")
+        try:
+            run(["cargo", "nextest", "run", "--locked", "--no-fail-fast", "--retries", "0", "--lib", *package_args], workspace,
+                output / "affected-libraries.log")
+        finally:
+            # Preserve actual failed JUnit as well; command failure still propagates.
+            if junit.is_file():
+                shutil.copyfile(junit, output / "affected-libraries.xml")
         all_libraries = check_junit(output / "affected-libraries.xml")
         run(["cargo", "nextest", "run", "--locked", "--no-fail-fast", "--retries", "0", *package_args,
              "-E", exact_filter(workspace_cases)], workspace, output / "new-and-foreground-tests.log")

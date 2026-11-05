@@ -37065,7 +37065,7 @@
     {
       "path": "codex-rs/tui/src/app/foreground_observation/tests.rs",
       "kind": "file",
-      "sha256": "f6e9663f968f5a80726ec33e915630bcf8bf1531dc8eba0332b164461959613c",
+      "sha256": "fc0125148a54413d65a2e3783e34870a134c93a71d3b43952f6a755c3800ff96",
       "executable": false
     },
     {
@@ -48327,7 +48327,7 @@
     {
       "path": "codex-rs/tui/src/pets/mod.rs",
       "kind": "file",
-      "sha256": "009c46d63d6ad360a8692cfe7a993282e323add081516c1e7626a904f0c322b9",
+      "sha256": "e029c4c4f6c4632d4feb5383d40ec0785059e8c8f2bcc0b2b0b532431183ab11",
       "executable": false
     },
     {
@@ -56766,5 +56766,5 @@
       "executable": false
     }
   ],
-  "sha256": "a549b808a9a26ce72d995cfe38bc24528b9c88a28db93c9e19c98a686a911940"
+  "sha256": "9f8f1a1ca3c884d76d1d0e3bd29811d667147a3bc3998e73c9b3e513c66f48a2"
 }

@@ -4,9 +4,9 @@
   "upstream_commit": "6aaac694803004a63c6f393d153c96d22521a6b9",
   "upstream_tree": "d0caeb3c076fbeade281c18295fada090c52cf8f",
   "owner_review": "OWNER-REVIEW.json",
-  "owner_review_sha256": "e7a477ad51d8ab191abd3674d4ad306d585a55d2e8080cb070f4c1bb3d5c9acb",
+  "owner_review_sha256": "88da1fba1f4284e62a5cdd511e638bc866fd0720a25476df5a6fe472ddbe222d",
   "overlay_patch": "native-compact-recovery.patch",
-  "overlay_patch_sha256": "ff51b3459977d79814d7b8bbf45fc861e9e2a5880b1de41290f667b828205665",
+  "overlay_patch_sha256": "d98f062a3401f25f4e54fe2adecf68196715d825aafb310edce6406ae2c16d4c",
   "overlay": {
     "codex-rs/Cargo.lock": {
       "source": "source/codex-rs/Cargo.lock",
@@ -256,7 +256,7 @@
     "codex-rs/tui/src/app/foreground_observation/tests.rs": {
       "source": "source/codex-rs/tui/src/app/foreground_observation/tests.rs",
       "before_sha256": "395a9b152371d4ed31462f3a850074a76b9c3d839428cfa109f3c99a3d089230",
-      "after_sha256": "f6e9663f968f5a80726ec33e915630bcf8bf1531dc8eba0332b164461959613c"
+      "after_sha256": "fc0125148a54413d65a2e3783e34870a134c93a71d3b43952f6a755c3800ff96"
     },
     "codex-rs/tui/src/app/startup.rs": {
       "source": "source/codex-rs/tui/src/app/startup.rs",
@@ -377,10 +377,15 @@
       "source": "source/codex-rs/tui/src/app/right_click_paste.rs",
       "before_sha256": "8cf7092afc3eb958547128dd4d559ff0018cc887bce90e9caa319b4dcf7a6e90",
       "after_sha256": "f412c8df6910b0cc0d45ecaa1976971d72ca8810b873645c1da3922dfe72b07e"
+    },
+    "codex-rs/tui/src/pets/mod.rs": {
+      "source": "source/codex-rs/tui/src/pets/mod.rs",
+      "before_sha256": "009c46d63d6ad360a8692cfe7a993282e323add081516c1e7626a904f0c322b9",
+      "after_sha256": "e029c4c4f6c4632d4feb5383d40ec0785059e8c8f2bcc0b2b0b532431183ab11"
     }
   },
-  "full_release_source_manifest_sha256": "a549b808a9a26ce72d995cfe38bc24528b9c88a28db93c9e19c98a686a911940",
-  "full_test_source_manifest_sha256": "176e13f28d686fffac343a7dbec7386574d1f30df0608dbe65b1656819f9007d",
+  "full_release_source_manifest_sha256": "9f8f1a1ca3c884d76d1d0e3bd29811d667147a3bc3998e73c9b3e513c66f48a2",
+  "full_test_source_manifest_sha256": "2d5c9ee81e2c47014f9353d70eeea54f46a737c0e40a7788a4b65a797754e036",
   "release_cargo_manifest_sha256": "11ce75d44b3fdc2cf92770ba0dd9e642a214dbf230fb2ef609d0805049f0887f",
   "release_cargo_lock_sha256": "57082b573e682fae144ea44fa15297e3fcf0cfecbb0f32fe491a28839b8caea0",
   "test_cargo_manifest_sha256": "f68b00f9afaefe023edee94111659f0f583113ca7855115a1a892e054ded8f95",

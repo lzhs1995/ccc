@@ -35,7 +35,7 @@ jobs:
       RUST_MIN_STACK: "8388608"
       INSTA_UPDATE: "no"
       STABLE_GIT_COMMIT: 6aaac694803004a63c6f393d153c96d22521a6b9
-      FREEZE_SHA256: ${{ inputs.freeze_sha256 || 'b68174b928d435565b4c9ec29829e7b15d1beef88d57e856a04ef4c253790f8a' }}
+      FREEZE_SHA256: ${{ inputs.freeze_sha256 || '5de4d3a33d6bd11874ce7b03b3a6931321f38182b881f240b542b4090cd46313' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:

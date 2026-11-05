@@ -935,6 +935,25 @@ async fn actual_terminal_event_waits_for_native_shared_lock_before_editing_draft
         ))
     ))
     .await?;
+    assert!(fixture.app.chat_widget.is_in_paste_burst());
+    assert_eq!(fixture.app.chat_widget.composer_text_with_pending(), draft);
+    tokio::time::sleep(crate::bottom_pane::ChatComposer::recommended_paste_flush_delay()).await;
+    fixture
+        .app
+        .before_foreground_tui_event(
+            Some(&TuiEvent::Draw),
+            fixture.server.backend_id(),
+            true,
+            true,
+        )
+        .await;
+    boxed_future!(fixture.app.handle_tui_event(
+        &mut fixture.tui,
+        &mut fixture.server,
+        TuiEvent::Draw
+    ))
+    .await?;
+    assert!(!fixture.app.chat_widget.is_in_paste_burst());
     assert_eq!(
         fixture.app.chat_widget.composer_text_with_pending(),
         format!("{draft}x")
@@ -1187,7 +1206,8 @@ async fn held_ascii_draw_waits_for_original_lock_before_flushing_input() -> Resu
         .is_err()
     );
     assert!(fixture.app.chat_widget.is_in_paste_burst());
-    assert_eq!(fixture.app.chat_widget.composer_text_with_pending(), "x");
+    // The held ASCII key has not reached the textarea while the native lock is held.
+    assert_eq!(fixture.app.chat_widget.composer_text_with_pending(), "");
     assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
     fixture
         .app

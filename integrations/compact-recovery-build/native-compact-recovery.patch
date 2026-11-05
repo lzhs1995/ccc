@@ -23,566 +23,6 @@ index fcdeeab..719d284 100644
   "codex-app-server-daemon",
   "codex-app-server-protocol",
   "codex-app-server-transport",
-diff --git a/codex-rs/app-server/Cargo.toml b/codex-rs/app-server/Cargo.toml
-index bddfc75..857a901 100644
---- a/codex-rs/app-server/Cargo.toml
-+++ b/codex-rs/app-server/Cargo.toml
-@@ -25,6 +25,7 @@ doctest = false
- workspace = true
- 
- [dependencies]
-+codex-api = { workspace = true }
- codex-utils-process = { workspace = true }
- anyhow = { workspace = true }
- base64 = { workspace = true }
-@@ -120,12 +121,13 @@ tokio-util = { workspace = true }
- tracing = { workspace = true, features = ["log"] }
- tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "json"] }
- url = { workspace = true }
--uuid = { workspace = true, features = ["serde", "v7"] }
-+uuid = { workspace = true, features = ["serde", "v4", "v7"] }
- 
- [target.'cfg(all(target_os = "linux", target_env = "musl", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
- tikv-jemallocator = { workspace = true }
- 
- [target.'cfg(unix)'.dependencies]
-+ccc-native-client-foreground = { path = "../../native/client-foreground" }
- libc = { workspace = true }
- 
- [target.'cfg(windows)'.dependencies]
-@@ -166,3 +168,4 @@ tokio-rustls = { workspace = true }
- tokio-tungstenite = { workspace = true }
- tracing-opentelemetry = { workspace = true }
- wiremock = { workspace = true }
-+
-diff --git a/codex-rs/app-server/src/message_processor.rs b/codex-rs/app-server/src/message_processor.rs
-index e1e5a7a..8ae35c0 100644
---- a/codex-rs/app-server/src/message_processor.rs
-+++ b/codex-rs/app-server/src/message_processor.rs
-@@ -1017,6 +1017,7 @@ impl MessageProcessor {
-             | ClientRequest::TurnSteer { .. }
-             | ClientRequest::ReviewStart { .. }
-             | ClientRequest::ThreadCompactStart { .. }
-+            | ClientRequest::ThreadCompactRecovery { .. }
-             | ClientRequest::ThreadShellCommand { .. }
-             | ClientRequest::ThreadQueueStart { .. }
-             | ClientRequest::ThreadRealtimeStart { .. } => {
-@@ -1482,6 +1483,9 @@ impl MessageProcessor {
-             ClientRequest::ThreadPredictionRequest { .. } => Err(method_not_found(
-                 "thread/prediction/request is not implemented yet",
-             )),
-+            ClientRequest::ThreadCompactRecovery { params, .. } => {
-+                self.thread_processor.thread_compact_recovery(params).await
-+            }
-             ClientRequest::ThreadCompactStart { params, .. } => {
-                 self.thread_processor
-                     .thread_compact_start(&request_id, params)
-diff --git a/codex-rs/app-server/src/request_processors/compaction_recovery_policy.rs b/codex-rs/app-server/src/request_processors/compaction_recovery_policy.rs
-new file mode 100644
-index 0000000..e476efb
---- /dev/null
-+++ b/codex-rs/app-server/src/request_processors/compaction_recovery_policy.rs
-@@ -0,0 +1,389 @@
-+//! Binds Core's original occurrence to the original native TUI grant and Goal.
-+//! Receipt files are write-once; an I/O ambiguity is never a replay grant.
-+use ccc_native_client_foreground::CompactionGrantGuard;
-+use ccc_native_client_foreground::verify_compaction_grant;
-+use codex_api::compaction_dispatch::CompactionDispatchAuthority;
-+use codex_core::RecoveryPolicy;
-+use codex_core::RecoveryPolicyHandle;
-+use codex_goal_extension::GoalRuntimeHandle;
-+use codex_protocol::compact_recovery::CompactionRecoveryIdentity;
-+use codex_protocol::compact_recovery::CompactionRecoveryRequest;
-+use futures::future::BoxFuture;
-+use serde_json::Value;
-+use serde_json::json;
-+use std::collections::BTreeMap;
-+use std::ffi::CString;
-+use std::fs::File;
-+use std::fs::OpenOptions;
-+use std::fs::{self};
-+use std::io::Write;
-+use std::os::fd::AsRawFd;
-+use std::os::fd::FromRawFd;
-+use std::os::unix::fs::MetadataExt;
-+use std::os::unix::fs::OpenOptionsExt;
-+use std::path::Path;
-+use std::sync::Arc;
-+use std::sync::Mutex;
-+
-+pub(super) struct NativeCompactionPolicy {
-+    goal: Arc<GoalRuntimeHandle>,
-+    requests: Mutex<BTreeMap<String, CompactionRecoveryRequest>>,
-+    reservations:
-+        Mutex<BTreeMap<String, std::sync::Weak<codex_goal_extension::CompactionGoalReservation>>>,
-+}
-+
-+impl NativeCompactionPolicy {
-+    pub(super) fn handle(goal: Arc<GoalRuntimeHandle>) -> RecoveryPolicyHandle {
-+        RecoveryPolicyHandle(Arc::new(Self {
-+            goal,
-+            requests: Mutex::new(BTreeMap::new()),
-+            reservations: Mutex::new(BTreeMap::new()),
-+        }))
-+    }
-+    fn request(&self, attempt: &str) -> Result<CompactionRecoveryRequest, String> {
-+        self.requests
-+            .lock()
-+            .map_err(|_| "native request ledger poisoned")?
-+            .get(attempt)
-+            .cloned()
-+            .ok_or_else(|| "original native request absent".into())
-+    }
-+    fn matching_request(
-+        &self,
-+        expected: &CompactionRecoveryIdentity,
-+    ) -> Result<CompactionRecoveryRequest, String> {
-+        let requests = self
-+            .requests
-+            .lock()
-+            .map_err(|_| "native request ledger poisoned")?;
-+        let mut found = requests.values().filter(|request| {
-+            request.expected.native_epoch == expected.native_epoch
-+                && request.expected.thread_id == expected.thread_id
-+                && request.expected.turn_id == expected.turn_id
-+                && request.expected.occurrence == expected.occurrence
-+                && request.expected.generation.checked_add(1) == Some(expected.generation)
-+        });
-+        let request = found
-+            .next()
-+            .cloned()
-+            .ok_or("original generation receipt absent")?;
-+        if found.next().is_some() {
-+            return Err("ambiguous original native request".into());
-+        }
-+        Ok(request)
-+    }
-+    fn receipt(
-+        request: &CompactionRecoveryRequest,
-+        phase: &str,
-+        expected: &CompactionRecoveryIdentity,
-+    ) -> Result<String, String> {
-+        if !request
-+            .attempt_id
-+            .bytes()
-+            .all(|c| c.is_ascii_alphanumeric() || b"-_".contains(&c))
-+            || request.attempt_id.is_empty()
-+            || request.attempt_id.len() > 128
-+        {
-+            return Err("invalid original attempt id".into());
-+        }
-+        let proof = Path::new(&request.authority.proof_path);
-+        let directory = proof.parent().ok_or("native proof directory absent")?;
-+        let name = format!("{}-{phase}.json", request.attempt_id);
-+        let value = json!({"schema":1,"purpose":"native_compaction_recovery_receipt",
-+            "phase":phase,"attemptId":request.attempt_id,"controllerId":request.authority.controller_id,
-+            "enrollmentId":request.authority.enrollment_id,"originalIntent":request.authority.intent_path,
-+            "originalIntentSha256":request.authority.intent_sha256,"expected":expected,
-+            "serverPid":std::process::id(),"originalAuthority":request.authority,
-+            "timestampMs":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-+                .map_err(|_| "native clock before epoch")?.as_millis()});
-+        let raw = serde_json::to_vec(&value).map_err(|error| error.to_string())?;
-+        write_once(directory, &name, &raw).map_err(|error| error.to_string())?;
-+        Ok(directory.join(name).to_string_lossy().into_owned())
-+    }
-+}
-+
-+impl RecoveryPolicy for NativeCompactionPolicy {
-+    fn admit<'a>(
-+        &'a self,
-+        request: &'a CompactionRecoveryRequest,
-+    ) -> BoxFuture<'a, Result<Arc<dyn CompactionDispatchAuthority>, String>> {
-+        Box::pin(async move {
-+            let expected = serde_json::to_value(request).map_err(|error| error.to_string())?;
-+            let client_guard = verify_compaction_grant(
-+                Path::new(&request.authority.proof_path),
-+                &request.authority.proof_sha256,
-+                &expected,
-+            )
-+            .map_err(|error| error.to_string())?;
-+            let remaining = client_guard
-+                .remaining()
-+                .map_err(|error| error.to_string())?;
-+            let goal = tokio::time::timeout(
-+                remaining,
-+                self.goal
-+                    .compaction_recovery_goal_guard(&request.authority.expected_goal),
-+            )
-+            .await
-+            .map_err(|_| "native original Goal authority deadline expired")??;
-+            self.reservations
-+                .lock()
-+                .map_err(|_| "native Goal ledger poisoned")?
-+                .insert(request.attempt_id.clone(), Arc::downgrade(&goal));
-+            Ok(Arc::new(NativeDispatchGuard {
-+                client: client_guard,
-+                _goal: Some(goal),
-+                request: request.clone(),
-+                replacement: None,
-+            }) as Arc<dyn CompactionDispatchAuthority>)
-+        })
-+    }
-+    fn persist_admission(&self, request: &CompactionRecoveryRequest) -> Result<String, String> {
-+        let mut requests = self
-+            .requests
-+            .lock()
-+            .map_err(|_| "native request ledger poisoned")?;
-+        if requests.contains_key(&request.attempt_id) {
-+            return Err("original attempt already consumed".into());
-+        }
-+        // Record in-memory before disk: a failed publication remains consumed.
-+        requests.insert(request.attempt_id.clone(), request.clone());
-+        Self::receipt(request, "admitted", &request.expected)
-+    }
-+    fn persist_drained(
-+        &self,
-+        expected: &CompactionRecoveryIdentity,
-+        attempt_id: &str,
-+    ) -> Result<(), String> {
-+        let request = self.request(attempt_id)?;
-+        if request.expected != *expected {
-+            return Err("original drain identity changed".into());
-+        }
-+        Self::receipt(&request, "drained", expected).map(|_| ())
-+    }
-+    fn authorize_replacement<'a>(
-+        &'a self,
-+        expected: &'a CompactionRecoveryIdentity,
-+        attempt_id: &'a str,
-+    ) -> BoxFuture<'a, Result<Arc<dyn CompactionDispatchAuthority>, String>> {
-+        Box::pin(async move {
-+            let request = self.request(attempt_id)?;
-+            if request.expected != *expected {
-+                return Err("original replacement identity changed".into());
-+            }
-+            let value = serde_json::to_value(&request).map_err(|error| error.to_string())?;
-+            let client_guard = verify_compaction_grant(
-+                Path::new(&request.authority.proof_path),
-+                &request.authority.proof_sha256,
-+                &value,
-+            )
-+            .map_err(|error| error.to_string())?;
-+            let goal = self
-+                .reservations
-+                .lock()
-+                .map_err(|_| "native Goal ledger poisoned")?
-+                .get(attempt_id)
-+                .and_then(std::sync::Weak::upgrade)
-+                .ok_or("original native Goal reservation disappeared")?;
-+            let remaining = client_guard
-+                .remaining()
-+                .map_err(|error| error.to_string())?;
-+            let updated = tokio::time::timeout(
-+                remaining,
-+                goal.settle_original_usage(&expected.turn_id, attempt_id),
-+            )
-+            .await
-+            .map_err(|_| "original native Goal settlement expired UNKNOWN")??;
-+            let name = format!("{}-goal-settled.json", request.attempt_id);
-+            let raw=serde_json::to_vec(&json!({"schema":1,"purpose":"native_compaction_goal_settlement","attemptId":attempt_id,
-+                "expected":expected,"originalGoal":request.authority.expected_goal,"settledGoal":updated,
-+                "intentSha256":request.authority.intent_sha256})).map_err(|e|e.to_string())?;
-+            write_once(
-+                Path::new(&request.authority.proof_path)
-+                    .parent()
-+                    .ok_or("native proof parent absent")?,
-+                &name,
-+                &raw,
-+            )
-+            .map_err(|e| e.to_string())?;
-+            // Keep original Goal permit through actual replacement dispatch.
-+            let mut replacement = expected.clone();
-+            replacement.generation = replacement
-+                .generation
-+                .checked_add(1)
-+                .ok_or("native generation overflow")?;
-+            Ok(Arc::new(NativeDispatchGuard {
-+                client: client_guard,
-+                _goal: Some(goal),
-+                request,
-+                replacement: Some(replacement),
-+            }) as Arc<dyn CompactionDispatchAuthority>)
-+        })
-+    }
-+    fn persist_replacement_dispatched(
-+        &self,
-+        expected: &CompactionRecoveryIdentity,
-+    ) -> Result<(), String> {
-+        let request = self.matching_request(expected)?;
-+        Self::receipt(&request, "replacement-dispatched", expected).map(|_| ())
-+    }
-+    fn persist_terminal(
-+        &self,
-+        expected: &CompactionRecoveryIdentity,
-+        attempt_id: Option<&str>,
-+        completed: bool,
-+    ) -> Result<(), String> {
-+        let request = if let Some(attempt_id) = attempt_id {
-+            let request = self.request(attempt_id)?;
-+            if request.expected != *expected {
-+                return Err("original terminal identity changed".into());
-+            }
-+            request
-+        } else {
-+            self.matching_request(expected)?
-+        };
-+        let phase = match (attempt_id.is_some(), completed) {
-+            (true, true) => "original-provider-completed",
-+            (true, false) => "original-provider-failed",
-+            (false, true) => "replacement-provider-completed",
-+            (false, false) => "replacement-provider-failed",
-+        };
-+        // Provider completion is not history-installation or Goal-completion proof.
-+        Self::receipt(&request, phase, expected).map(|_| ())
-+    }
-+}
-+
-+struct NativeDispatchGuard {
-+    client: CompactionGrantGuard,
-+    _goal: Option<Arc<codex_goal_extension::CompactionGoalReservation>>,
-+    request: CompactionRecoveryRequest,
-+    replacement: Option<CompactionRecoveryIdentity>,
-+}
-+impl CompactionDispatchAuthority for NativeDispatchGuard {
-+    fn remaining(&self) -> Result<std::time::Duration, String> {
-+        self.client.remaining().map_err(|error| error.to_string())
-+    }
-+    fn validate_fresh(&self) -> Result<(), String> {
-+        self.client
-+            .validate_fresh()
-+            .map_err(|error| error.to_string())
-+    }
-+    fn persist_send_intent(&self) -> Result<(), String> {
-+        let expected = self
-+            .replacement
-+            .as_ref()
-+            .ok_or("admission guard cannot send")?;
-+        NativeCompactionPolicy::receipt(&self.request, "replacement-send-intent", expected)
-+            .map(|_| ())
-+    }
-+    fn persist_sent(&self) -> Result<(), String> {
-+        let expected = self
-+            .replacement
-+            .as_ref()
-+            .ok_or("admission guard cannot send")?;
-+        NativeCompactionPolicy::receipt(&self.request, "replacement-dispatched", expected)
-+            .map(|_| ())
-+    }
-+}
-+
-+/// Directory-relative syscalls bind publication to the opened original inode.
-+/// A crash can leave a private temporary; neither a partial target nor an old
-+/// target is accepted as a new receipt. Parent replacement is reported UNKNOWN.
-+fn write_once(directory: &Path, name: &str, raw: &[u8]) -> std::io::Result<()> {
-+    let before = fs::symlink_metadata(directory)?;
-+    if !before.is_dir()
-+        || before.uid() != unsafe { libc::geteuid() }
-+        || before.mode() & 0o077 != 0
-+        || directory.canonicalize()? != directory
-+    {
-+        return Err(std::io::Error::other(
-+            "unsafe original native receipt directory",
-+        ));
-+    }
-+    let dir = OpenOptions::new()
-+        .read(true)
-+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
-+        .open(directory)?;
-+    let opened = dir.metadata()?;
-+    if opened.ino() != before.ino() || opened.dev() != before.dev() {
-+        return Err(std::io::Error::other("native receipt directory changed"));
-+    }
-+    if name.is_empty() || name.contains('/') || name == "." || name == ".." {
-+        return Err(std::io::Error::other("unsafe receipt name"));
-+    }
-+    let target = CString::new(name).map_err(std::io::Error::other)?;
-+    let temp = CString::new(format!(".{name}.{}.tmp", uuid::Uuid::new_v4()))
-+        .map_err(std::io::Error::other)?;
-+    let fd = unsafe {
-+        libc::openat(
-+            dir.as_raw_fd(),
-+            temp.as_ptr(),
-+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-+            0o600,
-+        )
-+    };
-+    if fd < 0 {
-+        return Err(std::io::Error::last_os_error());
-+    }
-+    let mut file = unsafe { File::from_raw_fd(fd) };
-+    file.write_all(raw)?;
-+    file.sync_all()?;
-+    if unsafe {
-+        libc::linkat(
-+            dir.as_raw_fd(),
-+            temp.as_ptr(),
-+            dir.as_raw_fd(),
-+            target.as_ptr(),
-+            0,
-+        )
-+    } != 0
-+    {
-+        return Err(std::io::Error::last_os_error());
-+    }
-+    dir.sync_all()?;
-+    if unsafe { libc::unlinkat(dir.as_raw_fd(), temp.as_ptr(), 0) } != 0 {
-+        return Err(std::io::Error::last_os_error());
-+    }
-+    dir.sync_all()?;
-+    let after = fs::symlink_metadata(directory)?;
-+    if after.ino() != before.ino() || after.dev() != before.dev() {
-+        return Err(std::io::Error::other(
-+            "native receipt parent changed; reconcile original inode",
-+        ));
-+    }
-+    Ok(())
-+}
-+
-+#[cfg(test)]
-+mod tests {
-+    use super::*;
-+    use std::os::unix::fs::PermissionsExt;
-+    use std::os::unix::fs::symlink;
-+    #[test]
-+    fn native_receipt_is_atomic_private_and_never_overwrites_original_attempt() {
-+        let root = tempfile::tempdir().unwrap();
-+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
-+        let directory = root.path().canonicalize().unwrap();
-+        write_once(&directory, "original.json", b"{\"phase\":\"admitted\"}").unwrap();
-+        assert!(write_once(&directory, "original.json", b"changed").is_err());
-+        assert_eq!(
-+            fs::read(directory.join("original.json")).unwrap(),
-+            b"{\"phase\":\"admitted\"}"
-+        );
-+        assert_eq!(
-+            fs::metadata(directory.join("original.json"))
-+                .unwrap()
-+                .mode()
-+                & 0o077,
-+            0
-+        );
-+    }
-+    #[test]
-+    fn native_receipt_rejects_symlink_parent_and_path_escape() {
-+        let root = tempfile::tempdir().unwrap();
-+        let directory = root.path().canonicalize().unwrap();
-+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
-+        symlink(&directory, directory.join("alias")).unwrap();
-+        assert!(write_once(&directory.join("alias"), "bad.json", b"{}").is_err());
-+        assert!(write_once(&directory, "../bad.json", b"{}").is_err());
-+    }
-+}
-diff --git a/codex-rs/app-server/src/request_processors/thread_processor.rs b/codex-rs/app-server/src/request_processors/thread_processor.rs
-index 4d104e2..6f74f04 100644
---- a/codex-rs/app-server/src/request_processors/thread_processor.rs
-+++ b/codex-rs/app-server/src/request_processors/thread_processor.rs
-@@ -822,6 +822,84 @@ impl ThreadRequestProcessor {
-         }
-     }
- 
-+    pub(crate) async fn thread_compact_recovery(
-+        &self,
-+        params: ThreadCompactRecoveryParams,
-+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-+        use codex_protocol::compact_recovery::CompactionRecoveryIdentity;
-+        use codex_protocol::compact_recovery::CompactionRecoveryRequest;
-+        params.validate_original_shape().map_err(invalid_request)?;
-+        let (_, thread) = self.load_thread(&params.thread_id).await?;
-+        ensure_direct_input_allowed(thread.as_ref()).await?;
-+        let request = match (
-+            params.expected_native_epoch,
-+            params.expected_turn_id,
-+            params.expected_occurrence,
-+            params.expected_generation,
-+            params.attempt_id,
-+        ) {
-+            (None, None, None, None, None) if params.authority.is_none() => None,
-+            (
-+                Some(native_epoch),
-+                Some(turn_id),
-+                Some(occurrence),
-+                Some(generation),
-+                Some(attempt_id),
-+            ) => Some(CompactionRecoveryRequest {
-+                expected: CompactionRecoveryIdentity {
-+                    native_epoch,
-+                    thread_id: params.thread_id,
-+                    turn_id,
-+                    occurrence,
-+                    generation,
-+                },
-+                attempt_id,
-+                authority: serde_json::from_value(
-+                    params
-+                        .authority
-+                        .clone()
-+                        .ok_or_else(|| invalid_request("native TUI authority is required"))?,
-+                )
-+                .map_err(|error| {
-+                    invalid_request(format!("invalid native TUI authority: {error}"))
-+                })?,
-+            }),
-+            _ => {
-+                return Err(invalid_request(
-+                    "all original compaction identity fields are required".to_string(),
-+                ));
-+            }
-+        };
-+        let goal = thread
-+            .thread_extension_data()
-+            .get::<codex_goal_extension::GoalRuntimeHandle>()
-+            .ok_or_else(|| {
-+                invalid_request("native Goal runtime unavailable for compaction recovery")
-+            })?;
-+        let goal_snapshot = if request.is_none() {
-+            Some(
-+                goal.compaction_recovery_goal_snapshot()
-+                    .await
-+                    .map_err(invalid_request)?,
-+            )
-+        } else {
-+            None
-+        };
-+        #[cfg(unix)]
-+        thread
-+            .thread_extension_data()
-+            .get_or_init::<codex_core::RecoveryPolicyHandle>(|| {
-+                super::compaction_recovery_policy::NativeCompactionPolicy::handle(goal)
-+            });
-+        let mut result = thread.compaction_recovery(request).await.map_err(|error| {
-+            internal_error(format!("conditional compaction recovery refused: {error}"))
-+        })?;
-+        if let Some(goal_snapshot) = goal_snapshot {
-+            result["goal"] = goal_snapshot;
-+        }
-+        Ok(Some(ThreadCompactRecoveryResponse { result }.into()))
-+    }
-+
-     pub(crate) async fn thread_compact_start(
-         &self,
-         request_id: &ConnectionRequestId,
-diff --git a/codex-rs/app-server/src/request_processors.rs b/codex-rs/app-server/src/request_processors.rs
-index f76e655..ad24a2d 100644
---- a/codex-rs/app-server/src/request_processors.rs
-+++ b/codex-rs/app-server/src/request_processors.rs
-@@ -203,6 +203,8 @@ use codex_app_server_protocol::ThreadBackgroundTerminalsListResponse;
- use codex_app_server_protocol::ThreadBackgroundTerminalsTerminateParams;
- use codex_app_server_protocol::ThreadBackgroundTerminalsTerminateResponse;
- use codex_app_server_protocol::ThreadClosedNotification;
-+use codex_app_server_protocol::ThreadCompactRecoveryParams;
-+use codex_app_server_protocol::ThreadCompactRecoveryResponse;
- use codex_app_server_protocol::ThreadCompactStartParams;
- use codex_app_server_protocol::ThreadCompactStartResponse;
- use codex_app_server_protocol::ThreadDecrementElicitationParams;
-@@ -542,6 +544,8 @@ mod apps_processor;
- mod bedrock_auth;
- mod catalog_processor;
- mod command_exec_processor;
-+#[cfg(unix)]
-+mod compaction_recovery_policy;
- pub(crate) mod config_processor;
- #[cfg(test)]
- #[path = "request_processors/config_reload_tests.rs"]
 diff --git a/codex-rs/app-server-protocol/schema/json/ClientRequest.json b/codex-rs/app-server-protocol/schema/json/ClientRequest.json
 index 00349de..8fa779c 100644
 --- a/codex-rs/app-server-protocol/schema/json/ClientRequest.json
@@ -13774,6 +13214,566 @@ index a7a7623..c8d0b02 100644
  #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
  #[serde(rename_all = "camelCase")]
  #[ts(export_to = "v2/")]
+diff --git a/codex-rs/app-server/Cargo.toml b/codex-rs/app-server/Cargo.toml
+index bddfc75..857a901 100644
+--- a/codex-rs/app-server/Cargo.toml
++++ b/codex-rs/app-server/Cargo.toml
+@@ -25,6 +25,7 @@ doctest = false
+ workspace = true
+ 
+ [dependencies]
++codex-api = { workspace = true }
+ codex-utils-process = { workspace = true }
+ anyhow = { workspace = true }
+ base64 = { workspace = true }
+@@ -120,12 +121,13 @@ tokio-util = { workspace = true }
+ tracing = { workspace = true, features = ["log"] }
+ tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "json"] }
+ url = { workspace = true }
+-uuid = { workspace = true, features = ["serde", "v7"] }
++uuid = { workspace = true, features = ["serde", "v4", "v7"] }
+ 
+ [target.'cfg(all(target_os = "linux", target_env = "musl", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
+ tikv-jemallocator = { workspace = true }
+ 
+ [target.'cfg(unix)'.dependencies]
++ccc-native-client-foreground = { path = "../../native/client-foreground" }
+ libc = { workspace = true }
+ 
+ [target.'cfg(windows)'.dependencies]
+@@ -166,3 +168,4 @@ tokio-rustls = { workspace = true }
+ tokio-tungstenite = { workspace = true }
+ tracing-opentelemetry = { workspace = true }
+ wiremock = { workspace = true }
++
+diff --git a/codex-rs/app-server/src/message_processor.rs b/codex-rs/app-server/src/message_processor.rs
+index e1e5a7a..8ae35c0 100644
+--- a/codex-rs/app-server/src/message_processor.rs
++++ b/codex-rs/app-server/src/message_processor.rs
+@@ -1017,6 +1017,7 @@ impl MessageProcessor {
+             | ClientRequest::TurnSteer { .. }
+             | ClientRequest::ReviewStart { .. }
+             | ClientRequest::ThreadCompactStart { .. }
++            | ClientRequest::ThreadCompactRecovery { .. }
+             | ClientRequest::ThreadShellCommand { .. }
+             | ClientRequest::ThreadQueueStart { .. }
+             | ClientRequest::ThreadRealtimeStart { .. } => {
+@@ -1482,6 +1483,9 @@ impl MessageProcessor {
+             ClientRequest::ThreadPredictionRequest { .. } => Err(method_not_found(
+                 "thread/prediction/request is not implemented yet",
+             )),
++            ClientRequest::ThreadCompactRecovery { params, .. } => {
++                self.thread_processor.thread_compact_recovery(params).await
++            }
+             ClientRequest::ThreadCompactStart { params, .. } => {
+                 self.thread_processor
+                     .thread_compact_start(&request_id, params)
+diff --git a/codex-rs/app-server/src/request_processors.rs b/codex-rs/app-server/src/request_processors.rs
+index f76e655..ad24a2d 100644
+--- a/codex-rs/app-server/src/request_processors.rs
++++ b/codex-rs/app-server/src/request_processors.rs
+@@ -203,6 +203,8 @@ use codex_app_server_protocol::ThreadBackgroundTerminalsListResponse;
+ use codex_app_server_protocol::ThreadBackgroundTerminalsTerminateParams;
+ use codex_app_server_protocol::ThreadBackgroundTerminalsTerminateResponse;
+ use codex_app_server_protocol::ThreadClosedNotification;
++use codex_app_server_protocol::ThreadCompactRecoveryParams;
++use codex_app_server_protocol::ThreadCompactRecoveryResponse;
+ use codex_app_server_protocol::ThreadCompactStartParams;
+ use codex_app_server_protocol::ThreadCompactStartResponse;
+ use codex_app_server_protocol::ThreadDecrementElicitationParams;
+@@ -542,6 +544,8 @@ mod apps_processor;
+ mod bedrock_auth;
+ mod catalog_processor;
+ mod command_exec_processor;
++#[cfg(unix)]
++mod compaction_recovery_policy;
+ pub(crate) mod config_processor;
+ #[cfg(test)]
+ #[path = "request_processors/config_reload_tests.rs"]
+diff --git a/codex-rs/app-server/src/request_processors/compaction_recovery_policy.rs b/codex-rs/app-server/src/request_processors/compaction_recovery_policy.rs
+new file mode 100644
+index 0000000..e476efb
+--- /dev/null
++++ b/codex-rs/app-server/src/request_processors/compaction_recovery_policy.rs
+@@ -0,0 +1,389 @@
++//! Binds Core's original occurrence to the original native TUI grant and Goal.
++//! Receipt files are write-once; an I/O ambiguity is never a replay grant.
++use ccc_native_client_foreground::CompactionGrantGuard;
++use ccc_native_client_foreground::verify_compaction_grant;
++use codex_api::compaction_dispatch::CompactionDispatchAuthority;
++use codex_core::RecoveryPolicy;
++use codex_core::RecoveryPolicyHandle;
++use codex_goal_extension::GoalRuntimeHandle;
++use codex_protocol::compact_recovery::CompactionRecoveryIdentity;
++use codex_protocol::compact_recovery::CompactionRecoveryRequest;
++use futures::future::BoxFuture;
++use serde_json::Value;
++use serde_json::json;
++use std::collections::BTreeMap;
++use std::ffi::CString;
++use std::fs::File;
++use std::fs::OpenOptions;
++use std::fs::{self};
++use std::io::Write;
++use std::os::fd::AsRawFd;
++use std::os::fd::FromRawFd;
++use std::os::unix::fs::MetadataExt;
++use std::os::unix::fs::OpenOptionsExt;
++use std::path::Path;
++use std::sync::Arc;
++use std::sync::Mutex;
++
++pub(super) struct NativeCompactionPolicy {
++    goal: Arc<GoalRuntimeHandle>,
++    requests: Mutex<BTreeMap<String, CompactionRecoveryRequest>>,
++    reservations:
++        Mutex<BTreeMap<String, std::sync::Weak<codex_goal_extension::CompactionGoalReservation>>>,
++}
++
++impl NativeCompactionPolicy {
++    pub(super) fn handle(goal: Arc<GoalRuntimeHandle>) -> RecoveryPolicyHandle {
++        RecoveryPolicyHandle(Arc::new(Self {
++            goal,
++            requests: Mutex::new(BTreeMap::new()),
++            reservations: Mutex::new(BTreeMap::new()),
++        }))
++    }
++    fn request(&self, attempt: &str) -> Result<CompactionRecoveryRequest, String> {
++        self.requests
++            .lock()
++            .map_err(|_| "native request ledger poisoned")?
++            .get(attempt)
++            .cloned()
++            .ok_or_else(|| "original native request absent".into())
++    }
++    fn matching_request(
++        &self,
++        expected: &CompactionRecoveryIdentity,
++    ) -> Result<CompactionRecoveryRequest, String> {
++        let requests = self
++            .requests
++            .lock()
++            .map_err(|_| "native request ledger poisoned")?;
++        let mut found = requests.values().filter(|request| {
++            request.expected.native_epoch == expected.native_epoch
++                && request.expected.thread_id == expected.thread_id
++                && request.expected.turn_id == expected.turn_id
++                && request.expected.occurrence == expected.occurrence
++                && request.expected.generation.checked_add(1) == Some(expected.generation)
++        });
++        let request = found
++            .next()
++            .cloned()
++            .ok_or("original generation receipt absent")?;
++        if found.next().is_some() {
++            return Err("ambiguous original native request".into());
++        }
++        Ok(request)
++    }
++    fn receipt(
++        request: &CompactionRecoveryRequest,
++        phase: &str,
++        expected: &CompactionRecoveryIdentity,
++    ) -> Result<String, String> {
++        if !request
++            .attempt_id
++            .bytes()
++            .all(|c| c.is_ascii_alphanumeric() || b"-_".contains(&c))
++            || request.attempt_id.is_empty()
++            || request.attempt_id.len() > 128
++        {
++            return Err("invalid original attempt id".into());
++        }
++        let proof = Path::new(&request.authority.proof_path);
++        let directory = proof.parent().ok_or("native proof directory absent")?;
++        let name = format!("{}-{phase}.json", request.attempt_id);
++        let value = json!({"schema":1,"purpose":"native_compaction_recovery_receipt",
++            "phase":phase,"attemptId":request.attempt_id,"controllerId":request.authority.controller_id,
++            "enrollmentId":request.authority.enrollment_id,"originalIntent":request.authority.intent_path,
++            "originalIntentSha256":request.authority.intent_sha256,"expected":expected,
++            "serverPid":std::process::id(),"originalAuthority":request.authority,
++            "timestampMs":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
++                .map_err(|_| "native clock before epoch")?.as_millis()});
++        let raw = serde_json::to_vec(&value).map_err(|error| error.to_string())?;
++        write_once(directory, &name, &raw).map_err(|error| error.to_string())?;
++        Ok(directory.join(name).to_string_lossy().into_owned())
++    }
++}
++
++impl RecoveryPolicy for NativeCompactionPolicy {
++    fn admit<'a>(
++        &'a self,
++        request: &'a CompactionRecoveryRequest,
++    ) -> BoxFuture<'a, Result<Arc<dyn CompactionDispatchAuthority>, String>> {
++        Box::pin(async move {
++            let expected = serde_json::to_value(request).map_err(|error| error.to_string())?;
++            let client_guard = verify_compaction_grant(
++                Path::new(&request.authority.proof_path),
++                &request.authority.proof_sha256,
++                &expected,
++            )
++            .map_err(|error| error.to_string())?;
++            let remaining = client_guard
++                .remaining()
++                .map_err(|error| error.to_string())?;
++            let goal = tokio::time::timeout(
++                remaining,
++                self.goal
++                    .compaction_recovery_goal_guard(&request.authority.expected_goal),
++            )
++            .await
++            .map_err(|_| "native original Goal authority deadline expired")??;
++            self.reservations
++                .lock()
++                .map_err(|_| "native Goal ledger poisoned")?
++                .insert(request.attempt_id.clone(), Arc::downgrade(&goal));
++            Ok(Arc::new(NativeDispatchGuard {
++                client: client_guard,
++                _goal: Some(goal),
++                request: request.clone(),
++                replacement: None,
++            }) as Arc<dyn CompactionDispatchAuthority>)
++        })
++    }
++    fn persist_admission(&self, request: &CompactionRecoveryRequest) -> Result<String, String> {
++        let mut requests = self
++            .requests
++            .lock()
++            .map_err(|_| "native request ledger poisoned")?;
++        if requests.contains_key(&request.attempt_id) {
++            return Err("original attempt already consumed".into());
++        }
++        // Record in-memory before disk: a failed publication remains consumed.
++        requests.insert(request.attempt_id.clone(), request.clone());
++        Self::receipt(request, "admitted", &request.expected)
++    }
++    fn persist_drained(
++        &self,
++        expected: &CompactionRecoveryIdentity,
++        attempt_id: &str,
++    ) -> Result<(), String> {
++        let request = self.request(attempt_id)?;
++        if request.expected != *expected {
++            return Err("original drain identity changed".into());
++        }
++        Self::receipt(&request, "drained", expected).map(|_| ())
++    }
++    fn authorize_replacement<'a>(
++        &'a self,
++        expected: &'a CompactionRecoveryIdentity,
++        attempt_id: &'a str,
++    ) -> BoxFuture<'a, Result<Arc<dyn CompactionDispatchAuthority>, String>> {
++        Box::pin(async move {
++            let request = self.request(attempt_id)?;
++            if request.expected != *expected {
++                return Err("original replacement identity changed".into());
++            }
++            let value = serde_json::to_value(&request).map_err(|error| error.to_string())?;
++            let client_guard = verify_compaction_grant(
++                Path::new(&request.authority.proof_path),
++                &request.authority.proof_sha256,
++                &value,
++            )
++            .map_err(|error| error.to_string())?;
++            let goal = self
++                .reservations
++                .lock()
++                .map_err(|_| "native Goal ledger poisoned")?
++                .get(attempt_id)
++                .and_then(std::sync::Weak::upgrade)
++                .ok_or("original native Goal reservation disappeared")?;
++            let remaining = client_guard
++                .remaining()
++                .map_err(|error| error.to_string())?;
++            let updated = tokio::time::timeout(
++                remaining,
++                goal.settle_original_usage(&expected.turn_id, attempt_id),
++            )
++            .await
++            .map_err(|_| "original native Goal settlement expired UNKNOWN")??;
++            let name = format!("{}-goal-settled.json", request.attempt_id);
++            let raw=serde_json::to_vec(&json!({"schema":1,"purpose":"native_compaction_goal_settlement","attemptId":attempt_id,
++                "expected":expected,"originalGoal":request.authority.expected_goal,"settledGoal":updated,
++                "intentSha256":request.authority.intent_sha256})).map_err(|e|e.to_string())?;
++            write_once(
++                Path::new(&request.authority.proof_path)
++                    .parent()
++                    .ok_or("native proof parent absent")?,
++                &name,
++                &raw,
++            )
++            .map_err(|e| e.to_string())?;
++            // Keep original Goal permit through actual replacement dispatch.
++            let mut replacement = expected.clone();
++            replacement.generation = replacement
++                .generation
++                .checked_add(1)
++                .ok_or("native generation overflow")?;
++            Ok(Arc::new(NativeDispatchGuard {
++                client: client_guard,
++                _goal: Some(goal),
++                request,
++                replacement: Some(replacement),
++            }) as Arc<dyn CompactionDispatchAuthority>)
++        })
++    }
++    fn persist_replacement_dispatched(
++        &self,
++        expected: &CompactionRecoveryIdentity,
++    ) -> Result<(), String> {
++        let request = self.matching_request(expected)?;
++        Self::receipt(&request, "replacement-dispatched", expected).map(|_| ())
++    }
++    fn persist_terminal(
++        &self,
++        expected: &CompactionRecoveryIdentity,
++        attempt_id: Option<&str>,
++        completed: bool,
++    ) -> Result<(), String> {
++        let request = if let Some(attempt_id) = attempt_id {
++            let request = self.request(attempt_id)?;
++            if request.expected != *expected {
++                return Err("original terminal identity changed".into());
++            }
++            request
++        } else {
++            self.matching_request(expected)?
++        };
++        let phase = match (attempt_id.is_some(), completed) {
++            (true, true) => "original-provider-completed",
++            (true, false) => "original-provider-failed",
++            (false, true) => "replacement-provider-completed",
++            (false, false) => "replacement-provider-failed",
++        };
++        // Provider completion is not history-installation or Goal-completion proof.
++        Self::receipt(&request, phase, expected).map(|_| ())
++    }
++}
++
++struct NativeDispatchGuard {
++    client: CompactionGrantGuard,
++    _goal: Option<Arc<codex_goal_extension::CompactionGoalReservation>>,
++    request: CompactionRecoveryRequest,
++    replacement: Option<CompactionRecoveryIdentity>,
++}
++impl CompactionDispatchAuthority for NativeDispatchGuard {
++    fn remaining(&self) -> Result<std::time::Duration, String> {
++        self.client.remaining().map_err(|error| error.to_string())
++    }
++    fn validate_fresh(&self) -> Result<(), String> {
++        self.client
++            .validate_fresh()
++            .map_err(|error| error.to_string())
++    }
++    fn persist_send_intent(&self) -> Result<(), String> {
++        let expected = self
++            .replacement
++            .as_ref()
++            .ok_or("admission guard cannot send")?;
++        NativeCompactionPolicy::receipt(&self.request, "replacement-send-intent", expected)
++            .map(|_| ())
++    }
++    fn persist_sent(&self) -> Result<(), String> {
++        let expected = self
++            .replacement
++            .as_ref()
++            .ok_or("admission guard cannot send")?;
++        NativeCompactionPolicy::receipt(&self.request, "replacement-dispatched", expected)
++            .map(|_| ())
++    }
++}
++
++/// Directory-relative syscalls bind publication to the opened original inode.
++/// A crash can leave a private temporary; neither a partial target nor an old
++/// target is accepted as a new receipt. Parent replacement is reported UNKNOWN.
++fn write_once(directory: &Path, name: &str, raw: &[u8]) -> std::io::Result<()> {
++    let before = fs::symlink_metadata(directory)?;
++    if !before.is_dir()
++        || before.uid() != unsafe { libc::geteuid() }
++        || before.mode() & 0o077 != 0
++        || directory.canonicalize()? != directory
++    {
++        return Err(std::io::Error::other(
++            "unsafe original native receipt directory",
++        ));
++    }
++    let dir = OpenOptions::new()
++        .read(true)
++        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
++        .open(directory)?;
++    let opened = dir.metadata()?;
++    if opened.ino() != before.ino() || opened.dev() != before.dev() {
++        return Err(std::io::Error::other("native receipt directory changed"));
++    }
++    if name.is_empty() || name.contains('/') || name == "." || name == ".." {
++        return Err(std::io::Error::other("unsafe receipt name"));
++    }
++    let target = CString::new(name).map_err(std::io::Error::other)?;
++    let temp = CString::new(format!(".{name}.{}.tmp", uuid::Uuid::new_v4()))
++        .map_err(std::io::Error::other)?;
++    let fd = unsafe {
++        libc::openat(
++            dir.as_raw_fd(),
++            temp.as_ptr(),
++            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
++            0o600,
++        )
++    };
++    if fd < 0 {
++        return Err(std::io::Error::last_os_error());
++    }
++    let mut file = unsafe { File::from_raw_fd(fd) };
++    file.write_all(raw)?;
++    file.sync_all()?;
++    if unsafe {
++        libc::linkat(
++            dir.as_raw_fd(),
++            temp.as_ptr(),
++            dir.as_raw_fd(),
++            target.as_ptr(),
++            0,
++        )
++    } != 0
++    {
++        return Err(std::io::Error::last_os_error());
++    }
++    dir.sync_all()?;
++    if unsafe { libc::unlinkat(dir.as_raw_fd(), temp.as_ptr(), 0) } != 0 {
++        return Err(std::io::Error::last_os_error());
++    }
++    dir.sync_all()?;
++    let after = fs::symlink_metadata(directory)?;
++    if after.ino() != before.ino() || after.dev() != before.dev() {
++        return Err(std::io::Error::other(
++            "native receipt parent changed; reconcile original inode",
++        ));
++    }
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::os::unix::fs::PermissionsExt;
++    use std::os::unix::fs::symlink;
++    #[test]
++    fn native_receipt_is_atomic_private_and_never_overwrites_original_attempt() {
++        let root = tempfile::tempdir().unwrap();
++        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
++        let directory = root.path().canonicalize().unwrap();
++        write_once(&directory, "original.json", b"{\"phase\":\"admitted\"}").unwrap();
++        assert!(write_once(&directory, "original.json", b"changed").is_err());
++        assert_eq!(
++            fs::read(directory.join("original.json")).unwrap(),
++            b"{\"phase\":\"admitted\"}"
++        );
++        assert_eq!(
++            fs::metadata(directory.join("original.json"))
++                .unwrap()
++                .mode()
++                & 0o077,
++            0
++        );
++    }
++    #[test]
++    fn native_receipt_rejects_symlink_parent_and_path_escape() {
++        let root = tempfile::tempdir().unwrap();
++        let directory = root.path().canonicalize().unwrap();
++        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
++        symlink(&directory, directory.join("alias")).unwrap();
++        assert!(write_once(&directory.join("alias"), "bad.json", b"{}").is_err());
++        assert!(write_once(&directory, "../bad.json", b"{}").is_err());
++    }
++}
+diff --git a/codex-rs/app-server/src/request_processors/thread_processor.rs b/codex-rs/app-server/src/request_processors/thread_processor.rs
+index 4d104e2..6f74f04 100644
+--- a/codex-rs/app-server/src/request_processors/thread_processor.rs
++++ b/codex-rs/app-server/src/request_processors/thread_processor.rs
+@@ -822,6 +822,84 @@ impl ThreadRequestProcessor {
+         }
+     }
+ 
++    pub(crate) async fn thread_compact_recovery(
++        &self,
++        params: ThreadCompactRecoveryParams,
++    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
++        use codex_protocol::compact_recovery::CompactionRecoveryIdentity;
++        use codex_protocol::compact_recovery::CompactionRecoveryRequest;
++        params.validate_original_shape().map_err(invalid_request)?;
++        let (_, thread) = self.load_thread(&params.thread_id).await?;
++        ensure_direct_input_allowed(thread.as_ref()).await?;
++        let request = match (
++            params.expected_native_epoch,
++            params.expected_turn_id,
++            params.expected_occurrence,
++            params.expected_generation,
++            params.attempt_id,
++        ) {
++            (None, None, None, None, None) if params.authority.is_none() => None,
++            (
++                Some(native_epoch),
++                Some(turn_id),
++                Some(occurrence),
++                Some(generation),
++                Some(attempt_id),
++            ) => Some(CompactionRecoveryRequest {
++                expected: CompactionRecoveryIdentity {
++                    native_epoch,
++                    thread_id: params.thread_id,
++                    turn_id,
++                    occurrence,
++                    generation,
++                },
++                attempt_id,
++                authority: serde_json::from_value(
++                    params
++                        .authority
++                        .clone()
++                        .ok_or_else(|| invalid_request("native TUI authority is required"))?,
++                )
++                .map_err(|error| {
++                    invalid_request(format!("invalid native TUI authority: {error}"))
++                })?,
++            }),
++            _ => {
++                return Err(invalid_request(
++                    "all original compaction identity fields are required".to_string(),
++                ));
++            }
++        };
++        let goal = thread
++            .thread_extension_data()
++            .get::<codex_goal_extension::GoalRuntimeHandle>()
++            .ok_or_else(|| {
++                invalid_request("native Goal runtime unavailable for compaction recovery")
++            })?;
++        let goal_snapshot = if request.is_none() {
++            Some(
++                goal.compaction_recovery_goal_snapshot()
++                    .await
++                    .map_err(invalid_request)?,
++            )
++        } else {
++            None
++        };
++        #[cfg(unix)]
++        thread
++            .thread_extension_data()
++            .get_or_init::<codex_core::RecoveryPolicyHandle>(|| {
++                super::compaction_recovery_policy::NativeCompactionPolicy::handle(goal)
++            });
++        let mut result = thread.compaction_recovery(request).await.map_err(|error| {
++            internal_error(format!("conditional compaction recovery refused: {error}"))
++        })?;
++        if let Some(goal_snapshot) = goal_snapshot {
++            result["goal"] = goal_snapshot;
++        }
++        Ok(Some(ThreadCompactRecoveryResponse { result }.into()))
++    }
++
+     pub(crate) async fn thread_compact_start(
+         &self,
+         request_id: &ConnectionRequestId,
 diff --git a/codex-rs/codex-api/src/common.rs b/codex-rs/codex-api/src/common.rs
 index 1abc89c..1527e97 100644
 --- a/codex-rs/codex-api/src/common.rs
@@ -14452,6 +14452,30 @@ index e23f1ea..22c57eb 100644
      /// Load a recorded V2 child through its live immediate parent, without sending input.
      /// Implementations validate ownership and restore the child under the parent's current
      /// authority. Success makes the child available for attachment through its thread manager.
+diff --git a/codex-rs/core/src/agent/control.rs b/codex-rs/core/src/agent/control.rs
+index 765725d..7fa0171 100644
+--- a/codex-rs/core/src/agent/control.rs
++++ b/codex-rs/core/src/agent/control.rs
+@@ -283,11 +283,14 @@ impl LocalAgentControl {
+                 let _membership = self.runtime.admit_start()?;
+                 self.runtime.ensure_agent_known(agent_id)?;
+                 let submission_id = uuid::Uuid::now_v7().to_string();
+-                self.runtime.mailboxes.enqueue(
+-                    agent_id,
+-                    Some(submission_id.clone()),
+-                    vec![crate::PendingAgentMessage::new(communication, delivery)],
+-                )?;
++                self.runtime
++                    .mailboxes
++                    .enqueue(
++                        agent_id,
++                        Some(submission_id.clone()),
++                        vec![crate::PendingAgentMessage::new(communication, delivery)],
++                    )
++                    .await?;
+                 if let Some(communication) = communication_for_log {
+                     crate::agent_communication::emit_agent_communication_send(
+                         &submission_id,
 diff --git a/codex-rs/core/src/agent/control/api.rs b/codex-rs/core/src/agent/control/api.rs
 index 0426ca3..1e31f28 100644
 --- a/codex-rs/core/src/agent/control/api.rs
@@ -14784,30 +14808,6 @@ index fb86e5a..0459a1f 100644
              // Preserve configured bindings across eviction without retaining turn-only attachments.
              // Raw bindings keep the original pending owner configuration alive.
              let environments = EvictedEnvironments {
-diff --git a/codex-rs/core/src/agent/control.rs b/codex-rs/core/src/agent/control.rs
-index 765725d..7fa0171 100644
---- a/codex-rs/core/src/agent/control.rs
-+++ b/codex-rs/core/src/agent/control.rs
-@@ -283,11 +283,14 @@ impl LocalAgentControl {
-                 let _membership = self.runtime.admit_start()?;
-                 self.runtime.ensure_agent_known(agent_id)?;
-                 let submission_id = uuid::Uuid::now_v7().to_string();
--                self.runtime.mailboxes.enqueue(
--                    agent_id,
--                    Some(submission_id.clone()),
--                    vec![crate::PendingAgentMessage::new(communication, delivery)],
--                )?;
-+                self.runtime
-+                    .mailboxes
-+                    .enqueue(
-+                        agent_id,
-+                        Some(submission_id.clone()),
-+                        vec![crate::PendingAgentMessage::new(communication, delivery)],
-+                    )
-+                    .await?;
-                 if let Some(communication) = communication_for_log {
-                     crate::agent_communication::emit_agent_communication_send(
-                         &submission_id,
 diff --git a/codex-rs/core/src/client.rs b/codex-rs/core/src/client.rs
 index 815ab10..08be947 100644
 --- a/codex-rs/core/src/client.rs
@@ -18682,6 +18682,19 @@ index dc5c2a3..c304d00 100644
              Self::CleanBackgroundTerminals => "clean_background_terminals",
              Self::RealtimeConversationStart(_) => "realtime_conversation_start",
              Self::RealtimeConversationAttach { .. } => "realtime_conversation_attach",
+diff --git a/codex-rs/tui/src/app.rs b/codex-rs/tui/src/app.rs
+index df9363a..46e8798 100644
+--- a/codex-rs/tui/src/app.rs
++++ b/codex-rs/tui/src/app.rs
+@@ -243,6 +243,8 @@ mod quick_dials;
+ mod turn_tips;
+ pub(crate) use new_session::has_launch_setting;
+ mod clipboard;
++#[cfg(unix)]
++mod compaction_control;
+ mod footer_selection;
+ mod foreground_observation;
+ mod native_history;
 diff --git a/codex-rs/tui/src/app/compaction_control.rs b/codex-rs/tui/src/app/compaction_control.rs
 new file mode 100644
 index 0000000..ced0169
@@ -18886,10 +18899,231 @@ index 6687d05..94a1f37 100644
              AppEvent::OpenDaemonMenu => self.open_daemon_menu(),
              AppEvent::ConfirmDaemonRestart => self.confirm_daemon_restart(),
              AppEvent::RunDaemonRestart => {
+diff --git a/codex-rs/tui/src/app/foreground_observation.rs b/codex-rs/tui/src/app/foreground_observation.rs
+index fe28a6e..20aecd5 100644
+--- a/codex-rs/tui/src/app/foreground_observation.rs
++++ b/codex-rs/tui/src/app/foreground_observation.rs
+@@ -2,6 +2,8 @@
+ 
+ use super::App;
+ use crate::backend_id::BackendId;
++use crate::chatwidget::ExternalEditorState;
++use crate::tui::TuiEvent;
+ use codex_protocol::ThreadId;
+ use std::path::Path;
+ 
+@@ -99,6 +101,9 @@ pub(super) struct NativeForeground {
+     changing: bool,
+     failure_notice: Option<String>,
+     failure_notice_shown: bool,
++    #[cfg(unix)]
++    control: Option<ccc_native_client_foreground::compaction_socket::NativeControlServer>,
++    control_attempted: bool,
+ }
+ 
+ impl Default for NativeForeground {
+@@ -113,6 +118,9 @@ impl Default for NativeForeground {
+             changing: false,
+             failure_notice: None,
+             failure_notice_shown: false,
++            #[cfg(unix)]
++            control: None,
++            control_attempted: false,
+         }
+     }
+ }
+@@ -150,7 +158,18 @@ impl App {
+     pub(super) async fn before_foreground_mutation(&mut self, reason: &str) {
+         #[cfg(unix)]
+         if self.foreground.enabled {
+-            if self.foreground.observer.before_change(reason).is_err() {
++            let mut withdrawal = self.foreground.observer.before_change(reason);
++            while withdrawal
++                .as_ref()
++                .is_err_and(|error| error.kind() == std::io::ErrorKind::WouldBlock)
++            {
++                // The original Core reservation owns a bounded drain/dispatch.
++                // Never bypass this lock based on the observer lease timeout.
++                self.native_foreground_heartbeat();
++                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
++                withdrawal = self.foreground.observer.before_change(reason);
++            }
++            if withdrawal.is_err() {
+                 self.foreground.connection_published = false;
+                 let remaining = self.foreground.observer.remaining_lease();
+                 if !remaining.is_zero() {
+@@ -223,7 +242,11 @@ impl App {
+         })
+     }
+ 
+-    fn native_foreground_has_barrier(&self, queue_empty: bool, startup_ready: bool) -> bool {
++    pub(super) fn native_foreground_has_barrier(
++        &self,
++        queue_empty: bool,
++        startup_ready: bool,
++    ) -> bool {
+         !queue_empty
+             || !startup_ready
+             || self.pending_startup_thread_start
+@@ -244,18 +267,15 @@ impl App {
+             || self.chat_widget.has_active_view()
+     }
+ 
+-    /// Called after the whole mutable step, including deferred early-continue
+-    /// paths, transcript replay/reset processing and startup-input restoration.
+-    pub(super) fn native_foreground_checkpoint(
+-        &mut self,
++    /// The same full eligibility check serves commit and presentation-only draws.
++    /// It never creates a proposal or repairs a missing native binding.
++    fn ready_native_foreground_selection(
++        &self,
+         owner: BackendId,
+         queue_empty: bool,
+         startup_ready: bool,
+-    ) {
+-        if !self.foreground.changing {
+-            return;
+-        }
+-        let thread = self.foreground.selection.filter(|selection| {
++    ) -> Option<NativeSelection> {
++        self.foreground.selection.filter(|selection| {
+             selection.direct_input_allowed
+                 && self.foreground.connected_owner == Some(owner)
+                 && !self.reconnect.offline
+@@ -281,7 +301,67 @@ impl App {
+                     .is_some_and(|entry| entry.is_closed)
+                 && self.chat_widget.accepts_native_direct_input()
+                 && !self.chat_widget.is_external_writer_view()
+-        });
++        })
++    }
++
++    fn native_foreground_display_is_committed(&self, thread: ThreadId) -> bool {
++        #[cfg(unix)]
++        {
++            self.foreground
++                .observer
++                .compaction_selection()
++                .is_ok_and(|selected| {
++                    selected["threadId"].as_str() == Some(thread.to_string().as_str())
++                })
++        }
++        #[cfg(not(unix))]
++        {
++            let _ = thread;
++            false
++        }
++    }
++
++    /// A Draw also drives delayed paste, approvals and modal timers. Only an
++    /// already committed, empty-input presentation tick may retain its identity.
++    /// Async producers only enqueue App events; their guarded handlers still
++    /// withdraw before applying them. No await separates this check from Draw.
++    pub(super) async fn before_foreground_tui_event(
++        &mut self,
++        event: Option<&TuiEvent>,
++        owner: BackendId,
++        queue_empty: bool,
++        startup_ready: bool,
++    ) {
++        let presentation_only = matches!(event, Some(TuiEvent::Draw))
++            && self.native_compaction_backend_matches(owner)
++            && self
++                .ready_native_foreground_selection(owner, queue_empty, startup_ready)
++                .is_some_and(|selected| {
++                    self.native_foreground_display_is_committed(selected.thread_id)
++                })
++            && self.chat_widget.native_compaction_input_clear()
++            && self.chat_widget.no_modal_or_popup_active()
++            && self.chat_widget.external_editor_state() == ExternalEditorState::Closed
++            && self.pending_right_click_paste.is_none()
++            && self.overlay.is_none()
++            && !self.backtrack.overlay_preview_active;
++        if !presentation_only {
++            self.before_foreground_mutation("terminal_event").await;
++        }
++    }
++
++    /// Called after the whole mutable step, including deferred early-continue
++    /// paths, transcript replay/reset processing and startup-input restoration.
++    pub(super) fn native_foreground_checkpoint(
++        &mut self,
++        owner: BackendId,
++        queue_empty: bool,
++        startup_ready: bool,
++    ) {
++        if !self.foreground.changing {
++            return;
++        }
++        let thread = self.ready_native_foreground_selection(owner, queue_empty, startup_ready);
+         #[cfg(unix)]
+         if self.foreground.enabled && !self.foreground.observer.is_suspended() {
+             if thread.is_some() && !self.foreground.connection_published {
+@@ -297,6 +377,7 @@ impl App {
+         #[cfg(not(unix))]
+         let _ = thread;
+         self.foreground.changing = false;
++        self.ensure_native_compaction_control();
+         self.show_native_foreground_failure();
+     }
+ 
+@@ -324,3 +405,51 @@ impl App {
+         self.native_foreground_disconnected();
+     }
+ }
++
++impl App {
++    pub(super) fn ensure_native_compaction_control(&mut self) {
++        #[cfg(unix)]
++        if self.foreground.enabled
++            && !self.foreground.control_attempted
++            && self.foreground.observer.compaction_selection().is_ok()
++            && self
++                .config
++                .codex_home
++                .join("credential-observations/compaction-recovery/enabled-v1")
++                .exists()
++        {
++            self.foreground.control_attempted = true;
++            let epoch = match self.foreground.observer.compaction_client_epoch() {
++                Ok(epoch) => epoch,
++                Err(_) => return,
++            };
++            let tx = self.app_event_tx.clone();
++            match ccc_native_client_foreground::compaction_socket::NativeControlServer::open(
++                &self.config.codex_home,
++                &epoch,
++                self.foreground.observer.clone(),
++                move |request| {
++                    tx.send(crate::app_event::AppEvent::NativeCompactionControl(request));
++                },
++            ) {
++                Ok(control) => self.foreground.control = Some(control),
++                Err(error) => self
++                    .chat_widget
++                    .add_error_message(format!("Native compaction control unavailable: {error}")),
++            }
++        }
++    }
++
++    pub(super) fn native_compaction_backend_matches(&self, owner: BackendId) -> bool {
++        self.foreground.connected_owner == Some(owner)
++            && self.foreground.connection_published
++            && !self.foreground.changing
++    }
++
++    #[cfg(unix)]
++    pub(super) fn native_compaction_observer(
++        &self,
++    ) -> &ccc_native_client_foreground::ForegroundObserver {
++        &self.foreground.observer
++    }
++}
 diff --git a/codex-rs/tui/src/app/foreground_observation/tests.rs b/codex-rs/tui/src/app/foreground_observation/tests.rs
+index 39e1886..3776bb4 100644
 --- a/codex-rs/tui/src/app/foreground_observation/tests.rs
 +++ b/codex-rs/tui/src/app/foreground_observation/tests.rs
-@@ -770,3 +770,524 @@
+@@ -770,3 +770,544 @@ async fn real_initialization_failure_is_visible_and_ordinary_app_work_continues(
      fixture.server.shutdown().await?;
      Ok(())
  }
@@ -19058,6 +19292,25 @@ diff --git a/codex-rs/tui/src/app/foreground_observation/tests.rs b/codex-rs/tui
 +        ))
 +    ))
 +    .await?;
++    assert!(fixture.app.chat_widget.is_in_paste_burst());
++    assert_eq!(fixture.app.chat_widget.composer_text_with_pending(), draft);
++    tokio::time::sleep(crate::bottom_pane::ChatComposer::recommended_paste_flush_delay()).await;
++    fixture
++        .app
++        .before_foreground_tui_event(
++            Some(&TuiEvent::Draw),
++            fixture.server.backend_id(),
++            true,
++            true,
++        )
++        .await;
++    boxed_future!(fixture.app.handle_tui_event(
++        &mut fixture.tui,
++        &mut fixture.server,
++        TuiEvent::Draw
++    ))
++    .await?;
++    assert!(!fixture.app.chat_widget.is_in_paste_burst());
 +    assert_eq!(
 +        fixture.app.chat_widget.composer_text_with_pending(),
 +        format!("{draft}x")
@@ -19310,7 +19563,8 @@ diff --git a/codex-rs/tui/src/app/foreground_observation/tests.rs b/codex-rs/tui
 +        .is_err()
 +    );
 +    assert!(fixture.app.chat_widget.is_in_paste_burst());
-+    assert_eq!(fixture.app.chat_widget.composer_text_with_pending(), "x");
++    // The held ASCII key has not reached the textarea while the native lock is held.
++    assert_eq!(fixture.app.chat_widget.composer_text_with_pending(), "");
 +    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
 +    fixture
 +        .app
@@ -19414,226 +19668,6 @@ diff --git a/codex-rs/tui/src/app/foreground_observation/tests.rs b/codex-rs/tui
 +    fixture.server.shutdown().await?;
 +    Ok(())
 +}
-diff --git a/codex-rs/tui/src/app/foreground_observation.rs b/codex-rs/tui/src/app/foreground_observation.rs
-index fe28a6e..20aecd5 100644
---- a/codex-rs/tui/src/app/foreground_observation.rs
-+++ b/codex-rs/tui/src/app/foreground_observation.rs
-@@ -2,6 +2,8 @@
- 
- use super::App;
- use crate::backend_id::BackendId;
-+use crate::chatwidget::ExternalEditorState;
-+use crate::tui::TuiEvent;
- use codex_protocol::ThreadId;
- use std::path::Path;
- 
-@@ -99,6 +101,9 @@ pub(super) struct NativeForeground {
-     changing: bool,
-     failure_notice: Option<String>,
-     failure_notice_shown: bool,
-+    #[cfg(unix)]
-+    control: Option<ccc_native_client_foreground::compaction_socket::NativeControlServer>,
-+    control_attempted: bool,
- }
- 
- impl Default for NativeForeground {
-@@ -113,6 +118,9 @@ impl Default for NativeForeground {
-             changing: false,
-             failure_notice: None,
-             failure_notice_shown: false,
-+            #[cfg(unix)]
-+            control: None,
-+            control_attempted: false,
-         }
-     }
- }
-@@ -150,7 +158,18 @@ impl App {
-     pub(super) async fn before_foreground_mutation(&mut self, reason: &str) {
-         #[cfg(unix)]
-         if self.foreground.enabled {
--            if self.foreground.observer.before_change(reason).is_err() {
-+            let mut withdrawal = self.foreground.observer.before_change(reason);
-+            while withdrawal
-+                .as_ref()
-+                .is_err_and(|error| error.kind() == std::io::ErrorKind::WouldBlock)
-+            {
-+                // The original Core reservation owns a bounded drain/dispatch.
-+                // Never bypass this lock based on the observer lease timeout.
-+                self.native_foreground_heartbeat();
-+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-+                withdrawal = self.foreground.observer.before_change(reason);
-+            }
-+            if withdrawal.is_err() {
-                 self.foreground.connection_published = false;
-                 let remaining = self.foreground.observer.remaining_lease();
-                 if !remaining.is_zero() {
-@@ -223,7 +242,11 @@ impl App {
-         })
-     }
- 
--    fn native_foreground_has_barrier(&self, queue_empty: bool, startup_ready: bool) -> bool {
-+    pub(super) fn native_foreground_has_barrier(
-+        &self,
-+        queue_empty: bool,
-+        startup_ready: bool,
-+    ) -> bool {
-         !queue_empty
-             || !startup_ready
-             || self.pending_startup_thread_start
-@@ -244,18 +267,15 @@ impl App {
-             || self.chat_widget.has_active_view()
-     }
- 
--    /// Called after the whole mutable step, including deferred early-continue
--    /// paths, transcript replay/reset processing and startup-input restoration.
--    pub(super) fn native_foreground_checkpoint(
--        &mut self,
-+    /// The same full eligibility check serves commit and presentation-only draws.
-+    /// It never creates a proposal or repairs a missing native binding.
-+    fn ready_native_foreground_selection(
-+        &self,
-         owner: BackendId,
-         queue_empty: bool,
-         startup_ready: bool,
--    ) {
--        if !self.foreground.changing {
--            return;
--        }
--        let thread = self.foreground.selection.filter(|selection| {
-+    ) -> Option<NativeSelection> {
-+        self.foreground.selection.filter(|selection| {
-             selection.direct_input_allowed
-                 && self.foreground.connected_owner == Some(owner)
-                 && !self.reconnect.offline
-@@ -281,7 +301,67 @@ impl App {
-                     .is_some_and(|entry| entry.is_closed)
-                 && self.chat_widget.accepts_native_direct_input()
-                 && !self.chat_widget.is_external_writer_view()
--        });
-+        })
-+    }
-+
-+    fn native_foreground_display_is_committed(&self, thread: ThreadId) -> bool {
-+        #[cfg(unix)]
-+        {
-+            self.foreground
-+                .observer
-+                .compaction_selection()
-+                .is_ok_and(|selected| {
-+                    selected["threadId"].as_str() == Some(thread.to_string().as_str())
-+                })
-+        }
-+        #[cfg(not(unix))]
-+        {
-+            let _ = thread;
-+            false
-+        }
-+    }
-+
-+    /// A Draw also drives delayed paste, approvals and modal timers. Only an
-+    /// already committed, empty-input presentation tick may retain its identity.
-+    /// Async producers only enqueue App events; their guarded handlers still
-+    /// withdraw before applying them. No await separates this check from Draw.
-+    pub(super) async fn before_foreground_tui_event(
-+        &mut self,
-+        event: Option<&TuiEvent>,
-+        owner: BackendId,
-+        queue_empty: bool,
-+        startup_ready: bool,
-+    ) {
-+        let presentation_only = matches!(event, Some(TuiEvent::Draw))
-+            && self.native_compaction_backend_matches(owner)
-+            && self
-+                .ready_native_foreground_selection(owner, queue_empty, startup_ready)
-+                .is_some_and(|selected| {
-+                    self.native_foreground_display_is_committed(selected.thread_id)
-+                })
-+            && self.chat_widget.native_compaction_input_clear()
-+            && self.chat_widget.no_modal_or_popup_active()
-+            && self.chat_widget.external_editor_state() == ExternalEditorState::Closed
-+            && self.pending_right_click_paste.is_none()
-+            && self.overlay.is_none()
-+            && !self.backtrack.overlay_preview_active;
-+        if !presentation_only {
-+            self.before_foreground_mutation("terminal_event").await;
-+        }
-+    }
-+
-+    /// Called after the whole mutable step, including deferred early-continue
-+    /// paths, transcript replay/reset processing and startup-input restoration.
-+    pub(super) fn native_foreground_checkpoint(
-+        &mut self,
-+        owner: BackendId,
-+        queue_empty: bool,
-+        startup_ready: bool,
-+    ) {
-+        if !self.foreground.changing {
-+            return;
-+        }
-+        let thread = self.ready_native_foreground_selection(owner, queue_empty, startup_ready);
-         #[cfg(unix)]
-         if self.foreground.enabled && !self.foreground.observer.is_suspended() {
-             if thread.is_some() && !self.foreground.connection_published {
-@@ -297,6 +377,7 @@ impl App {
-         #[cfg(not(unix))]
-         let _ = thread;
-         self.foreground.changing = false;
-+        self.ensure_native_compaction_control();
-         self.show_native_foreground_failure();
-     }
- 
-@@ -324,3 +405,51 @@ impl App {
-         self.native_foreground_disconnected();
-     }
- }
-+
-+impl App {
-+    pub(super) fn ensure_native_compaction_control(&mut self) {
-+        #[cfg(unix)]
-+        if self.foreground.enabled
-+            && !self.foreground.control_attempted
-+            && self.foreground.observer.compaction_selection().is_ok()
-+            && self
-+                .config
-+                .codex_home
-+                .join("credential-observations/compaction-recovery/enabled-v1")
-+                .exists()
-+        {
-+            self.foreground.control_attempted = true;
-+            let epoch = match self.foreground.observer.compaction_client_epoch() {
-+                Ok(epoch) => epoch,
-+                Err(_) => return,
-+            };
-+            let tx = self.app_event_tx.clone();
-+            match ccc_native_client_foreground::compaction_socket::NativeControlServer::open(
-+                &self.config.codex_home,
-+                &epoch,
-+                self.foreground.observer.clone(),
-+                move |request| {
-+                    tx.send(crate::app_event::AppEvent::NativeCompactionControl(request));
-+                },
-+            ) {
-+                Ok(control) => self.foreground.control = Some(control),
-+                Err(error) => self
-+                    .chat_widget
-+                    .add_error_message(format!("Native compaction control unavailable: {error}")),
-+            }
-+        }
-+    }
-+
-+    pub(super) fn native_compaction_backend_matches(&self, owner: BackendId) -> bool {
-+        self.foreground.connected_owner == Some(owner)
-+            && self.foreground.connection_published
-+            && !self.foreground.changing
-+    }
-+
-+    #[cfg(unix)]
-+    pub(super) fn native_compaction_observer(
-+        &self,
-+    ) -> &ccc_native_client_foreground::ForegroundObserver {
-+        &self.foreground.observer
-+    }
-+}
 diff --git a/codex-rs/tui/src/app/right_click_paste.rs b/codex-rs/tui/src/app/right_click_paste.rs
 index 632e134..0e7e732 100644
 --- a/codex-rs/tui/src/app/right_click_paste.rs
@@ -19700,19 +19734,6 @@ index b4eb2fb..69f2e04 100644
                          if let Some(event) = event {
                              if (matches!(
                                  &event,
-diff --git a/codex-rs/tui/src/app.rs b/codex-rs/tui/src/app.rs
-index df9363a..46e8798 100644
---- a/codex-rs/tui/src/app.rs
-+++ b/codex-rs/tui/src/app.rs
-@@ -243,6 +243,8 @@ mod quick_dials;
- mod turn_tips;
- pub(crate) use new_session::has_launch_setting;
- mod clipboard;
-+#[cfg(unix)]
-+mod compaction_control;
- mod footer_selection;
- mod foreground_observation;
- mod native_history;
 diff --git a/codex-rs/tui/src/app_event.rs b/codex-rs/tui/src/app_event.rs
 index e2b86c9..259fe68 100644
 --- a/codex-rs/tui/src/app_event.rs
@@ -19785,6 +19806,43 @@ index 4b9d285..feb16ac 100644
      pub(crate) fn composer_is_empty(&self) -> bool {
          self.bottom_pane.composer_is_empty() && !self.bottom_pane.is_in_paste_burst()
      }
+diff --git a/codex-rs/tui/src/pets/mod.rs b/codex-rs/tui/src/pets/mod.rs
+index 1026f62..800469d 100644
+--- a/codex-rs/tui/src/pets/mod.rs
++++ b/codex-rs/tui/src/pets/mod.rs
+@@ -349,9 +349,12 @@ mod tests {
+ 
+     #[test]
+     fn kitty_local_file_pet_image_uses_file_reference_without_inline_payload() {
++        use base64::Engine as _;
++
+         let dir = tempfile::tempdir().unwrap();
+         let frame = dir.path().join("frame.png");
+         std::fs::write(&frame, b"png").unwrap();
++        let expected_path = frame.canonicalize().unwrap();
+         let request = AmbientPetDraw {
+             frame,
+             protocol: ImageProtocol::KittyLocalFile,
+@@ -372,7 +375,18 @@ mod tests {
+         assert!(output.contains("a=d,d=I,i=49374,q=2;"));
+         assert!(output.contains("\x1b[4;3H"));
+         assert!(output.contains("a=T,t=f,f=100,c=4,r=2,q=2,i=49374,C=1;"));
+-        assert!(!output.contains("cG5n"));
++        let payload = output
++            .split_once("a=T,t=f,f=100,c=4,r=2,q=2,i=49374,C=1;")
++            .unwrap()
++            .1
++            .split_once("\x1b")
++            .unwrap()
++            .0;
++        let decoded = base64::engine::general_purpose::STANDARD
++            .decode(payload)
++            .unwrap();
++        assert_eq!(decoded, expected_path.to_string_lossy().as_bytes());
++        assert_ne!(decoded, b"png");
+         assert!(output.contains("\x1b8"));
+     }
+ 
 diff --git a/native/client-foreground/Cargo.lock b/native/client-foreground/Cargo.lock
 new file mode 100644
 index 0000000..c26a04b
