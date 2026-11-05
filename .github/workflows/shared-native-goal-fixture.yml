@@ -1,0 +1,79 @@
+name: Shared native Goal and default animation recovery fixture
+
+on:
+  push:
+    branches: [ccc/shared-native-goal-fixture-20261106-r7]
+    paths:
+      - .github/workflows/shared-native-goal-fixture.yml
+      - integrations/shared-native-goal-fixture/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: shared-native-goal-fixture-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  shared-native:
+    runs-on: macos-26
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        case: [goal, goal-ack-restart]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.14.7'
+      - name: Verify exact binary-only decryption dependencies and negative controls
+        working-directory: integrations/shared-native-goal-fixture
+        run: |
+          python3 -m pip install --only-binary=:all: --no-deps --require-hashes -r requirements-macos.txt
+          python3 -BE -m unittest -v test_secure_bundle test_diagnostic_coverage
+      - name: Authenticate and decrypt complete original shared fixture
+        env:
+          CCC_PRIVATE_FIXTURE_KEY: ${{ secrets.CCC_SHARED_GOAL_FIXTURE_INPUT_KEY_20261106 }}
+        run: python3 -BE integrations/shared-native-goal-fixture/secure_bundle.py decrypt
+      - name: Verify complete original runtime and preparation controls
+        run: |
+          cd "$SHARED_FIXTURE_BUNDLE"
+          python3 -BE - <<'PY'
+          import run_actions
+          run_actions.verified_bundle('9621f6dc357879099220aafd882d5d55183cb6969a18ca12b22f168355652e9c')
+          PY
+          python3 -BE -m unittest -v test_shared_preparation test_public_evidence test_evidence_contract test_runtime_layout test_protocol_boundaries test_goal_admission_observation
+      - name: Authenticate original r9 artifacts and execute one exact private case
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python3 -BE "$SHARED_FIXTURE_BUNDLE/run_actions.py"
+          --source-manifest-sha256 9621f6dc357879099220aafd882d5d55183cb6969a18ca12b22f168355652e9c
+          --case ${{ matrix.case }}
+      - name: Export only named fresh synthetic evidence
+        if: always() && env.GOAL_SHARED_PRIVATE_ROOT != '' && env.SHARED_FIXTURE_BUNDLE != ''
+        run: >-
+          python3 -BE "$SHARED_FIXTURE_BUNDLE/export_fixture.py"
+          --root "$GOAL_SHARED_PRIVATE_ROOT" --output "$RUNNER_TEMP/shared-evidence"
+      - name: Seal bounded private diagnostics without publishing plaintext logs
+        if: always() && env.GOAL_SHARED_PRIVATE_ROOT != '' && env.SHARED_FIXTURE_BUNDLE != ''
+        env:
+          CCC_PRIVATE_FIXTURE_KEY: ${{ secrets.CCC_SHARED_GOAL_FIXTURE_INPUT_KEY_20261106 }}
+        run: >-
+          python3 -BE integrations/shared-native-goal-fixture/secure_bundle.py seal-diagnostics
+          --private-root "$GOAL_SHARED_PRIVATE_ROOT" --output "$RUNNER_TEMP/shared-evidence"
+      - name: Preserve exact synthetic evidence and authenticated encrypted diagnostics
+        if: always() && env.GOAL_SHARED_PRIVATE_ROOT != '' && env.SHARED_FIXTURE_BUNDLE != ''
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: shared-goal-${{ matrix.case }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/shared-evidence
+          include-hidden-files: false
+          if-no-files-found: warn
+          retention-days: 14
