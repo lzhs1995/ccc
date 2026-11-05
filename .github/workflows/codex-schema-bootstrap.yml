@@ -1,0 +1,73 @@
+name: Isolated Codex recovery schema bootstrap
+
+on:
+  push:
+    branches: [ccc/compact-recovery-20261105-r4]
+    paths:
+      - .github/workflows/codex-schema-bootstrap.yml
+      - integrations/compact-recovery/**
+  workflow_dispatch:
+    inputs:
+      manifest_sha256:
+        description: SHA256 of the reviewed schema-bootstrap.json
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codex-schema-bootstrap-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  generate-candidate-schema:
+    runs-on: macos-15
+    timeout-minutes: 180
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "none"
+      CARGO_PROFILE_TEST_DEBUG: "none"
+      CARGO_BUILD_JOBS: "3"
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      INSTA_UPDATE: "no"
+      BOOTSTRAP_SHA256: ${{ inputs.manifest_sha256 || '5d112be225421a694f2fe9defc28ff2d989b45a75180ddbe95e3c37b7e9b04c4' }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          path: ccc
+          persist-credentials: false
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          repository: lzhs1995/ccc
+          ref: a0f7fa7216673009375405ca99ca5c0a4b8a997f
+          path: ccc-base
+          persist-credentials: false
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          repository: openai/codex
+          ref: 6aaac694803004a63c6f393d153c96d22521a6b9
+          path: codex
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8
+        with:
+          toolchain: "1.99.1"
+          targets: aarch64-apple-darwin
+      - name: Generate candidates with original test-only exporter
+        run: >-
+          python3 ccc/integrations/compact-recovery/schema_bootstrap.py
+          --ccc ccc-base --codex codex
+          --manifest ccc/integrations/compact-recovery/schema-bootstrap.json
+          --manifest-sha256 "$BOOTSTRAP_SHA256"
+          --output "$RUNNER_TEMP/compact-schema-evidence"
+      - name: Preserve source pins, generation logs and schema candidates
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: codex-recovery-schema-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/compact-schema-evidence/*.json
+            ${{ runner.temp }}/compact-schema-evidence/*.log
+            ${{ runner.temp }}/compact-schema-evidence/generated-schema/
+          if-no-files-found: warn
+          retention-days: 14
