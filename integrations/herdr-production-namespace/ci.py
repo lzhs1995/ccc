@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import subprocess
 import tarfile
@@ -101,7 +102,8 @@ def compile_target(source, output, env, unit):
     log = output / (label + "-build.log")
     run(command, source, env, log)
     messages = []
-    lines = log.read_text().splitlines()
+    # Preserve raw log bytes; Cargo color escapes must not hide the actual Running line.
+    lines = re.sub(r"\x1b\[[0-9;]*m", "", log.read_text()).splitlines()
     for line in lines:
         try:
             value = json.loads(line)
