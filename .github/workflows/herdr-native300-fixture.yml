@@ -1,0 +1,75 @@
+name: Original Herdr guard native 180 300 shared selected-child denial fixture
+
+on:
+  push:
+    branches: [ccc/herdr-native300-shared-selection-20261106-r25]
+    paths:
+      - .github/workflows/herdr-native300-fixture.yml
+      - integrations/herdr-native300-fixture/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: herdr-native300-fixture-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  original-standalone:
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.14.7'
+      - name: Install exact binary-only decryption dependencies and verify transport
+        working-directory: integrations/herdr-native300-fixture
+        run: |
+          python3 -m pip install --only-binary=:all: --no-deps --require-hashes -r requirements-macos.txt
+          python3 -BE -m unittest -v test_secure_bundle test_export_evidence
+      - name: Authenticate and decrypt complete original source
+        env:
+          CCC_PRIVATE_FIXTURE_KEY: ${{ secrets.CCC_NATIVE300_FIXTURE_INPUT_KEY_20261106 }}
+        run: python3 -BE integrations/herdr-native300-fixture/secure_bundle.py decrypt
+      - name: Verify complete original source and source-only negative controls
+        run: |
+          cd "$CCC_PRIVATE_SOURCE"
+          python3 -BE - <<'PY'
+          import run_actions
+          run_actions.verified_bundle('7e8e51b74bec5dbd716ebc8d8b8e60a1f3545c8468e5793ad84f98745f783a0f')
+          PY
+          python3 -BE -m unittest -v test_private_factory test_gui_nightly test_compaction_provider test_remote_preparation test_artifact_admission test_standalone_evidence test_actions_preparation test_optional_effort test_native_log_scope test_current_user_evidence test_active_goal test_shared_compaction test_selection_denial test_request_parent22 test_native_parent23
+      - name: Authenticate exact artifacts then run original real standalone guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python3 -BE "$CCC_PRIVATE_SOURCE/run_actions.py"
+          --source-manifest-sha256 7e8e51b74bec5dbd716ebc8d8b8e60a1f3545c8468e5793ad84f98745f783a0f --shared
+      - name: Export explicit new evidence only
+        if: always() && env.NATIVE300_PRIVATE_ROOT != '' && env.CCC_PRIVATE_SOURCE != ''
+        run: >-
+          python3 -BE integrations/herdr-native300-fixture/export_evidence.py
+          --private-root "$NATIVE300_PRIVATE_ROOT" --bundle "$CCC_PRIVATE_SOURCE"
+          --bundle-manifest-sha256 7e8e51b74bec5dbd716ebc8d8b8e60a1f3545c8468e5793ad84f98745f783a0f
+          --output "$RUNNER_TEMP/ccc-public-evidence"
+      - name: Seal bounded private diagnostic files
+        if: always() && env.NATIVE300_PRIVATE_ROOT != '' && env.CCC_PRIVATE_SOURCE != ''
+        env:
+          CCC_PRIVATE_FIXTURE_KEY: ${{ secrets.CCC_NATIVE300_FIXTURE_INPUT_KEY_20261106 }}
+        run: >-
+          python3 -BE integrations/herdr-native300-fixture/secure_bundle.py seal-diagnostics
+          --private-root "$NATIVE300_PRIVATE_ROOT" --output "$RUNNER_TEMP/ccc-public-evidence"
+      - name: Preserve reviewed export and encrypted diagnostics
+        if: always() && env.NATIVE300_PRIVATE_ROOT != '' && env.CCC_PRIVATE_SOURCE != ''
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: herdr-native300-shared-selection-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ccc-public-evidence/
+          include-hidden-files: false
+          if-no-files-found: warn
+          retention-days: 14
