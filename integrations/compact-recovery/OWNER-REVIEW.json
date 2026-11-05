@@ -1,0 +1,19 @@
+{
+  "schema": "ccc-native-combined-source-owner-review-v1",
+  "scope": "Exact r3 reviewed logic plus twelve formatter-only import changes; schema generation only, no full build approval",
+  "core_independent_review": {
+    "path": "/Users/lzhs/Documents/Herdr会话恢复/compat-20261104/herdr-180-300-audit-20261105/candidate/CORE-INDEPENDENT-REVIEW-r4/REVIEW-RESULT.json",
+    "sha256": "51de494854f96873ea7960e5924a901448e00d83137fac487f9456016947cb07"
+  },
+  "native_freeze_sha256": "614992329469acbbdf2e63771da42cd3a8c65a8fc165832bb3c727cf7f59479e",
+  "format_review_sha256": "722f8719c8c460965a840480568d5d8fc6326a5a4cf9d0e2fa149b462ab87370",
+  "format_delta_sha256": "f04a08453a94c427762dc70087052a1ec69fd74aca22f21a224df86934a7558a",
+  "all_native_tui17_unchanged": true,
+  "overlay_members": 62,
+  "complete_source_members": 9457,
+  "full_source_sha256": "35c84c4a875e7388c2a66823ce03e07442a7ae2f6c113787beb967bfc7c63310",
+  "full_compile_tests_passed": false,
+  "real_recovery_passed": false,
+  "production_mutations": 0,
+  "coordinator_review_before_dispatch": true
+}
