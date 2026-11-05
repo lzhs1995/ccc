@@ -1,13 +1,9 @@
 # Native compaction recovery schema preparation
 
-This branch stages an isolated schema generation job for reviewed Core, API, TUI, Goal, and native foreground recovery changes. It does not install or restart clients. The job uses a pinned official Codex source and a separate pinned V187 foreground base.
+This branch stages the reviewed Core, API, TUI, Goal and native foreground recovery changes against pinned official Codex source and the separate V187 foreground base. It does not install or restart clients.
 
-The bootstrap manifest fixes 62 overlay members and the complete 9457-member source. It generates schema candidates only; complete compilation, test suites, real 180/300-second recovery, and deployment remain separate gates. The local workspace/native formatting checks used Rust 1.95 rustfmt; the workflow uses the original Rust 1.99.1 toolchain.
+The bootstrap manifest fixes 62 overlay members and the complete 9457-member source. Source SHA256: `97907f664f19cded25dcb9360eb007c18a351d2bfb50eb5e6faa90faec9342b8`. Bootstrap manifest SHA256: `fe9b9b031cc23364a1035608c8bae5fb3f8f323390005fffccacea995d2ea668`.
 
-Source SHA256: 7013d28d993ccdc5119873acde2a2c3c38e818647cac0e17f849e10ae073a4c5. Bootstrap manifest SHA256: c6bb394e19fb29435b50276fce7a38fbaf711bc54dbfe89b4a8c621d0d143582.
+[Schema generation run 41988236011](https://github.com/lzhs1995/ccc/actions/runs/41988236011) passed on commit `aacdb9badd1606b5c98d1630a3e4d0fd27ddd7bd`. Its artifact SHA256 is `75dbc4fc0ed1cf94ac811099a4587592aa2f5ccb023f0669b03eddcea82d9ec6`. Independent structural comparison verified four added and seven changed schema files, with all existing API semantics preserved. The original compact-start response still accepts unknown fields; the new recovery request rejects them.
 
-Only pushes affecting the exact candidate branch and paths trigger the schema job. Manual dispatch is available when registered. No old test success is imported as evidence for the candidate.
-
-The compatibility revision preserves the original empty compact response's treatment of unknown fields and adds a regression test. The earlier schema generation evidence remains separate; this source requires a new schema generation and complete build.
-
-The second schema-generation source restores the existing compact-start response compatibility and adds a regression test; generated protocol files are not manually edited.
+Full compilation, fresh tests, actual 180/300-second recovery and deployment are separate gates. The full build bundle is staged separately under `integrations/compact-recovery-build`. Historical test results are not reused as candidate evidence.
