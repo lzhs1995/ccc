@@ -2,6 +2,8 @@
 
 use super::App;
 use crate::backend_id::BackendId;
+use crate::chatwidget::ExternalEditorState;
+use crate::tui::TuiEvent;
 use codex_protocol::ThreadId;
 use std::path::Path;
 
@@ -265,18 +267,15 @@ impl App {
             || self.chat_widget.has_active_view()
     }
 
-    /// Called after the whole mutable step, including deferred early-continue
-    /// paths, transcript replay/reset processing and startup-input restoration.
-    pub(super) fn native_foreground_checkpoint(
-        &mut self,
+    /// The same full eligibility check serves commit and presentation-only draws.
+    /// It never creates a proposal or repairs a missing native binding.
+    fn ready_native_foreground_selection(
+        &self,
         owner: BackendId,
         queue_empty: bool,
         startup_ready: bool,
-    ) {
-        if !self.foreground.changing {
-            return;
-        }
-        let thread = self.foreground.selection.filter(|selection| {
+    ) -> Option<NativeSelection> {
+        self.foreground.selection.filter(|selection| {
             selection.direct_input_allowed
                 && self.foreground.connected_owner == Some(owner)
                 && !self.reconnect.offline
@@ -302,7 +301,67 @@ impl App {
                     .is_some_and(|entry| entry.is_closed)
                 && self.chat_widget.accepts_native_direct_input()
                 && !self.chat_widget.is_external_writer_view()
-        });
+        })
+    }
+
+    fn native_foreground_display_is_committed(&self, thread: ThreadId) -> bool {
+        #[cfg(unix)]
+        {
+            self.foreground
+                .observer
+                .compaction_selection()
+                .is_ok_and(|selected| {
+                    selected["threadId"].as_str() == Some(thread.to_string().as_str())
+                })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = thread;
+            false
+        }
+    }
+
+    /// A Draw also drives delayed paste, approvals and modal timers. Only an
+    /// already committed, empty-input presentation tick may retain its identity.
+    /// Async producers only enqueue App events; their guarded handlers still
+    /// withdraw before applying them. No await separates this check from Draw.
+    pub(super) async fn before_foreground_tui_event(
+        &mut self,
+        event: Option<&TuiEvent>,
+        owner: BackendId,
+        queue_empty: bool,
+        startup_ready: bool,
+    ) {
+        let presentation_only = matches!(event, Some(TuiEvent::Draw))
+            && self.native_compaction_backend_matches(owner)
+            && self
+                .ready_native_foreground_selection(owner, queue_empty, startup_ready)
+                .is_some_and(|selected| {
+                    self.native_foreground_display_is_committed(selected.thread_id)
+                })
+            && self.chat_widget.native_compaction_input_clear()
+            && self.chat_widget.no_modal_or_popup_active()
+            && self.chat_widget.external_editor_state() == ExternalEditorState::Closed
+            && self.pending_right_click_paste.is_none()
+            && self.overlay.is_none()
+            && !self.backtrack.overlay_preview_active;
+        if !presentation_only {
+            self.before_foreground_mutation("terminal_event").await;
+        }
+    }
+
+    /// Called after the whole mutable step, including deferred early-continue
+    /// paths, transcript replay/reset processing and startup-input restoration.
+    pub(super) fn native_foreground_checkpoint(
+        &mut self,
+        owner: BackendId,
+        queue_empty: bool,
+        startup_ready: bool,
+    ) {
+        if !self.foreground.changing {
+            return;
+        }
+        let thread = self.ready_native_foreground_selection(owner, queue_empty, startup_ready);
         #[cfg(unix)]
         if self.foreground.enabled && !self.foreground.observer.is_suspended() {
             if thread.is_some() && !self.foreground.connection_published {

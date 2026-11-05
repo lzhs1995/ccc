@@ -4,9 +4,9 @@
   "upstream_commit": "6aaac694803004a63c6f393d153c96d22521a6b9",
   "upstream_tree": "d0caeb3c076fbeade281c18295fada090c52cf8f",
   "owner_review": "OWNER-REVIEW.json",
-  "owner_review_sha256": "fbeebde983eed95805000797352a9eb9ddcc6990946f6b67d5c56d0ffd0b7975",
+  "owner_review_sha256": "28d8bb73d297c750e72f5bb5e5b6f0343aca3d520b6fd0563706b7b5af1f4d3e",
   "overlay_patch": "native-compact-recovery.patch",
-  "overlay_patch_sha256": "b0b5504fc5d208a05d1771a88a650b380ae3f31f50dfcb0b471d923305867c4c",
+  "overlay_patch_sha256": "0cf4dbe6a8c174359ae8e4be24e8874b47b298df3ada96d581e2c4ff445e9560",
   "overlay": {
     "codex-rs/Cargo.lock": {
       "source": "source/codex-rs/Cargo.lock",
@@ -166,7 +166,7 @@
     "codex-rs/core/src/session/compaction_recovery_tests.rs": {
       "source": "source/codex-rs/core/src/session/compaction_recovery_tests.rs",
       "before_sha256": null,
-      "after_sha256": "807b92c67d0dae95d7f75d53cb824b6febadf16ac31b1ef739222796822eab64"
+      "after_sha256": "00e4a6aebbb96654ab4593a458c504deed5fee3729e166cfdff4ff955633d63a"
     },
     "codex-rs/core/src/session/handlers.rs": {
       "source": "source/codex-rs/core/src/session/handlers.rs",
@@ -251,17 +251,17 @@
     "codex-rs/tui/src/app/foreground_observation.rs": {
       "source": "source/codex-rs/tui/src/app/foreground_observation.rs",
       "before_sha256": "6e63d1216616d1f5e4d7460db3962844094e4df5862a0f685ced1901890ecea6",
-      "after_sha256": "2cee4642351d8f006a02dc74f03a798dce442240455f6ba68e5d2208de2888c1"
+      "after_sha256": "97b6249331b014ec44aa26d460aff83d97ed665e703a3960d7c56a1c11fbd64a"
     },
     "codex-rs/tui/src/app/foreground_observation/tests.rs": {
       "source": "source/codex-rs/tui/src/app/foreground_observation/tests.rs",
       "before_sha256": "395a9b152371d4ed31462f3a850074a76b9c3d839428cfa109f3c99a3d089230",
-      "after_sha256": "2c5f86c685ce3ef7dcf145617a34330e2ac2a134719a7bc3ac2da6f8a02172b8"
+      "after_sha256": "faf0d2692a414e19159706ee956f9b2129174cb93f5cac22bf81f3bfca6ccbda"
     },
     "codex-rs/tui/src/app/startup.rs": {
       "source": "source/codex-rs/tui/src/app/startup.rs",
       "before_sha256": "142507d7c8ca036ecf597ecce03674a62413df1ad8bad1d5e4debdd91c36852c",
-      "after_sha256": "7599c3753593663305c18102f691722848c66a4830621c6204071ddd90f5ecf1"
+      "after_sha256": "3308aaa49358ee1018a2e1340f3ead06968d8be7a47dc0eae8045975ac7b5dcb"
     },
     "codex-rs/tui/src/app_event.rs": {
       "source": "source/codex-rs/tui/src/app_event.rs",
@@ -372,10 +372,15 @@
       "source": "source/codex-rs/app-server-protocol/schema/typescript/v2/index.ts",
       "before_sha256": "d9565cae649b76039200f803de2be7c8e1ad85ade2f78dbab9ea230592fd4f5c",
       "after_sha256": "69424f840d8c05cb89f7f29c3dbc0cf090f302cb5de4b316e2e6ead98ca1d7bc"
+    },
+    "codex-rs/tui/src/app/right_click_paste.rs": {
+      "source": "source/codex-rs/tui/src/app/right_click_paste.rs",
+      "before_sha256": "8cf7092afc3eb958547128dd4d559ff0018cc887bce90e9caa319b4dcf7a6e90",
+      "after_sha256": "f412c8df6910b0cc0d45ecaa1976971d72ca8810b873645c1da3922dfe72b07e"
     }
   },
-  "full_release_source_manifest_sha256": "497fed49f63a2bc576f91224671c226f976de2184efed78ae4c3b2dbf9a60ab3",
-  "full_test_source_manifest_sha256": "6fd9c0ad6d3450cc562054bc2b00a23219d85ef08c01ab9ba7cf3e61c6d34cbd",
+  "full_release_source_manifest_sha256": "c83499a8c9d742e3b203546b9249160037faa38a52b7fce0e54adb8230d52c17",
+  "full_test_source_manifest_sha256": "df0af272252da9952b5a5db35eeb4be700b43e38e31d4a7ed939abdd391efa7d",
   "release_cargo_manifest_sha256": "11ce75d44b3fdc2cf92770ba0dd9e642a214dbf230fb2ef609d0805049f0887f",
   "release_cargo_lock_sha256": "57082b573e682fae144ea44fa15297e3fcf0cfecbb0f32fe491a28839b8caea0",
   "test_cargo_manifest_sha256": "f68b00f9afaefe023edee94111659f0f583113ca7855115a1a892e054ded8f95",
@@ -1087,6 +1092,48 @@
       "binary": "codex_app_server_protocol",
       "name": "protocol::v2::thread::compact_recovery_tests::legacy_compact_start_response_accepts_unknown_fields_without_relaxing_recovery",
       "role": "protocol",
+      "new": true
+    },
+    {
+      "package": "codex-tui",
+      "binary": "codex_tui",
+      "name": "app::tests::foreground_observation::animation_draws_retain_original_generation_under_native_shared_lock",
+      "role": "tui",
+      "new": true
+    },
+    {
+      "package": "codex-tui",
+      "binary": "codex_tui",
+      "name": "app::tests::foreground_observation::non_draw_events_and_terminal_eof_still_withdraw_before_handling",
+      "role": "tui",
+      "new": true
+    },
+    {
+      "package": "codex-tui",
+      "binary": "codex_tui",
+      "name": "app::tests::foreground_observation::draw_with_pending_input_or_transition_still_withdraws",
+      "role": "tui",
+      "new": true
+    },
+    {
+      "package": "codex-tui",
+      "binary": "codex_tui",
+      "name": "app::tests::foreground_observation::held_ascii_draw_waits_for_original_lock_before_flushing_input",
+      "role": "tui",
+      "new": true
+    },
+    {
+      "package": "codex-tui",
+      "binary": "codex_tui",
+      "name": "app::tests::foreground_observation::delayed_approval_draw_is_not_treated_as_presentation_only",
+      "role": "tui",
+      "new": true
+    },
+    {
+      "package": "codex-tui",
+      "binary": "codex_tui",
+      "name": "app::tests::foreground_observation::draw_never_treats_an_uncommitted_proposal_as_live_selection",
+      "role": "tui",
       "new": true
     }
   ],

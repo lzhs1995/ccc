@@ -704,5 +704,47 @@
     "name": "protocol::v2::thread::compact_recovery_tests::legacy_compact_start_response_accepts_unknown_fields_without_relaxing_recovery",
     "role": "protocol",
     "new": true
+  },
+  {
+    "package": "codex-tui",
+    "binary": "codex_tui",
+    "name": "app::tests::foreground_observation::animation_draws_retain_original_generation_under_native_shared_lock",
+    "role": "tui",
+    "new": true
+  },
+  {
+    "package": "codex-tui",
+    "binary": "codex_tui",
+    "name": "app::tests::foreground_observation::non_draw_events_and_terminal_eof_still_withdraw_before_handling",
+    "role": "tui",
+    "new": true
+  },
+  {
+    "package": "codex-tui",
+    "binary": "codex_tui",
+    "name": "app::tests::foreground_observation::draw_with_pending_input_or_transition_still_withdraws",
+    "role": "tui",
+    "new": true
+  },
+  {
+    "package": "codex-tui",
+    "binary": "codex_tui",
+    "name": "app::tests::foreground_observation::held_ascii_draw_waits_for_original_lock_before_flushing_input",
+    "role": "tui",
+    "new": true
+  },
+  {
+    "package": "codex-tui",
+    "binary": "codex_tui",
+    "name": "app::tests::foreground_observation::delayed_approval_draw_is_not_treated_as_presentation_only",
+    "role": "tui",
+    "new": true
+  },
+  {
+    "package": "codex-tui",
+    "binary": "codex_tui",
+    "name": "app::tests::foreground_observation::draw_never_treats_an_uncommitted_proposal_as_live_selection",
+    "role": "tui",
+    "new": true
   }
 ]

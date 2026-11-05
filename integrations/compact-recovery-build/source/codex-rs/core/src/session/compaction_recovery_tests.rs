@@ -1,6 +1,7 @@
 use super::*;
 use crate::session::compaction_recovery::CompactionIo;
 use futures::future::BoxFuture;
+use pretty_assertions::assert_eq;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 

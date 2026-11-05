@@ -942,3 +942,348 @@ async fn actual_terminal_event_waits_for_native_shared_lock_before_editing_draft
     fixture.server.shutdown().await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn animation_draws_retain_original_generation_under_native_shared_lock() -> Result<()> {
+    use std::os::fd::AsRawFd;
+    let mut fixture = boxed_future!(ForegroundFixture::new()).await?;
+    let thread_id = ThreadId::new();
+    boxed_future!(fixture.enqueue(thread_id, Vec::new())).await?;
+    boxed_future!(fixture.finish()).await?;
+    let before = fixture.files.assert_live(thread_id)?;
+    let root = fixture
+        .files
+        .home
+        .path()
+        .join("credential-observations/compaction-recovery");
+    DirBuilder::new().mode(0o700).create(&root)?;
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(root.join(format!(
+            "client-{}-{}.lock",
+            std::process::id(),
+            before["client_epoch"].as_str().unwrap()
+        )))?;
+    fixture.app.local_settings.tui.animations = true;
+    for _ in 0..8 {
+        let before = fixture.files.assert_live(thread_id)?;
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) },
+            0
+        );
+        // This is the exact startup gate followed by the real Draw handler.
+        // The old unconditional gate times out while this real SH is held.
+        tokio::time::timeout(
+            Duration::from_millis(80),
+            boxed_future!(fixture.app.before_foreground_tui_event(
+                Some(&TuiEvent::Draw),
+                fixture.server.backend_id(),
+                fixture.events.is_empty(),
+                true,
+            )),
+        )
+        .await?;
+        fixture.files.assert_live(thread_id)?;
+        boxed_future!(fixture.app.handle_tui_event(
+            &mut fixture.tui,
+            &mut fixture.server,
+            TuiEvent::Draw,
+        ))
+        .await?;
+        fixture.checkpoint(true);
+        assert_eq!(
+            fixture.files.record()?["selection_generation"],
+            before["selection_generation"]
+        );
+        assert_eq!(
+            fixture.files.record()?["connection_epoch"],
+            before["connection_epoch"]
+        );
+        assert!(fixture.app.chat_widget.native_compaction_input_clear());
+        assert!(
+            fixture
+                .app
+                .native_compaction_backend_matches(fixture.server.backend_id())
+        );
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+        // Newly queued side effects use the existing guarded event handlers;
+        // they are not treated as additional presentation-only frames.
+        boxed_future!(fixture.finish()).await?;
+    }
+    fixture.server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn non_draw_events_and_terminal_eof_still_withdraw_before_handling() -> Result<()> {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    for event in [
+        Some(TuiEvent::Key(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+        ))),
+        Some(TuiEvent::Paste("kept input".into())),
+        Some(TuiEvent::Resize(ratatui::layout::Size::new(80, 24))),
+        Some(TuiEvent::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Moved,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        })),
+        Some(TuiEvent::FocusLost),
+        Some(TuiEvent::FocusGained),
+        Some(TuiEvent::Resume),
+        None,
+    ] {
+        let mut fixture = boxed_future!(ForegroundFixture::new()).await?;
+        let thread_id = ThreadId::new();
+        boxed_future!(fixture.enqueue(thread_id, Vec::new())).await?;
+        boxed_future!(fixture.finish()).await?;
+        let before = fixture.files.assert_live(thread_id)?;
+        fixture
+            .app
+            .before_foreground_tui_event(event.as_ref(), fixture.server.backend_id(), true, true)
+            .await;
+        fixture.files.assert_clear()?;
+        assert!(
+            fixture.files.record()?["selection_generation"].as_u64()
+                > before["selection_generation"].as_u64()
+        );
+        assert!(
+            !fixture
+                .app
+                .native_compaction_backend_matches(fixture.server.backend_id())
+        );
+        fixture.server.shutdown().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn draw_with_pending_input_or_transition_still_withdraws() -> Result<()> {
+    for denial in [
+        "queue",
+        "startup",
+        "foreign-owner",
+        "pending-paste",
+        "editor",
+        "replay",
+        "offline",
+    ] {
+        let mut fixture = boxed_future!(ForegroundFixture::new()).await?;
+        let thread_id = ThreadId::new();
+        boxed_future!(fixture.enqueue(thread_id, Vec::new())).await?;
+        boxed_future!(fixture.finish()).await?;
+        fixture.files.assert_live(thread_id)?;
+        match denial {
+            "pending-paste" => {
+                fixture.app.pending_right_click_paste = Some(
+                    crate::app::right_click_paste::PendingPaste::for_foreground_gate_test(
+                        thread_id,
+                    ),
+                )
+            }
+            "editor" => fixture
+                .app
+                .chat_widget
+                .set_external_editor_state(crate::chatwidget::ExternalEditorState::Requested),
+            "replay" => fixture.app.begin_initial_history_replay_buffer(),
+            "offline" => fixture.app.reconnect.offline = true,
+            _ => {}
+        }
+        let owner = if denial == "foreign-owner" {
+            BackendId::new()
+        } else {
+            fixture.server.backend_id()
+        };
+        fixture
+            .app
+            .before_foreground_tui_event(
+                Some(&TuiEvent::Draw),
+                owner,
+                denial != "queue",
+                denial != "startup",
+            )
+            .await;
+        fixture.files.assert_clear()?;
+        assert!(
+            !fixture
+                .app
+                .native_compaction_backend_matches(fixture.server.backend_id()),
+            "{denial}"
+        );
+        fixture.server.shutdown().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn held_ascii_draw_waits_for_original_lock_before_flushing_input() -> Result<()> {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::os::fd::AsRawFd;
+    let mut fixture = boxed_future!(ForegroundFixture::new()).await?;
+    let thread_id = ThreadId::new();
+    boxed_future!(fixture.enqueue(thread_id, Vec::new())).await?;
+    boxed_future!(fixture.finish()).await?;
+    fixture
+        .app
+        .before_foreground_tui_event(
+            Some(&TuiEvent::Key(KeyEvent::new(
+                KeyCode::Char('x'),
+                KeyModifiers::NONE,
+            ))),
+            fixture.server.backend_id(),
+            true,
+            true,
+        )
+        .await;
+    boxed_future!(fixture.app.handle_tui_event(
+        &mut fixture.tui,
+        &mut fixture.server,
+        TuiEvent::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+    ))
+    .await?;
+    assert!(fixture.app.chat_widget.is_in_paste_burst());
+    fixture.checkpoint(true);
+    let before = fixture.files.assert_live(thread_id)?;
+    let root = fixture
+        .files
+        .home
+        .path()
+        .join("credential-observations/compaction-recovery");
+    DirBuilder::new().mode(0o700).create(&root)?;
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(root.join(format!(
+            "client-{}-{}.lock",
+            std::process::id(),
+            before["client_epoch"].as_str().unwrap()
+        )))?;
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) },
+        0
+    );
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(80),
+            boxed_future!(fixture.app.before_foreground_tui_event(
+                Some(&TuiEvent::Draw),
+                fixture.server.backend_id(),
+                true,
+                true
+            ))
+        )
+        .await
+        .is_err()
+    );
+    assert!(fixture.app.chat_widget.is_in_paste_burst());
+    assert_eq!(fixture.app.chat_widget.composer_text_with_pending(), "x");
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+    fixture
+        .app
+        .before_foreground_tui_event(
+            Some(&TuiEvent::Draw),
+            fixture.server.backend_id(),
+            true,
+            true,
+        )
+        .await;
+    fixture.files.assert_clear()?;
+    boxed_future!(fixture.app.handle_tui_event(
+        &mut fixture.tui,
+        &mut fixture.server,
+        TuiEvent::Draw
+    ))
+    .await?;
+    assert!(!fixture.app.chat_widget.is_in_paste_burst());
+    assert_eq!(fixture.app.chat_widget.composer_text_with_pending(), "x");
+    fixture.server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn delayed_approval_draw_is_not_treated_as_presentation_only() -> Result<()> {
+    let mut fixture = boxed_future!(ForegroundFixture::new()).await?;
+    let thread_id = ThreadId::new();
+    boxed_future!(fixture.enqueue(thread_id, Vec::new())).await?;
+    boxed_future!(fixture.finish()).await?;
+    let (mut pane, _events) = super::startup::startup_bottom_pane();
+    pane.set_composer_text(String::new(), Vec::new(), Vec::new());
+    let mut draft = pane.composer_draft_snapshot();
+    draft.last_composer_activity_at = Some(Instant::now());
+    fixture
+        .app
+        .chat_widget
+        .restore_startup_draft_when_ready(&mut Some(draft));
+    let request = exec_approval_request(thread_id, "turn-draw", "call-draw", None);
+    let _ = fixture
+        .app
+        .pending_app_server_requests
+        .note_server_request(&request);
+    fixture.app.enqueue_primary_thread_request(request).await?;
+    let event = fixture.app.active_thread_rx.as_mut().unwrap().try_recv()?;
+    fixture.app.handle_thread_event_now(event);
+    assert!(fixture.app.chat_widget.has_pending_protected_request());
+    assert!(fixture.app.chat_widget.composer_is_empty());
+    assert!(!fixture.app.chat_widget.has_active_modal());
+    fixture
+        .app
+        .before_foreground_tui_event(
+            Some(&TuiEvent::Draw),
+            fixture.server.backend_id(),
+            true,
+            true,
+        )
+        .await;
+    fixture.files.assert_clear()?;
+    assert_eq!(fixture.app.chat_widget.composer_text_with_pending(), "");
+    fixture.server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn draw_never_treats_an_uncommitted_proposal_as_live_selection() -> Result<()> {
+    let mut fixture = boxed_future!(ForegroundFixture::new()).await?;
+    let thread_id = ThreadId::new();
+    boxed_future!(fixture.enqueue(thread_id, Vec::new())).await?;
+    boxed_future!(fixture.finish()).await?;
+    fixture.files.assert_live(thread_id)?;
+    // A library-level clear must remain authoritative even if App's proposal
+    // and connected-owner fields still describe the same visible thread.
+    fixture
+        .app
+        .native_compaction_observer()
+        .before_change("test_authoritative_clear")?;
+    fixture.files.assert_clear()?;
+    fixture
+        .app
+        .before_foreground_tui_event(
+            Some(&TuiEvent::Draw),
+            fixture.server.backend_id(),
+            true,
+            true,
+        )
+        .await;
+    assert!(
+        !fixture
+            .app
+            .native_compaction_backend_matches(fixture.server.backend_id())
+    );
+    fixture.files.assert_clear()?;
+    boxed_future!(fixture.app.handle_tui_event(
+        &mut fixture.tui,
+        &mut fixture.server,
+        TuiEvent::Draw
+    ))
+    .await?;
+    fixture.checkpoint(true);
+    fixture.files.assert_live(thread_id)?;
+    fixture.server.shutdown().await?;
+    Ok(())
+}

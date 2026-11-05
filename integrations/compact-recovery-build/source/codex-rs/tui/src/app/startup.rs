@@ -1498,7 +1498,12 @@ See the Codex keymap documentation for supported actions and examples."
                     }
                     event = tui_events.next(), if app.pending_thread_switch_resets == 0
                         && (app.reconnect.offline || !block_terminal_input_for_pending_startup_events) => {
-                        app.before_foreground_mutation("terminal_event").await;
+                        app.before_foreground_tui_event(
+                            event.as_ref(),
+                            initial_owner,
+                            app_event_rx.is_empty(),
+                            !waiting_for_initial_session_configured && pending_startup_draft.is_none(),
+                        ).await;
                         if let Some(event) = event {
                             if (matches!(
                                 &event,

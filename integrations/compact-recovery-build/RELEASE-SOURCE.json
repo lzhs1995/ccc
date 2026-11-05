@@ -18741,7 +18741,7 @@
     {
       "path": "codex-rs/core/src/session/compaction_recovery_tests.rs",
       "kind": "file",
-      "sha256": "807b92c67d0dae95d7f75d53cb824b6febadf16ac31b1ef739222796822eab64",
+      "sha256": "00e4a6aebbb96654ab4593a458c504deed5fee3729e166cfdff4ff955633d63a",
       "executable": false
     },
     {
@@ -37059,13 +37059,13 @@
     {
       "path": "codex-rs/tui/src/app/foreground_observation.rs",
       "kind": "file",
-      "sha256": "2cee4642351d8f006a02dc74f03a798dce442240455f6ba68e5d2208de2888c1",
+      "sha256": "97b6249331b014ec44aa26d460aff83d97ed665e703a3960d7c56a1c11fbd64a",
       "executable": false
     },
     {
       "path": "codex-rs/tui/src/app/foreground_observation/tests.rs",
       "kind": "file",
-      "sha256": "2c5f86c685ce3ef7dcf145617a34330e2ac2a134719a7bc3ac2da6f8a02172b8",
+      "sha256": "faf0d2692a414e19159706ee956f9b2129174cb93f5cac22bf81f3bfca6ccbda",
       "executable": false
     },
     {
@@ -37311,7 +37311,7 @@
     {
       "path": "codex-rs/tui/src/app/right_click_paste.rs",
       "kind": "file",
-      "sha256": "8cf7092afc3eb958547128dd4d559ff0018cc887bce90e9caa319b4dcf7a6e90",
+      "sha256": "f412c8df6910b0cc0d45ecaa1976971d72ca8810b873645c1da3922dfe72b07e",
       "executable": false
     },
     {
@@ -37917,7 +37917,7 @@
     {
       "path": "codex-rs/tui/src/app/startup.rs",
       "kind": "file",
-      "sha256": "7599c3753593663305c18102f691722848c66a4830621c6204071ddd90f5ecf1",
+      "sha256": "3308aaa49358ee1018a2e1340f3ead06968d8be7a47dc0eae8045975ac7b5dcb",
       "executable": false
     },
     {
@@ -56766,5 +56766,5 @@
       "executable": false
     }
   ],
-  "sha256": "497fed49f63a2bc576f91224671c226f976de2184efed78ae4c3b2dbf9a60ab3"
+  "sha256": "c83499a8c9d742e3b203546b9249160037faa38a52b7fce0e54adb8230d52c17"
 }
