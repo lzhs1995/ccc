@@ -1181,7 +1181,7 @@ pub struct ThreadCompactStartParams {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ThreadCompactStartResponse {}
 
@@ -1222,6 +1222,18 @@ impl ThreadCompactRecoveryParams {
 #[cfg(test)]
 mod compact_recovery_tests {
     use super::ThreadCompactRecoveryParams;
+    use super::ThreadCompactStartResponse;
+
+    #[test]
+    fn legacy_empty_compact_response_keeps_extra_field_compatibility() {
+        let response: ThreadCompactStartResponse =
+            serde_json::from_value(serde_json::json!({"futureField": true})).unwrap();
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            serde_json::json!({})
+        );
+    }
+
     #[test]
     fn conditional_compaction_api_rejects_partial_identity_and_query_authority() {
         let query: ThreadCompactRecoveryParams =

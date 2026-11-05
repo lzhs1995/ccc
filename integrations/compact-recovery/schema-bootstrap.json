@@ -5,9 +5,9 @@
   "upstream_tree": "d0caeb3c076fbeade281c18295fada090c52cf8f",
   "generator": "schema_fixtures_tests::write_schema_fixtures_from_env",
   "owner_review": "OWNER-REVIEW.json",
-  "owner_review_sha256": "7bca17fb09d3adfda65e925b90f41b0005ffdcf2a420b6a5ebb988d136ec629b",
+  "owner_review_sha256": "4a6637fcf7ce18733970259fba1dd7e29e6671076669ec703b18124db446d221",
   "overlay_patch": "native-compact-recovery.patch",
-  "overlay_patch_sha256": "07c0e171a7947272fca714e4ea6b51b8e647e053ac5ccf5ffc536e2116b1a8d5",
+  "overlay_patch_sha256": "afe7ce071b66d3ace3547e94d89bc732834d32d3f977e6cc99c19467d0e0658b",
   "overlay": {
     "codex-rs/Cargo.lock": {
       "source": "source/codex-rs/Cargo.lock",
@@ -22,7 +22,7 @@
     "codex-rs/app-server-protocol/src/protocol/v2/thread.rs": {
       "source": "source/codex-rs/app-server-protocol/src/protocol/v2/thread.rs",
       "before_sha256": "8fe95c7e0d8d6d26ac9e8f5af3256a755c57c5c6c4a217310b0dd51fc7de05fc",
-      "after_sha256": "2bec9e2a6651d5e99e902094ea6226cb897ce2e8ae0008f983286108ad8bc324"
+      "after_sha256": "1a66aaaacee71f5cbd401e2d6a2faf156b3715dee0640f7b2be5b258f73f3514"
     },
     "codex-rs/app-server/Cargo.toml": {
       "source": "source/codex-rs/app-server/Cargo.toml",
@@ -320,7 +320,7 @@
       "after_sha256": "c3306c38eb73a54b56b1139c3f43b1a29159948cb263b860466ccf62ca8e68a0"
     }
   },
-  "full_source_sha256": "35c84c4a875e7388c2a66823ce03e07442a7ae2f6c113787beb967bfc7c63310",
+  "full_source_sha256": "7013d28d993ccdc5119873acde2a2c3c38e818647cac0e17f849e10ae073a4c5",
   "cargo_manifest_sha256": "11ce75d44b3fdc2cf92770ba0dd9e642a214dbf230fb2ef609d0805049f0887f",
   "cargo_lock_sha256": "57082b573e682fae144ea44fa15297e3fcf0cfecbb0f32fe491a28839b8caea0",
   "historical_tests_reused": false,

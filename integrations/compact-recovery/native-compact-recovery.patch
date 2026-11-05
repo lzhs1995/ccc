@@ -1,7 +1,8 @@
 diff --git a/codex-rs/Cargo.lock b/codex-rs/Cargo.lock
+index fcdeeab..719d284 100644
 --- a/codex-rs/Cargo.lock
 +++ b/codex-rs/Cargo.lock
-@@ -1623,6 +1623,7 @@
+@@ -1623,6 +1623,7 @@ version = "0.1.0"
  dependencies = [
   "libc",
   "serde_json",
@@ -9,7 +10,7 @@ diff --git a/codex-rs/Cargo.lock b/codex-rs/Cargo.lock
   "uuid",
  ]
  
-@@ -2072,10 +2073,12 @@
+@@ -2072,10 +2073,12 @@ dependencies = [
   "app_test_support",
   "axum",
   "base64 0.22.1",
@@ -23,32 +24,29 @@ diff --git a/codex-rs/Cargo.lock b/codex-rs/Cargo.lock
   "codex-app-server-protocol",
   "codex-app-server-transport",
 diff --git a/codex-rs/app-server-protocol/src/protocol/common.rs b/codex-rs/app-server-protocol/src/protocol/common.rs
+index b183d6a..b5bd9c9 100644
 --- a/codex-rs/app-server-protocol/src/protocol/common.rs
 +++ b/codex-rs/app-server-protocol/src/protocol/common.rs
-@@ -748,6 +748,11 @@
-         params: v2::ThreadCompactStartParams,
+@@ -749,6 +749,11 @@ client_request_definitions! {
          serialization: thread_id(params.thread_id),
          response: v2::ThreadCompactStartResponse,
-+    },
+     },
 +    ThreadCompactRecovery => "thread/compact/recovery" {
 +        params: v2::ThreadCompactRecoveryParams,
 +        serialization: thread_id(params.thread_id),
 +        response: v2::ThreadCompactRecoveryResponse,
-     },
++    },
      ThreadShellCommand => "thread/shellCommand" {
          params: v2::ThreadShellCommandParams,
+         serialization: thread_id(params.thread_id),
 diff --git a/codex-rs/app-server-protocol/src/protocol/v2/thread.rs b/codex-rs/app-server-protocol/src/protocol/v2/thread.rs
+index a7a7623..c7bf172 100644
 --- a/codex-rs/app-server-protocol/src/protocol/v2/thread.rs
 +++ b/codex-rs/app-server-protocol/src/protocol/v2/thread.rs
-@@ -1181,9 +1181,76 @@
- }
- 
- #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
--#[serde(rename_all = "camelCase")]
-+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+@@ -1185,6 +1185,85 @@ pub struct ThreadCompactStartParams {
  #[ts(export_to = "v2/")]
  pub struct ThreadCompactStartResponse {}
-+
+ 
 +/// Experimental conditional recovery of one original native provider wait.
 +/// Omit expected fields to query the current native identity without mutation.
 +#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -86,6 +84,18 @@ diff --git a/codex-rs/app-server-protocol/src/protocol/v2/thread.rs b/codex-rs/a
 +#[cfg(test)]
 +mod compact_recovery_tests {
 +    use super::ThreadCompactRecoveryParams;
++    use super::ThreadCompactStartResponse;
++
++    #[test]
++    fn legacy_empty_compact_response_keeps_extra_field_compatibility() {
++        let response: ThreadCompactStartResponse =
++            serde_json::from_value(serde_json::json!({"futureField": true})).unwrap();
++        assert_eq!(
++            serde_json::to_value(response).unwrap(),
++            serde_json::json!({})
++        );
++    }
++
 +    #[test]
 +    fn conditional_compaction_api_rejects_partial_identity_and_query_authority() {
 +        let query: ThreadCompactRecoveryParams =
@@ -115,13 +125,15 @@ diff --git a/codex-rs/app-server-protocol/src/protocol/v2/thread.rs b/codex-rs/a
 +pub struct ThreadCompactRecoveryResponse {
 +    pub result: JsonValue,
 +}
- 
++
  #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
  #[serde(rename_all = "camelCase")]
+ #[ts(export_to = "v2/")]
 diff --git a/codex-rs/app-server/Cargo.toml b/codex-rs/app-server/Cargo.toml
+index bddfc75..857a901 100644
 --- a/codex-rs/app-server/Cargo.toml
 +++ b/codex-rs/app-server/Cargo.toml
-@@ -25,6 +25,7 @@
+@@ -25,6 +25,7 @@ doctest = false
  workspace = true
  
  [dependencies]
@@ -129,7 +141,7 @@ diff --git a/codex-rs/app-server/Cargo.toml b/codex-rs/app-server/Cargo.toml
  codex-utils-process = { workspace = true }
  anyhow = { workspace = true }
  base64 = { workspace = true }
-@@ -120,12 +121,13 @@
+@@ -120,12 +121,13 @@ tokio-util = { workspace = true }
  tracing = { workspace = true, features = ["log"] }
  tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "json"] }
  url = { workspace = true }
@@ -144,15 +156,16 @@ diff --git a/codex-rs/app-server/Cargo.toml b/codex-rs/app-server/Cargo.toml
  libc = { workspace = true }
  
  [target.'cfg(windows)'.dependencies]
-@@ -166,3 +168,4 @@
+@@ -166,3 +168,4 @@ tokio-rustls = { workspace = true }
  tokio-tungstenite = { workspace = true }
  tracing-opentelemetry = { workspace = true }
  wiremock = { workspace = true }
 +
 diff --git a/codex-rs/app-server/src/message_processor.rs b/codex-rs/app-server/src/message_processor.rs
+index e1e5a7a..8ae35c0 100644
 --- a/codex-rs/app-server/src/message_processor.rs
 +++ b/codex-rs/app-server/src/message_processor.rs
-@@ -1017,6 +1017,7 @@
+@@ -1017,6 +1017,7 @@ impl MessageProcessor {
              | ClientRequest::TurnSteer { .. }
              | ClientRequest::ReviewStart { .. }
              | ClientRequest::ThreadCompactStart { .. }
@@ -160,7 +173,7 @@ diff --git a/codex-rs/app-server/src/message_processor.rs b/codex-rs/app-server/
              | ClientRequest::ThreadShellCommand { .. }
              | ClientRequest::ThreadQueueStart { .. }
              | ClientRequest::ThreadRealtimeStart { .. } => {
-@@ -1482,6 +1483,9 @@
+@@ -1482,6 +1483,9 @@ impl MessageProcessor {
              ClientRequest::ThreadPredictionRequest { .. } => Err(method_not_found(
                  "thread/prediction/request is not implemented yet",
              )),
@@ -171,9 +184,10 @@ diff --git a/codex-rs/app-server/src/message_processor.rs b/codex-rs/app-server/
                  self.thread_processor
                      .thread_compact_start(&request_id, params)
 diff --git a/codex-rs/app-server/src/request_processors.rs b/codex-rs/app-server/src/request_processors.rs
+index f76e655..ad24a2d 100644
 --- a/codex-rs/app-server/src/request_processors.rs
 +++ b/codex-rs/app-server/src/request_processors.rs
-@@ -203,6 +203,8 @@
+@@ -203,6 +203,8 @@ use codex_app_server_protocol::ThreadBackgroundTerminalsListResponse;
  use codex_app_server_protocol::ThreadBackgroundTerminalsTerminateParams;
  use codex_app_server_protocol::ThreadBackgroundTerminalsTerminateResponse;
  use codex_app_server_protocol::ThreadClosedNotification;
@@ -182,7 +196,7 @@ diff --git a/codex-rs/app-server/src/request_processors.rs b/codex-rs/app-server
  use codex_app_server_protocol::ThreadCompactStartParams;
  use codex_app_server_protocol::ThreadCompactStartResponse;
  use codex_app_server_protocol::ThreadDecrementElicitationParams;
-@@ -542,6 +544,8 @@
+@@ -542,6 +544,8 @@ mod apps_processor;
  mod bedrock_auth;
  mod catalog_processor;
  mod command_exec_processor;
@@ -193,6 +207,7 @@ diff --git a/codex-rs/app-server/src/request_processors.rs b/codex-rs/app-server
  #[path = "request_processors/config_reload_tests.rs"]
 diff --git a/codex-rs/app-server/src/request_processors/compaction_recovery_policy.rs b/codex-rs/app-server/src/request_processors/compaction_recovery_policy.rs
 new file mode 100644
+index 0000000..e476efb
 --- /dev/null
 +++ b/codex-rs/app-server/src/request_processors/compaction_recovery_policy.rs
 @@ -0,0 +1,389 @@
@@ -586,14 +601,13 @@ new file mode 100644
 +    }
 +}
 diff --git a/codex-rs/app-server/src/request_processors/thread_processor.rs b/codex-rs/app-server/src/request_processors/thread_processor.rs
+index 4d104e2..6f74f04 100644
 --- a/codex-rs/app-server/src/request_processors/thread_processor.rs
 +++ b/codex-rs/app-server/src/request_processors/thread_processor.rs
-@@ -820,6 +820,84 @@
-             }
-             Err(error) => Err(error),
+@@ -822,6 +822,84 @@ impl ThreadRequestProcessor {
          }
-+    }
-+
+     }
+ 
 +    pub(crate) async fn thread_compact_recovery(
 +        &self,
 +        params: ThreadCompactRecoveryParams,
@@ -670,13 +684,16 @@ diff --git a/codex-rs/app-server/src/request_processors/thread_processor.rs b/co
 +            result["goal"] = goal_snapshot;
 +        }
 +        Ok(Some(ThreadCompactRecoveryResponse { result }.into()))
-     }
- 
++    }
++
      pub(crate) async fn thread_compact_start(
+         &self,
+         request_id: &ConnectionRequestId,
 diff --git a/codex-rs/codex-api/src/common.rs b/codex-rs/codex-api/src/common.rs
+index 1abc89c..1527e97 100644
 --- a/codex-rs/codex-api/src/common.rs
 +++ b/codex-rs/codex-api/src/common.rs
-@@ -426,6 +426,9 @@
+@@ -426,6 +426,9 @@ pub struct ResponseStream {
      /// Requests a graceful interrupt. Keep consuming events through completion.
      /// Only `Cancel` validates and waits for an interruption acknowledgement.
      pub interrupt: Option<oneshot::Sender<ResponseInterrupt>>,
@@ -688,6 +705,7 @@ diff --git a/codex-rs/codex-api/src/common.rs b/codex-rs/codex-api/src/common.rs
  impl Stream for ResponseStream {
 diff --git a/codex-rs/codex-api/src/compaction_dispatch.rs b/codex-rs/codex-api/src/compaction_dispatch.rs
 new file mode 100644
+index 0000000..08f2fc0
 --- /dev/null
 +++ b/codex-rs/codex-api/src/compaction_dispatch.rs
 @@ -0,0 +1,359 @@
@@ -1051,9 +1069,10 @@ new file mode 100644
 +    }
 +}
 diff --git a/codex-rs/codex-api/src/endpoint/responses_websocket.rs b/codex-rs/codex-api/src/endpoint/responses_websocket.rs
+index c59683d..a0eb6c1 100644
 --- a/codex-rs/codex-api/src/endpoint/responses_websocket.rs
 +++ b/codex-rs/codex-api/src/endpoint/responses_websocket.rs
-@@ -59,6 +59,7 @@
+@@ -59,6 +59,7 @@ enum WsCommand {
      Send {
          message: Message,
          tx_result: oneshot::Sender<Result<(), WsError>>,
@@ -1061,7 +1080,7 @@ diff --git a/codex-rs/codex-api/src/endpoint/responses_websocket.rs b/codex-rs/c
      },
  }
  
-@@ -76,8 +77,23 @@
+@@ -76,8 +77,23 @@ impl WsStream {
                              break;
                          };
                          match command {
@@ -1087,7 +1106,7 @@ diff --git a/codex-rs/codex-api/src/endpoint/responses_websocket.rs b/codex-rs/c
                                  let should_break = result.is_err();
                                  let _ = tx_result.send(result);
                                  if should_break {
-@@ -143,9 +159,24 @@
+@@ -143,9 +159,24 @@ impl WsStream {
          Err(WsError::ConnectionClosed)
      }
  
@@ -1115,7 +1134,7 @@ diff --git a/codex-rs/codex-api/src/endpoint/responses_websocket.rs b/codex-rs/c
      }
  
      async fn next(&mut self) -> Option<Result<Message, WsError>> {
-@@ -279,7 +310,14 @@
+@@ -279,7 +310,14 @@ impl ResponsesWebsocketConnection {
              connection_reused,
          };
          let request_text = serialize_websocket_request(&request)?;
@@ -1131,7 +1150,7 @@ diff --git a/codex-rs/codex-api/src/endpoint/responses_websocket.rs b/codex-rs/c
          let current_span = Span::current();
          tokio::spawn(
              #[expect(
-@@ -287,6 +325,8 @@
+@@ -287,6 +325,8 @@ impl ResponsesWebsocketConnection {
                  reason = "the guard serializes exclusive use of the websocket stream for the lifetime of the response stream"
              )]
              async move {
@@ -1140,7 +1159,7 @@ diff --git a/codex-rs/codex-api/src/endpoint/responses_websocket.rs b/codex-rs/c
                  if let Some(model) = server_model {
                      let _ = tx_event.send(Ok(ResponseEvent::ServerModel(model))).await;
                  }
-@@ -315,6 +355,8 @@
+@@ -315,6 +355,8 @@ impl ResponsesWebsocketConnection {
                  let mut guard = tokio::select! {
                      biased;
                      _ = tx_event.closed() => return,
@@ -1149,7 +1168,7 @@ diff --git a/codex-rs/codex-api/src/endpoint/responses_websocket.rs b/codex-rs/c
                      () = &mut interrupt_timeout => {
                          let _ = tx_event.send(Err(ApiError::Stream(
                              "timed out draining interrupted response".into(),
-@@ -349,6 +391,7 @@
+@@ -349,6 +391,7 @@ impl ResponsesWebsocketConnection {
                              &timing_log_context,
                              interrupt.clone(),
                              &mut completion,
@@ -1157,7 +1176,7 @@ diff --git a/codex-rs/codex-api/src/endpoint/responses_websocket.rs b/codex-rs/c
                          ) => result,
                          () = &mut interrupt_timeout => Err(ApiError::Stream(
                              "timed out draining interrupted response".into(),
-@@ -356,6 +399,10 @@
+@@ -356,6 +399,10 @@ impl ResponsesWebsocketConnection {
                          _ = tx_event.closed() => Err(ApiError::Stream(
                              "response event consumer dropped".to_string(),
                          )),
@@ -1168,7 +1187,7 @@ diff --git a/codex-rs/codex-api/src/endpoint/responses_websocket.rs b/codex-rs/c
                      }
                  };
  
-@@ -364,7 +411,9 @@
+@@ -364,7 +411,9 @@ impl ResponsesWebsocketConnection {
                      // graceful close handshake here can stall indefinitely and mask the error.
                      let failed_stream = guard.take();
                      drop(guard);
@@ -1179,7 +1198,7 @@ diff --git a/codex-rs/codex-api/src/endpoint/responses_websocket.rs b/codex-rs/c
                      // Failed cancellation retires the socket while preserving any received
                      // completion and its usage for the abandoned classifier's cleanup.
                      let event = completion.map_or_else(|| Err(err), Ok);
-@@ -383,6 +432,8 @@
+@@ -383,6 +432,8 @@ impl ResponsesWebsocketConnection {
              rx_event,
              upstream_request_id: None,
              interrupt: Some(tx_interrupt),
@@ -1188,7 +1207,7 @@ diff --git a/codex-rs/codex-api/src/endpoint/responses_websocket.rs b/codex-rs/c
          })
      }
  }
-@@ -716,6 +767,7 @@
+@@ -716,6 +767,7 @@ async fn run_websocket_response_stream(
      timing_log_context: &ResponsesWebsocketTimingLogContext,
      interrupt: impl Future<Output = ResponseInterrupt> + Clone + Unpin,
      completion: &mut Option<ResponseEvent>,
@@ -1196,7 +1215,7 @@ diff --git a/codex-rs/codex-api/src/endpoint/responses_websocket.rs b/codex-rs/c
  ) -> Result<(), ApiError> {
      let mut last_server_model: Option<String> = None;
      let mut safety_buffering_treatment = SafetyBufferingTreatment::default();
-@@ -732,6 +784,7 @@
+@@ -732,6 +784,7 @@ async fn run_websocket_response_stream(
          idle_timeout,
          telemetry.as_ref(),
          timing_log_context.connection_reused,
@@ -1204,7 +1223,7 @@ diff --git a/codex-rs/codex-api/src/endpoint/responses_websocket.rs b/codex-rs/c
      )
      .await?;
  
-@@ -758,6 +811,7 @@
+@@ -758,6 +811,7 @@ async fn run_websocket_response_stream(
                      idle_timeout,
                      /*telemetry*/ None,
                      timing_log_context.connection_reused,
@@ -1212,7 +1231,7 @@ diff --git a/codex-rs/codex-api/src/endpoint/responses_websocket.rs b/codex-rs/c
                  )
                  .await?;
                  awaiting_interrupt_ack = matches!(request, ResponseInterrupt::Cancel { .. });
-@@ -1003,11 +1057,12 @@
+@@ -1003,11 +1057,12 @@ async fn send_websocket_request(
      idle_timeout: Duration,
      telemetry: Option<&Arc<dyn WebsocketTelemetry>>,
      connection_reused: bool,
@@ -1227,9 +1246,10 @@ diff --git a/codex-rs/codex-api/src/endpoint/responses_websocket.rs b/codex-rs/c
      .await
      .map_err(|_| ApiError::Stream("idle timeout sending websocket request".into()))
 diff --git a/codex-rs/codex-api/src/endpoint/session.rs b/codex-rs/codex-api/src/endpoint/session.rs
+index 7849225..de12505 100644
 --- a/codex-rs/codex-api/src/endpoint/session.rs
 +++ b/codex-rs/codex-api/src/endpoint/session.rs
-@@ -145,7 +145,19 @@
+@@ -145,7 +145,19 @@ impl<T: HttpTransport> EndpointSession<T> {
                  let transport = &self.transport;
                  async move {
                      let req = auth.apply_auth(req).await.map_err(TransportError::from)?;
@@ -1251,18 +1271,20 @@ diff --git a/codex-rs/codex-api/src/endpoint/session.rs b/codex-rs/codex-api/src
              },
          )
 diff --git a/codex-rs/codex-api/src/lib.rs b/codex-rs/codex-api/src/lib.rs
+index 9075210..8289f56 100644
 --- a/codex-rs/codex-api/src/lib.rs
 +++ b/codex-rs/codex-api/src/lib.rs
-@@ -121,3 +121,5 @@
+@@ -121,3 +121,5 @@ pub use crate::telemetry::SseTelemetry;
  pub use crate::telemetry::WebsocketTelemetry;
  pub use codex_protocol::protocol::RealtimeAudioFrame;
  pub use codex_protocol::protocol::RealtimeEvent;
 +
 +pub mod compaction_dispatch;
 diff --git a/codex-rs/codex-api/src/sse/responses.rs b/codex-rs/codex-api/src/sse/responses.rs
+index 34d5511..e13f0a1 100644
 --- a/codex-rs/codex-api/src/sse/responses.rs
 +++ b/codex-rs/codex-api/src/sse/responses.rs
-@@ -72,7 +72,15 @@
+@@ -72,7 +72,15 @@ pub fn spawn_response_stream(
          let _ = turn_state.set(header_value.to_string());
      }
      let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent, ApiError>>(1600);
@@ -1278,7 +1300,7 @@ diff --git a/codex-rs/codex-api/src/sse/responses.rs b/codex-rs/codex-api/src/ss
          if let Some(model) = server_model {
              let _ = tx_event.send(Ok(ResponseEvent::ServerModel(model))).await;
          }
-@@ -87,20 +95,23 @@
+@@ -87,20 +95,23 @@ pub fn spawn_response_stream(
                  .send(Ok(ResponseEvent::ServerReasoningIncluded(true)))
                  .await;
          }
@@ -1311,9 +1333,10 @@ diff --git a/codex-rs/codex-api/src/sse/responses.rs b/codex-rs/codex-api/src/ss
  }
  
 diff --git a/codex-rs/core/src/agent/api.rs b/codex-rs/core/src/agent/api.rs
+index e23f1ea..22c57eb 100644
 --- a/codex-rs/core/src/agent/api.rs
 +++ b/codex-rs/core/src/agent/api.rs
-@@ -31,6 +31,12 @@
+@@ -31,6 +31,12 @@ use futures::future::BoxFuture;
  // Keep dynamic dispatch a compile-time property of the contract.
  const _: Option<&dyn AgentControl> = None;
  
@@ -1326,11 +1349,10 @@ diff --git a/codex-rs/core/src/agent/api.rs b/codex-rs/core/src/agent/api.rs
  /// Coordinates agent operations and shared state through a local or host backend.
  ///
  /// Implementations preserve the existing wake modes and keep loading and delivery behind
-@@ -75,6 +81,17 @@
-     /// Observe whether unread mail is available. Subscribe before the first read so
+@@ -76,6 +82,17 @@ pub trait AgentControl: Send + Sync {
      /// arrivals cannot be missed; notifications do not consume mail or start a turn.
      fn watch_mailbox(&self, agent: ThreadId) -> tokio::sync::watch::Receiver<bool>;
-+
+ 
 +    /// Reserve the original empty mailbox until native recovery dispatch.
 +    /// Unimplemented remote controllers cannot claim this atomic capability.
 +    fn reserve_mailbox_for_compaction(
@@ -1341,13 +1363,15 @@ diff --git a/codex-rs/core/src/agent/api.rs b/codex-rs/core/src/agent/api.rs
 +            "controller lacks native mailbox reservation".into(),
 +        ))
 +    }
- 
++
      /// Load a recorded V2 child through its live immediate parent, without sending input.
      /// Implementations validate ownership and restore the child under the parent's current
+     /// authority. Success makes the child available for attachment through its thread manager.
 diff --git a/codex-rs/core/src/agent/control.rs b/codex-rs/core/src/agent/control.rs
+index 765725d..7fa0171 100644
 --- a/codex-rs/core/src/agent/control.rs
 +++ b/codex-rs/core/src/agent/control.rs
-@@ -283,11 +283,14 @@
+@@ -283,11 +283,14 @@ impl LocalAgentControl {
                  let _membership = self.runtime.admit_start()?;
                  self.runtime.ensure_agent_known(agent_id)?;
                  let submission_id = uuid::Uuid::now_v7().to_string();
@@ -1368,9 +1392,10 @@ diff --git a/codex-rs/core/src/agent/control.rs b/codex-rs/core/src/agent/contro
                      crate::agent_communication::emit_agent_communication_send(
                          &submission_id,
 diff --git a/codex-rs/core/src/agent/control/api.rs b/codex-rs/core/src/agent/control/api.rs
+index 0426ca3..1e31f28 100644
 --- a/codex-rs/core/src/agent/control/api.rs
 +++ b/codex-rs/core/src/agent/control/api.rs
-@@ -31,6 +31,7 @@
+@@ -31,6 +31,7 @@ use codex_protocol::protocol::TokenUsage;
  use codex_rollout_trace::ThreadTraceContext;
  use futures::future::BoxFuture;
  use std::collections::HashSet;
@@ -1378,7 +1403,7 @@ diff --git a/codex-rs/core/src/agent/control/api.rs b/codex-rs/core/src/agent/co
  
  impl AgentControl for LocalAgentControl {
      fn identity(&self) -> SessionId {
-@@ -182,6 +183,13 @@
+@@ -182,6 +183,13 @@ impl AgentControl for LocalAgentControl {
          self.runtime.mailboxes.take(agent)
      }
  
@@ -1393,9 +1418,10 @@ diff --git a/codex-rs/core/src/agent/control/api.rs b/codex-rs/core/src/agent/co
          self.runtime.mailboxes.watch(agent)
      }
 diff --git a/codex-rs/core/src/agent/control/legacy.rs b/codex-rs/core/src/agent/control/legacy.rs
+index 743bb75..cf0ca50 100644
 --- a/codex-rs/core/src/agent/control/legacy.rs
 +++ b/codex-rs/core/src/agent/control/legacy.rs
-@@ -43,7 +43,7 @@
+@@ -43,7 +43,7 @@ impl LocalAgentControl {
          let _ = state.remove_thread(&agent_id).await;
          self.forget_v2_residency(agent_id);
          self.runtime.registry.release_spawned_thread(agent_id);
@@ -1405,6 +1431,7 @@ diff --git a/codex-rs/core/src/agent/control/legacy.rs b/codex-rs/core/src/agent
      }
  
 diff --git a/codex-rs/core/src/agent/control/mailbox.rs b/codex-rs/core/src/agent/control/mailbox.rs
+index c5e7e06..c63ea26 100644
 --- a/codex-rs/core/src/agent/control/mailbox.rs
 +++ b/codex-rs/core/src/agent/control/mailbox.rs
 @@ -2,21 +2,23 @@
@@ -1433,7 +1460,7 @@ diff --git a/codex-rs/core/src/agent/control/mailbox.rs b/codex-rs/core/src/agen
      }
  }
  
-@@ -24,6 +26,29 @@
+@@ -24,6 +26,29 @@ impl Default for Mailboxes {
  struct Mailbox {
      pending: Vec<StoredMail>,
      state: watch::Sender<bool>,
@@ -1463,7 +1490,7 @@ diff --git a/codex-rs/core/src/agent/control/mailbox.rs b/codex-rs/core/src/agen
  }
  
  struct StoredMail {
-@@ -33,18 +58,64 @@
+@@ -33,18 +58,64 @@ struct StoredMail {
  }
  
  impl Mailboxes {
@@ -1531,7 +1558,7 @@ diff --git a/codex-rs/core/src/agent/control/mailbox.rs b/codex-rs/core/src/agen
          mailbox
              .pending
              .extend(messages.into_iter().map(|communication| StoredMail {
-@@ -85,7 +156,9 @@
+@@ -85,7 +156,9 @@ impl Mailboxes {
                  // Private delegates and cancelled startups can stop without explicit removal.
                  // Retain unread mail and live subscriptions, but reclaim abandoned empty entries.
                  mailboxes.retain(|_, mailbox| {
@@ -1542,7 +1569,7 @@ diff --git a/codex-rs/core/src/agent/control/mailbox.rs b/codex-rs/core/src/agen
                  });
                  mailboxes.entry(agent).or_default().state.subscribe()
              }
-@@ -93,15 +166,34 @@
+@@ -93,15 +166,34 @@ impl Mailboxes {
          }
      }
  
@@ -1586,7 +1613,7 @@ diff --git a/codex-rs/core/src/agent/control/mailbox.rs b/codex-rs/core/src/agen
      }
  
      pub(super) fn close(&self) {
-@@ -114,3 +206,93 @@
+@@ -114,3 +206,93 @@ impl Mailboxes {
          }
      }
  }
@@ -1681,9 +1708,10 @@ diff --git a/codex-rs/core/src/agent/control/mailbox.rs b/codex-rs/core/src/agen
 +    }
 +}
 diff --git a/codex-rs/core/src/agent/control/residency.rs b/codex-rs/core/src/agent/control/residency.rs
+index fb86e5a..0459a1f 100644
 --- a/codex-rs/core/src/agent/control/residency.rs
 +++ b/codex-rs/core/src/agent/control/residency.rs
-@@ -76,7 +76,10 @@
+@@ -76,7 +76,10 @@ impl ThreadManagerState {
                  .map(|mail| mail.communication)
                  .collect();
              let runtime = &thread.session.services.local_agent_runtime;
@@ -1696,9 +1724,10 @@ diff --git a/codex-rs/core/src/agent/control/residency.rs b/codex-rs/core/src/ag
              // Raw bindings keep the original pending owner configuration alive.
              let environments = EvictedEnvironments {
 diff --git a/codex-rs/core/src/client.rs b/codex-rs/core/src/client.rs
+index 815ab10..08be947 100644
 --- a/codex-rs/core/src/client.rs
 +++ b/codex-rs/core/src/client.rs
-@@ -2532,6 +2532,8 @@
+@@ -2532,6 +2532,8 @@ fn map_response_stream(
  ) -> (ResponseStream, oneshot::Receiver<LastResponse>) {
      let upstream_request_id = api_stream.upstream_request_id.take();
      let interrupt = api_stream.interrupt.take();
@@ -1707,7 +1736,7 @@ diff --git a/codex-rs/core/src/client.rs b/codex-rs/core/src/client.rs
      let (mut stream, last_response) = map_response_events(
          upstream_request_id,
          crate::model_request::intercept_stream(Box::pin(api_stream), interceptors),
-@@ -2540,6 +2542,8 @@
+@@ -2540,6 +2542,8 @@ fn map_response_stream(
          provider,
      );
      stream.interrupt = interrupt;
@@ -1716,14 +1745,13 @@ diff --git a/codex-rs/core/src/client.rs b/codex-rs/core/src/client.rs
      (stream, last_response)
  }
  
-@@ -2561,8 +2565,16 @@
+@@ -2561,8 +2565,16 @@ where
      let (tx_last_response, rx_last_response) = oneshot::channel::<LastResponse>();
      let consumer_dropped = CancellationToken::new();
      let consumer_dropped_for_stream = consumer_dropped.clone();
--
 +    let mapper_finished = CancellationToken::new();
 +    let mapper_finished_guard = mapper_finished.clone().drop_guard();
-+
+ 
 +    let recovery_scope = codex_api::compaction_dispatch::transport_scope();
 +    let recovery_lease = recovery_scope.as_ref().map(|scope| scope.lease());
      tokio::spawn(async move {
@@ -1734,7 +1762,7 @@ diff --git a/codex-rs/core/src/client.rs b/codex-rs/core/src/client.rs
          let mut logged_error = false;
          let mut tx_last_response = Some(tx_last_response);
          let mut items_added: Vec<ResponseItem> = Vec::new();
-@@ -2574,6 +2586,7 @@
+@@ -2574,6 +2586,7 @@ where
          }
          loop {
              let event = tokio::select! {
@@ -1742,7 +1770,7 @@ diff --git a/codex-rs/core/src/client.rs b/codex-rs/core/src/client.rs
                  _ = consumer_dropped.cancelled() => {
                      inference_trace_attempt.record_cancelled(
                          STREAM_DROPPED_REASON,
-@@ -2689,6 +2702,9 @@
+@@ -2689,6 +2702,9 @@ where
              rx_event,
              interrupt: None,
              consumer_dropped: consumer_dropped_for_stream,
@@ -1753,9 +1781,10 @@ diff --git a/codex-rs/core/src/client.rs b/codex-rs/core/src/client.rs
          rx_last_response,
      )
 diff --git a/codex-rs/core/src/client_common.rs b/codex-rs/core/src/client_common.rs
+index a19431c..9991ec5 100644
 --- a/codex-rs/core/src/client_common.rs
 +++ b/codex-rs/core/src/client_common.rs
-@@ -121,6 +121,11 @@
+@@ -121,6 +121,11 @@ pub struct ResponseStream {
      /// Signals the mapper task that the consumer stopped polling before the
      /// provider stream reached its own terminal event.
      pub(crate) consumer_dropped: CancellationToken,
@@ -1768,9 +1797,10 @@ diff --git a/codex-rs/core/src/client_common.rs b/codex-rs/core/src/client_commo
  
  impl Stream for ResponseStream {
 diff --git a/codex-rs/core/src/client_common_tests.rs b/codex-rs/core/src/client_common_tests.rs
+index e4f431a..8141420 100644
 --- a/codex-rs/core/src/client_common_tests.rs
 +++ b/codex-rs/core/src/client_common_tests.rs
-@@ -268,3 +268,28 @@
+@@ -268,3 +268,28 @@ fn serializes_flex_service_tier_when_set() {
          Some("flex")
      );
  }
@@ -1800,9 +1830,10 @@ diff --git a/codex-rs/core/src/client_common_tests.rs b/codex-rs/core/src/client
 +    task.await.expect("owned mapper fixture must finish");
 +}
 diff --git a/codex-rs/core/src/client_tests.rs b/codex-rs/core/src/client_tests.rs
+index f929e2c..afd2b58 100644
 --- a/codex-rs/core/src/client_tests.rs
 +++ b/codex-rs/core/src/client_tests.rs
-@@ -2207,6 +2207,8 @@
+@@ -2207,6 +2207,8 @@ async fn intercepted_output_reaches_trace_and_websocket_bookkeeping() -> anyhow:
              rx_event,
              upstream_request_id: None,
              interrupt: None,
@@ -1812,9 +1843,10 @@ diff --git a/codex-rs/core/src/client_tests.rs b/codex-rs/core/src/client_tests.
          test_session_telemetry(),
          attempt,
 diff --git a/codex-rs/core/src/compact.rs b/codex-rs/core/src/compact.rs
+index 163e7d5..dd91ca0 100644
 --- a/codex-rs/core/src/compact.rs
 +++ b/codex-rs/core/src/compact.rs
-@@ -828,90 +828,155 @@
+@@ -828,90 +828,155 @@ async fn drain_to_completed(
  ) -> CodexResult<CompactionResponse> {
      sess.set_server_reasoning_included(turn_context.model_info().use_responses_lite)
          .await;
@@ -1826,6 +1858,14 @@ diff --git a/codex-rs/core/src/compact.rs b/codex-rs/core/src/compact.rs
 -            sess.reasoning_effort_for_request(
 -                &turn_context.initial_settings,
 -                RequestEffortUsage::Compaction,
+-            )
+-            .await,
+-            turn_context.reasoning_summary(),
+-            turn_context.config.service_tier.clone(),
+-            responses_metadata,
+-            // Rollout tracing currently models remote compaction only; local compaction streams
+-            // are left untraced until the reducer has a first-class local compaction lifecycle.
+-            &InferenceTraceContext::disabled(),
 +    let result = sess
 +        .collect_recoverable_compaction(
 +            &turn_context.sub_id,
@@ -1836,7 +1876,7 @@ diff --git a/codex-rs/core/src/compact.rs b/codex-rs/core/src/compact.rs
 +                responses_metadata,
 +                prompt,
 +            },
-+        )
+         )
 +        .await;
 +    let mut collected = match result {
 +        Ok(collected) => collected,
@@ -1867,15 +1907,7 @@ diff --git a/codex-rs/core/src/compact.rs b/codex-rs/core/src/compact.rs
 +                        ..Default::default()
 +                    }),
 +                }],
-             )
--            .await,
--            turn_context.reasoning_summary(),
--            turn_context.config.service_tier.clone(),
--            responses_metadata,
--            // Rollout tracing currently models remote compaction only; local compaction streams
--            // are left untraced until the reducer has a first-class local compaction lifecycle.
--            &InferenceTraceContext::disabled(),
--        )
++            )
 +            .await;
 +        }
 +    }
@@ -2035,9 +2067,10 @@ diff --git a/codex-rs/core/src/compact.rs b/codex-rs/core/src/compact.rs
      }
  }
 diff --git a/codex-rs/core/src/compact_remote_v2.rs b/codex-rs/core/src/compact_remote_v2.rs
+index bacf8c3..0db825d 100644
 --- a/codex-rs/core/src/compact_remote_v2.rs
 +++ b/codex-rs/core/src/compact_remote_v2.rs
-@@ -321,7 +321,6 @@
+@@ -321,7 +321,6 @@ async fn run_remote_compaction_request_v2(
          }
          CompactionRequestTransport::Foreground(client_session) => client_session,
      };
@@ -2045,7 +2078,7 @@ diff --git a/codex-rs/core/src/compact_remote_v2.rs b/codex-rs/core/src/compact_
      let max_retries = turn_context
          .provider
          .info()
-@@ -329,31 +328,26 @@
+@@ -329,31 +328,26 @@ async fn run_remote_compaction_request_v2(
          .min(MAX_REMOTE_COMPACTION_V2_STREAM_RETRIES);
      let mut retry_state = ResponsesStreamRetryState::default();
      loop {
@@ -2060,23 +2093,17 @@ diff --git a/codex-rs/core/src/compact_remote_v2.rs b/codex-rs/core/src/compact_
 -                step_context.settings.service_tier.clone(),
 -                responses_metadata,
 -                &InferenceTraceContext::disabled(),
+-            )
+-            .await
+-        {
+-            Ok(stream) => {
+-                collect_compaction_output(
 +        let request_client = &mut *client_session;
 +        let collected = sess
 +            .collect_recoverable_compaction(
 +                &turn_context.sub_id,
 +                RemoteCompactionIo {
-+                    sess,
-+                    step_context,
-+                    client_session: request_client,
-+                    prompt,
-+                    responses_metadata,
-+                },
-             )
--            .await
--        {
--            Ok(stream) => {
--                collect_compaction_output(
--                    sess,
+                     sess,
 -                    turn_context,
 -                    stream,
 -                    CompactionRequestKind::Foreground,
@@ -2085,6 +2112,12 @@ diff --git a/codex-rs/core/src/compact_remote_v2.rs b/codex-rs/core/src/compact_
 -            }
 -            Err(err) => Err(err),
 -        };
++                    step_context,
++                    client_session: request_client,
++                    prompt,
++                    responses_metadata,
++                },
++            )
 +            .await;
 +        let result = account_collected_compaction_output(
 +            sess,
@@ -2096,7 +2129,7 @@ diff --git a/codex-rs/core/src/compact_remote_v2.rs b/codex-rs/core/src/compact_
          match result {
              Ok(compaction_output) => return Ok(compaction_output),
              Err(err) => {
-@@ -372,49 +366,154 @@
+@@ -372,49 +366,154 @@ async fn run_remote_compaction_request_v2(
      }
  }
  
@@ -2276,7 +2309,7 @@ diff --git a/codex-rs/core/src/compact_remote_v2.rs b/codex-rs/core/src/compact_
          match event? {
              ResponseEvent::OutputItemDone(item) => {
                  output_item_count += 1;
-@@ -431,50 +530,18 @@
+@@ -431,50 +530,18 @@ async fn collect_compaction_output(
                  usage_metadata,
                  ..
              } => {
@@ -2335,7 +2368,7 @@ diff --git a/codex-rs/core/src/compact_remote_v2.rs b/codex-rs/core/src/compact_
  }
  
  fn build_v2_compacted_history(
-@@ -838,6 +905,9 @@
+@@ -838,6 +905,9 @@ mod tests {
              rx_event,
              interrupt: None,
              consumer_dropped: CancellationToken::new(),
@@ -2345,10 +2378,11 @@ diff --git a/codex-rs/core/src/compact_remote_v2.rs b/codex-rs/core/src/compact_
          }
      }
  
-@@ -1241,6 +1311,75 @@
+@@ -1240,6 +1310,75 @@ mod tests {
+         assert_eq!(truncated, vec![newest]);
      }
  
-     #[tokio::test]
++    #[tokio::test]
 +    async fn uncommitted_compaction_retains_usage_without_publishing_or_installing() {
 +        let mut stream = response_stream(vec![
 +            Ok(ResponseEvent::OutputItemDone(ResponseItem::Compaction {
@@ -2417,14 +2451,14 @@ diff --git a/codex-rs/core/src/compact_remote_v2.rs b/codex-rs/core/src/compact_
 +        assert_eq!(completed.response_id, "invalid-but-billed");
 +    }
 +
-+    #[tokio::test]
+     #[tokio::test]
      async fn collect_background_incomplete_does_not_publish_foreground_usage() {
          let stream = response_stream(vec![Err(CodexErr::new(
-             CodexErrorDetails::ResponseIncomplete(Box::new(
 diff --git a/codex-rs/core/src/lib.rs b/codex-rs/core/src/lib.rs
+index 390b658..161c1de 100644
 --- a/codex-rs/core/src/lib.rs
 +++ b/codex-rs/core/src/lib.rs
-@@ -64,6 +64,7 @@
+@@ -64,6 +64,7 @@ pub use agent::api::AgentInfo;
  pub use agent::api::AgentInput;
  pub use agent::api::AgentTarget;
  pub use agent::api::AgentTurnOutcome;
@@ -2432,7 +2466,7 @@ diff --git a/codex-rs/core/src/lib.rs b/codex-rs/core/src/lib.rs
  pub use agent::api::DeliveryReceipt;
  pub use agent::api::SendRequest;
  pub use agent::api::SpawnRequest;
-@@ -259,3 +260,6 @@
+@@ -259,3 +260,6 @@ pub mod otel_init;
  // Captured environment bindings can be passed back to ThreadManager by internal reviewers.
  pub use environment_selection::TurnEnvironmentSnapshot;
  pub use environment_selection::validate_environment_ids_and_cwds;
@@ -2440,9 +2474,10 @@ diff --git a/codex-rs/core/src/lib.rs b/codex-rs/core/src/lib.rs
 +pub use session::compaction_recovery::RecoveryPolicy;
 +pub use session::compaction_recovery::RecoveryPolicyHandle;
 diff --git a/codex-rs/core/src/model_request_tests.rs b/codex-rs/core/src/model_request_tests.rs
+index 84ab501..c693010 100644
 --- a/codex-rs/core/src/model_request_tests.rs
 +++ b/codex-rs/core/src/model_request_tests.rs
-@@ -33,6 +33,9 @@
+@@ -33,6 +33,9 @@ async fn interceptors_forward_before_completion_in_order_and_cancel_upstream() {
                  rx_event,
                  interrupt: None,
                  consumer_dropped,
@@ -2454,6 +2489,7 @@ diff --git a/codex-rs/core/src/model_request_tests.rs b/codex-rs/core/src/model_
                  event.map_err(|error| {
 diff --git a/codex-rs/core/src/session/compaction_recovery.rs b/codex-rs/core/src/session/compaction_recovery.rs
 new file mode 100644
+index 0000000..0cfb90b
 --- /dev/null
 +++ b/codex-rs/core/src/session/compaction_recovery.rs
 @@ -0,0 +1,969 @@
@@ -3428,6 +3464,7 @@ new file mode 100644
 +}
 diff --git a/codex-rs/core/src/session/compaction_recovery_gate.rs b/codex-rs/core/src/session/compaction_recovery_gate.rs
 new file mode 100644
+index 0000000..1514a8d
 --- /dev/null
 +++ b/codex-rs/core/src/session/compaction_recovery_gate.rs
 @@ -0,0 +1,485 @@
@@ -3918,6 +3955,7 @@ new file mode 100644
 +mod tests;
 diff --git a/codex-rs/core/src/session/compaction_recovery_gate_tests.rs b/codex-rs/core/src/session/compaction_recovery_gate_tests.rs
 new file mode 100644
+index 0000000..ea20c90
 --- /dev/null
 +++ b/codex-rs/core/src/session/compaction_recovery_gate_tests.rs
 @@ -0,0 +1,410 @@
@@ -4333,6 +4371,7 @@ new file mode 100644
 +}
 diff --git a/codex-rs/core/src/session/compaction_recovery_tests.rs b/codex-rs/core/src/session/compaction_recovery_tests.rs
 new file mode 100644
+index 0000000..8dc4b48
 --- /dev/null
 +++ b/codex-rs/core/src/session/compaction_recovery_tests.rs
 @@ -0,0 +1,276 @@
@@ -4613,31 +4652,31 @@ new file mode 100644
 +    session.abort_all_tasks(TurnAbortReason::Replaced).await;
 +}
 diff --git a/codex-rs/core/src/session/handlers.rs b/codex-rs/core/src/session/handlers.rs
+index 5ded792..6475152 100644
 --- a/codex-rs/core/src/session/handlers.rs
 +++ b/codex-rs/core/src/session/handlers.rs
-@@ -502,6 +502,13 @@
-                 Op::InterruptIfNoPendingInput { turn_id, reply } => {
-                     sess.interrupt_turn_if_no_pending_input(&turn_id, reply)
+@@ -504,6 +504,13 @@ pub(super) async fn submission_loop(
                          .await;
-+                    false
-+                }
+                     false
+                 }
 +                Op::CompactionRecovery { request, reply } => {
 +                    if !reply.is_closed() {
 +                        let result = sess.handle_compaction_recovery(request).await;
 +                        let _ = reply.send(result);
 +                    }
-                     false
-                 }
++                    false
++                }
                  Op::CleanBackgroundTerminals => {
+                     clean_background_terminals(&sess).await;
+                     false
 diff --git a/codex-rs/core/src/session/input_queue.rs b/codex-rs/core/src/session/input_queue.rs
+index 21d31dd..3f9678a 100644
 --- a/codex-rs/core/src/session/input_queue.rs
 +++ b/codex-rs/core/src/session/input_queue.rs
-@@ -218,6 +218,38 @@
-             _diagnostics_guard: PENDING_MAILBOX_MESSAGES.track(),
-         });
+@@ -220,6 +220,38 @@ impl InputQueue {
          self.activity_tx.send_replace(InputQueueActivity::Mailbox);
-+    }
-+
+     }
+ 
 +    pub(crate) fn reserve_controller_mailbox(
 +        &self,
 +    ) -> Result<Option<std::sync::Arc<dyn crate::agent::api::CompactionMailboxReservation>>, String>
@@ -4668,13 +4707,16 @@ diff --git a/codex-rs/core/src/session/input_queue.rs b/codex-rs/core/src/sessio
 +            return Err("original mailbox input is pending".into());
 +        }
 +        Ok(pending)
-     }
- 
++    }
++
      pub(crate) async fn has_pending_mailbox_items(&self) -> bool {
+         !self.mailbox_pending_mails.lock().await.is_empty()
+             || self
 diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
+index 96cfaa1..a8b91d6 100644
 --- a/codex-rs/core/src/session/mod.rs
 +++ b/codex-rs/core/src/session/mod.rs
-@@ -242,6 +242,8 @@
+@@ -242,6 +242,8 @@ use codex_protocol::exec_output::StreamOutput;
  
  pub(crate) mod async_compaction;
  mod code_mode_warning;
@@ -4683,7 +4725,7 @@ diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
  mod config_refresh;
  pub(crate) mod context_window;
  mod daemon_recovery;
-@@ -2751,6 +2753,9 @@
+@@ -2751,6 +2753,9 @@ impl Session {
      }
  
      pub(crate) async fn emit_turn_item_started(&self, turn_context: &TurnContext, item: &TurnItem) {
@@ -4694,9 +4736,10 @@ diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
              .turn_timing_state
              .record_item_started(item.id(), now_unix_timestamp_ms())
 diff --git a/codex-rs/core/src/session/tests.rs b/codex-rs/core/src/session/tests.rs
+index 7bd3a38..b3c4efe 100644
 --- a/codex-rs/core/src/session/tests.rs
 +++ b/codex-rs/core/src/session/tests.rs
-@@ -13562,3 +13562,6 @@
+@@ -13562,3 +13562,6 @@ async fn rejected_mcp_refresh_then_corrected_user_config_blocks_ordinary_replace
          "rejection must not permit same-name ordinary-auth replacement in this session"
      );
  }
@@ -4704,9 +4747,10 @@ diff --git a/codex-rs/core/src/session/tests.rs b/codex-rs/core/src/session/test
 +#[path = "compaction_recovery_tests.rs"]
 +mod compaction_recovery_tests;
 diff --git a/codex-rs/ext/goal/Cargo.toml b/codex-rs/ext/goal/Cargo.toml
+index 3939da1..de422a7 100644
 --- a/codex-rs/ext/goal/Cargo.toml
 +++ b/codex-rs/ext/goal/Cargo.toml
-@@ -7,7 +7,7 @@
+@@ -7,7 +7,7 @@ version.workspace = true
  [lib]
  name = "codex_goal_extension"
  path = "src/lib.rs"
@@ -4716,9 +4760,10 @@ diff --git a/codex-rs/ext/goal/Cargo.toml b/codex-rs/ext/goal/Cargo.toml
  
  [lints]
 diff --git a/codex-rs/ext/goal/src/accounting.rs b/codex-rs/ext/goal/src/accounting.rs
+index e338a56..1b31301 100644
 --- a/codex-rs/ext/goal/src/accounting.rs
 +++ b/codex-rs/ext/goal/src/accounting.rs
-@@ -7,6 +7,7 @@
+@@ -7,6 +7,7 @@ use codex_protocol::models::MessagePhase;
  use codex_protocol::protocol::TokenUsage;
  use codex_state::ThreadGoalStatus;
  use std::collections::HashMap;
@@ -4726,7 +4771,7 @@ diff --git a/codex-rs/ext/goal/src/accounting.rs b/codex-rs/ext/goal/src/account
  use std::sync::Mutex;
  use std::sync::PoisonError;
  use std::sync::atomic::AtomicI64;
-@@ -19,7 +20,7 @@
+@@ -19,7 +20,7 @@ use tokio::sync::SemaphorePermit;
  #[derive(Debug)]
  pub(crate) struct GoalAccountingState {
      inner: Mutex<GoalAccountingInner>,
@@ -4735,7 +4780,7 @@ diff --git a/codex-rs/ext/goal/src/accounting.rs b/codex-rs/ext/goal/src/account
      // Serialize turn-start accounting with stopping a deferred interrupted turn.
      // Never hold this lock while submitting a turn or awaiting the goal-state permit.
      turn_start_lock: Semaphore,
-@@ -256,6 +257,12 @@
+@@ -256,6 +257,12 @@ impl GoalAccountingState {
          self.progress_accounting_lock.acquire().await
      }
  
@@ -4748,7 +4793,7 @@ diff --git a/codex-rs/ext/goal/src/accounting.rs b/codex-rs/ext/goal/src/account
      pub(crate) async fn turn_start_permit(
          &self,
      ) -> Result<SemaphorePermit<'_>, tokio::sync::AcquireError> {
-@@ -541,7 +548,7 @@
+@@ -541,7 +548,7 @@ impl Default for GoalAccountingState {
      fn default() -> Self {
          Self {
              inner: Mutex::new(GoalAccountingInner::default()),
@@ -4759,6 +4804,7 @@ diff --git a/codex-rs/ext/goal/src/accounting.rs b/codex-rs/ext/goal/src/account
          }
 diff --git a/codex-rs/ext/goal/src/compaction_recovery_tests.rs b/codex-rs/ext/goal/src/compaction_recovery_tests.rs
 new file mode 100644
+index 0000000..154f4ee
 --- /dev/null
 +++ b/codex-rs/ext/goal/src/compaction_recovery_tests.rs
 @@ -0,0 +1,144 @@
@@ -4907,18 +4953,20 @@ new file mode 100644
 +    Ok(())
 +}
 diff --git a/codex-rs/ext/goal/src/lib.rs b/codex-rs/ext/goal/src/lib.rs
+index ccd091a..15fb73d 100644
 --- a/codex-rs/ext/goal/src/lib.rs
 +++ b/codex-rs/ext/goal/src/lib.rs
-@@ -26,3 +26,5 @@
+@@ -26,3 +26,5 @@ pub use spec::CREATE_GOAL_TOOL_NAME;
  pub use spec::GET_GOAL_TOOL_NAME;
  pub use spec::UPDATE_GOAL_TOOL_NAME;
  pub use tool::CreateGoalRequest;
 +
 +pub use runtime::CompactionGoalReservation;
 diff --git a/codex-rs/ext/goal/src/runtime.rs b/codex-rs/ext/goal/src/runtime.rs
+index 8744473..4f0eed1 100644
 --- a/codex-rs/ext/goal/src/runtime.rs
 +++ b/codex-rs/ext/goal/src/runtime.rs
-@@ -56,7 +56,9 @@
+@@ -56,7 +56,9 @@ struct GoalRuntimeInner {
      enabled: AtomicBool,
      tools_available_for_thread: bool,
      tools_visible_for_thread: bool,
@@ -4929,7 +4977,7 @@ diff --git a/codex-rs/ext/goal/src/runtime.rs b/codex-rs/ext/goal/src/runtime.rs
  }
  
  pub(crate) struct AccountedGoalProgress {
-@@ -110,7 +112,9 @@
+@@ -110,7 +112,9 @@ impl GoalRuntimeHandle {
                  enabled: AtomicBool::new(config.enabled),
                  tools_available_for_thread: config.tools_available_for_thread,
                  tools_visible_for_thread: config.tools_visible_for_thread,
@@ -4940,12 +4988,10 @@ diff --git a/codex-rs/ext/goal/src/runtime.rs b/codex-rs/ext/goal/src/runtime.rs
              }),
          }
      }
-@@ -159,6 +163,56 @@
-             .acquire()
-             .await
+@@ -161,6 +165,56 @@ impl GoalRuntimeHandle {
              .map_err(|err| err.to_string())
-+    }
-+
+     }
+ 
 +    /// Reserve both actual Goal mutation and progress accounting, in the
 +    /// existing Goal→progress order. Token events may still accumulate their
 +    /// native delta; only this reservation can settle it before replacement.
@@ -4994,10 +5040,12 @@ diff --git a/codex-rs/ext/goal/src/runtime.rs b/codex-rs/ext/goal/src/runtime.rs
 +            .await
 +            .map_err(|error| error.to_string())?;
 +        Ok(compaction_goal_value(goal))
-     }
- 
++    }
++
      pub async fn prepare_external_goal_mutation(&self) -> Result<(), String> {
-@@ -560,6 +614,23 @@
+         if !self.is_enabled() {
+             return Ok(());
+@@ -560,6 +614,23 @@ impl GoalRuntimeHandle {
              .progress_accounting_permit()
              .await
              .map_err(|err| err.to_string())?;
@@ -5021,7 +5069,7 @@ diff --git a/codex-rs/ext/goal/src/runtime.rs b/codex-rs/ext/goal/src/runtime.rs
          let Some(snapshot) = accounting.progress_snapshot(turn_id) else {
              return Ok(None);
          };
-@@ -579,6 +650,16 @@
+@@ -579,6 +650,16 @@ impl GoalRuntimeHandle {
              )
              .await
              .map_err(|err| err.to_string())?;
@@ -5038,7 +5086,7 @@ diff --git a/codex-rs/ext/goal/src/runtime.rs b/codex-rs/ext/goal/src/runtime.rs
          Ok(match outcome {
              codex_state::GoalAccountingOutcome::Updated(goal) => {
                  let goal_id = goal.goal_id.clone();
-@@ -693,3 +774,149 @@
+@@ -693,3 +774,149 @@ impl GoalRuntimeHandle {
          }))
      }
  }
@@ -5189,9 +5237,10 @@ diff --git a/codex-rs/ext/goal/src/runtime.rs b/codex-rs/ext/goal/src/runtime.rs
 +#[path = "compaction_recovery_tests.rs"]
 +mod compaction_recovery_tests;
 diff --git a/codex-rs/ext/goal/tests/goal_extension_backend.rs b/codex-rs/ext/goal/tests/goal_extension_backend.rs
+index cc88125..9a6786d 100644
 --- a/codex-rs/ext/goal/tests/goal_extension_backend.rs
 +++ b/codex-rs/ext/goal/tests/goal_extension_backend.rs
-@@ -2101,3 +2101,237 @@
+@@ -2101,3 +2101,237 @@ fn protocol_status(status: codex_state::ThreadGoalStatus) -> ThreadGoalStatus {
          codex_state::ThreadGoalStatus::Complete => ThreadGoalStatus::Complete,
      }
  }
@@ -5431,6 +5480,7 @@ diff --git a/codex-rs/ext/goal/tests/goal_extension_backend.rs b/codex-rs/ext/go
 +}
 diff --git a/codex-rs/protocol/src/compact_recovery.rs b/codex-rs/protocol/src/compact_recovery.rs
 new file mode 100644
+index 0000000..9f84142
 --- /dev/null
 +++ b/codex-rs/protocol/src/compact_recovery.rs
 @@ -0,0 +1,76 @@
@@ -5511,18 +5561,20 @@ new file mode 100644
 +    }
 +}
 diff --git a/codex-rs/protocol/src/lib.rs b/codex-rs/protocol/src/lib.rs
+index 17e22cc..a3c61ba 100644
 --- a/codex-rs/protocol/src/lib.rs
 +++ b/codex-rs/protocol/src/lib.rs
-@@ -56,3 +56,5 @@
+@@ -56,3 +56,5 @@ pub mod security_risk;
  pub mod shell_environment;
  pub mod turn_input;
  pub mod user_input;
 +
 +pub mod compact_recovery;
 diff --git a/codex-rs/protocol/src/protocol.rs b/codex-rs/protocol/src/protocol.rs
+index dc5c2a3..c304d00 100644
 --- a/codex-rs/protocol/src/protocol.rs
 +++ b/codex-rs/protocol/src/protocol.rs
-@@ -665,6 +665,13 @@
+@@ -665,6 +665,13 @@ pub enum Op {
          reply: oneshot::Sender<bool>,
      },
  
@@ -5536,7 +5588,7 @@ diff --git a/codex-rs/protocol/src/protocol.rs b/codex-rs/protocol/src/protocol.
      /// Terminate all running background terminal processes for this thread.
      /// Use this when callers intentionally want to stop long-lived background shells.
      CleanBackgroundTerminals,
-@@ -1043,6 +1050,7 @@
+@@ -1043,6 +1050,7 @@ impl Op {
          match self {
              Self::Interrupt => "interrupt",
              Self::InterruptIfNoPendingInput { .. } => "interrupt_if_no_pending_input",
@@ -5545,9 +5597,10 @@ diff --git a/codex-rs/protocol/src/protocol.rs b/codex-rs/protocol/src/protocol.
              Self::RealtimeConversationStart(_) => "realtime_conversation_start",
              Self::RealtimeConversationAttach { .. } => "realtime_conversation_attach",
 diff --git a/codex-rs/tui/src/app.rs b/codex-rs/tui/src/app.rs
+index df9363a..46e8798 100644
 --- a/codex-rs/tui/src/app.rs
 +++ b/codex-rs/tui/src/app.rs
-@@ -243,6 +243,8 @@
+@@ -243,6 +243,8 @@ mod quick_dials;
  mod turn_tips;
  pub(crate) use new_session::has_launch_setting;
  mod clipboard;
@@ -5558,6 +5611,7 @@ diff --git a/codex-rs/tui/src/app.rs b/codex-rs/tui/src/app.rs
  mod native_history;
 diff --git a/codex-rs/tui/src/app/compaction_control.rs b/codex-rs/tui/src/app/compaction_control.rs
 new file mode 100644
+index 0000000..ced0169
 --- /dev/null
 +++ b/codex-rs/tui/src/app/compaction_control.rs
 @@ -0,0 +1,169 @@
@@ -5731,9 +5785,10 @@ new file mode 100644
 +    }
 +}
 diff --git a/codex-rs/tui/src/app/event_dispatch.rs b/codex-rs/tui/src/app/event_dispatch.rs
+index 6687d05..94a1f37 100644
 --- a/codex-rs/tui/src/app/event_dispatch.rs
 +++ b/codex-rs/tui/src/app/event_dispatch.rs
-@@ -32,6 +32,15 @@
+@@ -32,6 +32,15 @@ impl App {
          app_server: &mut AppServerSession,
          event: AppEvent,
      ) -> Result<AppRunControl> {
@@ -5749,7 +5804,7 @@ diff --git a/codex-rs/tui/src/app/event_dispatch.rs b/codex-rs/tui/src/app/event
          let from_agents_overview = matches!(event, AppEvent::ForkAgentsOverviewThreadReady { .. });
          let event = if let AppEvent::ForkAgentsOverviewThreadReady { thread_id } = event {
              if self.current_displayed_thread_id() != Some(thread_id)
-@@ -163,6 +172,8 @@
+@@ -163,6 +172,8 @@ impl App {
              event => (event, None),
          };
          match event {
@@ -5759,9 +5814,10 @@ diff --git a/codex-rs/tui/src/app/event_dispatch.rs b/codex-rs/tui/src/app/event
              AppEvent::ConfirmDaemonRestart => self.confirm_daemon_restart(),
              AppEvent::RunDaemonRestart => {
 diff --git a/codex-rs/tui/src/app/foreground_observation.rs b/codex-rs/tui/src/app/foreground_observation.rs
+index fe28a6e..9e2e9aa 100644
 --- a/codex-rs/tui/src/app/foreground_observation.rs
 +++ b/codex-rs/tui/src/app/foreground_observation.rs
-@@ -99,6 +99,9 @@
+@@ -99,6 +99,9 @@ pub(super) struct NativeForeground {
      changing: bool,
      failure_notice: Option<String>,
      failure_notice_shown: bool,
@@ -5771,7 +5827,7 @@ diff --git a/codex-rs/tui/src/app/foreground_observation.rs b/codex-rs/tui/src/a
  }
  
  impl Default for NativeForeground {
-@@ -113,6 +116,9 @@
+@@ -113,6 +116,9 @@ impl Default for NativeForeground {
              changing: false,
              failure_notice: None,
              failure_notice_shown: false,
@@ -5781,7 +5837,7 @@ diff --git a/codex-rs/tui/src/app/foreground_observation.rs b/codex-rs/tui/src/a
          }
      }
  }
-@@ -150,7 +156,18 @@
+@@ -150,7 +156,18 @@ impl App {
      pub(super) async fn before_foreground_mutation(&mut self, reason: &str) {
          #[cfg(unix)]
          if self.foreground.enabled {
@@ -5801,7 +5857,7 @@ diff --git a/codex-rs/tui/src/app/foreground_observation.rs b/codex-rs/tui/src/a
                  self.foreground.connection_published = false;
                  let remaining = self.foreground.observer.remaining_lease();
                  if !remaining.is_zero() {
-@@ -223,7 +240,11 @@
+@@ -223,7 +240,11 @@ impl App {
          })
      }
  
@@ -5814,7 +5870,7 @@ diff --git a/codex-rs/tui/src/app/foreground_observation.rs b/codex-rs/tui/src/a
          !queue_empty
              || !startup_ready
              || self.pending_startup_thread_start
-@@ -297,6 +318,7 @@
+@@ -297,6 +318,7 @@ impl App {
          #[cfg(not(unix))]
          let _ = thread;
          self.foreground.changing = false;
@@ -5822,7 +5878,7 @@ diff --git a/codex-rs/tui/src/app/foreground_observation.rs b/codex-rs/tui/src/a
          self.show_native_foreground_failure();
      }
  
-@@ -324,3 +346,51 @@
+@@ -324,3 +346,51 @@ impl App {
          self.native_foreground_disconnected();
      }
  }
@@ -5875,9 +5931,10 @@ diff --git a/codex-rs/tui/src/app/foreground_observation.rs b/codex-rs/tui/src/a
 +    }
 +}
 diff --git a/codex-rs/tui/src/app/foreground_observation/tests.rs b/codex-rs/tui/src/app/foreground_observation/tests.rs
+index 39e1886..55f50f7 100644
 --- a/codex-rs/tui/src/app/foreground_observation/tests.rs
 +++ b/codex-rs/tui/src/app/foreground_observation/tests.rs
-@@ -770,3 +770,175 @@
+@@ -770,3 +770,175 @@ async fn real_initialization_failure_is_visible_and_ordinary_app_work_continues(
      fixture.server.shutdown().await?;
      Ok(())
  }
@@ -6054,9 +6111,10 @@ diff --git a/codex-rs/tui/src/app/foreground_observation/tests.rs b/codex-rs/tui
 +    Ok(())
 +}
 diff --git a/codex-rs/tui/src/app/startup.rs b/codex-rs/tui/src/app/startup.rs
+index b4eb2fb..83a523d 100644
 --- a/codex-rs/tui/src/app/startup.rs
 +++ b/codex-rs/tui/src/app/startup.rs
-@@ -1444,8 +1444,14 @@
+@@ -1444,8 +1444,14 @@ See the Codex keymap documentation for supported actions and examples."
                          }
                          AppRunControl::Continue
                      }
@@ -6074,9 +6132,10 @@ diff --git a/codex-rs/tui/src/app/startup.rs b/codex-rs/tui/src/app/startup.rs
                              &event,
                              AppEvent::InsertHistoryCell(cell)
 diff --git a/codex-rs/tui/src/app_event.rs b/codex-rs/tui/src/app_event.rs
+index e2b86c9..259fe68 100644
 --- a/codex-rs/tui/src/app_event.rs
 +++ b/codex-rs/tui/src/app_event.rs
-@@ -295,6 +295,8 @@
+@@ -295,6 +295,8 @@ pub(crate) struct AgentPickerThreadRefresh {
  #[allow(clippy::large_enum_variant)]
  #[derive(Debug, IntoStaticStr)]
  pub(crate) enum AppEvent {
@@ -6085,7 +6144,7 @@ diff --git a/codex-rs/tui/src/app_event.rs b/codex-rs/tui/src/app_event.rs
      AccountEmailLoaded {
          request_id: uuid::Uuid,
          email: Option<String>,
-@@ -1795,3 +1797,13 @@
+@@ -1795,3 +1797,13 @@ pub(crate) enum FeedbackCategory {
      SafetyCheck,
      Other,
  }
@@ -6100,9 +6159,10 @@ diff --git a/codex-rs/tui/src/app_event.rs b/codex-rs/tui/src/app_event.rs
 +    }
 +}
 diff --git a/codex-rs/tui/src/app_server_session.rs b/codex-rs/tui/src/app_server_session.rs
+index a9476b1..fd55b18 100644
 --- a/codex-rs/tui/src/app_server_session.rs
 +++ b/codex-rs/tui/src/app_server_session.rs
-@@ -1695,6 +1695,19 @@
+@@ -1695,6 +1695,19 @@ impl AppServerSession {
          Ok(())
      }
  
@@ -6123,9 +6183,10 @@ diff --git a/codex-rs/tui/src/app_server_session.rs b/codex-rs/tui/src/app_serve
          let request_id = self.next_request_id();
          let _: ThreadCompactStartResponse = self
 diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+index 4b9d285..feb16ac 100644
 --- a/codex-rs/tui/src/chatwidget.rs
 +++ b/codex-rs/tui/src/chatwidget.rs
-@@ -1753,6 +1753,16 @@
+@@ -1753,6 +1753,16 @@ impl ChatWidget {
          self.plan_stream_controller.is_some()
      }
  
@@ -6144,6 +6205,7 @@ diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
      }
 diff --git a/native/client-foreground/Cargo.lock b/native/client-foreground/Cargo.lock
 new file mode 100644
+index 0000000..c26a04b
 --- /dev/null
 +++ b/native/client-foreground/Cargo.lock
 @@ -0,0 +1,671 @@
@@ -6819,9 +6881,10 @@ new file mode 100644
 +source = "registry+https://github.com/rust-lang/crates.io-index"
 +checksum = "3ff05f8caa9038894637571ae6b9e29466c1f4f829d26c9b28f869a29cbe3445"
 diff --git a/native/client-foreground/Cargo.toml b/native/client-foreground/Cargo.toml
+index d793ded..63b3ebc 100644
 --- a/native/client-foreground/Cargo.toml
 +++ b/native/client-foreground/Cargo.toml
-@@ -7,6 +7,7 @@
+@@ -7,6 +7,7 @@ publish = false
  [dependencies]
  libc = "0.2"
  serde_json = "1"
@@ -6831,6 +6894,7 @@ diff --git a/native/client-foreground/Cargo.toml b/native/client-foreground/Carg
  [dev-dependencies]
 diff --git a/native/client-foreground/src/compaction_authority.rs b/native/client-foreground/src/compaction_authority.rs
 new file mode 100644
+index 0000000..55927a2
 --- /dev/null
 +++ b/native/client-foreground/src/compaction_authority.rs
 @@ -0,0 +1,723 @@
@@ -7559,6 +7623,7 @@ new file mode 100644
 +mod tests;
 diff --git a/native/client-foreground/src/compaction_authority_tests.rs b/native/client-foreground/src/compaction_authority_tests.rs
 new file mode 100644
+index 0000000..7fecc6e
 --- /dev/null
 +++ b/native/client-foreground/src/compaction_authority_tests.rs
 @@ -0,0 +1,273 @@
@@ -7837,6 +7902,7 @@ new file mode 100644
 +}
 diff --git a/native/client-foreground/src/compaction_socket.rs b/native/client-foreground/src/compaction_socket.rs
 new file mode 100644
+index 0000000..9870753
 --- /dev/null
 +++ b/native/client-foreground/src/compaction_socket.rs
 @@ -0,0 +1,381 @@
@@ -8223,6 +8289,7 @@ new file mode 100644
 +mod tests;
 diff --git a/native/client-foreground/src/compaction_socket_tests.rs b/native/client-foreground/src/compaction_socket_tests.rs
 new file mode 100644
+index 0000000..40cb3a2
 --- /dev/null
 +++ b/native/client-foreground/src/compaction_socket_tests.rs
 @@ -0,0 +1,139 @@
@@ -8366,9 +8433,10 @@ new file mode 100644
 +        .exists());
 +}
 diff --git a/native/client-foreground/src/lib.rs b/native/client-foreground/src/lib.rs
+index f5d07c3..c97b74d 100644
 --- a/native/client-foreground/src/lib.rs
 +++ b/native/client-foreground/src/lib.rs
-@@ -7,21 +7,39 @@
+@@ -7,15 +7,28 @@
  #![cfg(unix)]
  
  use std::ffi::CString;
@@ -8406,18 +8474,19 @@ diff --git a/native/client-foreground/src/lib.rs b/native/client-foreground/src/
  use uuid::Uuid;
  
  pub const LEASE_MS: u64 = 5_000;
- pub const HEARTBEAT: Duration = Duration::from_secs(1);
+@@ -23,6 +36,11 @@ pub const HEARTBEAT: Duration = Duration::from_secs(1);
  const MARKER: &[u8] = b"ccc-request-credentials-v1\n";
  const MAX_RECORD_BYTES: usize = 4_096;
-+
+ 
 +pub mod compaction_authority;
 +pub use compaction_authority::verify_compaction_grant;
 +pub use compaction_authority::CompactionGrantGuard;
 +pub mod compaction_socket;
- 
++
  #[cfg(test)]
  mod tests;
-@@ -45,14 +63,21 @@
+ 
+@@ -45,14 +63,21 @@ fn milliseconds() -> io::Result<u64> {
  }
  
  fn monotonic_nanoseconds() -> io::Result<u64> {
@@ -8442,7 +8511,7 @@ diff --git a/native/client-foreground/src/lib.rs b/native/client-foreground/src/
          .ok_or_else(|| invalid("monotonic clock overflow"))
  }
  
-@@ -62,8 +87,15 @@
+@@ -62,8 +87,15 @@ fn directory_identity(info: &Metadata) -> (u64, u64, u32, u32) {
  
  fn full_identity(info: &Metadata) -> (u64, u64, u32, u32, u64, i64, i64, i64, i64) {
      (
@@ -8460,7 +8529,7 @@ diff --git a/native/client-foreground/src/lib.rs b/native/client-foreground/src/
      )
  }
  
-@@ -79,7 +111,8 @@
+@@ -79,7 +111,8 @@ fn relative_file(dir: &File, name: &str) -> io::Result<File> {
      let name = CString::new(name).map_err(|_| invalid("invalid relative observation name"))?;
      let fd = unsafe {
          libc::openat(
@@ -8470,17 +8539,16 @@ diff --git a/native/client-foreground/src/lib.rs b/native/client-foreground/src/
              libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
          )
      };
-@@ -108,15 +141,21 @@
+@@ -108,15 +141,21 @@ struct FileJournal {
  impl FileJournal {
      fn open(home: &Path, pid: u32, epoch: &str) -> io::Result<Self> {
          if !home.is_absolute() || unsafe { libc::getuid() } != unsafe { libc::geteuid() } {
 -            return Err(invalid("foreground home/owner is not a native user directory"));
--        }
--        let home_file = OpenOptions::new().read(true)
 +            return Err(invalid(
 +                "foreground home/owner is not a native user directory",
 +            ));
-+        }
+         }
+-        let home_file = OpenOptions::new().read(true)
 +        let home_file = OpenOptions::new()
 +            .read(true)
              .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
@@ -8497,7 +8565,7 @@ diff --git a/native/client-foreground/src/lib.rs b/native/client-foreground/src/
          };
          if fd < 0 {
              return Err(io::Error::last_os_error());
-@@ -138,11 +177,15 @@
+@@ -138,11 +177,15 @@ impl FileJournal {
      fn validate(&self) -> io::Result<()> {
          let home = self.home.metadata()?;
          let directory = self.directory.metadata()?;
@@ -8517,7 +8585,7 @@ diff --git a/native/client-foreground/src/lib.rs b/native/client-foreground/src/
          {
              return Err(invalid("foreground observation directory identity changed"));
          }
-@@ -152,10 +195,15 @@
+@@ -152,10 +195,15 @@ impl FileJournal {
              return Err(invalid("foreground observation opt-in is not private"));
          }
          let mut bytes = Vec::new();
@@ -8535,7 +8603,7 @@ diff --git a/native/client-foreground/src/lib.rs b/native/client-foreground/src/
          {
              return Err(invalid("foreground observation opt-in changed"));
          }
-@@ -173,18 +221,24 @@
+@@ -173,18 +221,24 @@ impl FileJournal {
              return Err(invalid("foreground record is not private regular data"));
          }
          let mut bytes = Vec::new();
@@ -8564,7 +8632,7 @@ diff --git a/native/client-foreground/src/lib.rs b/native/client-foreground/src/
          {
              return Err(invalid("foreground record belongs to another native owner"));
          }
-@@ -195,7 +249,8 @@
+@@ -195,7 +249,8 @@ impl FileJournal {
  impl Journal for FileJournal {
      fn store(&mut self, record: &Value) -> io::Result<()> {
          self.validate()?;
@@ -8574,7 +8642,7 @@ diff --git a/native/client-foreground/src/lib.rs b/native/client-foreground/src/
          if bytes.len() > MAX_RECORD_BYTES {
              return Err(invalid("foreground record exceeded bounded size"));
          }
-@@ -209,9 +264,12 @@
+@@ -209,9 +264,12 @@ impl Journal for FileJournal {
          let temporary = CString::new(temporary_name.clone()).expect("generated ASCII name");
          let destination = CString::new(self.name.clone()).expect("generated ASCII name");
          let fd = unsafe {
@@ -8589,7 +8657,7 @@ diff --git a/native/client-foreground/src/lib.rs b/native/client-foreground/src/
          };
          if fd < 0 {
              return Err(io::Error::last_os_error());
-@@ -225,8 +283,12 @@
+@@ -225,8 +283,12 @@ impl Journal for FileJournal {
                  return Err(invalid("foreground destination changed before publication"));
              }
              let result = unsafe {
@@ -8604,7 +8672,7 @@ diff --git a/native/client-foreground/src/lib.rs b/native/client-foreground/src/
              };
              if result != 0 {
                  return Err(io::Error::last_os_error());
-@@ -236,7 +298,8 @@
+@@ -236,7 +298,8 @@ impl Journal for FileJournal {
              self.published_identity = Some(full_identity(&file.metadata()?));
              self.directory.sync_all()?;
              self.validate()?;
@@ -8614,7 +8682,7 @@ diff --git a/native/client-foreground/src/lib.rs b/native/client-foreground/src/
                  .ok_or_else(|| invalid("native publication disappeared"))?;
              if full_identity(&published) != full_identity(&file.metadata()?) {
                  return Err(invalid("native publication replaced before commit"));
-@@ -245,13 +308,17 @@
+@@ -245,13 +308,17 @@ impl Journal for FileJournal {
          })();
          // Remove only this attempt's unique temporary name. No recursive or
          // wildcard cleanup ever touches another observation or client file.
@@ -8634,7 +8702,7 @@ diff --git a/native/client-foreground/src/lib.rs b/native/client-foreground/src/
          let current = fs::symlink_metadata(self.directory_path.join(&self.name))?;
          if full_identity(&current) != full_identity(&before)
              || full_identity(&file.metadata()?) != full_identity(&before)
-@@ -270,6 +337,9 @@
+@@ -270,6 +337,9 @@ impl Journal for FileJournal {
  
  struct State {
      journal: Option<Box<dyn Journal>>,
@@ -8644,7 +8712,7 @@ diff --git a/native/client-foreground/src/lib.rs b/native/client-foreground/src/
      client_epoch: String,
      connection_epoch: Option<String>,
      generation: u64,
-@@ -298,7 +368,9 @@
+@@ -298,7 +368,9 @@ impl State {
      }
  
      fn next_generation(&self) -> io::Result<u64> {
@@ -8655,7 +8723,7 @@ diff --git a/native/client-foreground/src/lib.rs b/native/client-foreground/src/
              .ok_or_else(|| invalid("native selection generation exhausted"))
      }
  
-@@ -309,7 +381,9 @@
+@@ -309,7 +381,9 @@ impl State {
          if record["thread_id"].as_str().is_some() {
              self.positive_until = Some(Instant::now() + Duration::from_millis(LEASE_MS));
          }
@@ -8666,7 +8734,7 @@ diff --git a/native/client-foreground/src/lib.rs b/native/client-foreground/src/
          self.last_heartbeat = Instant::now();
          Ok(())
      }
-@@ -326,7 +400,9 @@
+@@ -326,7 +400,9 @@ impl State {
          let record = self.record(generation, None, reason)?;
          if let Err(error) = self.store(&record) {
              if let Some(journal) = &mut self.journal {
@@ -8677,7 +8745,7 @@ diff --git a/native/client-foreground/src/lib.rs b/native/client-foreground/src/
              }
          }
          self.positive_until = None;
-@@ -343,27 +419,41 @@
+@@ -343,27 +419,41 @@ impl State {
  }
  
  impl Drop for State {
@@ -8725,7 +8793,7 @@ diff --git a/native/client-foreground/src/lib.rs b/native/client-foreground/src/
              return Ok(Self::disabled());
          }
          Self::open_enabled(home)
-@@ -375,26 +465,50 @@
+@@ -375,26 +465,50 @@ impl ForegroundObserver {
          let epoch = Uuid::new_v4().to_string();
          let journal = FileJournal::open(home, std::process::id(), &epoch)?;
          let value = Self(Arc::new(Mutex::new(State {
@@ -8783,7 +8851,7 @@ diff --git a/native/client-foreground/src/lib.rs b/native/client-foreground/src/
              .unwrap_or(Duration::from_millis(LEASE_MS))
      }
  
-@@ -403,7 +517,11 @@
+@@ -403,7 +517,11 @@ impl ForegroundObserver {
      }
  
      pub fn connected(&self) -> io::Result<()> {
@@ -8796,7 +8864,7 @@ diff --git a/native/client-foreground/src/lib.rs b/native/client-foreground/src/
          state.clear_before_change("new_connection")?;
          let next_epoch = Uuid::new_v4().to_string();
          let generation = state.next_generation()?;
-@@ -413,7 +531,10 @@
+@@ -413,7 +531,10 @@ impl ForegroundObserver {
          state.generation = generation;
          let record = match state.record(generation, None, "connected_clear") {
              Ok(record) => record,
@@ -8808,7 +8876,7 @@ diff --git a/native/client-foreground/src/lib.rs b/native/client-foreground/src/
          };
          if let Err(error) = state.store(&record) {
              state.suspended = true;
-@@ -425,12 +546,27 @@
+@@ -425,12 +546,27 @@ impl ForegroundObserver {
      /// Called only after a completed native Live display attachment. Null is
      /// required for missing/replay-only/external-writer or disconnected state.
      pub fn committed(&self, thread: Option<&str>) -> io::Result<()> {
@@ -8838,7 +8906,7 @@ diff --git a/native/client-foreground/src/lib.rs b/native/client-foreground/src/
              return Err(invalid("native foreground publication is suspended"));
          }
          if thread.is_some() && state.connection_epoch.is_none() {
-@@ -455,20 +591,35 @@
+@@ -455,20 +591,35 @@ impl ForegroundObserver {
      }
  
      pub fn disconnected(&self) -> io::Result<()> {
@@ -8881,9 +8949,10 @@ diff --git a/native/client-foreground/src/lib.rs b/native/client-foreground/src/
              Err(error) => {
                  state.suspended = true;
 diff --git a/native/client-foreground/src/tests.rs b/native/client-foreground/src/tests.rs
+index 4595ab8..9824746 100644
 --- a/native/client-foreground/src/tests.rs
 +++ b/native/client-foreground/src/tests.rs
-@@ -16,15 +16,21 @@
+@@ -16,15 +16,21 @@ struct MemoryJournal {
  impl Journal for Arc<Mutex<MemoryJournal>> {
      fn store(&mut self, record: &Value) -> io::Result<()> {
          let mut value = self.lock().unwrap();
@@ -8908,7 +8977,7 @@ diff --git a/native/client-foreground/src/tests.rs b/native/client-foreground/sr
          value.invalidated += 1;
          Ok(())
      }
-@@ -32,10 +38,17 @@
+@@ -32,10 +38,17 @@ impl Journal for Arc<Mutex<MemoryJournal>> {
  
  fn observer(journal: impl Journal + 'static) -> ForegroundObserver {
      ForegroundObserver(Arc::new(Mutex::new(State {
@@ -8929,7 +8998,7 @@ diff --git a/native/client-foreground/src/tests.rs b/native/client-foreground/sr
      })))
  }
  
-@@ -61,15 +74,25 @@
+@@ -61,15 +74,25 @@ fn fixture() -> (tempfile::TempDir, ForegroundObserver, PathBuf) {
      let epoch = Uuid::new_v4().to_string();
      let journal = FileJournal::open(home.path(), std::process::id(), &epoch).unwrap();
      let value = ForegroundObserver(Arc::new(Mutex::new(State {
@@ -8959,7 +9028,7 @@ diff --git a/native/client-foreground/src/tests.rs b/native/client-foreground/sr
  
  #[test]
  fn connection_heartbeat_preserves_committed_epoch_and_generation() {
-@@ -81,9 +104,16 @@
+@@ -81,9 +104,16 @@ fn connection_heartbeat_preserves_committed_epoch_and_generation() {
      let committed = &records[records.len() - 2];
      let heartbeat = records.last().unwrap();
      assert_eq!(committed["connection_epoch"], heartbeat["connection_epoch"]);
@@ -8978,7 +9047,7 @@ diff --git a/native/client-foreground/src/tests.rs b/native/client-foreground/sr
  }
  
  #[test]
-@@ -95,7 +125,10 @@
+@@ -95,7 +125,10 @@ fn clear_precedes_thread_switch_and_heartbeat_never_samples_a_proposal() {
      pulse(&value).unwrap();
      assert!(journal.lock().unwrap().records.last().unwrap()["thread_id"].is_null());
      value.committed(Some(NEXT)).unwrap();
@@ -8990,7 +9059,7 @@ diff --git a/native/client-foreground/src/tests.rs b/native/client-foreground/sr
  }
  
  #[test]
-@@ -103,17 +136,33 @@
+@@ -103,17 +136,33 @@ fn failed_withdrawal_stops_renewal_and_bounds_the_mutation_drain() {
      let (value, journal) = memory();
      value.connected().unwrap();
      value.committed(Some(THREAD)).unwrap();
@@ -9027,7 +9096,7 @@ diff --git a/native/client-foreground/src/tests.rs b/native/client-foreground/sr
      value.0.lock().unwrap().positive_until = Some(Instant::now() - Duration::from_millis(1));
      assert_eq!(value.remaining_lease(), Duration::ZERO);
  }
-@@ -134,7 +183,11 @@
+@@ -134,7 +183,11 @@ fn disconnect_drops_positive_memory_even_when_both_withdrawals_fail() {
      let (value, journal) = memory();
      value.connected().unwrap();
      value.committed(Some(THREAD)).unwrap();
@@ -9040,7 +9109,7 @@ diff --git a/native/client-foreground/src/tests.rs b/native/client-foreground/sr
      assert!(value.disconnected().is_err());
      assert!(value.0.lock().unwrap().committed_thread.is_none());
      journal.lock().unwrap().fail_store = false;
-@@ -157,7 +210,10 @@
+@@ -157,7 +210,10 @@ fn failed_positive_durability_withdraws_at_a_later_generation_without_replay() {
      let last = records.last().unwrap();
      assert!(last["thread_id"].is_null());
      assert!(last["selection_generation"].as_u64() > positive["selection_generation"].as_u64());
@@ -9052,7 +9121,7 @@ diff --git a/native/client-foreground/src/tests.rs b/native/client-foreground/sr
  }
  
  #[test]
-@@ -169,7 +225,10 @@
+@@ -169,7 +225,10 @@ fn failed_connected_durability_never_rolls_epoch_back_on_heartbeat() {
      journal.lock().unwrap().fail_after_store = false;
      pulse(&value).unwrap();
      let records = &journal.lock().unwrap().records;
@@ -9064,7 +9133,7 @@ diff --git a/native/client-foreground/src/tests.rs b/native/client-foreground/sr
      let last = records.last().unwrap();
      assert_eq!(attempted["connection_epoch"], last["connection_epoch"]);
      assert!(last["selection_generation"].as_u64() >= attempted["selection_generation"].as_u64());
-@@ -200,13 +259,22 @@
+@@ -200,13 +259,22 @@ fn private_atomic_file_heartbeat_keeps_semantics_while_changing_inode() {
      assert_ne!(old.ino(), new.ino());
      assert_eq!(new.mode() & 0o777, 0o600);
      assert_eq!(new.nlink(), 1);
@@ -9090,7 +9159,7 @@ diff --git a/native/client-foreground/src/tests.rs b/native/client-foreground/sr
      assert!(next["monotonic_published_ns"].as_u64().unwrap() <= monotonic_nanoseconds().unwrap());
  }
  
-@@ -249,7 +317,10 @@
+@@ -249,7 +317,10 @@ fn destination_symlink_never_modifies_its_target() {
      assert!(value.before_change("startup").is_err());
      drop(value);
      assert_eq!(fs::read(&victim).unwrap(), b"preserve");
@@ -9102,7 +9171,7 @@ diff --git a/native/client-foreground/src/tests.rs b/native/client-foreground/sr
  }
  
  #[test]
-@@ -267,7 +338,10 @@
+@@ -267,7 +338,10 @@ fn directory_swap_cannot_redirect_publication_or_cleanup() {
      assert!(pulse(&value).is_err());
      drop(value);
      assert_eq!(fs::read(&victim).unwrap(), b"unrelated");
@@ -9114,7 +9183,7 @@ diff --git a/native/client-foreground/src/tests.rs b/native/client-foreground/sr
  }
  
  #[test]
-@@ -316,14 +390,31 @@
+@@ -316,14 +390,31 @@ fn failed_heartbeat_never_recovers_a_previous_positive_implicitly() {
      let (value, journal) = memory();
      value.connected().unwrap();
      value.committed(Some(THREAD)).unwrap();
@@ -9138,7 +9207,6 @@ diff --git a/native/client-foreground/src/tests.rs b/native/client-foreground/sr
      assert!(!value.is_suspended());
      assert!(value.remaining_lease() < before);
 -    assert_eq!(journal.lock().unwrap().records.iter().filter(|r| r["thread_id"] == THREAD).count(), 1);
--}
 +    assert_eq!(
 +        journal
 +            .lock()
@@ -9149,4 +9217,4 @@ diff --git a/native/client-foreground/src/tests.rs b/native/client-foreground/sr
 +            .count(),
 +        1
 +    );
-+}
+ }
