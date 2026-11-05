@@ -2,9 +2,11 @@
 import copy
 import importlib.util
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("namespace_ci", HERE / "ci.py")
@@ -16,7 +18,7 @@ class Gates(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name)
+        self.root = Path(self.tmp.name).resolve()
         self.expected = {"nonignored": ["actual"], "ignored": ["kept_ignored"]}
         self.listing = {"rust-suites": {"herdr::bin/herdr": {
             "binary-path": "/immutable/unit", "testcases": {
@@ -97,6 +99,96 @@ class Gates(unittest.TestCase):
         self.assertEqual([row["path"] for row in difference["removed"]], ["removed.rs"])
         self.assertEqual([row["before"]["path"] for row in difference["changed"]], ["changed.rs"])
         self.assertEqual(json.loads((self.root / "SOURCE-mutation.json").read_bytes()), ci.source_manifest(source))
+
+
+    def mirror_fixture(self):
+        source = self.root / "source"
+        vendor = source / "vendor/libghostty-vt"
+        vendor.mkdir(parents=True)
+        (vendor / "VERSION").write_text("fixture-version\n")
+        (vendor / "build.zig").write_text("// frozen fixture, never compiled\n")
+        output = self.root / "output";output.mkdir()
+        real = self.root / "zig";real.write_text("not executable in these tests")
+        spec = ci.prepare_zig_mirror(source, output, {"CARGO_TARGET_DIR": str(output / "target")},
+                                     real, ci.source_manifest(source))
+        spec_path = output / "ZIG-MIRROR-SPEC.json"
+        argv = ["build", "--prefix", str(output / "target/debug/build/fixture/out/zig-out"), *spec["build_tail"]]
+        return source, output, vendor, spec, spec_path, argv
+
+    def call_wrapper(self, spec_path, argv, cwd):
+        original = Path.cwd()
+        try:
+            os.chdir(cwd)
+            with mock.patch.object(ci.os, "execv") as execute:
+                ci.zig_wrapper_main(spec_path, ci.sha(spec_path), argv)
+                return execute.call_args, Path.cwd()
+        finally:
+            os.chdir(original)
+
+    def test_wrapper_preserves_exact_build_argv_and_switches_only_to_verified_mirror(self):
+        source, output, vendor, spec, spec_path, argv = self.mirror_fixture()
+        before = ci.source_manifest(source)
+        call, cwd = self.call_wrapper(spec_path, argv, vendor)
+        self.assertEqual(call.args, (spec["real_zig"], [spec["real_zig"], *argv]))
+        self.assertEqual(cwd, Path(spec["mirror"]))
+        self.assertEqual(ci.source_manifest(source), before)
+        event = json.loads(Path(spec["invocations"]).read_text())
+        self.assertEqual(event["event"], "exec_intent")
+        self.assertEqual(event["original_cwd"], str(vendor))
+        self.assertEqual(event["execution_cwd"], str(cwd))
+
+    def test_wrapper_version_executes_real_zig_without_cwd_change(self):
+        _, _, _, spec, spec_path, _ = self.mirror_fixture()
+        call, cwd = self.call_wrapper(spec_path, ["version"], self.root)
+        self.assertEqual(call.args, (spec["real_zig"], [spec["real_zig"], "version"]))
+        self.assertEqual(cwd, self.root)
+
+    def test_wrapper_rejects_foreign_cwd_changed_flags_fetch_and_outside_prefix(self):
+        _, _, vendor, spec, spec_path, argv = self.mirror_fixture()
+        variants = [(argv, self.root), (["fetch", "archive.tar.gz"], vendor),
+                    ([*argv, "--system", "/tmp/packages"], vendor)]
+        bad = argv.copy();bad[2] = "/tmp/out/zig-out";variants.append((bad, vendor))
+        bad = argv.copy();bad[4] = "-Doptimize=Debug";variants.append((bad, vendor))
+        for args, cwd in variants:
+            with self.subTest(args=args, cwd=str(cwd)),self.assertRaises(ValueError):
+                self.call_wrapper(spec_path, args, cwd)
+        self.assertFalse(Path(spec["invocations"]).exists())
+
+    def test_wrapper_rejects_changed_original_or_mirror_frozen_input(self):
+        _, _, vendor, spec, spec_path, argv = self.mirror_fixture()
+        for directory in [vendor, Path(spec["mirror"])]:
+            target = directory / "VERSION";old = target.read_bytes();target.write_bytes(b"changed")
+            try:
+                with self.subTest(directory=str(directory)),self.assertRaises(ValueError):
+                    self.call_wrapper(spec_path, argv, vendor)
+            finally:target.write_bytes(old)
+        self.assertFalse(Path(spec["invocations"]).exists())
+
+    def test_wrapper_rejects_changed_real_binary_or_manifest_pin(self):
+        _, _, vendor, spec, spec_path, argv = self.mirror_fixture()
+        for target in [Path(spec["real_zig"]), Path(spec["inputs"])]:
+            old = target.read_bytes();target.write_bytes(old + b"changed")
+            try:
+                with self.subTest(target=str(target)),self.assertRaises(ValueError):
+                    self.call_wrapper(spec_path, argv, vendor)
+            finally:target.write_bytes(old)
+        with self.assertRaises(ValueError):ci.zig_wrapper_main(spec_path, "0" * 64, argv)
+
+    def test_mirror_generated_packages_fully_recorded_without_source_exclusion(self):
+        source, output, _, spec, _, _ = self.mirror_fixture()
+        before = ci.source_manifest(source)
+        mirror = Path(spec["mirror"]);package = mirror / "zig-pkg/exact-hash/one.zig"
+        package.parent.mkdir(parents=True);package.write_text("package")
+        ci.zig_mirror_checkpoint(output, spec, "test")
+        packages = json.loads((output / "ZIG-PACKAGES-test.json").read_bytes())
+        self.assertEqual([x["path"] for x in packages["files"]], ["zig-pkg/exact-hash/one.zig"])
+        self.assertEqual(ci.source_manifest(source), before)
+        (mirror / "unexpected").write_text("reject")
+        with self.assertRaises(ValueError):ci.zig_mirror_checkpoint(output, spec, "bad")
+
+    def test_original_vendor_cache_is_not_accepted_as_frozen_input(self):
+        bad = {"files": [{"path":"vendor/libghostty-vt/zig-pkg/hidden", "kind":"file"}]}
+        with self.assertRaises(ValueError):ci.zig_vendor_inputs(bad)
 
 
 if __name__ == "__main__":

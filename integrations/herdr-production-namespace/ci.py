@@ -1,5 +1,6 @@
 """Isolated Herdr build; final crate uses production namespace, not release profile."""
 import argparse
+import fcntl
 from collections import Counter
 import hashlib
 import json
@@ -9,6 +10,7 @@ import platform
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 import time
 import urllib.request
@@ -92,6 +94,107 @@ def source_checkpoint(source, expected, output, phase):
     save(output / ("SOURCE-" + phase + ".json"), actual)
     save(output / ("SOURCE-DIFF-" + phase + ".json"), difference)
     require(actual == expected, "frozen source changed at " + phase + "; see saved SOURCE-DIFF")
+
+
+def zig_vendor_inputs(expected_source):
+    prefix = "vendor/libghostty-vt/"
+    rows = [{**row, "path": row["path"][len(prefix):]} for row in expected_source["files"]
+            if row["path"].startswith(prefix)]
+    require(rows and all(row["kind"] == "file" and not row["path"].startswith("zig-pkg/")
+                         for row in rows), "unexpected frozen Zig vendor input shape")
+    digest = hashlib.sha256(json.dumps(rows, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return {"files": rows, "sha256": digest}
+
+
+def validate_zig_mirror(mirror, expected):
+    actual = source_manifest(mirror)
+    frozen = {row["path"]: row for row in expected["files"]}
+    observed = {row["path"]: row for row in actual["files"]}
+    require(all(observed.get(name) == row for name, row in frozen.items()),
+            "Zig mirror frozen input changed or disappeared")
+    packages = [row for name, row in observed.items() if name not in frozen]
+    require(all(row["path"].startswith("zig-pkg/") for row in packages),
+            "unexpected generated file outside external Zig package directory")
+    return actual, packages
+
+
+def zig_wrapper_main(spec_path, spec_sha256, argv):
+    spec_path = Path(spec_path)
+    require(sha(spec_path) == spec_sha256, "Zig wrapper spec changed")
+    spec = json.loads(spec_path.read_bytes())
+    require(sha(Path(__file__)) == spec["ci_sha256"] and sha(Path(spec["real_zig"])) == spec["real_zig_sha256"],
+            "reviewed CI or real Zig executable changed")
+    original_cwd = Path.cwd().resolve()
+    if argv == ["version"]:
+        execution_cwd = original_cwd
+    else:
+        require(len(argv) == 9 and argv[:2] == ["build", "--prefix"], "unexpected Zig command")
+        prefix = Path(argv[2])
+        require(prefix.is_absolute() and prefix.resolve().is_relative_to(Path(spec["target_dir"]))
+                and prefix.name == "zig-out" and prefix.parent.name == "out",
+                "Zig install prefix outside original Cargo OUT_DIR")
+        require(argv[3:] == spec["build_tail"] and original_cwd == Path(spec["original_vendor"]),
+                "Zig build arguments or original vendor cwd changed")
+        inputs = Path(spec["inputs"])
+        require(sha(inputs) == spec["inputs_sha256"], "Zig input manifest changed")
+        expected = json.loads(inputs.read_bytes())
+        require(source_manifest(original_cwd) == expected, "original frozen Zig source changed")
+        execution_cwd = Path(spec["mirror"])
+        validate_zig_mirror(execution_cwd, expected)
+        os.chdir(execution_cwd)
+    event = {"event": "exec_intent", "pid": os.getpid(), "argv": [spec["real_zig"], *argv],
+             "original_cwd": str(original_cwd), "execution_cwd": str(execution_cwd),
+             "real_zig_sha256": spec["real_zig_sha256"], "spec_sha256": spec_sha256,
+             "wrapper_sha256": sha(Path(spec["wrapper"])), "at_epoch": time.time()}
+    with Path(spec["invocations"]).open("a") as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        stream.write(json.dumps(event, sort_keys=True) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.execv(spec["real_zig"], [spec["real_zig"], *argv])
+
+
+def prepare_zig_mirror(source, output, env, real_zig, expected_source):
+    expected = zig_vendor_inputs(expected_source)
+    vendor = (source / "vendor/libghostty-vt").resolve()
+    require(source_manifest(vendor) == expected, "original vendor differs before mirroring")
+    mirror = output / "zig-vendor-inputs"
+    shutil.copytree(vendor, mirror, symlinks=True)
+    require(source_manifest(mirror) == expected, "copied vendor differs from frozen source")
+    inputs = output / "ZIG-MIRROR-INPUTS.json"
+    save(inputs, expected)
+    wrapper = output / "zig-output-wrapper"
+    spec_path = output / "ZIG-MIRROR-SPEC.json"
+    spec = {"schema": "herdr-zig-output-mirror-v1", "original_vendor": str(vendor),
+            "mirror": str(mirror), "inputs": str(inputs), "inputs_sha256": sha(inputs),
+            "target_dir": env["CARGO_TARGET_DIR"], "real_zig": str(real_zig), "real_zig_sha256": sha(real_zig),
+            "ci_sha256": sha(Path(__file__)), "ci_path": str(Path(__file__).resolve()), "wrapper": str(wrapper),
+            "invocations": str(output / "zig-invocations.log"),
+            "build_tail": ["-Demit-lib-vt", "-Doptimize=ReleaseFast", "-Dsimd=true", "-Dtarget=aarch64-macos",
+                           "-Dversion-string=" + (vendor / "VERSION").read_text().strip(), "-Demit-xcframework=false"]}
+    save(spec_path, spec)
+    wrapper.write_text("#!" + sys.executable + "\nimport hashlib, pathlib, runpy, sys\n"
+        + "ci_path = pathlib.Path(" + repr(str(Path(__file__).resolve())) + ")\n"
+        + "assert hashlib.sha256(ci_path.read_bytes()).hexdigest() == " + repr(spec["ci_sha256"]) + "\n"
+        + "runpy.run_path(str(ci_path))['zig_wrapper_main'](" + repr(str(spec_path)) + ", "
+        + repr(sha(spec_path)) + ", sys.argv[1:])\n")
+    wrapper.chmod(0o555)
+    save(output / "ZIG-MIRROR-PREPARATION.json", {"spec_sha256": sha(spec_path),
+        "inputs_sha256": sha(inputs), "frozen_input_count": len(expected["files"]),
+        "wrapper_sha256": sha(wrapper), "wrapper_source": wrapper.read_text(),
+        "real_zig_sha256": spec["real_zig_sha256"], "system_package_mode": False})
+    env["ZIG"] = str(wrapper)
+    return spec
+
+
+def zig_mirror_checkpoint(output, spec, phase):
+    inputs = Path(spec["inputs"])
+    require(sha(inputs) == spec["inputs_sha256"], "Zig input manifest changed")
+    expected = json.loads(inputs.read_bytes())
+    actual, packages = validate_zig_mirror(Path(spec["mirror"]), expected)
+    save(output / ("ZIG-MIRROR-" + phase + ".json"), actual)
+    save(output / ("ZIG-PACKAGES-" + phase + ".json"), {"files": packages,
+        "sha256": hashlib.sha256(json.dumps(packages, sort_keys=True, separators=(",", ":")).encode()).hexdigest()})
 
 
 def download(pin, destination):
@@ -277,14 +380,18 @@ def main():
         zig = extract(output / "zig.tar.xz", output / "zig")
         env["ZIG"] = str(zig / "zig")
         require(run([env["ZIG"], "version"], output, env) == "0.16.0", "Zig version differs")
+        zig_mirror = prepare_zig_mirror(source, output, env, zig / "zig", expected_source)
         run(["cargo", "+1.99.0", "fetch", "--locked", "--target", "aarch64-apple-darwin"], source, env, output / "fetch.log")
         source_checkpoint(source, expected_source, output, "after-fetch")
         server, _ = compile_target(source, output, env, False)
         source_checkpoint(source, expected_source, output, "after-server")
+        zig_mirror_checkpoint(output, zig_mirror, "after-server")
         unit, messages = compile_target(source, output, env, True)
         source_checkpoint(source, expected_source, output, "after-unit")
+        zig_mirror_checkpoint(output, zig_mirror, "after-unit")
         expected = json.loads((bundle / "EXPECTED-CASES.json").read_bytes())
         tests = run_units(source, output, env, unit, messages, expected, expected_source)
+        zig_mirror_checkpoint(output, zig_mirror, "after-tests")
         require(sha(server["path"]) == server["sha256"], "server artifact changed")
         package = output / "package"
         package.mkdir()
