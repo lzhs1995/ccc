@@ -1,0 +1,34 @@
+{
+  "schema": "herdr-production-namespace-ci-v1",
+  "status": "FROZEN_FOR_ISOLATED_CI_ONLY",
+  "upstream_commit": "2ecf19a92fc3a7fff75b6ce3655ef04f4625ec01",
+  "source_archive": {
+    "url": "https://codeload.github.com/herdrdev/herdr/tar.gz/2ecf19a92fc3a7fff75b6ce3655ef04f4625ec01",
+    "sha256": "cbd4354f1c44530d9f094c2797380208c50f19b4d6350b6e5206e220133c3168",
+    "bytes": 10980560
+  },
+  "zig_archive": {
+    "url": "https://ziglang.org/download/0.16.0/zig-aarch64-macos-0.16.0.tar.xz",
+    "sha256": "b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489",
+    "bytes": 52238004,
+    "top_directory": "zig-aarch64-macos-0.16.0"
+  },
+  "patch_sha256": "3a18fdb4c86a77acfe2471bb6610db3f283281e9d4e75c890f8d3a105f661966",
+  "pins_sha256": "7e1c5f48af8502b069f54fc33847ad1177a5e661ae6bc4108e16db6db14fd0c8",
+  "upstream_manifest_sha256": "9e656b5b54815e0c6eda376cfde479bdbeed5ddf654d546a0640b0953331d16b",
+  "candidate_manifest_sha256": "5a379471e7387c908924984ea8a8670ea04bba0335a4466d4ef7663783deb749",
+  "expected_cases_sha256": "ce822662c9924e63c6090946103e5c76971c9670d1580a0e819b381f5f7567d3",
+  "cargo_manifest_sha256": "ba95df35ac75cf91fb3c91daa62e58da1b23c7a0cc120c825524a1f4830b300a",
+  "cargo_lock_sha256": "d6e79361a89a049221eaea001494a7d4f7210c283277c12ab72343221df77302",
+  "rust_toolchain": "1.99.0",
+  "upstream_toolchain": "1.96.1",
+  "nextest": "0.9.146",
+  "zig": "0.16.0",
+  "target": "aarch64-apple-darwin",
+  "root_crate_debug_assertions": false,
+  "nonoptimized": true,
+  "unit_nonignored": 3656,
+  "unit_ignored": 11,
+  "production_installed": false,
+  "real_fixture_required_after_download": true
+}

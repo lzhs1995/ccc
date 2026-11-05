@@ -1,0 +1,13 @@
+{
+  "repository": "lzhs1995/ccc",
+  "run_id": 42014273454,
+  "run_attempt": 1,
+  "head_sha": "be088d0a754edd7fc0603e4dac64e6ee1903edd0",
+  "freeze_sha256": "c977160d40cf0f2ee829cbdd710bfaa8a8eb86c0273ff088610133c69bbd0527",
+  "ci_sha256": "64dcf007a480d8ef7f50990a06eb6af29ffb2b23c787096ef86e37cb09e1f23f",
+  "workflow_sha256": "e51a89aef1aa4165e9b4709d96eb241a6c2fbff18fbff20d3c87d70dec878d52",
+  "reviewed_at": "2026-11-05T18:54:09.136422+08:00",
+  "review_scope": "Exact build source only; not assertion of successful run. Admission still requires actual completed success, all5 phase complete-source inventories,3 mirror inventories,original3656 tests and exact artifacts.",
+  "production_installed": false,
+  "physical_restart_authorized": false
+}

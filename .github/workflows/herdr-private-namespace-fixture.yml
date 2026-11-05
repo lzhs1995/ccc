@@ -1,0 +1,56 @@
+name: Isolated existing Herdr artifact restoration fixture
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/herdr-v3-production-namespace-20261105
+    paths:
+      - .github/workflows/herdr-private-namespace-fixture.yml
+      - integrations/herdr-private-namespace-fixture/**
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: herdr-private-namespace-fixture-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  fixture:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          path: ccc
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8
+        with:
+          toolchain: "1.99.0"
+          targets: aarch64-apple-darwin
+      - name: Verify original body and offline admission controls
+        run: |
+          python3 -BE ccc/integrations/herdr-private-namespace-fixture/test_port.py
+          python3 -BE ccc/integrations/herdr-private-namespace-fixture/fixture/test_remote_proof.py
+      - name: Authenticate original artifact and run private TUI recovery fixture
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python3 -BE ccc/integrations/herdr-private-namespace-fixture/run_actions.py
+          --source-manifest-sha256 4d4f95d49eb7728d7b57d41aabc13b8c5799413d4b8a92d7fc075de1f54ff188
+          --output "$RUNNER_TEMP/herdr-private-fixture"
+      - name: Preserve original proof and private recovery cleanup evidence
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: herdr-private-fixture-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/herdr-private-fixture/*.json
+            ${{ runner.temp }}/herdr-private-fixture/*.log
+            ${{ runner.temp }}/herdr-private-fixture/*.zip
+            ${{ runner.temp }}/herdr-private-fixture/proof/*.json
+            ${{ runner.temp }}/herdr-private-fixture/fixture-assets/candidate-private-server-*/**
+          if-no-files-found: warn
+          retention-days: 14

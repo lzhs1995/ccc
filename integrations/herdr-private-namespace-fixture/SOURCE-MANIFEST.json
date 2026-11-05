@@ -1,0 +1,25 @@
+{
+  "schema": "herdr-private-actions-fixture-source-v1",
+  "original_build_run": 42014273454,
+  "original_build_attempt": 1,
+  "original_head": "be088d0a754edd7fc0603e4dac64e6ee1903edd0",
+  "files": {
+    "CONTRACT.json": "7f52049cdfb026c201a5c2d3f5840c70b1a8e683cd5df0c034d998c9f10c8457",
+    "ORIGINAL-CONTROLLER-PINS.json": "c4839decf734b1897ea5524efd75253b9166f6c2fd3711e1036780de2bcdd6e0",
+    "README.md": "30cd38463efad85fcac81300947ca5d7f987b8c73e3d23140bf476ee8f7cef7e",
+    "actions_context.py": "b3f45122d5760c868de21f632c11785915bf4e2fcaac0747c1f6933e8007cbed",
+    "fixture/remote_proof.py": "bd413076cb485836571112c53cea477843537ffa68cfcd6d32cfc1de0e205556",
+    "fixture/run_private_remote_namespace.py": "914cc5e017d7484b8bfab7aa727b75c70bae4f735eb6f72d9b068c80201a3360",
+    "fixture/test_remote_proof.py": "8b6d0bb04a8029ba32a3fe111a8ff052d0472be51162ba9da753e4ad0c3058de",
+    "github-build-preparation/AGY-RECOVERY-V3.patch": "3a18fdb4c86a77acfe2471bb6610db3f283281e9d4e75c890f8d3a105f661966",
+    "github-build-preparation/CANDIDATE-SOURCE.json": "5a379471e7387c908924984ea8a8670ea04bba0335a4466d4ef7663783deb749",
+    "github-build-preparation/EXPECTED-CASES.json": "ce822662c9924e63c6090946103e5c76971c9670d1580a0e819b381f5f7567d3",
+    "github-build-preparation/freeze.json": "c977160d40cf0f2ee829cbdd710bfaa8a8eb86c0273ff088610133c69bbd0527",
+    "run_actions.py": "a3e2e026fff5dd1f00d94fcc2251fbc98e4aca7a2ad6379eac2025336b0eea9c",
+    "scope/ccc_codex_queue.py": "41f524e57983a058c3a0149d24bbcec882ca84ec96088b34fb9ac3f04a4c8dc9",
+    "scope/ccc_guard_scope.py": "a276ddc5275c66595f2a273fbd1bcf521f638c79080ebb1c99401bff348d9685",
+    "scope/ccc_provider_retry.py": "d8f03b7a80cde441e9b387bc56c3d526addae20cfcc97ba9959f0e623a4672e2",
+    "simulated_agy.rs": "a192babf9b70623be82a076274defe593eb9b16c1db2f41f0408d45e371a49d0",
+    "test_port.py": "0fda546ad944ed9f9a30689267c9bcedb5df8a5515af2698c6d8ddd5a081b44a"
+  }
+}

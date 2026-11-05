@@ -1,0 +1,33 @@
+{
+  "original_private_tui_ast_sha256": "f4158237d94359bc2c0613c041c79fa05086c1900d05239d91269d09ea443bf7",
+  "original_runtime_body_normalized_ast_sha256": "fd4d6c956f75197021ec4f31637ee7462d298366748ad9808985ebe3acfd62da",
+  "normalization": [
+    "CLI transport only: remove exact original rtk proxy prefix",
+    "USER/LOGNAME runner username only"
+  ],
+  "original_harness_sha256": "bb50b00c6f82d5dbe153c5f314bad4ea444e285dca4339697f66c2265def7e91",
+  "original_remote_proof_sha256": "4d72c2a04e67d19376665466f2f8bbc7cda206bc8b31a29bdcac4ac921dbd2e9",
+  "original_scope_release": "847c9e9e69e3d5972de4bdc74f8786aa7d8b3a16e4b389e4551a311b887bd9ac",
+  "scope_files": {
+    "ccc_provider_retry.py": "d8f03b7a80cde441e9b387bc56c3d526addae20cfcc97ba9959f0e623a4672e2",
+    "ccc_guard_scope.py": "a276ddc5275c66595f2a273fbd1bcf521f638c79080ebb1c99401bff348d9685",
+    "ccc_codex_queue.py": "41f524e57983a058c3a0149d24bbcec882ca84ec96088b34fb9ac3f04a4c8dc9"
+  },
+  "original_verifier_functions": {
+    "need": "7eb0d2d301bcca240a568f4bc6c80a42903ec58c06c1a09dd059b36989209fef",
+    "sha": "c36f795b9a0ac4d69ce43afc8e0d8b77267d9ef093edfabd5e4bff7eb9162e84",
+    "read": "021d86e0b92ba5caea3d8b5390f63a9be67bc200adb5175fc8834825c6fa0e56",
+    "save": "7fd0a82a6bc5e9dd0da5a6ce5f21825d22c4b20df55bbf5c3a99ae782b19c43b",
+    "validate_run": "c59cad0c87972dff6d695a6420c123d5aa0b04bf0eddb47c3ac1eaae748c770d",
+    "validate_zip": "b4ffe5116fabee62102c89816954ca99eed963dc435ff70b81a60cdaf2da11d1",
+    "parse_json": "576bf4666ce2305cfbc00b3b8ec8d5117bf128f65d21e6a0b31d13647107528b",
+    "validate_compile": "71bf8768deb774feb882ddaba3f253cbe8aa83f5b34103071d11c8528863ead3",
+    "validate_cases": "c463db9ab74f8bd74b375f72edb8e793f99c42f0c2a63e67a13fa816bcee21e3",
+    "validate_source_checkpoints": "617bcd0a4faae0b5ad8fbe6493d25e87ca2ad650ea3d28f9d8a54f8f767e1510",
+    "validate_zig_mirror_evidence": "db3d400f03d9d701d7a41679333b3981d0d05afc9b35cc3b3d6eb2c4a6a2a9d1",
+    "validate_artifact_contents": "afbcc86a3f96b8771e5b92a56d72d83e5336dc4f7c36d7ef67b862d7433b0c46",
+    "verify_files": "e8fdb844ff36737b187530fd595000373f1500faf6ac170c6750c57a6ab5dd79",
+    "verify_saved_proof": "0c31e93884183bdb152cdcb9fb0d7aaa0b01d896dcc680e55a6606331e281121",
+    "main": "1b7246adca29b3c9033f536f422e3cb773ba9ed320cf24b3d82cba93ffab7349"
+  }
+}
