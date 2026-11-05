@@ -1,0 +1,17 @@
+{
+  "schema": "ccc-native-full-build-owner-review-v1",
+  "scope": "Previously reviewed r5 implementation plus exact compatible generator output",
+  "prior_owner_review_sha256": "16eb7d2924311bc4dd17bebc2e457b66a0b5b3bcc0b8b2918333e105fda1f62d",
+  "schema_origin_sha256": "1a90a1230efbdd743ab7206792f9269fbba5664328a06d7a5eaf63a52b91ccba",
+  "overlay_members": 73,
+  "full_source_members": 9461,
+  "full_release_source_sha256": "497fed49f63a2bc576f91224671c226f976de2184efed78ae4c3b2dbf9a60ab3",
+  "full_test_source_sha256": "6fd9c0ad6d3450cc562054bc2b00a23219d85ef08c01ab9ba7cf3e61c6d34cbd",
+  "required_cases": 96,
+  "source_manifest_basis": "virtual schema substitutions over authenticated r5; full reconstruction required in CI",
+  "full_codex_compiled": false,
+  "new_tests_executed": false,
+  "real_180_300_passed": false,
+  "production_installed": false,
+  "coordinator_review_before_dispatch": true
+}

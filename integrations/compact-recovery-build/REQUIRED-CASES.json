@@ -1,0 +1,708 @@
+[
+  {
+    "package": "codex-core",
+    "binary": "codex_core",
+    "name": "session::compaction_recovery_gate::tests::completion_wins_and_old_control_cannot_touch_result",
+    "role": "core",
+    "new": true
+  },
+  {
+    "package": "codex-core",
+    "binary": "codex_core",
+    "name": "session::compaction_recovery_gate::tests::exact_epoch_thread_turn_occurrence_generation_required",
+    "role": "core",
+    "new": true
+  },
+  {
+    "package": "codex-core",
+    "binary": "codex_core",
+    "name": "session::compaction_recovery_gate::tests::claim_is_not_drained_and_replacement_factory_follows_drop",
+    "role": "core",
+    "new": true
+  },
+  {
+    "package": "codex-core",
+    "binary": "codex_core",
+    "name": "session::compaction_recovery_gate::tests::claim_wakes_original_wait",
+    "role": "core",
+    "new": true
+  },
+  {
+    "package": "codex-core",
+    "binary": "codex_core",
+    "name": "session::compaction_recovery_gate::tests::actual_concurrent_claim_keeps_raced_output_for_accounting_only",
+    "role": "core",
+    "new": true
+  },
+  {
+    "package": "codex-core",
+    "binary": "codex_core",
+    "name": "session::compaction_recovery_gate::tests::two_real_callers_can_consume_only_one_attempt",
+    "role": "core",
+    "new": true
+  },
+  {
+    "package": "codex-core",
+    "binary": "codex_core",
+    "name": "session::compaction_recovery_gate::tests::no_replay_after_claim_or_changed_generation",
+    "role": "core",
+    "new": true
+  },
+  {
+    "package": "codex-core",
+    "binary": "codex_core",
+    "name": "session::compaction_recovery_gate::tests::dropping_claimed_future_is_unknown_not_replayable",
+    "role": "core",
+    "new": true
+  },
+  {
+    "package": "codex-core",
+    "binary": "codex_core",
+    "name": "session::compaction_recovery_gate::tests::dropping_unclaimed_future_cancels_without_consuming_attempt",
+    "role": "core",
+    "new": true
+  },
+  {
+    "package": "codex-core",
+    "binary": "codex_core",
+    "name": "session::compaction_recovery_gate::tests::dropping_drained_permit_keeps_consumed_intent_unknown",
+    "role": "core",
+    "new": true
+  },
+  {
+    "package": "codex-core",
+    "binary": "codex_core",
+    "name": "session::compaction_recovery_gate::tests::replacement_ceiling_never_resets",
+    "role": "core",
+    "new": true
+  },
+  {
+    "package": "codex-core",
+    "binary": "codex_core",
+    "name": "session::compaction_recovery_gate::tests::panicking_factory_does_not_publish_live_replacement",
+    "role": "core",
+    "new": true
+  },
+  {
+    "package": "codex-core",
+    "binary": "codex_core",
+    "name": "session::compaction_recovery_gate::tests::invalid_initial_identity_and_nonzero_generation_rejected",
+    "role": "core",
+    "new": true
+  },
+  {
+    "package": "codex-core",
+    "binary": "codex_core",
+    "name": "session::compaction_recovery_gate::tests::future_error_is_preserved_and_is_not_native_retry_authorization",
+    "role": "core",
+    "new": true
+  },
+  {
+    "package": "codex-core",
+    "binary": "codex_core",
+    "name": "session::compaction_recovery_gate::tests::slot_is_consumed_before_async_factory_and_failure_cannot_replay",
+    "role": "core",
+    "new": true
+  },
+  {
+    "package": "codex-core",
+    "binary": "codex_core",
+    "name": "session::compaction_recovery_gate::tests::successful_factory_attaches_only_reserved_generation",
+    "role": "core",
+    "new": true
+  },
+  {
+    "package": "codex-core",
+    "binary": "codex_core",
+    "name": "session::compaction_recovery_gate::tests::factory_collection_transition_preserves_generation_and_consumed_budget",
+    "role": "core",
+    "new": true
+  },
+  {
+    "package": "codex-core",
+    "binary": "codex_core",
+    "name": "session::tests::compaction_recovery_tests::native_compaction_factory_is_visible_before_headers_and_uninstrumented_stream_still_completes_once",
+    "role": "core",
+    "new": true
+  },
+  {
+    "package": "codex-core",
+    "binary": "codex_core",
+    "name": "session::tests::compaction_recovery_tests::native_compaction_actor_refuses_control_without_original_authenticated_policy",
+    "role": "core",
+    "new": true
+  },
+  {
+    "package": "codex-core",
+    "binary": "codex_core",
+    "name": "session::tests::compaction_recovery_tests::native_actor_300_deadline_exact_occurrence_and_once_claim_use_original_turn",
+    "role": "core",
+    "new": true
+  },
+  {
+    "package": "codex-api",
+    "binary": "codex_api",
+    "name": "compaction_dispatch::tests::expired_at_real_send_does_not_consume_or_emit_intent",
+    "role": "transport",
+    "new": true
+  },
+  {
+    "package": "codex-api",
+    "binary": "codex_api",
+    "name": "compaction_dispatch::tests::owner_drop_refuses_queued_websocket_command",
+    "role": "transport",
+    "new": true
+  },
+  {
+    "package": "codex-api",
+    "binary": "codex_api",
+    "name": "compaction_dispatch::tests::send_failure_consumes_same_attempt_across_http_websocket_fallback",
+    "role": "transport",
+    "new": true
+  },
+  {
+    "package": "codex-api",
+    "binary": "codex_api",
+    "name": "compaction_dispatch::tests::receipt_failure_never_confirms_or_permits_retry",
+    "role": "transport",
+    "new": true
+  },
+  {
+    "package": "codex-api",
+    "binary": "codex_api",
+    "name": "compaction_dispatch::tests::transport_receipt_requires_prior_send_intent",
+    "role": "transport",
+    "new": true
+  },
+  {
+    "package": "codex-api",
+    "binary": "codex_api",
+    "name": "compaction_dispatch::tests::scoped_factory_keeps_actual_guard_and_confirmed_receipt",
+    "role": "transport",
+    "new": true
+  },
+  {
+    "package": "codex-api",
+    "binary": "codex_api",
+    "name": "compaction_dispatch::tests::two_transport_threads_admit_exactly_one_send",
+    "role": "transport",
+    "new": true
+  },
+  {
+    "package": "codex-api",
+    "binary": "codex_api",
+    "name": "compaction_dispatch::tests::factory_task_scope_requires_actual_task_drop_after_cancel",
+    "role": "transport",
+    "new": true
+  },
+  {
+    "package": "codex-api",
+    "binary": "codex_api",
+    "name": "compaction_dispatch::tests::original_scope_is_inherited_only_by_its_factory",
+    "role": "transport",
+    "new": true
+  },
+  {
+    "package": "codex-api",
+    "binary": "codex_api",
+    "name": "compaction_dispatch::tests::owner_revoked_during_native_attestation_cannot_send_late",
+    "role": "transport",
+    "new": true
+  },
+  {
+    "package": "codex-protocol",
+    "binary": "codex_protocol",
+    "name": "compact_recovery::tests::native_occurrence_identity_does_not_accept_foreign_fields_or_missing_generation",
+    "role": "core_protocol",
+    "new": true
+  },
+  {
+    "package": "codex-app-server",
+    "binary": "codex_app_server",
+    "name": "request_processors::compaction_recovery_policy::tests::native_receipt_is_atomic_private_and_never_overwrites_original_attempt",
+    "role": "api",
+    "new": true
+  },
+  {
+    "package": "codex-app-server",
+    "binary": "codex_app_server",
+    "name": "request_processors::compaction_recovery_policy::tests::native_receipt_rejects_symlink_parent_and_path_escape",
+    "role": "api",
+    "new": true
+  },
+  {
+    "package": "codex-goal-extension",
+    "binary": "goal_extension_backend",
+    "name": "native_compaction_guard_serializes_real_goal_mutation_without_resetting_budget",
+    "role": "goal",
+    "new": true
+  },
+  {
+    "package": "codex-goal-extension",
+    "binary": "goal_extension_backend",
+    "name": "native_compaction_guard_rejects_real_paused_goal_and_stale_usage",
+    "role": "goal",
+    "new": true
+  },
+  {
+    "package": "codex-app-server-protocol",
+    "binary": "codex_app_server_protocol",
+    "name": "protocol::v2::thread::compact_recovery_tests::conditional_compaction_api_rejects_partial_identity_and_query_authority",
+    "role": "protocol",
+    "new": true
+  },
+  {
+    "package": "codex-api",
+    "binary": "codex_api",
+    "name": "compaction_dispatch::tests::owner_revoked_during_durable_intent_cannot_send_late",
+    "role": "transport",
+    "new": true
+  },
+  {
+    "package": "codex-core",
+    "binary": "codex_core",
+    "name": "session::compaction_recovery::authority_tests::original_controller_mail_arriving_during_native_attestation_rejects_dispatch",
+    "role": "core",
+    "new": true
+  },
+  {
+    "package": "codex-core",
+    "binary": "codex_core",
+    "name": "agent::control::mailbox::recovery_tests::original_mailbox_enqueue_linearizes_after_native_dispatch_guard_release",
+    "role": "core",
+    "new": true
+  },
+  {
+    "package": "codex-goal-extension",
+    "binary": "goal_extension_backend",
+    "name": "native_compaction_settles_received_usage_once_under_original_goal_reservation",
+    "role": "goal",
+    "new": true
+  },
+  {
+    "package": "codex-goal-extension",
+    "binary": "goal_extension_backend",
+    "name": "native_compaction_drain_usage_exhausting_original_budget_refuses_replacement_without_reset",
+    "role": "goal",
+    "new": true
+  },
+  {
+    "package": "codex-core",
+    "binary": "codex_core",
+    "name": "agent::control::mailbox::recovery_tests::remove_waits_for_original_dispatch_and_old_waiter_cannot_enter_recreated_mailbox",
+    "role": "core",
+    "new": true
+  },
+  {
+    "package": "codex-core",
+    "binary": "codex_core",
+    "name": "agent::control::mailbox::recovery_tests::shutdown_revokes_original_reservation_and_waiting_enqueue_without_new_epoch",
+    "role": "core",
+    "new": true
+  },
+  {
+    "package": "codex-core",
+    "binary": "codex_core",
+    "name": "session::compaction_recovery::authority_tests::original_mailbox_epoch_closed_during_native_attestation_rejects_dispatch",
+    "role": "core",
+    "new": true
+  },
+  {
+    "package": "codex-goal-extension",
+    "binary": "codex_goal_extension",
+    "name": "runtime::compaction_recovery_tests::settlement_wait_cancelled_after_real_sqlite_commit_does_not_double_charge",
+    "role": "goal",
+    "new": true
+  },
+  {
+    "package": "ccc-native-client-foreground",
+    "binary": "ccc_native_client_foreground",
+    "name": "tests::connection_heartbeat_preserves_committed_epoch_and_generation",
+    "role": "native_authority",
+    "new": false,
+    "manifest_path": "native/client-foreground/Cargo.toml"
+  },
+  {
+    "package": "ccc-native-client-foreground",
+    "binary": "ccc_native_client_foreground",
+    "name": "tests::clear_precedes_thread_switch_and_heartbeat_never_samples_a_proposal",
+    "role": "native_authority",
+    "new": false,
+    "manifest_path": "native/client-foreground/Cargo.toml"
+  },
+  {
+    "package": "ccc-native-client-foreground",
+    "binary": "ccc_native_client_foreground",
+    "name": "tests::failed_withdrawal_stops_renewal_and_bounds_the_mutation_drain",
+    "role": "native_authority",
+    "new": false,
+    "manifest_path": "native/client-foreground/Cargo.toml"
+  },
+  {
+    "package": "ccc-native-client-foreground",
+    "binary": "ccc_native_client_foreground",
+    "name": "tests::successful_invalidation_allows_clear_after_store_failure",
+    "role": "native_authority",
+    "new": false,
+    "manifest_path": "native/client-foreground/Cargo.toml"
+  },
+  {
+    "package": "ccc-native-client-foreground",
+    "binary": "ccc_native_client_foreground",
+    "name": "tests::disconnect_drops_positive_memory_even_when_both_withdrawals_fail",
+    "role": "native_authority",
+    "new": false,
+    "manifest_path": "native/client-foreground/Cargo.toml"
+  },
+  {
+    "package": "ccc-native-client-foreground",
+    "binary": "ccc_native_client_foreground",
+    "name": "tests::failed_positive_durability_withdraws_at_a_later_generation_without_replay",
+    "role": "native_authority",
+    "new": false,
+    "manifest_path": "native/client-foreground/Cargo.toml"
+  },
+  {
+    "package": "ccc-native-client-foreground",
+    "binary": "ccc_native_client_foreground",
+    "name": "tests::failed_connected_durability_never_rolls_epoch_back_on_heartbeat",
+    "role": "native_authority",
+    "new": false,
+    "manifest_path": "native/client-foreground/Cargo.toml"
+  },
+  {
+    "package": "ccc-native-client-foreground",
+    "binary": "ccc_native_client_foreground",
+    "name": "tests::positive_requires_connected_canonical_thread",
+    "role": "native_authority",
+    "new": false,
+    "manifest_path": "native/client-foreground/Cargo.toml"
+  },
+  {
+    "package": "ccc-native-client-foreground",
+    "binary": "ccc_native_client_foreground",
+    "name": "tests::private_atomic_file_heartbeat_keeps_semantics_while_changing_inode",
+    "role": "native_authority",
+    "new": false,
+    "manifest_path": "native/client-foreground/Cargo.toml"
+  },
+  {
+    "package": "ccc-native-client-foreground",
+    "binary": "ccc_native_client_foreground",
+    "name": "tests::existing_foreign_owner_is_neither_replaced_nor_unlinked",
+    "role": "native_authority",
+    "new": false,
+    "manifest_path": "native/client-foreground/Cargo.toml"
+  },
+  {
+    "package": "ccc-native-client-foreground",
+    "binary": "ccc_native_client_foreground",
+    "name": "tests::replacement_of_owned_record_is_preserved_on_heartbeat_and_exit",
+    "role": "native_authority",
+    "new": false,
+    "manifest_path": "native/client-foreground/Cargo.toml"
+  },
+  {
+    "package": "ccc-native-client-foreground",
+    "binary": "ccc_native_client_foreground",
+    "name": "tests::destination_symlink_never_modifies_its_target",
+    "role": "native_authority",
+    "new": false,
+    "manifest_path": "native/client-foreground/Cargo.toml"
+  },
+  {
+    "package": "ccc-native-client-foreground",
+    "binary": "ccc_native_client_foreground",
+    "name": "tests::directory_swap_cannot_redirect_publication_or_cleanup",
+    "role": "native_authority",
+    "new": false,
+    "manifest_path": "native/client-foreground/Cargo.toml"
+  },
+  {
+    "package": "ccc-native-client-foreground",
+    "binary": "ccc_native_client_foreground",
+    "name": "tests::marker_opt_out_prevents_positive_renewal",
+    "role": "native_authority",
+    "new": false,
+    "manifest_path": "native/client-foreground/Cargo.toml"
+  },
+  {
+    "package": "ccc-native-client-foreground",
+    "binary": "ccc_native_client_foreground",
+    "name": "tests::last_owner_drop_revokes_but_a_borrowed_clone_drop_does_not",
+    "role": "native_authority",
+    "new": false,
+    "manifest_path": "native/client-foreground/Cargo.toml"
+  },
+  {
+    "package": "ccc-native-client-foreground",
+    "binary": "ccc_native_client_foreground",
+    "name": "tests::explicit_open_keeps_opt_in_and_does_not_mutate_process_environment",
+    "role": "native_authority",
+    "new": false,
+    "manifest_path": "native/client-foreground/Cargo.toml"
+  },
+  {
+    "package": "ccc-native-client-foreground",
+    "binary": "ccc_native_client_foreground",
+    "name": "tests::failed_heartbeat_never_recovers_a_previous_positive_implicitly",
+    "role": "native_authority",
+    "new": false,
+    "manifest_path": "native/client-foreground/Cargo.toml"
+  },
+  {
+    "package": "ccc-native-client-foreground",
+    "binary": "ccc_native_client_foreground",
+    "name": "compaction_authority::tests::actual_native_grant_and_server_lock_exclude_tui_change_until_dispatch_guard_drop",
+    "role": "native_authority",
+    "new": true,
+    "manifest_path": "native/client-foreground/Cargo.toml"
+  },
+  {
+    "package": "ccc-native-client-foreground",
+    "binary": "ccc_native_client_foreground",
+    "name": "compaction_authority::tests::consumed_original_intent_cannot_mint_second_native_grant",
+    "role": "native_authority",
+    "new": true,
+    "manifest_path": "native/client-foreground/Cargo.toml"
+  },
+  {
+    "package": "ccc-native-client-foreground",
+    "binary": "ccc_native_client_foreground",
+    "name": "compaction_authority::tests::same_sid_wrong_selection_epoch_rejected_before_once_file",
+    "role": "native_authority",
+    "new": true,
+    "manifest_path": "native/client-foreground/Cargo.toml"
+  },
+  {
+    "package": "ccc-native-client-foreground",
+    "binary": "ccc_native_client_foreground",
+    "name": "compaction_authority::tests::real_peer_birth_and_uid_are_required",
+    "role": "native_authority",
+    "new": true,
+    "manifest_path": "native/client-foreground/Cargo.toml"
+  },
+  {
+    "package": "ccc-native-client-foreground",
+    "binary": "ccc_native_client_foreground",
+    "name": "compaction_authority::tests::changed_original_intent_and_symlink_are_rejected",
+    "role": "native_authority",
+    "new": true,
+    "manifest_path": "native/client-foreground/Cargo.toml"
+  },
+  {
+    "package": "ccc-native-client-foreground",
+    "binary": "ccc_native_client_foreground",
+    "name": "compaction_authority::tests::server_rejects_different_attempt_goal_or_tampered_proof",
+    "role": "native_authority",
+    "new": true,
+    "manifest_path": "native/client-foreground/Cargo.toml"
+  },
+  {
+    "package": "ccc-native-client-foreground",
+    "binary": "ccc_native_client_foreground",
+    "name": "compaction_authority::tests::native_disconnect_revokes_existing_grant_even_while_reserved",
+    "role": "native_authority",
+    "new": true,
+    "manifest_path": "native/client-foreground/Cargo.toml"
+  },
+  {
+    "package": "ccc-native-client-foreground",
+    "binary": "ccc_native_client_foreground",
+    "name": "compaction_authority::tests::replaced_native_control_lock_does_not_authorize_old_guard",
+    "role": "native_authority",
+    "new": true,
+    "manifest_path": "native/client-foreground/Cargo.toml"
+  },
+  {
+    "package": "ccc-native-client-foreground",
+    "binary": "ccc_native_client_foreground",
+    "name": "compaction_authority::tests::plausible_same_uid_forged_grant_is_rejected_by_real_native_memory_attestation",
+    "role": "native_authority",
+    "new": true,
+    "manifest_path": "native/client-foreground/Cargo.toml"
+  },
+  {
+    "package": "ccc-native-client-foreground",
+    "binary": "ccc_native_client_foreground",
+    "name": "compaction_authority::tests::native_authority_attestation_still_responds_while_control_request_waits_for_app",
+    "role": "native_authority",
+    "new": true,
+    "manifest_path": "native/client-foreground/Cargo.toml"
+  },
+  {
+    "package": "ccc-native-client-foreground",
+    "binary": "ccc_native_client_foreground",
+    "name": "compaction_socket::tests::slow_trickle_does_not_extend_total_native_socket_read_deadline",
+    "role": "native_authority",
+    "new": false,
+    "manifest_path": "native/client-foreground/Cargo.toml"
+  },
+  {
+    "package": "ccc-native-client-foreground",
+    "binary": "ccc_native_client_foreground",
+    "name": "compaction_socket::tests::revoked_listener_never_accepts_an_already_buffered_control_message",
+    "role": "native_authority",
+    "new": false,
+    "manifest_path": "native/client-foreground/Cargo.toml"
+  },
+  {
+    "package": "ccc-native-client-foreground",
+    "binary": "ccc_native_client_foreground",
+    "name": "compaction_socket::tests::real_socket_captures_kernel_peer_before_native_app_dispatch_and_exact_cleanup",
+    "role": "native_authority",
+    "new": false,
+    "manifest_path": "native/client-foreground/Cargo.toml"
+  },
+  {
+    "package": "ccc-native-client-foreground",
+    "binary": "ccc_native_client_foreground",
+    "name": "compaction_socket::tests::existing_foreign_capability_is_preserved_and_new_socket_cleaned",
+    "role": "native_authority",
+    "new": false,
+    "manifest_path": "native/client-foreground/Cargo.toml"
+  },
+  {
+    "package": "ccc-native-client-foreground",
+    "binary": "ccc_native_client_foreground",
+    "name": "compaction_socket::tests::optin_marker_symlink_never_advertises_native_control",
+    "role": "native_authority",
+    "new": false,
+    "manifest_path": "native/client-foreground/Cargo.toml"
+  },
+  {
+    "package": "ccc-native-client-foreground",
+    "binary": "ccc_native_client_foreground",
+    "name": "compaction_authority::tests::original_grant_remaining_budget_decreases_and_never_renews_expired_authority",
+    "role": "native_authority",
+    "new": true,
+    "manifest_path": "native/client-foreground/Cargo.toml"
+  },
+  {
+    "package": "ccc-native-client-foreground",
+    "binary": "ccc_native_client_foreground",
+    "name": "compaction_authority::tests::enrollment_expiry_during_live_attestation_cannot_authorize_late_send",
+    "role": "native_authority",
+    "new": true,
+    "manifest_path": "native/client-foreground/Cargo.toml"
+  },
+  {
+    "package": "codex-tui",
+    "binary": "codex_tui",
+    "name": "app::tests::foreground_observation::startup_commits_after_event_drain_and_actual_draft_restoration",
+    "role": "foreground_regression",
+    "new": false
+  },
+  {
+    "package": "codex-tui",
+    "binary": "codex_tui",
+    "name": "app::tests::foreground_observation::delayed_startup_external_writer_or_parent_ownership_never_commits",
+    "role": "foreground_regression",
+    "new": false
+  },
+  {
+    "package": "codex-tui",
+    "binary": "codex_tui",
+    "name": "app::tests::foreground_observation::buffered_replay_and_thread_switch_resets_finish_before_publication",
+    "role": "foreground_regression",
+    "new": false
+  },
+  {
+    "package": "codex-tui",
+    "binary": "codex_tui",
+    "name": "app::tests::foreground_observation::ineligible_or_incomplete_native_attachments_stay_clear",
+    "role": "foreground_regression",
+    "new": false
+  },
+  {
+    "package": "codex-tui",
+    "binary": "codex_tui",
+    "name": "app::tests::foreground_observation::heartbeat_then_ready_active_thread_close_withdraws_before_drain",
+    "role": "foreground_regression",
+    "new": false
+  },
+  {
+    "package": "codex-tui",
+    "binary": "codex_tui",
+    "name": "app::tests::foreground_observation::actual_reconnect_rotates_connection_uuid_with_same_backend_and_sid",
+    "role": "foreground_regression",
+    "new": false
+  },
+  {
+    "package": "codex-tui",
+    "binary": "codex_tui",
+    "name": "app::tests::foreground_observation::failed_named_profile_verification_denies_a_live_channel_and_survives_reconnect",
+    "role": "foreground_regression",
+    "new": false
+  },
+  {
+    "package": "codex-tui",
+    "binary": "codex_tui",
+    "name": "app::tests::foreground_observation::refused_clear_and_invalidation_drain_lease_without_mutating_selected_thread",
+    "role": "foreground_regression",
+    "new": false
+  },
+  {
+    "package": "codex-tui",
+    "binary": "codex_tui",
+    "name": "app::tests::foreground_observation::successful_retry_after_refused_withdrawal_uses_a_fresh_connection_epoch",
+    "role": "foreground_regression",
+    "new": false
+  },
+  {
+    "package": "codex-tui",
+    "binary": "codex_tui",
+    "name": "app::tests::foreground_observation::actual_parked_voice_operation_restores_the_visible_selection",
+    "role": "foreground_regression",
+    "new": false
+  },
+  {
+    "package": "codex-tui",
+    "binary": "codex_tui",
+    "name": "app::tests::foreground_observation::startup_guard_and_teardown_revoke_while_app_clone_remains_alive",
+    "role": "foreground_regression",
+    "new": false
+  },
+  {
+    "package": "codex-tui",
+    "binary": "codex_tui",
+    "name": "app::tests::foreground_observation::dropping_app_revokes_while_the_startup_guard_still_owns_state",
+    "role": "foreground_regression",
+    "new": false
+  },
+  {
+    "package": "codex-tui",
+    "binary": "codex_tui",
+    "name": "app::tests::foreground_observation::real_initialization_failure_is_visible_and_ordinary_app_work_continues",
+    "role": "foreground_regression",
+    "new": false
+  },
+  {
+    "package": "codex-tui",
+    "binary": "codex_tui",
+    "name": "app::tests::foreground_observation::native_compaction_event_preserves_real_draft_and_never_withdraws_selection",
+    "role": "tui",
+    "new": true
+  },
+  {
+    "package": "codex-tui",
+    "binary": "codex_tui",
+    "name": "app::tests::foreground_observation::native_compaction_control_refuses_queued_events_and_old_client_epoch",
+    "role": "tui",
+    "new": true
+  },
+  {
+    "package": "codex-tui",
+    "binary": "codex_tui",
+    "name": "app::tests::foreground_observation::actual_terminal_event_waits_for_native_shared_lock_before_editing_draft",
+    "role": "tui",
+    "new": true
+  },
+  {
+    "package": "codex-app-server-protocol",
+    "binary": "codex_app_server_protocol",
+    "name": "protocol::v2::thread::compact_recovery_tests::legacy_compact_start_response_accepts_unknown_fields_without_relaxing_recovery",
+    "role": "protocol",
+    "new": true
+  }
+]

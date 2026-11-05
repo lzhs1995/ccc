@@ -1,0 +1,48 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "additionalProperties": false,
+  "description": "Experimental conditional recovery of one original native provider wait. Omit expected fields to query the current native identity without mutation.",
+  "properties": {
+    "attemptId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "authority": true,
+    "expectedGeneration": {
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "expectedNativeEpoch": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "expectedOccurrence": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "expectedTurnId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "threadId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "threadId"
+  ],
+  "title": "ThreadCompactRecoveryParams",
+  "type": "object"
+}
