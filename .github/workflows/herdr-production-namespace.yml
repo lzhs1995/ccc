@@ -1,0 +1,68 @@
+name: Isolated Herdr v3 production namespace
+
+on:
+  workflow_dispatch:
+    inputs:
+      freeze_sha256:
+        description: Exact reviewed Herdr namespace freeze SHA256
+        required: true
+        default: c977160d40cf0f2ee829cbdd710bfaa8a8eb86c0273ff088610133c69bbd0527
+        type: string
+  push:
+    branches:
+      - codex/herdr-v3-production-namespace-20261105
+    paths:
+      - .github/workflows/herdr-production-namespace.yml
+      - integrations/herdr-production-namespace/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: herdr-production-namespace-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  candidate:
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      FREEZE_SHA256: ${{ inputs.freeze_sha256 || 'c977160d40cf0f2ee829cbdd710bfaa8a8eb86c0273ff088610133c69bbd0527' }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          path: ccc
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8
+        with:
+          toolchain: "1.99.0"
+          targets: aarch64-apple-darwin
+      - uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532
+        with:
+          tool: nextest@0.9.146
+      - name: Build exact candidate and execute same-cfg complete unit suite
+        run: >-
+          python3 ccc/integrations/herdr-production-namespace/ci.py
+          --bundle ccc/integrations/herdr-production-namespace
+          --freeze-sha256 "$FREEZE_SHA256"
+          --output "$RUNNER_TEMP/herdr-namespace-evidence"
+      - name: Preserve exact compilation and unit evidence
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: herdr-namespace-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/herdr-namespace-evidence/*.json
+            ${{ runner.temp }}/herdr-namespace-evidence/*.log
+            ${{ runner.temp }}/herdr-namespace-evidence/*.toml
+            ${{ runner.temp }}/herdr-namespace-evidence/*.xml
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Preserve candidate artifact without installation
+        if: success()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: herdr-namespace-arm64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/herdr-namespace-evidence/package/
+          if-no-files-found: error
+          retention-days: 14

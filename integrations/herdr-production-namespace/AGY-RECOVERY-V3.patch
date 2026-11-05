@@ -1,0 +1,1226 @@
+--- a/src/app/actions.rs
++++ b/src/app/actions.rs
+@@ -1531,6 +1531,11 @@
+                 })
+                 .into_iter()
+                 .collect(),
++            AppEvent::BoundAgentResumeReported { pane_id, terminal_id, epoch, identity, seq, argv } => self
++                .update_terminal_state(pane_id, |terminal| {
++                    terminal.record_bound_reported_resume(&terminal_id, epoch, identity, seq, argv);
++                    None
++                }).into_iter().collect(),
+             AppEvent::ReportedAgentShellReturned {
+                 pane_id,
+                 observed_at,
+@@ -1608,7 +1613,21 @@
+                 ..
+             } => {
+                 if crate::agent_resume::is_official_agent_source(&source, &agent_label) {
+-                    Vec::new()
++                    let can_release = self.workspaces.iter().find_map(|workspace| {
++                        workspace.pane_state(pane_id).and_then(|pane| {
++                            self.terminals.get(&pane.attached_terminal_id)
++                        })
++                    }).is_some_and(|terminal| {
++                        terminal.can_release_retained_agent_recovery(&source, &agent_label, seq)
++                    });
++                    if !can_release {
++                        return Vec::new();
++                    }
++                    self.update_terminal_state(pane_id, |terminal| {
++                        terminal.release_agent_with_mutation(&source, &agent_label, seq)
++                    })
++                    .into_iter()
++                    .collect()
+                 } else {
+                     self.update_terminal_state(pane_id, |terminal| {
+                         terminal.release_agent_with_mutation(&source, &agent_label, seq)
+@@ -1710,10 +1729,12 @@
+             let previous_agent_name = terminal.agent_name.clone();
+             let had_completion = terminal.last_agent_completion_seq.is_some() || !previous_seen;
+             let resume_revision = terminal.reported_resume_revision();
++            let recovery_revision = terminal.recovery.revision();
+             let mutation = update(terminal);
+             terminal.reconcile_reported_resume();
+             // Resume-only changes return no mutation but must still be saved.
+-            if terminal.reported_resume_revision() != resume_revision {
++            if terminal.reported_resume_revision() != resume_revision
++                || terminal.recovery.revision() != recovery_revision {
+                 self.session_dirty = true;
+             }
+             let mutation = mutation?;
+--- a/src/app/api/panes.rs
++++ b/src/app/api/panes.rs
+@@ -1592,6 +1592,7 @@
+             params.source,
+             agent_label,
+             params.seq.filter(|_| applied),
++            session_ref,
+             applied.then_some(params.resume_argv).flatten(),
+         )
+     }
+@@ -1638,6 +1639,7 @@
+             params.source,
+             agent_label,
+             params.seq.filter(|_| applied),
++            session_ref,
+             applied.then_some(params.resume_argv).flatten(),
+         )
+     }
+@@ -1673,6 +1675,7 @@
+         source: String,
+         agent_label: String,
+         seq: Option<u64>,
++        session_ref: Option<crate::agent_resume::AgentSessionRef>,
+         resume_argv: Option<Vec<String>>,
+     ) -> String {
+         let Some(argv) = resume_argv else {
+@@ -1688,13 +1691,29 @@
+                 "resume_argv requires the reporter to hold the pane; report its state with pane.report_agent first",
+             );
+         }
+-        self.handle_internal_event(crate::events::AppEvent::AgentResumeReported {
+-            pane_id,
+-            source,
+-            agent_label,
+-            seq,
+-            argv,
+-        });
++        if let Some(session_ref) = session_ref {
++            let binding = self.pane_terminal(ws_idx, pane_id).and_then(|terminal| {
++                terminal.recovery_resume_binding(&source, &agent_label, &session_ref)
++                    .map(|epoch| (terminal.id.clone(), epoch))
++            });
++            let Some((terminal_id, epoch)) = binding else {
++                return encode_error(id, "resume_not_accepted", "resume_argv must carry the accepted session identity");
++            };
++            self.handle_internal_event(crate::events::AppEvent::BoundAgentResumeReported {
++                pane_id, terminal_id, epoch,
++                identity: crate::agent_resume::PersistedAgentSession { source, agent: agent_label, session_ref },
++                seq, argv,
++            });
++        } else {
++            if self.pane_terminal(ws_idx, pane_id).is_some_and(|terminal| {
++                terminal.recovery.record().is_some() || terminal.recovery.blocked()
++            }) {
++                return encode_error(id, "resume_not_accepted", "resume_argv requires an explicit session identity");
++            }
++            self.handle_internal_event(crate::events::AppEvent::AgentResumeReported {
++                pane_id, source, agent_label, seq, argv,
++            });
++        }
+         encode_success(id, ResponseResult::Ok {})
+     }
+ 
+--- a/src/events.rs
++++ b/src/events.rs
+@@ -128,6 +128,15 @@
+         seq: Option<u64>,
+         argv: Vec<String>,
+     },
++    /// SID-bound resume report with the server-observed terminal generation.
++    BoundAgentResumeReported {
++        pane_id: PaneId,
++        terminal_id: crate::terminal::TerminalId,
++        epoch: u64,
++        identity: crate::agent_resume::PersistedAgentSession,
++        seq: Option<u64>,
++        argv: Vec<String>,
++    },
+     /// A pane held by a self-reported agent is back at its idle shell.
+     ReportedAgentShellReturned {
+         pane_id: PaneId,
+--- a/src/persist/restore.rs
++++ b/src/persist/restore.rs
+@@ -450,13 +450,14 @@
+     terminal.restore_error = Some(reason);
+     if let Some(pane) = pane {
+         terminal.manual_label = pane.label.clone();
+-        terminal.launch_argv = pane.launch_argv.clone();
+-        if let Some(session) = restored_terminal_agent_session(pane.agent_session.as_ref(), false) {
++        terminal.launch_argv = saved_launch_argv(pane);
++        if let Some(session) = restored_terminal_agent_session(saved_agent_session(pane), false) {
+             terminal.set_persisted_agent_session(session);
+         }
+         if let Some(resume) = saved_reported_resume(pane) {
+             terminal.restore_reported_resume(reported_resume_from_snapshot(resume));
+         }
++        restore_recovery_record(&mut terminal, Some(pane), false, false);
+         match (
+             pane.agent_name.as_ref(),
+             pane.managed_agent_kind
+@@ -537,8 +538,8 @@
+         let saved_managed_agent = saved_pane
+             .and_then(|pane| pane.managed_agent_kind.as_deref())
+             .and_then(crate::detect::parse_canonical_agent_label);
+-        let saved_launch_argv = saved_pane.and_then(|p| p.launch_argv.clone());
+-        let saved_agent_session = saved_pane.and_then(|p| p.agent_session.as_ref());
++        let saved_launch_argv = saved_pane.and_then(saved_launch_argv);
++        let saved_agent_session = saved_pane.and_then(saved_agent_session);
+         let saved_agent_resume = saved_pane.and_then(saved_reported_resume);
+         let saved_history =
+             old_id.and_then(|old_id| history.and_then(|history| history.panes.get(old_id)));
+@@ -602,6 +603,7 @@
+             if let Some(resume) = restored_agent_resume {
+                 terminal.restore_reported_resume(resume);
+             }
++            restore_recovery_record(&mut terminal, saved_pane, startup.duplicate_agent_session, false);
+             match (saved_agent_name, saved_managed_agent) {
+                 (Some(agent_name), Some(agent)) => {
+                     terminal.restore_managed_agent(agent_name, agent)
+@@ -726,6 +728,7 @@
+                 if let Some(agent_state) = handoff_agent_state {
+                     terminal.restore_handoff_agent_state(agent_state);
+                 }
++                restore_recovery_record(&mut terminal, saved_pane, startup.duplicate_agent_session, was_imported);
+                 panes.insert(*id, PaneState::new(terminal_id.clone()));
+                 terminal_runtimes.insert(terminal_id, runtime);
+                 terminals.push(terminal);
+@@ -824,7 +827,11 @@
+     let restore_plan = if !agent_restore.enabled {
+         None
+     } else if let Some(resume) = reported_resume {
+-        Some(reported_resume_from_snapshot(resume).plan(cwd))
++        let mut plan = reported_resume_from_snapshot(resume).plan(cwd);
++        if let Some(session_plan) = session.and_then(|session| restore_plan_for_snapshot(session, true)) {
++            plan.dedupe_key = session_plan.dedupe_key;
++        }
++        Some(plan)
+     } else {
+         session.and_then(|session| restore_plan_for_snapshot(session, true))
+     };
+@@ -862,7 +869,59 @@
+     }
+ }
+ 
++fn saved_agent_session(pane: &super::snapshot::PaneSnapshot) -> Option<&PaneAgentSessionSnapshot> {
++    if let Some(recovery) = &pane.agent_recovery {
++        if !recovery.automatic || recovery.to_record().is_none() { return None; }
++        let session = recovery.session.as_ref()?;
++        if pane.agent_session.as_ref().is_some_and(|active| active != session) { return None; }
++        return Some(session);
++    }
++    pane.agent_session.as_ref() // legacy snapshots remain readable
++}
++
++fn saved_launch_argv(pane: &super::snapshot::PaneSnapshot) -> Option<Vec<String>> {
++    // New identity-aware snapshots resume only through the checked plan. Raw
++    // launch argv may still name a previous conversation and cannot bypass it.
++    if pane.agent_recovery.is_some() { return None; }
++    pane.launch_argv.clone()
++}
++
++fn restore_recovery_record(terminal: &mut TerminalState,
++    pane: Option<&super::snapshot::PaneSnapshot>, duplicate: bool, imported: bool,
++) {
++    if let Some(pane) = pane {
++        if let Some(recovery) = &pane.agent_recovery {
++            let record = recovery.to_record();
++            let saved_is_allowed = saved_agent_session(pane).is_some();
++            terminal.recovery.restore(record);
++            if !saved_is_allowed || duplicate { terminal.recovery.invalidate(); }
++        } else if duplicate {
++            // Persist the refusal even for a legacy duplicate with no new field.
++            terminal.recovery.invalidate();
++        } else if let (Some(session), Some(resume)) =
++            (pane.agent_session.as_ref(), saved_reported_resume(pane)) {
++            // One-time migration of the original legacy pair. Live unbound
++            // reports never use this trusted snapshot-only path.
++            if let Some(identity) = persisted_agent_session_from_snapshot(session) {
++                if resume.source == identity.source && resume.agent == identity.agent {
++                    terminal.recovery.bind_resume(&identity, terminal.recovery.epoch(),
++                        reported_resume_from_snapshot(resume));
++                }
++            }
++        }
++    }
++    // A live imported terminal may contain a newer identity. Keep its original
++    // active authority; never attach the saved old argv to that identity.
++    if imported { terminal.reconcile_restored_recovery(); }
++    if terminal.recovery.blocked() { terminal.launch_argv = None; }
++}
++
+ fn saved_reported_resume(pane: &super::snapshot::PaneSnapshot) -> Option<&PaneAgentResumeSnapshot> {
++    if let Some(recovery) = &pane.agent_recovery {
++        saved_agent_session(pane)?;
++        return recovery.resume.as_ref();
++    }
++
+     pane.agent_resume
+         .as_ref()
+         .filter(|resume| crate::agent_resume::validate_resume_argv(&resume.argv).is_ok())
+@@ -1012,6 +1071,67 @@
+ 
+ #[cfg(test)]
+ mod tests {
++    fn durability_snapshot() -> super::super::snapshot::PaneSnapshot {
++        serde_json::from_value(serde_json::json!({"cwd":"/tmp",
++            "agent_session":{"source":"herdr:antigravity_cli","agent":"agy","kind":"id","value":"simulated-a"},
++            "agent_resume":{"source":"herdr:antigravity_cli","agent":"agy","argv":["agy","--conversation","simulated-a"]},
++            "launch_argv":["agy","--conversation","simulated-a"]
++        })).unwrap()
++    }
++    fn durability_record(pane: &super::super::snapshot::PaneSnapshot) -> super::super::snapshot::PaneAgentRecoverySnapshot {
++        super::super::snapshot::PaneAgentRecoverySnapshot { version:1, automatic:true,
++            session:pane.agent_session.clone(),resume:pane.agent_resume.clone() }
++    }
++    #[test]
++    fn recovery_durability_legacy_snapshot_is_readable_and_exact_new_intent_restores() {
++        let mut pane=durability_snapshot();
++        assert!(saved_agent_session(&pane).is_some()); assert!(saved_reported_resume(&pane).is_some());
++        pane.agent_recovery=Some(durability_record(&pane));
++        let terminal=unavailable_restored_terminal(Some(&pane),"/tmp".into(),"simulated".into());
++        assert!(terminal.recovery.record().unwrap().automatic);
++        assert_eq!(terminal.recovery.record().unwrap().identity.session_ref.value,"simulated-a");
++        assert!(terminal.recovery.record().unwrap().resume.is_some());
++    }
++    #[test]
++    fn recovery_durability_invalid_or_tombstone_survives_two_real_snapshot_roundtrips() {
++        for case in 0..4 {
++            let mut pane=durability_snapshot(); let mut record=durability_record(&pane);
++            match case { 0=>record.automatic=false,1=>record.version=99,
++                2=>record.resume.as_mut().unwrap().argv=vec!["/bad/path".into()],
++                _=>record.session.as_mut().unwrap().value="different-sid".into(), }
++            pane.agent_recovery=Some(record);
++            for _ in 0..2 {
++                assert!(saved_agent_session(&pane).is_none()); assert!(saved_reported_resume(&pane).is_none());
++                assert!(saved_launch_argv(&pane).is_none());
++                let terminal=unavailable_restored_terminal(Some(&pane),"/tmp".into(),"simulated".into());
++                assert!(terminal.recovery.blocked()); assert!(terminal.launch_argv.is_none());
++                pane.agent_recovery=super::super::snapshot::PaneAgentRecoverySnapshot::from_state(&terminal.recovery);
++                pane=serde_json::from_str(&serde_json::to_string(&pane).unwrap()).unwrap();
++                assert!(pane.agent_recovery.is_some());
++            }
++        }
++    }
++    #[test]
++    fn recovery_durability_duplicate_does_not_rearm_on_next_capture() {
++        let mut pane=durability_snapshot(); pane.agent_recovery=Some(durability_record(&pane));
++        let mut terminal=TerminalState::new(TerminalId::alloc(),"/tmp".into());
++        restore_recovery_record(&mut terminal,Some(&pane),true,false);
++        pane.agent_recovery=super::super::snapshot::PaneAgentRecoverySnapshot::from_state(&terminal.recovery);
++        assert!(saved_agent_session(&pane).is_none()); assert!(saved_launch_argv(&pane).is_none());
++    }
++    #[test]
++    fn recovery_durability_imported_new_identity_drops_saved_old_argv() {
++        let mut pane=durability_snapshot(); pane.agent_recovery=Some(durability_record(&pane));
++        let mut terminal=TerminalState::new(TerminalId::alloc(),"/tmp".into());
++        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
++            source:"herdr:antigravity_cli".into(),agent:"agy".into(),
++            session_ref:crate::agent_resume::AgentSessionRef::id("new-live-sid").unwrap(),
++        });
++        restore_recovery_record(&mut terminal,Some(&pane),false,true);
++        let r=terminal.recovery.record().unwrap();
++        assert_eq!(r.identity.session_ref.value,"new-live-sid"); assert!(r.resume.is_none());
++    }
++
+     use super::*;
+ 
+     fn test_session_path(name: &str) -> String {
+@@ -1553,6 +1673,7 @@
+                                 value: "opencode-session".into(),
+                             }),
+                             agent_resume: None,
++                            agent_recovery: None,
+                             launch_argv: None,
+                         },
+                     )]),
+@@ -1635,6 +1756,7 @@
+                                 managed_agent_kind: None,
+                                 agent_session: None,
+                                 agent_resume: None,
++                                agent_recovery: None,
+                                 launch_argv: None,
+                             },
+                         ),
+@@ -1647,6 +1769,7 @@
+                                 managed_agent_kind: None,
+                                 agent_session: None,
+                                 agent_resume: None,
++                                agent_recovery: None,
+                                 launch_argv: None,
+                             },
+                         ),
+@@ -1701,6 +1824,7 @@
+                     managed_agent_kind: None,
+                     agent_session: None,
+                     agent_resume: None,
++                    agent_recovery: None,
+                     launch_argv: None,
+                 },
+             )
+@@ -1717,6 +1841,7 @@
+                 value: "codex-session".into(),
+             }),
+             agent_resume: None,
++            agent_recovery: None,
+             launch_argv: None,
+         };
+         let snapshot = SessionSnapshot {
+@@ -1869,6 +1994,7 @@
+                                 value: "codex-session".into(),
+                             }),
+                             agent_resume: None,
++                            agent_recovery: None,
+                             launch_argv: None,
+                         },
+                     )]),
+@@ -2175,6 +2301,7 @@
+                 managed_agent_kind: None,
+                 agent_session: None,
+                 agent_resume: None,
++                agent_recovery: None,
+                 launch_argv: None,
+             },
+         );
+--- a/src/persist/snapshot.rs
++++ b/src/persist/snapshot.rs
+@@ -110,7 +110,55 @@
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub agent_resume: Option<PaneAgentResumeSnapshot>,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub agent_recovery: Option<PaneAgentRecoverySnapshot>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub launch_argv: Option<Vec<String>>,
++}
++
++/// Saved recovery intent is never used as live agent authority.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct PaneAgentRecoverySnapshot {
++    pub version: u8,
++    #[serde(default)]
++    pub session: Option<PaneAgentSessionSnapshot>,
++    pub resume: Option<PaneAgentResumeSnapshot>,
++    pub automatic: bool,
++}
++
++impl PaneAgentRecoverySnapshot {
++    pub fn from_state(state: &crate::terminal::recovery::RecoveryState<
++        crate::agent_resume::PersistedAgentSession, crate::agent_resume::ReportedAgentResume,
++    >) -> Option<Self> {
++        let Some(record) = state.record() else {
++            return state.blocked().then_some(Self { version: 1, automatic: false, session: None, resume: None });
++        };
++        Some(Self { version: 1, automatic: record.automatic && !state.blocked(),
++            session: Some(PaneAgentSessionSnapshot {
++                source: record.identity.source.clone(), agent: record.identity.agent.clone(),
++                kind: record.identity.session_ref.kind, value: record.identity.session_ref.value.clone(),
++            }),
++            resume: record.resume.as_ref().map(|resume| PaneAgentResumeSnapshot {
++                source: resume.source.clone(), agent: resume.agent.clone(), argv: resume.argv.clone(),
++            }),
++        })
++    }
++
++    pub fn to_record(&self) -> Option<crate::terminal::recovery::RecoveryRecord<
++        crate::agent_resume::PersistedAgentSession, crate::agent_resume::ReportedAgentResume,
++    >> {
++        if self.version != 1 { return None; }
++        let session = self.session.as_ref()?;
++        let identity = crate::agent_resume::session_ref_from_snapshot(
++            &session.source, &session.agent, session.kind, &session.value)?;
++        let resume = if let Some(resume) = &self.resume {
++            if resume.source != identity.source || resume.agent != identity.agent
++                || crate::agent_resume::validate_resume_argv(&resume.argv).is_err() { return None; }
++            Some(crate::agent_resume::ReportedAgentResume {
++                source: resume.source.clone(), agent: resume.agent.clone(), argv: resume.argv.clone(),
++            })
++        } else { None };
++        Some(crate::terminal::recovery::RecoveryRecord { identity, resume, automatic: self.automatic })
++    }
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+@@ -387,6 +435,7 @@
+                 managed_agent_kind,
+                 agent_session,
+                 agent_resume,
++                agent_recovery: terminal.and_then(|t| PaneAgentRecoverySnapshot::from_state(&t.recovery)),
+                 launch_argv,
+             },
+         );
+@@ -706,6 +755,7 @@
+                 managed_agent_kind: None,
+                 agent_session: None,
+                 agent_resume: None,
++                agent_recovery: None,
+                 launch_argv: None,
+             },
+         );
+@@ -718,6 +768,7 @@
+                 managed_agent_kind: None,
+                 agent_session: None,
+                 agent_resume: None,
++                agent_recovery: None,
+                 launch_argv: None,
+             },
+         );
+@@ -1404,6 +1455,7 @@
+                 managed_agent_kind: None,
+                 agent_session: None,
+                 agent_resume: None,
++                agent_recovery: None,
+                 launch_argv: None,
+             },
+         );
+@@ -1418,6 +1470,7 @@
+                 managed_agent_kind: None,
+                 agent_session: None,
+                 agent_resume: None,
++                agent_recovery: None,
+                 launch_argv: None,
+             },
+         );
+--- /dev/null
++++ b/src/server/headless/tests/agent_recovery.rs
+@@ -0,0 +1,213 @@
++use super::*;
++
++fn retained_release_server() -> (
++    HeadlessServer,
++    crate::layout::PaneId,
++    crate::terminal::TerminalId,
++) {
++    let mut server = test_headless_server();
++    server.app.state.workspaces = vec![crate::workspace::Workspace::test_new("recovery")];
++    server.app.state.ensure_test_terminals();
++    server.app.state.active = Some(0);
++    let pane_id = server.app.state.workspaces[0].tabs[0].root_pane;
++    let terminal_id = server.app.state.workspaces[0].tabs[0].panes[&pane_id]
++        .attached_terminal_id
++        .clone();
++    server.handle_internal_event_with_forwarding(AppEvent::AgentProcessDetected {
++        pane_id,
++        agent: crate::detect::Agent::Antigravity,
++        observed_at: Instant::now(),
++    });
++    let public_pane_id = server.app.public_pane_id(0, pane_id).unwrap();
++    completion_guard_api_report(
++        &mut server,
++        api::schema::Method::PaneReportAgentSession(api::schema::PaneReportAgentSessionParams {
++            pane_id: public_pane_id,
++            source: "herdr:antigravity_cli".into(),
++            agent: "agy".into(),
++            seq: Some(10),
++            agent_session_id: Some("simulated-retained".into()),
++            agent_session_path: None,
++            session_start_source: Some("startup".into()),
++            resume_argv: Some(vec![
++                "agy".into(),
++                "--conversation".into(),
++                "simulated-retained".into(),
++            ]),
++        }),
++    );
++    assert!(server.app.state.terminals[&terminal_id]
++        .recovery
++        .record()
++        .unwrap()
++        .automatic);
++    (server, pane_id, terminal_id)
++}
++
++fn retained_release_passive_exit(server: &mut HeadlessServer, pane_id: crate::layout::PaneId) {
++    server.handle_internal_event_with_forwarding(AppEvent::StateChanged {
++        pane_id,
++        agent: Some(crate::detect::Agent::Antigravity),
++        state: crate::detect::AgentState::Idle,
++        visible_blocker: false,
++        visible_working: false,
++        process_exited: true,
++        observed_at: Instant::now(),
++    });
++}
++
++fn retained_release_api(
++    server: &mut HeadlessServer,
++    pane_id: crate::layout::PaneId,
++    source: &str,
++    agent: &str,
++    seq: Option<u64>,
++) {
++    let public_pane_id = server.app.public_pane_id(0, pane_id).unwrap();
++    completion_guard_api_report(
++        server,
++        api::schema::Method::PaneReleaseAgent(api::schema::PaneReleaseAgentParams {
++            pane_id: public_pane_id,
++            source: source.into(),
++            agent: agent.into(),
++            seq,
++        }),
++    );
++}
++
++#[test]
++fn recovery_durability_api_official_release_after_exit_saves_tombstone() {
++    let (mut server, pane_id, terminal_id) = retained_release_server();
++    retained_release_passive_exit(&mut server, pane_id);
++    let before = server.app.state.terminals[&terminal_id].recovery.record().unwrap().clone();
++    let terminal = &server.app.state.terminals[&terminal_id];
++    assert!(terminal.hook_authority.is_none());
++    assert!(terminal.persisted_agent_session.is_none());
++    assert!(terminal.effective_agent_label().is_none());
++    assert!(before.automatic);
++    server.app.state.session_dirty = false;
++
++    retained_release_api(&mut server, pane_id, "herdr:antigravity_cli", "agy", Some(11));
++
++    let terminal = &server.app.state.terminals[&terminal_id];
++    let after = terminal.recovery.record().unwrap();
++    assert!(terminal.recovery.blocked());
++    assert!(!after.automatic);
++    assert_eq!(after.identity, before.identity);
++    assert_eq!(after.resume, before.resume);
++    assert!(terminal.launch_argv.is_none());
++    assert!(terminal.effective_agent_label().is_none());
++    assert!(server.app.state.session_dirty);
++    let snapshot = crate::persist::capture(
++        &server.app.state.workspaces,
++        &server.app.state.terminals,
++        &server.app.terminal_runtimes,
++        server.app.state.active,
++        server.app.state.selected,
++    );
++    let json = serde_json::to_string(&snapshot).unwrap();
++    let saved: crate::persist::SessionSnapshot = serde_json::from_str(&json).unwrap();
++    let pane = &saved.workspaces[0].tabs[0].panes[&pane_id.raw()];
++    let recovery = pane.agent_recovery.as_ref().unwrap();
++    assert!(!recovery.automatic);
++    assert_eq!(recovery.session.as_ref().unwrap().value, "simulated-retained");
++    assert!(pane.agent_session.is_none());
++    assert!(pane.agent_resume.is_none());
++    assert!(pane.launch_argv.is_none());
++}
++
++#[test]
++fn recovery_durability_api_retained_release_rejects_foreign_and_stale_reports() {
++    let (mut server, pane_id, terminal_id) = retained_release_server();
++    retained_release_passive_exit(&mut server, pane_id);
++    let before = server.app.state.terminals[&terminal_id].recovery.clone();
++    server.app.state.session_dirty = false;
++    for (source, agent, seq) in [
++        ("foreign", "agy", Some(11)),
++        ("herdr:codex", "codex", Some(11)),
++        ("herdr:antigravity_cli", "agy", Some(9)),
++        ("herdr:antigravity_cli", "agy", Some(10)),
++        ("herdr:antigravity_cli", "agy", None),
++    ] {
++        retained_release_api(&mut server, pane_id, source, agent, seq);
++        assert_eq!(server.app.state.terminals[&terminal_id].recovery, before);
++        assert!(!server.app.state.session_dirty);
++    }
++    // Rejections must not consume the first valid sequence or lose the locator.
++    retained_release_api(&mut server, pane_id, "herdr:antigravity_cli", "agy", Some(11));
++    assert!(server.app.state.terminals[&terminal_id].recovery.blocked());
++}
++
++#[test]
++fn recovery_durability_api_official_release_preserves_live_identity_and_intent() {
++    let (mut server, pane_id, terminal_id) = retained_release_server();
++    let terminal = &server.app.state.terminals[&terminal_id];
++    let before = terminal.recovery.clone();
++    let before_session = terminal.persisted_agent_session.clone();
++    let before_resume = terminal.reported_resume().cloned();
++    let before_agent = terminal.effective_agent_label().map(str::to_string);
++    assert_eq!(before_agent.as_deref(), Some("agy"));
++    server.app.state.session_dirty = false;
++
++    retained_release_api(&mut server, pane_id, "herdr:antigravity_cli", "agy", Some(11));
++
++    let terminal = &server.app.state.terminals[&terminal_id];
++    assert_eq!(terminal.recovery, before);
++    assert_eq!(terminal.persisted_agent_session, before_session);
++    assert_eq!(terminal.reported_resume(), before_resume.as_ref());
++    assert_eq!(terminal.effective_agent_label(), before_agent.as_deref());
++    assert!(!server.app.state.session_dirty);
++}
++
++#[test]
++fn recovery_durability_appstate_retained_release_marks_session_dirty() {
++    let (mut server, pane_id, terminal_id) = retained_release_server();
++    retained_release_passive_exit(&mut server, pane_id);
++    server.app.state.session_dirty = false;
++    server.app.state.handle_app_event(AppEvent::HookAgentReleased {
++        pane_id,
++        source: "herdr:antigravity_cli".into(),
++        agent_label: "agy".into(),
++        known_agent: Some(crate::detect::Agent::Antigravity),
++        seq: Some(11),
++    });
++    assert!(server.app.state.terminals[&terminal_id].recovery.blocked());
++    assert!(server.app.state.session_dirty);
++}
++
++#[test]
++fn recovery_durability_api_reports_bind_original_sid_and_reject_unbound_late_argv() {
++    let (writer,_control_rx,_render_rx)=test_client_writer();
++    let (mut server,pane_id)=completion_guard_server(writer);
++    let public_pane_id=server.app.public_pane_id(0,pane_id).unwrap();
++    let terminal_id=server.app.state.workspaces[0].tabs[0].panes[&pane_id].attached_terminal_id.clone();
++    server.handle_internal_event_with_forwarding(AppEvent::AgentProcessDetected {
++        pane_id,agent:crate::detect::Agent::Antigravity,observed_at:Instant::now(),
++    });
++    let report=|sid:Option<&str>,seq,argv:Option<Vec<&str>>| {
++        api::schema::Method::PaneReportAgentSession(api::schema::PaneReportAgentSessionParams {
++            pane_id:public_pane_id.clone(),source:"herdr:antigravity_cli".into(),agent:"agy".into(),
++            seq:Some(seq),agent_session_id:sid.map(String::from),agent_session_path:None,
++            session_start_source:Some("startup".into()),
++            resume_argv:argv.map(|v|v.into_iter().map(String::from).collect()),
++        })
++    };
++    completion_guard_api_report(&mut server,report(Some("simulated-a"),1,Some(vec!["agy","--conversation","simulated-a"])));
++    let original=server.app.state.terminals[&terminal_id].recovery.record().unwrap().clone();
++    assert_eq!(original.identity.session_ref.value,"simulated-a");
++    assert_eq!(original.resume.as_ref().unwrap().argv[2],"simulated-a");
++    // Use the existing accepted-identity setter to model an already adopted B;
++    // the late A argv still travels through the actual public request handler.
++    server.app.state.terminals.get_mut(&terminal_id).unwrap().set_persisted_agent_session(
++        crate::agent_resume::PersistedAgentSession { source:"herdr:antigravity_cli".into(),agent:"agy".into(),
++            session_ref:crate::agent_resume::AgentSessionRef::id("simulated-b").unwrap() });
++    let (respond_to,response_rx)=std::sync::mpsc::channel();
++    server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
++        request:api::schema::Request { id:"late-unbound-a".into(),method:report(None,2,Some(vec!["agy","--conversation","simulated-a"])) },
++        respond_to,response_write_complete:None,
++    });
++    let response=response_rx.recv_timeout(Duration::from_millis(100)).unwrap();
++    assert!(response.contains("resume_not_accepted"),"{response}");
++    let r=server.app.state.terminals[&terminal_id].recovery.record().unwrap();
++    assert_eq!(r.identity.session_ref.value,"simulated-b"); assert!(r.resume.is_none());
++}
+--- a/src/server/headless/tests/mod.rs
++++ b/src/server/headless/tests/mod.rs
+@@ -8333,3 +8333,5 @@
+         bypass_lines.join("\n  ")
+     );
+ }
++
++mod agent_recovery;
+--- a/src/terminal/mod.rs
++++ b/src/terminal/mod.rs
+@@ -3,6 +3,7 @@
+ mod runtime;
+ mod runtime_registry;
+ pub mod state;
++pub mod recovery;
+ mod title;
+ 
+ pub(crate) use history_read::{merge_scrolled_up, snapshot_text, ScreenSnapshot, UpwardMerge};
+--- /dev/null
++++ b/src/terminal/recovery.rs
+@@ -0,0 +1,165 @@
++//! Durable recovery intent, separate from current terminal authority.
++//! This module is dependency-free so its exact transition rules can be tested
++//! with rustc --test without building the terminal renderer or native agents.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct RecoveryRecord<I, R> {
++    pub identity: I,
++    pub resume: Option<R>,
++    pub automatic: bool,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct RecoveryState<I, R> {
++    record: Option<RecoveryRecord<I, R>>,
++    revision: u64,
++    epoch: u64,
++    blocked: bool,
++}
++
++impl<I: Clone + Eq, R: Clone + Eq> Default for RecoveryState<I, R> {
++    fn default() -> Self { Self { record: None, revision: 0, epoch: 0, blocked: false } }
++}
++
++impl<I: Clone + Eq, R: Clone + Eq> RecoveryState<I, R> {
++    pub fn record(&self) -> Option<&RecoveryRecord<I, R>> { self.record.as_ref() }
++    pub fn revision(&self) -> u64 { self.revision }
++    pub fn epoch(&self) -> u64 { self.epoch }
++    pub fn blocked(&self) -> bool { self.blocked }
++    /// In-memory terminal generation, never a claim about process identity.
++    /// Existing active-state gates still authenticate the reporter.
++    pub fn end_generation(&mut self) {
++        self.epoch = self.epoch.wrapping_add(1);
++        self.revision = self.revision.wrapping_add(1);
++    }
++
++    /// Called only after the existing native report/sequence gates accept.
++    /// A different identity or explicit rearm starts without the old argv.
++    pub fn accept_session(&mut self, identity: I) -> bool {
++        if self.record.as_ref().is_some_and(|r| r.identity == identity && r.automatic) {
++            return false;
++        }
++        self.end_generation();
++        self.blocked = false;
++        self.record = Some(RecoveryRecord { identity, resume: None, automatic: true });
++        self.revision = self.revision.wrapping_add(1);
++        true
++    }
++
++    /// Bind argv to the full accepted source/agent/session identity, not agent only.
++    pub fn binding_matches(&self, identity: &I, epoch: u64) -> bool {
++        !self.blocked && self.epoch == epoch
++            && self.record.as_ref().is_some_and(|r| r.automatic && &r.identity == identity)
++    }
++
++    pub fn bind_resume(&mut self, identity: &I, epoch: u64, resume: R) -> bool {
++        if !self.binding_matches(identity, epoch) { return false; }
++        let Some(record) = self.record.as_mut() else { return false; };
++        if !record.automatic || &record.identity != identity { return false; }
++        if record.resume.as_ref() == Some(&resume) { return false; }
++        record.resume = Some(resume);
++        self.revision = self.revision.wrapping_add(1);
++        true
++    }
++
++    /// Explicit release or a different occupant revokes automatic reuse.
++    /// Retain the record as a recovery locator, never as current authority.
++    pub fn invalidate(&mut self) -> bool {
++        let changed = !self.blocked || self.record.as_ref().is_some_and(|r| r.automatic);
++        self.blocked = true;
++        if let Some(record) = self.record.as_mut() { record.automatic = false; }
++        if changed { self.end_generation(); }
++        changed
++    }
++
++    /// Import a saved intent into a fresh in-memory generation.
++    /// A present but invalid snapshot is a durable block, never legacy absence.
++    pub fn restore(&mut self, record: Option<RecoveryRecord<I, R>>) {
++        self.blocked = record.as_ref().map_or(true, |r| !r.automatic);
++        self.record = record;
++        self.end_generation();
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    type Identity = (&'static str, &'static str, &'static str);
++    type State = RecoveryState<Identity, Vec<&'static str>>;
++    const A: Identity = ("herdr:antigravity_cli", "agy", "fixture-a");
++    const B: Identity = ("herdr:antigravity_cli", "agy", "fixture-b");
++    fn bound() -> State {
++        let mut state = State::default();
++        assert!(state.accept_session(A));
++        assert!(state.bind_resume(&A, state.epoch(), vec!["env", "private-v2-helper", "fixture-a"]));
++        state
++    }
++    #[test]
++    fn passive_departure_keeps_only_separate_recovery_intent() {
++        let state = bound();
++        let saved = state.record().unwrap().clone();
++        let mut restored = State::default();
++        restored.restore(Some(saved));
++        assert_eq!(state.record(), restored.record());
++        assert!(restored.record().unwrap().automatic);
++    }
++    #[test]
++    fn same_accepted_sid_keeps_bound_argv() {
++        let mut state = bound(); let before = state.clone();
++        assert!(!state.accept_session(A)); assert_eq!(state, before);
++    }
++    #[test]
++    fn clear_to_new_sid_cannot_reuse_old_argv() {
++        let mut state = bound(); assert!(state.accept_session(B));
++        assert_eq!(state.record().unwrap().identity, B);
++        assert!(state.record().unwrap().resume.is_none());
++        assert!(!state.bind_resume(&A, state.epoch(), vec!["agy", "--conversation", "fixture-a"]));
++    }
++    #[test]
++    fn explicit_release_revokes_auto_and_old_resume_cannot_rearm() {
++        let mut state = bound(); assert!(state.invalidate());
++        assert!(!state.record().unwrap().automatic);
++        assert!(!state.bind_resume(&A, state.epoch(), vec!["agy", "--conversation", "fixture-a"]));
++        assert!(!state.record().unwrap().automatic);
++    }
++    #[test]
++    fn accepted_new_generation_rearms_without_stale_resume() {
++        let mut state = bound(); state.invalidate(); assert!(state.accept_session(A));
++        assert!(state.record().unwrap().automatic);
++        assert!(state.record().unwrap().resume.is_none());
++    }
++    #[test]
++    fn full_identity_includes_source_and_agent() {
++        let mut state = bound();
++        assert!(!state.bind_resume(&("custom:wrapper", "agy", "fixture-a"), state.epoch(), vec!["wrong"])) ;
++        assert!(!state.bind_resume(&("herdr:codex", "codex", "fixture-a"), state.epoch(), vec!["wrong"])) ;
++        assert_eq!(state.record().unwrap().identity, A);
++    }
++    #[test]
++    fn no_implicit_legacy_upgrade_or_report_without_identity() {
++        let mut state = State::default();
++        assert!(!state.bind_resume(&A, state.epoch(), vec!["agy", "--continue"]));
++        assert!(state.record().is_none());
++    }
++    #[test]
++    fn late_same_identity_from_previous_runtime_epoch_is_rejected() {
++        let mut state = bound(); let epoch = state.epoch();
++        state.end_generation();
++        assert!(state.record().unwrap().automatic);
++        assert!(!state.bind_resume(&A, epoch, vec!["stale"]));
++    }
++    #[test]
++    fn invalid_snapshot_stays_blocked_across_repeated_restore() {
++        let mut state = State::default(); state.restore(None);
++        assert!(state.blocked());
++        let mut second = State::default(); second.restore(state.record().cloned());
++        assert!(second.blocked());
++        assert!(!second.bind_resume(&A, second.epoch(), vec!["old"]));
++    }
++    #[test]
++    fn tombstone_survives_save_restore() {
++        let mut state = bound(); state.invalidate();
++        let mut restored = State::default(); restored.restore(state.record().cloned());
++        assert!(!restored.record().unwrap().automatic);
++        assert_eq!(state.record(), restored.record());
++    }
++}
+--- a/src/terminal/state.rs
++++ b/src/terminal/state.rs
+@@ -139,6 +139,11 @@
+     pub persisted_agent_session: Option<crate::agent_resume::PersistedAgentSession>,
+     reported_resume: Option<crate::agent_resume::ReportedAgentResume>,
+     reported_resume_revision: u64,
++    recovery_last_seq: Option<u64>,
++    pub recovery: super::recovery::RecoveryState<
++        crate::agent_resume::PersistedAgentSession,
++        crate::agent_resume::ReportedAgentResume,
++    >,
+     pub terminal_title: Option<String>,
+     pub manual_label: Option<String>,
+     pub agent_name: Option<String>,
+@@ -179,6 +184,8 @@
+             persisted_agent_session: None,
+             reported_resume: None,
+             reported_resume_revision: 0,
++            recovery: Default::default(),
++            recovery_last_seq: None,
+             terminal_title: None,
+             manual_label: None,
+             agent_name: None,
+@@ -457,6 +464,9 @@
+             self.recent_agent_process_exit = None;
+         }
+         if process_exited {
++            if !newer_custom_authority && self.recovery.record().is_some_and(|r| {
++                crate::detect::parse_agent_label(&r.identity.agent) == agent
++            }) { self.recovery.end_generation(); }
+             let mut reset_sources = Vec::new();
+             let mut stale_sessions = Vec::new();
+             for (source, suppressed) in &mut self.suppressed_full_lifecycle_hook_reports {
+@@ -800,6 +810,7 @@
+             reported_at: now,
+             session_ref,
+         });
++        self.remember_recovery_session();
+         let current_session = self.current_session_identity_for_persistence();
+         let effective_state_change = self.recompute_effective_state(
+             previous_agent_label,
+@@ -1327,6 +1338,88 @@
+         })
+     }
+ 
++    fn recovery_identity(&self) -> Option<crate::agent_resume::PersistedAgentSession> {
++        self.current_session_identity_for_persistence().map(|(source, agent, kind, value)| {
++            crate::agent_resume::PersistedAgentSession {
++                source, agent, session_ref: crate::agent_resume::AgentSessionRef { kind, value },
++            }
++        })
++    }
++
++    /// Called only after an original report/sequence gate accepted this identity.
++    fn remember_recovery_session(&mut self) {
++        if let Some(identity) = self.recovery_identity() {
++            self.recovery_last_seq = self.hook_report_sequences.get(&identity.source).copied();
++            if self.recovery.accept_session(identity) {
++                // A new SID or explicit new generation cannot inherit old argv.
++                self.set_reported_resume(None);
++            }
++        } else if self.recovery.record().is_some() {
++            self.recovery.invalidate();
++        }
++    }
++
++    pub fn recovery_resume_binding(
++        &self, source: &str, agent: &str,
++        session_ref: &crate::agent_resume::AgentSessionRef,
++    ) -> Option<u64> {
++        let identity = crate::agent_resume::PersistedAgentSession {
++            source: source.into(), agent: agent.into(), session_ref: session_ref.clone(),
++        };
++        (self.recovery_identity().as_ref() == Some(&identity)
++            && self.recovery.binding_matches(&identity, self.recovery.epoch()))
++            .then_some(self.recovery.epoch())
++    }
++
++    /// API callers carry the SID from the original report, never infer it here.
++    pub fn record_bound_reported_resume(
++        &mut self, terminal_id: &TerminalId, epoch: u64,
++        identity: crate::agent_resume::PersistedAgentSession,
++        seq: Option<u64>, argv: Vec<String>,
++    ) -> bool {
++        if &self.id != terminal_id
++            || self.recovery_identity().as_ref() != Some(&identity)
++            || !self.recovery.binding_matches(&identity, epoch)
++            || !self.can_record_reported_resume(&identity.source, &identity.agent)
++            || self.hook_report_sequences.get(&identity.source)
++                .is_some_and(|last| seq.is_none_or(|seq| seq < *last))
++        { return false; }
++        let resume = crate::agent_resume::ReportedAgentResume {
++            source: identity.source.clone(), agent: identity.agent.clone(), argv: argv.clone(),
++        };
++        let changed = self.recovery.bind_resume(&identity, epoch, resume);
++        self.store_reported_resume(&identity.source, &identity.agent, seq, argv) || changed
++    }
++
++    fn recovery_owner_matches(&self, source: &str, agent: Option<&str>) -> bool {
++        self.recovery.record().is_some_and(|r| r.automatic
++            && r.identity.source == source && agent.is_none_or(|a| r.identity.agent == a))
++    }
++
++    fn retained_recovery_report_is_newer(&self, seq: Option<u64>) -> bool {
++        match (seq, self.recovery_last_seq) {
++            (Some(seq), Some(last)) => seq > last,
++            (_, None) => true,
++            (None, Some(_)) => false,
++        }
++    }
++
++    /// Handoff state is live authority; a saved different locator cannot override it.
++    pub fn reconcile_restored_recovery(&mut self) {
++        if self.recovery.blocked() {
++            self.set_reported_resume(None);
++            self.launch_argv = None;
++            return;
++        }
++        if let (Some(current), Some(saved)) = (self.recovery_identity(), self.recovery.record()) {
++            if current != saved.identity {
++                self.recovery.accept_session(current);
++                self.set_reported_resume(None);
++                self.launch_argv = None;
++            }
++        }
++    }
++
+     fn current_session_owner_conflicts(&self, source: &str, agent_label: &str) -> bool {
+         self.current_session_identity_for_persistence().is_some_and(
+             |(current_source, current_agent, _, _)| {
+@@ -1438,13 +1531,14 @@
+         session: crate::agent_resume::PersistedAgentSession,
+     ) {
+         self.persisted_agent_session = Some(session);
++        self.remember_recovery_session();
+     }
+ 
+     pub fn set_managed_agent_launch_session(
+         &mut self,
+         session: crate::agent_resume::PersistedAgentSession,
+     ) {
+-        self.persisted_agent_session = Some(session.clone());
++        self.set_persisted_agent_session(session.clone());
+         self.managed_agent_launch_session = Some(session);
+     }
+ 
+@@ -1677,6 +1771,7 @@
+             self.managed_agent_launch_session = None;
+         }
+         self.persisted_agent_session = Some(persisted_session);
++        self.remember_recovery_session();
+         let current_session = self.current_session_identity_for_persistence();
+         if previous_session.is_some() && previous_session != current_session {
+             // Rebinding can expose a cached Working screen; only a fresh report ends acquisition.
+@@ -1764,16 +1859,22 @@
+         source: Option<&str>,
+         seq: Option<u64>,
+     ) -> Option<TerminalStateMutation> {
++        let retained_matches = self.hook_authority.is_none()
++            && self.persisted_agent_session.is_none()
++            && self.recovery.record().is_some_and(|r| r.automatic
++                && source.is_none_or(|source| r.identity.source == source));
++        if retained_matches && !self.retained_recovery_report_is_newer(seq) { return None; }
+         let sequence_source = source.map(str::to_string).or_else(|| {
+             self.hook_authority
+                 .as_ref()
+                 .map(|authority| authority.source.clone())
++                .or_else(|| retained_matches.then(|| self.recovery.record().unwrap().identity.source.clone()))
+         });
+         let should_clear = self
+             .hook_authority
+             .as_ref()
+             .is_some_and(|authority| source.is_none_or(|source| authority.source == source));
+-        if !should_clear {
++        if !should_clear && !retained_matches {
+             return None;
+         }
+         if let Some(source) = sequence_source.as_deref() {
+@@ -1791,6 +1892,8 @@
+         self.suppress_current_full_lifecycle_hook_authority(
+             FullLifecycleHookSuppressionReason::HookClear,
+         );
++        if self.recovery.record().is_some() { self.recovery.invalidate(); }
++        self.launch_argv = None;
+         if let Some(authority) = self.hook_authority.take() {
+             self.forget_reported_resume_of(&authority.source, &authority.agent_label);
+         }
+@@ -1808,6 +1911,25 @@
+         })
+     }
+ 
++    /// Official releases cannot override a live process-owned identity. Once the
++    /// detector has observed its exit, the same owner may revoke retained intent.
++    pub fn can_release_retained_agent_recovery(
++        &self,
++        source: &str,
++        agent_label: &str,
++        seq: Option<u64>,
++    ) -> bool {
++        self.hook_authority.is_none()
++            && self.persisted_agent_session.is_none()
++            && self.effective_agent_label().is_none()
++            && self.recovery_owner_matches(source, Some(agent_label))
++            && self.recent_agent_process_exit.is_some_and(|exit| {
++                crate::detect::parse_agent_label(agent_label) == Some(exit.agent)
++            })
++            && self.retained_recovery_report_is_newer(seq)
++            && self.hook_report_is_newer(source, seq)
++    }
++
+     pub fn release_agent_with_mutation(
+         &mut self,
+         source: &str,
+@@ -1822,7 +1944,12 @@
+ 
+         let matches_current_agent = self.effective_agent_label() == Some(agent_label);
+         let matches_persisted_session = self.persisted_agent_session_matches(source, agent_label);
+-        if !matches_current_agent && !matches_persisted_session {
++        let retained_matches = self.hook_authority.is_none()
++            && self.persisted_agent_session.is_none()
++            && self.effective_agent_label().is_none()
++            && self.recovery_owner_matches(source, Some(agent_label));
++        if retained_matches && !self.retained_recovery_report_is_newer(seq) { return None; }
++        if !matches_current_agent && !matches_persisted_session && !retained_matches {
+             return None;
+         }
+         if !self.accept_hook_report(source, seq) {
+@@ -1854,6 +1981,10 @@
+             self.fallback_visible_blocker = false;
+             self.fallback_observed_at = None;
+             self.clear_agent_name();
++        }
++        if self.recovery_owner_matches(source, Some(agent_label)) {
++            self.recovery.invalidate();
++            self.launch_argv = None;
+         }
+         self.hook_authority = None;
+         self.forget_reported_resume_of(source, agent_label);
+@@ -1897,6 +2028,7 @@
+         let previous_state = self.state;
+         let previous_presentation = self.effective_presentation_for_state_at(previous_state, now);
+         let previous_session = self.current_session_identity_for_persistence();
++        self.recovery.end_generation();
+         self.hook_authority = None;
+         self.set_reported_resume(None);
+         self.detected_agent = None;
+@@ -1960,6 +2092,13 @@
+         seq: Option<u64>,
+         argv: Vec<String>,
+     ) -> bool {
++        // Unbound legacy/custom reporters cannot attach argv to a known SID.
++        if self.recovery.record().is_some() || self.recovery.blocked() { return false; }
++        self.store_reported_resume(source, agent_label, seq, argv)
++    }
++
++    fn store_reported_resume(&mut self, source: &str, agent_label: &str,
++                             seq: Option<u64>, argv: Vec<String>) -> bool {
+         if !self.can_record_reported_resume(source, agent_label) {
+             return false;
+         }
+@@ -1994,6 +2133,13 @@
+ 
+     /// Drops the command once a different agent holds the pane.
+     pub fn reconcile_reported_resume(&mut self) {
++        let other_recovery_owner = self.recovery.record().is_some_and(|record| {
++            self.detected_agent.is_some_and(|agent| crate::detect::agent_label(agent) != record.identity.agent)
++                || self.hook_authority.as_ref().is_some_and(|authority| {
++                    authority.source != record.identity.source || authority.agent_label != record.identity.agent
++                })
++        });
++        if other_recovery_owner { self.recovery.invalidate(); self.launch_argv = None; }
+         let Some(resume) = self.reported_resume.as_ref() else {
+             return;
+         };
+@@ -2325,6 +2471,7 @@
+     }
+ 
+     pub fn clear_agent_runtime_identity_after_respawn(&mut self) {
++        self.recovery.end_generation();
+         self.detected_agent = None;
+         self.fallback_state = AgentState::Unknown;
+         self.fallback_visible_blocker = false;
+@@ -2454,6 +2601,68 @@
+     use super::*;
+     use crate::detect::AgentDetection;
+ 
++
++    fn durability_identity(sid: &str) -> crate::agent_resume::PersistedAgentSession {
++        crate::agent_resume::PersistedAgentSession {
++            source: "herdr:antigravity_cli".into(), agent: "agy".into(),
++            session_ref: crate::agent_resume::AgentSessionRef::id(sid).unwrap(),
++        }
++    }
++    fn durability_bound_terminal() -> TerminalState {
++        let mut t=test_terminal();
++        t.set_detected_state(Some(Agent::Antigravity), AgentState::Idle);
++        let i=durability_identity("simulated-a");
++        assert!(t.set_agent_session_ref(i.source.clone(), i.agent.clone(), Some(i.session_ref.clone()), Some(10)).is_some());
++        let epoch=t.recovery_resume_binding(&i.source,&i.agent,&i.session_ref).unwrap();
++        assert!(t.record_bound_reported_resume(&t.id.clone(),epoch,i,Some(10),vec!["agy".into(),"--conversation".into(),"simulated-a".into()]));
++        t
++    }
++    fn durability_passive_exit(t: &mut TerminalState) {
++        t.set_detected_state_with_screen_signals_at(Some(Agent::Antigravity),AgentState::Idle,
++            false,false,false,true,Instant::now());
++    }
++    #[test]
++    fn recovery_durability_passive_exit_and_respawn_preserve_only_intent() {
++        let mut t=durability_bound_terminal(); let old_epoch=t.recovery.epoch();
++        let old=t.recovery.record().cloned();
++        durability_passive_exit(&mut t);
++        assert!(t.persisted_agent_session.is_none()); assert!(t.reported_resume().is_none());
++        assert_eq!(t.recovery.record().cloned(),old); assert_ne!(t.recovery.epoch(),old_epoch);
++        t.clear_agent_runtime_identity_after_respawn();
++        assert_eq!(t.recovery.record().cloned(),old); assert!(!t.recovery.blocked());
++    }
++    #[test]
++    fn recovery_durability_clear_after_passive_exit_checks_source_and_sequence() {
++        let mut t=durability_bound_terminal(); durability_passive_exit(&mut t);
++        assert!(t.clear_hook_authority_with_mutation(Some("foreign"),Some(11)).is_none());
++        assert!(t.clear_hook_authority_with_mutation(Some("herdr:antigravity_cli"),Some(10)).is_none());
++        assert!(t.recovery.record().unwrap().automatic);
++        assert!(t.clear_hook_authority_with_mutation(Some("herdr:antigravity_cli"),Some(11)).is_some());
++        assert!(t.recovery.blocked()); assert!(!t.recovery.record().unwrap().automatic);
++    }
++    #[test]
++    fn recovery_durability_release_after_passive_exit_cannot_silently_leave_auto() {
++        let mut t=durability_bound_terminal(); durability_passive_exit(&mut t);
++        assert!(t.release_agent_with_mutation("foreign","agy",Some(11)).is_none());
++        assert!(t.release_agent_with_mutation("herdr:antigravity_cli","agy",Some(10)).is_none());
++        assert!(t.release_agent_with_mutation("herdr:antigravity_cli","agy",Some(11)).is_some());
++        assert!(t.recovery.blocked());
++    }
++    #[test]
++    fn recovery_durability_delayed_bound_and_unbound_argv_never_attach_to_new_sid() {
++        let mut t=durability_bound_terminal(); let old_epoch=t.recovery.epoch();
++        let old_id=t.id.clone(); let old=durability_identity("simulated-a");
++        let new=durability_identity("simulated-b");
++        t.set_persisted_agent_session(new.clone());
++        assert!(t.recovery_resume_binding(&old.source,&old.agent,&old.session_ref).is_none());
++        assert!(!t.record_bound_reported_resume(&old_id,old_epoch,old,Some(11),vec!["agy".into(),"--old".into()]));
++        assert!(!t.record_reported_resume(&new.source,&new.agent,Some(12),vec!["agy".into(),"--old".into()]));
++        assert!(t.reported_resume().is_none()); assert!(t.recovery.record().unwrap().resume.is_none());
++        let epoch=t.recovery.epoch();
++        assert!(!t.record_bound_reported_resume(&TerminalId::alloc(),epoch,new.clone(),Some(12),vec!["agy".into()]));
++        t.recovery.end_generation();
++        assert!(!t.record_bound_reported_resume(&old_id,epoch,new,Some(12),vec!["agy".into()]));
++    }
+     fn test_terminal() -> TerminalState {
+         TerminalState::new(TerminalId::alloc(), "/tmp".into())
+     }
