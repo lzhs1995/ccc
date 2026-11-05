@@ -1,0 +1,36 @@
+{
+  "schema": "ccc-compact-recovery-build-v1",
+  "status": "PENDING_IMPLEMENTER_FREEZE_DO_NOT_DISPATCH",
+  "upstream_commit": "6aaac694803004a63c6f393d153c96d22521a6b9",
+  "upstream_tree": "d0caeb3c076fbeade281c18295fada090c52cf8f",
+  "owner_review": "OWNER-REVIEW.json",
+  "owner_review_sha256": null,
+  "overlay_patch": "native-compact-recovery.patch",
+  "overlay_patch_sha256": null,
+  "overlay": {},
+  "full_release_source_manifest_sha256": null,
+  "full_test_source_manifest_sha256": null,
+  "release_cargo_manifest_sha256": null,
+  "release_cargo_lock_sha256": null,
+  "test_cargo_manifest_sha256": null,
+  "test_cargo_lock_sha256": null,
+  "native_cargo_manifest_sha256": null,
+  "native_cargo_lock_sha256": null,
+  "required_cases": [],
+  "schema_export_argv": [
+    "app-server",
+    "generate-json-schema",
+    "--experimental"
+  ],
+  "generated_schema_files": {},
+  "historical_test_passes_reused": false,
+  "production_installed": false,
+  "pending_owner_inputs": [
+    "Complete overlay frozen on V187 foreground base, including TUI transport/receipt and native endpoint",
+    "New core/api/tui/protocol/goal/native_authority exact test names and binary IDs; no zero-test selectors; Goal lib currently test=false so use a real enabled test target",
+    "Release/test Cargo.toml and Cargo.lock exact hashes with no external dependency changes",
+    "Complete source manifests for release and explicit 0.0.0 test-version graph",
+    "Generated schema file hashes frozen from reviewed candidate schema fixtures; do not edit old fixtures to hide incompatibility",
+    "Independent source review hash; immutable final patch and source member pins"
+  ]
+}
