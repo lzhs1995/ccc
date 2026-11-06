@@ -1,0 +1,57 @@
+{
+  "status": "FROZEN_FOR_FIRST_NATIVE_EXECUTION_NOT_YET_RUN",
+  "upstream_commit": "2e109a1739d320fe36220afb3e7775b59c1acd47",
+  "ghostty_commit": "ef4f1570d62117ebc51e3b0f07ad4f34032267b6",
+  "ghostty_archive_sha256": "ae38ade4e1c7e4d6ce21b8d7c16e9a95c346005848b4e2daa2afb6f56084c024",
+  "tests_patch_sha256": "e0c34b67a4877e9e4e0a0d8f9f198a843536dc2343383123f8b0170047bf31a5",
+  "fix_patch_sha256": "940e44bcd4a744edd0665297a64daf751f6cc5367544653b070e0d634ac8243f",
+  "selector": "cmuxTests/HerdrStartupRestoreRegressionTests",
+  "expected_red_test_ids": [
+    "HerdrStartupRestoreRegressionTests/emptyScanBeforeStartupPreservesOuterBindingInBothReadAndSave()",
+    "HerdrStartupRestoreRegressionTests/backgroundHerdrWaitsForTopologyCommitWithoutAgentLifecycle()",
+    "HerdrStartupRestoreRegressionTests/freshProcessReadClosesGapBeforeLaterEmptyScan()",
+    "HerdrStartupRestoreRegressionTests/initialShellActivityDoesNotProveHerdrStartupFailed()",
+    "HerdrStartupRestoreRegressionTests/acceptedExplicitInputCancelsPendingAutomaticIntent()",
+    "HerdrStartupRestoreRegressionTests/manualOuterIntentSurvivesAnotherRestoreWithoutInnerAutoResume()"
+  ],
+  "required_green_test_ids": [
+    "HerdrStartupRestoreRegressionTests/emptyScanBeforeStartupPreservesOuterBindingInBothReadAndSave()",
+    "HerdrStartupRestoreRegressionTests/backgroundHerdrWaitsForTopologyCommitWithoutAgentLifecycle()",
+    "HerdrStartupRestoreRegressionTests/observedHerdrClosesGapAndLaterExitIsNotPreserved()",
+    "HerdrStartupRestoreRegressionTests/freshProcessReadClosesGapBeforeLaterEmptyScan()",
+    "HerdrStartupRestoreRegressionTests/newDetectedGenerationReplacesPendingOriginal()",
+    "HerdrStartupRestoreRegressionTests/explicitClearCannotBeResurrectedByPendingOriginal()",
+    "HerdrStartupRestoreRegressionTests/initialShellActivityDoesNotProveHerdrStartupFailed()",
+    "HerdrStartupRestoreRegressionTests/acceptedExplicitInputCancelsPendingAutomaticIntent()",
+    "HerdrStartupRestoreRegressionTests/manualOuterIntentSurvivesAnotherRestoreWithoutInnerAutoResume()",
+    "HerdrStartupRestoreRegressionTests/oldExplicitInputCallbackCannotRetireReplacementBinding()",
+    "HerdrStartupRestoreRegressionTests/manualAndUntrustedImportsNeverAcquireAutomaticStartupAdmission()"
+  ],
+  "expected_red_assertion_text": [
+    "HERDR_PENDING_READ_MUST_KEEP_OUTER_BINDING",
+    "HERDR_PENDING_SAVE_MUST_KEEP_OUTER_BINDING",
+    "HERDR_STARTUP_REQUIRES_TOPOLOGY_ADMISSION"
+  ],
+  "boundary_test_ids": [
+    "HerdrStartupRestoreBoundaryTests/deadlineCancelsBeforeTopologyCommitAndKeepsManualOuter()",
+    "HerdrStartupRestoreBoundaryTests/readsDoNotExtendFixedDeadline()",
+    "HerdrStartupRestoreBoundaryTests/staleTimerCannotRetireNewPendingGeneration()",
+    "HerdrStartupRestoreBoundaryTests/unavailableSaveDowngradeCancelsPendingAndStaysManual()",
+    "HerdrStartupRestoreBoundaryTests/observedProcessWinsAtDeadlineAndOldTimerCannotDowngradeIt()",
+    "HerdrStartupRestoreBoundaryTests/freshProcessReadAtDeadlineCommitsObservedBindingAndLaterExit()"
+  ],
+  "existing_binding_test_ids": [
+    "HerdrResumeBindingTests/testNamedSessionAttachProducesAutomaticProcessDetectedBinding()",
+    "HerdrResumeBindingTests/testDefaultSessionAttachBindsWithoutCheckpoint()",
+    "HerdrResumeBindingTests/testClientsInsideAHerdrPaneYieldNoBinding()",
+    "HerdrResumeBindingTests/testProcessScanPrefersTheSurfaceClientOverAProcessInsideAHerdrPane()"
+  ],
+  "package_test_display_names": [
+    "Restore admission composes with relaunch spawn pacing",
+    "Explicit input cancels a deferred agent resume before admission",
+    "Cancelling deferred admission drops the resume command",
+    "Expired restore input stays cancelled across topology commit",
+    "Cancellation after admission removes unsent prompt input",
+    "A stale cancellation cannot suppress replacement runtime input"
+  ]
+}

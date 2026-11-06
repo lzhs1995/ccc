@@ -1,0 +1,149 @@
+# Isolated native regression validation; never installs or restarts a user client.
+name: Nested restore native red-green
+on:
+  push:
+    branches: ['ccc/nested-native-red-green-20261106-r3']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: nested-native-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  regression:
+    runs-on: macos-26
+    timeout-minutes: 120
+    env:
+      CMUX_DEV_BACKEND_MODE: local
+      CMUX_SKIP_ZIG_BUILD: "1"
+      CMUX_GHOSTTYKIT_PREPROVISIONED: "1"
+      CMUX_CI_REQUIRED_MACOS_SDK_MAJOR: "26"
+      CMUX_CI_APP_HOST_ISOLATION_REQUIRED: "1"
+      CMUX_APP_HOST_SHARD: "1"
+      CMUX_APP_HOST_XCODEBUILD_ATTEMPTS: "1"
+      CMUX_XCODEBUILD_NONINTERACTIVE_RESTART_BUDGET: "0"
+      GHOSTTYKIT_DOWNLOAD_RETRIES: "2"
+      GHOSTTYKIT_DOWNLOAD_RETRY_DELAY: "2"
+      GHOSTTYKIT_DOWNLOAD_CONNECT_TIMEOUT: "10"
+      GHOSTTYKIT_DOWNLOAD_MAX_TIME: "300"
+    defaults:
+      run:
+        shell: bash
+        working-directory: cmux-source
+    steps:
+      - name: Require disposable GitHub runner
+        working-directory: ${{ github.workspace }}
+        env:
+          NESTED_RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          test "$NESTED_RUNNER_KIND" = github-hosted
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+      - name: Checkout reviewed preparation commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ github.sha }}
+          path: preparation
+          persist-credentials: false
+      - name: Reject incomplete patch contract
+        working-directory: ${{ github.workspace }}/preparation/ci/nested-restore
+        run: python3 contract.py admit .
+      - name: Checkout exact upstream
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          repository: manaflow-ai/cmux
+          ref: 2e109a1739d320fe36220afb3e7775b59c1acd47
+          submodules: recursive
+          fetch-depth: 0
+          path: cmux-source
+          persist-credentials: false
+      - name: Pin source and private evidence paths
+        run: |
+          test "$(git rev-parse HEAD)" = 2e109a1739d320fe36220afb3e7775b59c1acd47
+          test "$(git rev-parse HEAD:ghostty)" = ef4f1570d62117ebc51e3b0f07ad4f34032267b6
+          test "$(git -C ghostty rev-parse HEAD)" = ef4f1570d62117ebc51e3b0f07ad4f34032267b6
+          echo "NESTED_PREPARATION=$GITHUB_WORKSPACE/preparation/ci/nested-restore" >> "$GITHUB_ENV"
+          echo "NESTED_EVIDENCE=$RUNNER_TEMP/nested-native-evidence" >> "$GITHUB_ENV"
+          echo "NESTED_DERIVED=$RUNNER_TEMP/nested-native-derived" >> "$GITHUB_ENV"
+          echo "CMUX_CI_RUNTIME_SOURCE_ROOT=$GITHUB_WORKSPACE/cmux-source" >> "$GITHUB_ENV"
+      - name: Select official Xcode toolchain
+        run: ./scripts/select-ci-xcode.sh
+      - name: Check Metal and install official Rust dependencies
+        timeout-minutes: 15
+        run: |
+          ./scripts/ensure-metal-toolchain.sh
+          ./scripts/install-rust-ci.sh
+      - name: Fetch exact checksum-pinned GhosttyKit
+        timeout-minutes: 17
+        run: |
+          test "$(awk '$1 == "ef4f1570d62117ebc51e3b0f07ad4f34032267b6" {print $2}' scripts/ghosttykit-checksums.txt)" = ae38ade4e1c7e4d6ce21b8d7c16e9a95c346005848b4e2daa2afb6f56084c024
+          ./scripts/download-prebuilt-ghosttykit.sh
+          test -d GhosttyKit.xcframework
+      - name: Apply only regression tests
+        run: |
+          git apply --check "$NESTED_PREPARATION/tests.patch"
+          git apply --index "$NESTED_PREPARATION/tests.patch"
+          ./scripts/sync-test-wiring --check
+          python3 scripts/verify-local.py --only test-wiring --only swift-syntax --swift-changed HEAD
+          git -c user.name=NestedRestoreValidation -c user.email=nested-validation@example.invalid commit -m "test: reproduce nested Herdr restore loss"
+          mkdir -p "$NESTED_EVIDENCE"
+          git rev-parse HEAD > "$NESTED_EVIDENCE/red-commit.txt"
+      - name: Compile red app and test product using official wrapper
+        timeout-minutes: 40
+        run: bash "$NESTED_PREPARATION/compile-focused.sh"
+      - name: Prepare isolated native test home
+        id: prepare
+        run: ./scripts/ci/prepare-app-host-home.sh
+      - name: Enable official XCTest automation
+        run: ./scripts/ci/enable-xctest-automation-mode.sh
+      - name: Run exact focused command and require behavioral red
+        timeout-minutes: 10
+        env:
+          NESTED_PHASE: red
+        run: bash "$NESTED_PREPARATION/run-focused.sh"
+      - name: Apply only reviewed fix
+        run: |
+          git apply --check "$NESTED_PREPARATION/fix.patch"
+          git apply --index "$NESTED_PREPARATION/fix.patch"
+          ./scripts/sync-test-wiring --check
+          python3 scripts/verify-local.py --only test-wiring --only swift-syntax --swift-changed HEAD
+          git -c user.name=NestedRestoreValidation -c user.email=nested-validation@example.invalid commit -m "fix: preserve nested Herdr restore ownership"
+          git rev-parse HEAD > "$NESTED_EVIDENCE/green-commit.txt"
+      - name: Compile green app and test product using same official wrapper
+        timeout-minutes: 30
+        run: bash "$NESTED_PREPARATION/compile-focused.sh"
+      - name: Run identical focused command and require green
+        timeout-minutes: 10
+        env:
+          NESTED_PHASE: green
+        run: bash "$NESTED_PREPARATION/run-focused.sh"
+      - name: Run new API boundary cases only after fix
+        timeout-minutes: 10
+        env:
+          NESTED_PHASE: boundary
+        run: bash "$NESTED_PREPARATION/run-focused.sh"
+      - name: Run migrated original Herdr binding cases
+        timeout-minutes: 10
+        env:
+          NESTED_PHASE: existing-binding
+        run: bash "$NESTED_PREPARATION/run-focused.sh"
+      - name: Cleanup only prepared app-host state
+        if: always() && (steps.prepare.outcome == 'success' || steps.prepare.outcome == 'failure' || steps.prepare.outcome == 'cancelled')
+        run: |
+          ./scripts/ci/run-in-console-session.sh scripts/ci/cleanup-app-host-home.sh \
+            2>&1 | tee "$NESTED_EVIDENCE/app-host-cleanup.log"
+      - name: Run package startup input policy cases after fix
+        timeout-minutes: 17
+        run: bash "$NESTED_PREPARATION/run-package.sh"
+      - name: Retain separately tagged app with source and signature receipts
+        timeout-minutes: 40
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash "$NESTED_PREPARATION/preserve-app.sh"
+      - name: Preserve original red and green evidence
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: nested-native-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/nested-native-evidence
+          if-no-files-found: error
+          retention-days: 7
