@@ -1,0 +1,279 @@
+--- a/cmuxTests/HerdrResumeBindingTests.swift
++++ b/cmuxTests/HerdrResumeBindingTests.swift
+@@ -1,5 +1,6 @@
++import CmuxTerminal
+ import Foundation
+-import XCTest
++import Testing
+ 
+ #if canImport(cmux_DEV)
+ @testable import cmux_DEV
+@@ -7,7 +8,8 @@
+ @testable import cmux
+ #endif
+ 
+-final class HerdrResumeBindingTests: XCTestCase {
++@Suite
++struct HerdrResumeBindingTests {
+     private func binding(
+         _ arguments: [String],
+         environment: [String: String] = [:]
+@@ -22,44 +24,44 @@
+ 
+     /// A herdr attach becomes an automatic, process-detected binding that
+     /// re-runs the normalized attach in the directory it ran in.
+-    func testNamedSessionAttachProducesAutomaticProcessDetectedBinding() throws {
+-        let binding = try XCTUnwrap(
++    @Test func testNamedSessionAttachProducesAutomaticProcessDetectedBinding() throws {
++        let binding = try #require(
+             binding(["herdr", "session", "attach", "manu"], environment: ["PWD": "/tmp/project"])
+         )
+ 
+-        XCTAssertEqual(binding.kind, "herdr")
+-        XCTAssertEqual(binding.name, "herdr manu")
+-        XCTAssertEqual(binding.source, "process-detected")
+-        XCTAssertEqual(binding.allowsAutomaticResume, true)
+-        XCTAssertEqual(binding.checkpointId, "manu")
+-        XCTAssertEqual(binding.cwd, "/tmp/project")
+-        XCTAssertEqual(binding.command, "'herdr' '--session' 'manu'")
+-        XCTAssertEqual(binding.launchCommand?.executablePath, "herdr")
+-        XCTAssertEqual(binding.launchCommand?.arguments, ["herdr", "--session", "manu"])
+-        XCTAssertEqual(binding.launchCommand?.workingDirectory, "/tmp/project")
++        #expect(binding.kind == "herdr")
++        #expect(binding.name == "herdr manu")
++        #expect(binding.source == "process-detected")
++        #expect(binding.allowsAutomaticResume == true)
++        #expect(binding.checkpointId == "manu")
++        #expect(binding.cwd == "/tmp/project")
++        #expect(binding.command == "'herdr' '--session' 'manu'")
++        #expect(binding.launchCommand?.executablePath == "herdr")
++        #expect(binding.launchCommand?.arguments == ["herdr", "--session", "manu"])
++        #expect(binding.launchCommand?.workingDirectory == "/tmp/project")
+     }
+ 
+     /// The default session keeps the executable path and has no checkpoint.
+-    func testDefaultSessionAttachBindsWithoutCheckpoint() throws {
+-        let binding = try XCTUnwrap(binding(["/Users/test/.local/bin/herdr"]))
+-
+-        XCTAssertEqual(binding.name, "herdr")
+-        XCTAssertNil(binding.checkpointId)
+-        XCTAssertEqual(binding.command, "'/Users/test/.local/bin/herdr'")
++    @Test func testDefaultSessionAttachBindsWithoutCheckpoint() throws {
++        let binding = try #require(binding(["/Users/test/.local/bin/herdr"]))
++
++        #expect(binding.name == "herdr")
++        #expect(binding.checkpointId == nil)
++        #expect(binding.command == "'/Users/test/.local/bin/herdr'")
+     }
+ 
+     /// An ssh or tmux client inside a herdr pane carries a borrowed cmux
+     /// scope, so the chain yields no binding for it at all.
+-    func testClientsInsideAHerdrPaneYieldNoBinding() {
++    @Test func testClientsInsideAHerdrPaneYieldNoBinding() {
+         let insidePane = ["HERDR_ENV": "1"]
+-        XCTAssertNil(binding(["/usr/bin/ssh", "tinybox"], environment: insidePane))
+-        XCTAssertNil(binding(["tmux", "attach", "-t", "work"], environment: insidePane))
+-        XCTAssertNil(binding(["herdr", "--session", "manu"], environment: insidePane))
++        #expect(binding(["/usr/bin/ssh", "tinybox"], environment: insidePane) == nil)
++        #expect(binding(["tmux", "attach", "-t", "work"], environment: insidePane) == nil)
++        #expect(binding(["herdr", "--session", "manu"], environment: insidePane) == nil)
+     }
+ 
+     /// The surface's own herdr client wins over a newer process inside one
+     /// of its panes that shares the same panel key.
+-    func testProcessScanPrefersTheSurfaceClientOverAProcessInsideAHerdrPane() throws {
++    @Test func testProcessScanPrefersTheSurfaceClientOverAProcessInsideAHerdrPane() throws {
+         let workspaceID = UUID(uuidString: "11111111-1111-1111-1111-111111111111")!
+         let panelID = UUID(uuidString: "22222222-2222-2222-2222-222222222222")!
+         // The herdr client runs on the surface's TTY. The ssh runs later inside
+@@ -85,9 +87,9 @@
+             }
+         )
+ 
+-        let binding = try XCTUnwrap(detected[key]?.binding)
+-        XCTAssertEqual(binding.kind, "herdr")
+-        XCTAssertEqual(binding.command, "'herdr' '--session' 'manu'")
++        let binding = try #require(detected[key]?.binding)
++        #expect(binding.kind == "herdr")
++        #expect(binding.command == "'herdr' '--session' 'manu'")
+     }
+ 
+     private func foregroundProcess(
+@@ -115,3 +117,177 @@
+         )
+     }
+ }
++
++
++/// Exercise the actual workspace restore and snapshot paths. The base loses
++/// Herdr on its first empty scan and leaves its startup outside topology admission.
++@Suite(.serialized)
++@MainActor
++struct HerdrStartupRestoreRegressionTests {
++    fileprivate func herdrBinding(session: String = "outer-session", capturedAt: TimeInterval = 10) throws -> SurfaceResumeBindingSnapshot {
++        try #require(ProcessDetectedTerminalBinding.binding(
++            processName: "herdr",
++            processPath: nil,
++            processArguments: CmuxTopProcessArguments(
++                arguments: ["/cmux-restore-test-missing/herdr", "--session", session],
++                environment: ["PWD": "/tmp"]
++            ),
++            capturedAt: capturedAt
++        ))
++    }
++
++    fileprivate func restore(
++        _ binding: SurfaceResumeBindingSnapshot,
++        includeInnerAgent: Bool = false
++    ) throws -> (Workspace, UUID, TerminalPanel) {
++        let source = Workspace()
++        defer { close(source) }
++        let sourcePanelID = try #require(source.focusedPanelId)
++        #expect(source.setSurfaceResumeBinding(binding, panelId: sourcePanelID))
++        var snapshot = source.sessionSnapshot(includeScrollback: false)
++        if includeInnerAgent {
++            snapshot.panels[0].terminal?.agent = SessionRestorableAgentSnapshot(
++                kind: .codex, sessionId: "inner-must-not-replace-herdr",
++                workingDirectory: "/tmp", launchCommand: nil
++            )
++            snapshot.panels[0].terminal?.wasAgentRunning = true
++        }
++        let workspace = Workspace()
++        workspace.restoreSessionSnapshot(snapshot, startupRestoreCommitOwner: .tabManagerTopology)
++        let panelID = try #require(workspace.focusedPanelId)
++        return (workspace, panelID, try #require(workspace.terminalPanel(for: panelID)))
++    }
++
++    fileprivate func close(_ workspace: Workspace) {
++        for panelID in Array(workspace.panels.keys) {
++            _ = workspace.closePanel(panelID, force: true)
++        }
++    }
++
++    private func detected(_ binding: SurfaceResumeBindingSnapshot, workspace: Workspace, panelID: UUID) -> SurfaceResumeBindingIndex {
++        SurfaceResumeBindingIndex(bindingsByPanel: [
++            .init(workspaceId: workspace.id, panelId: panelID): binding
++        ])
++    }
++
++    @Test func emptyScanBeforeStartupPreservesOuterBindingInBothReadAndSave() throws {
++        let binding = try herdrBinding()
++        let (workspace, panelID, _) = try restore(binding, includeInnerAgent: true)
++        defer { close(workspace) }
++        #expect(workspace.effectiveSurfaceResumeBinding(panelId: panelID, surfaceResumeBindingIndex: .empty)?.kind == "herdr", "HERDR_PENDING_READ_MUST_KEEP_OUTER_BINDING")
++        let saved = workspace.sessionSnapshot(includeScrollback: false, surfaceResumeBindingIndex: .empty)
++        #expect(saved.panels.first?.terminal?.resumeBinding?.checkpointId == "outer-session", "HERDR_PENDING_SAVE_MUST_KEEP_OUTER_BINDING")
++        #expect(workspace.surfaceResumeBinding(panelId: panelID)?.kind == "herdr")
++    }
++
++    @Test func backgroundHerdrWaitsForTopologyCommitWithoutAgentLifecycle() throws {
++        let (workspace, panelID, panel) = try restore(herdrBinding())
++        defer { close(workspace) }
++        #expect(panel.surface.initialInput != nil)
++        #expect(panel.surface.isAwaitingStartupRestoreAdmission, "HERDR_STARTUP_REQUIRES_TOPOLOGY_ADMISSION")
++        #expect(workspace.restoredAgentResumeStatesByPanelId[panelID] == nil)
++        workspace.terminalStartupRestoreCoordinator.commitPendingRestores()
++        #expect(!panel.surface.isAwaitingStartupRestoreAdmission)
++        #expect(workspace.restoredAgentResumeStatesByPanelId[panelID] == nil)
++    }
++
++    @Test func observedHerdrClosesGapAndLaterExitIsNotPreserved() throws {
++        let (workspace, panelID, _) = try restore(herdrBinding())
++        defer { close(workspace) }
++        let live = try herdrBinding(capturedAt: 20)
++        workspace.reconcileSurfaceResumeBindings(using: detected(live, workspace: workspace, panelID: panelID))
++        #expect(workspace.surfaceResumeBinding(panelId: panelID) == live)
++        workspace.reconcileSurfaceResumeBindings(using: .empty)
++        #expect(workspace.surfaceResumeBinding(panelId: panelID) == nil)
++    }
++
++    @Test func freshProcessReadClosesGapBeforeLaterEmptyScan() throws {
++        let (workspace, panelID, _) = try restore(herdrBinding())
++        defer { close(workspace) }
++        let live = try herdrBinding(capturedAt: 20)
++        #expect(workspace.effectiveSurfaceResumeBinding(
++            panelId: panelID, surfaceResumeBindingIndex: detected(live, workspace: workspace, panelID: panelID)
++        ) == live)
++        #expect(workspace.surfaceResumeBinding(panelId: panelID) == live)
++        workspace.reconcileSurfaceResumeBindings(using: .empty)
++        #expect(workspace.surfaceResumeBinding(panelId: panelID) == nil)
++    }
++
++    @Test func newDetectedGenerationReplacesPendingOriginal() throws {
++        let (workspace, panelID, _) = try restore(herdrBinding())
++        defer { close(workspace) }
++        let replacement = try herdrBinding(session: "different-session", capturedAt: 30)
++        workspace.reconcileSurfaceResumeBindings(using: detected(replacement, workspace: workspace, panelID: panelID))
++        #expect(workspace.surfaceResumeBinding(panelId: panelID) == replacement)
++        workspace.reconcileSurfaceResumeBindings(using: .empty)
++        #expect(workspace.surfaceResumeBinding(panelId: panelID) == nil)
++    }
++
++    @Test func explicitClearCannotBeResurrectedByPendingOriginal() throws {
++        let (workspace, panelID, _) = try restore(herdrBinding())
++        defer { close(workspace) }
++        #expect(workspace.clearSurfaceResumeBinding(panelId: panelID))
++        workspace.reconcileSurfaceResumeBindings(using: .empty)
++        #expect(workspace.surfaceResumeBinding(panelId: panelID) == nil)
++        #expect(workspace.effectiveSurfaceResumeBinding(panelId: panelID, surfaceResumeBindingIndex: .empty) == nil)
++    }
++
++    @Test func initialShellActivityDoesNotProveHerdrStartupFailed() throws {
++        let (workspace, panelID, _) = try restore(herdrBinding(), includeInnerAgent: true)
++        defer { close(workspace) }
++        workspace.updatePanelShellActivityState(panelId: panelID, state: .commandRunning)
++        workspace.updatePanelShellActivityState(panelId: panelID, state: .promptIdle)
++        for _ in 0..<4 { workspace.reconcileSurfaceResumeBindings(using: .empty) }
++        let binding = try #require(workspace.surfaceResumeBinding(panelId: panelID))
++        #expect(binding.kind == "herdr")
++        #expect(binding.autoResume == true)
++        let saved = workspace.sessionSnapshot(includeScrollback: false, surfaceResumeBindingIndex: .empty)
++        #expect(saved.panels.first?.terminal?.resumeBinding?.kind == "herdr")
++    }
++
++    @Test func acceptedExplicitInputCancelsPendingAutomaticIntent() throws {
++        let (workspace, panelID, panel) = try restore(herdrBinding())
++        defer { close(workspace) }
++        panel.surface.didAcceptExplicitInput()
++        workspace.reconcileSurfaceResumeBindings(using: .empty)
++        let manual = try #require(workspace.surfaceResumeBinding(panelId: panelID))
++        #expect(manual.kind == "herdr")
++        #expect(manual.autoResume == false)
++        #expect(panel.hasReceivedExplicitInput)
++    }
++
++    @Test func manualOuterIntentSurvivesAnotherRestoreWithoutInnerAutoResume() throws {
++        let (workspace, panelID, panel) = try restore(herdrBinding(), includeInnerAgent: true)
++        defer { close(workspace) }
++        panel.surface.didAcceptExplicitInput()
++        let manual = try #require(workspace.surfaceResumeBinding(panelId: panelID))
++        let (next, nextID, nextPanel) = try restore(manual, includeInnerAgent: true)
++        defer { close(next) }
++        let saved = next.sessionSnapshot(includeScrollback: false, surfaceResumeBindingIndex: .empty)
++        #expect(saved.panels.first?.terminal?.resumeBinding?.kind == "herdr")
++        #expect(next.surfaceResumeBinding(panelId: nextID)?.autoResume == false)
++        #expect(nextPanel.surface.initialInput == nil)
++        #expect(!nextPanel.surface.isAwaitingStartupRestoreAdmission)
++    }
++
++    @Test func oldExplicitInputCallbackCannotRetireReplacementBinding() throws {
++        let (workspace, panelID, panel) = try restore(herdrBinding())
++        defer { close(workspace) }
++        let oldCallback = panel.surface.onExplicitInput
++        let replacement = try herdrBinding(session: "replacement", capturedAt: 40)
++        #expect(workspace.setSurfaceResumeBinding(replacement, panelId: panelID))
++        oldCallback?()
++        #expect(workspace.surfaceResumeBinding(panelId: panelID) == replacement)
++        workspace.reconcileSurfaceResumeBindings(using: .empty)
++        #expect(workspace.surfaceResumeBinding(panelId: panelID) == nil)
++    }
++
++    @Test func manualAndUntrustedImportsNeverAcquireAutomaticStartupAdmission() throws {
++        for binding in [try herdrBinding().forcingManualRestore(), try herdrBinding().markingUntrustedSessionImport()] {
++            let (workspace, _, panel) = try restore(binding)
++            defer { close(workspace) }
++            #expect(panel.surface.initialInput == nil)
++            #expect(!panel.surface.isAwaitingStartupRestoreAdmission)
++        }
++    }
++}

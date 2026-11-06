@@ -1,0 +1,50 @@
+{
+  "upstream_commit": "2e109a1739d320fe36220afb3e7775b59c1acd47",
+  "files": {
+    "README.md": {
+      "sha256": "4ce137648a1ab917b3d107daec4f84cda8482f8947870e8c7f3b3bb8fb7188af",
+      "bytes": 1187
+    },
+    "attest-app.py": {
+      "sha256": "09cf5622a9bca99b1715d0fa8fe4386c39afddcbe530c480f3df148aacccb095",
+      "bytes": 6571
+    },
+    "compile-focused.sh": {
+      "sha256": "c2ef8fbd85e857ef594dfcb69fb2cb2b8eb432888d02d8b6c9ea49553fa546ec",
+      "bytes": 522
+    },
+    "contract.json": {
+      "sha256": "fc5913f54ac2625177ddc4548552b225dd8063de244a2f78837944a14d189e63",
+      "bytes": 3861
+    },
+    "contract.py": {
+      "sha256": "d738a45e550c8a72ed0916a30bcd80fc959393c05e6f935424822cefec6f4682",
+      "bytes": 9416
+    },
+    "fix.patch": {
+      "sha256": "940e44bcd4a744edd0665297a64daf751f6cc5367544653b070e0d634ac8243f",
+      "bytes": 32704
+    },
+    "nested-native-red-green.yml": {
+      "sha256": "cbbe79ec70550edfb3da4221d6c89963813b983da581979150b0512ccc5d477e",
+      "bytes": 6816
+    },
+    "preserve-app.sh": {
+      "sha256": "4648eca463db895e55728adf5969abb0c337cd45d39a745eb3dbc8a3f54d9c45",
+      "bytes": 1789
+    },
+    "run-focused.sh": {
+      "sha256": "c2f2b5e2fb88b829499f002edf1dfcb945f8fcd69b4b5d19fed15a06dfea4e86",
+      "bytes": 1699
+    },
+    "run-package.sh": {
+      "sha256": "1bb97edbd7f38794f894d072376ccdb199ca2566fd823f3b908b9b67951208d0",
+      "bytes": 1008
+    },
+    "tests.patch": {
+      "sha256": "e0c34b67a4877e9e4e0a0d8f9f198a843536dc2343383123f8b0170047bf31a5",
+      "bytes": 14338
+    }
+  },
+  "native_test_execution": "not yet run"
+}
