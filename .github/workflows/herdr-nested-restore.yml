@@ -1,0 +1,63 @@
+name: Three Herdr nine synthetic sessions cold restore
+on:
+  push:
+    branches: [ccc/nested-cold-restore-20261106-r4]
+    paths:
+      - .github/workflows/herdr-nested-restore.yml
+      - integrations/herdr-nested-restore/**
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: herdr-nested-restore-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  nested-restore:
+    runs-on: macos-26
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.14.7'
+      - name: Verify encrypted transport
+        working-directory: integrations/herdr-nested-restore
+        run: |
+          python3 -m pip install --only-binary=:all: --no-deps --require-hashes -r requirements-macos.txt
+          python3 -BE -m unittest -v test_secure_bundle test_seal_nested
+      - name: Authenticate complete original source
+        env:
+          CCC_PRIVATE_FIXTURE_KEY: ${{ secrets.CCC_NATIVE300_FIXTURE_INPUT_KEY_20261106 }}
+        run: python3 -BE integrations/herdr-nested-restore/secure_bundle.py decrypt
+      - name: Verify exact source and restore rejection checks
+        run: |
+          cd "$CCC_PRIVATE_SOURCE"
+          python3 -BE -c "import run_actions; run_actions.verified_bundle('f4528ccecbafd146a3093dab5d72701bdb5065d52138b4ff5d43b52cb18478a3')"
+          python3 -BE -W error::ResourceWarning -m unittest -v test_nested_restore_evidence test_nested_runtime test_nested_diagnostics
+      - name: Prepare pinned tiny simulation compiler
+        run: rustup toolchain install 1.99.1 --profile minimal --no-self-update
+      - name: Authenticate existing official artifacts and exercise combined restore
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python3 -BE "$CCC_PRIVATE_SOURCE/run_nested_actions.py"
+          --source-manifest-sha256 f4528ccecbafd146a3093dab5d72701bdb5065d52138b4ff5d43b52cb18478a3
+      - name: Seal exact synthetic diagnostics
+        if: always() && env.NESTED_PRIVATE_ROOT != '' && env.CCC_PRIVATE_SOURCE != ''
+        env:
+          CCC_PRIVATE_FIXTURE_KEY: ${{ secrets.CCC_NATIVE300_FIXTURE_INPUT_KEY_20261106 }}
+        run: >-
+          python3 -BE integrations/herdr-nested-restore/seal_nested.py
+          --private-root "$NESTED_PRIVATE_ROOT" --output "$RUNNER_TEMP/nested-evidence"
+      - name: Preserve original attempt evidence
+        if: always() && env.NESTED_PRIVATE_ROOT != '' && env.CCC_PRIVATE_SOURCE != ''
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: nested-cold-restore-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/nested-evidence/
+          include-hidden-files: false
+          if-no-files-found: warn
+          retention-days: 14
