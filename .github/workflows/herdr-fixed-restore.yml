@@ -1,0 +1,106 @@
+# Existing GUI consumer with independently reviewed original build and sealed source.
+name: Fixed cmux three Herdr nine synthetic sessions cold restore
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - ccc/herdr-fixed-restore-20261107-r5
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: herdr-fixed-restore-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  fixed-restore:
+    runs-on: macos-26
+    timeout-minutes: 35
+    env:
+      FIXED_SOURCE_PIN: ec7e6b4b63d75dbb8264266b0e36a10d5a270fddbe75ef4196919a157c881d2b
+      FIXED_APP_PIN_HASH: cc1f7d5223d96b135955c39ee2955c27966d52f458918c7c2096546912f7a4b0
+    steps:
+      - name: Verify actual GitHub-hosted runner
+        env:
+          NESTED_RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          test "$NESTED_RUNNER_KIND" = github-hosted
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - name: Reject unfilled preparation before dependency or artifact downloads
+        run: |
+          python3 -BE - <<'PY'
+          import hashlib, json, os, pathlib, re
+          for key in ('FIXED_SOURCE_PIN', 'FIXED_APP_PIN_HASH'):
+              if not re.fullmatch('[0-9a-f]{64}', os.environ[key]):
+                  raise SystemExit('Preparation still lacks independently reviewed pins')
+          raw = pathlib.Path('integrations/herdr-fixed-restore/reviewed-build/APP-PIN.json').read_bytes()
+          if hashlib.sha256(raw).hexdigest() != os.environ['FIXED_APP_PIN_HASH']:
+              raise SystemExit('Reviewed application pin bytes differ')
+          if json.loads(raw).get('status') != 'PINNED_ORIGINAL_BUILD':
+              raise SystemExit('Original successful application build is not admitted')
+          PY
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.14.7'
+      - name: Verify transport preparation
+        working-directory: integrations/herdr-fixed-restore
+        run: |
+          python3 -m pip install --only-binary=:all: --no-deps --require-hashes -r requirements-macos.txt
+          python3 -BE -m unittest -v test_secure_bundle test_seal_nested
+      - name: Authenticate complete fixed source
+        env:
+          CCC_PRIVATE_FIXTURE_KEY: ${{ secrets.CCC_NATIVE300_FIXTURE_INPUT_KEY_20261106 }}
+        run: python3 -BE integrations/herdr-fixed-restore/secure_bundle.py decrypt
+      - name: Require reviewed original build pin and API bytes before any app transfer
+        run: >-
+          python3 -BE "$CCC_PRIVATE_SOURCE/stage_fixed_artifact.py"
+          --source "$CCC_PRIVATE_SOURCE" --source-manifest-sha256 "$FIXED_SOURCE_PIN"
+          --pin "$GITHUB_WORKSPACE/integrations/herdr-fixed-restore/reviewed-build/APP-PIN.json"
+          --pin-sha256 "$FIXED_APP_PIN_HASH"
+          --metadata "$GITHUB_WORKSPACE/integrations/herdr-fixed-restore/reviewed-build"
+          --output "$RUNNER_TEMP/fixed-app-inputs" --check-only
+      - name: Verify fixed fixture and staging rejection tests
+        run: |
+          cd "$CCC_PRIVATE_SOURCE"
+          python3 -BE -c 'import os, run_nested_actions; run_nested_actions.verified_bundle(os.environ["FIXED_SOURCE_PIN"])'
+          python3 -BE -W error::ResourceWarning -m unittest -v test_fixed_gui test_nested_restore_evidence test_nested_runtime test_nested_diagnostics
+          FIXED_TEST_SOURCE="$CCC_PRIVATE_SOURCE" python3 -BE -W error::ResourceWarning -m unittest -v test_stage_fixed_artifact
+      - name: Stage one original fixed app artifact on this fresh runner
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python3 -BE "$CCC_PRIVATE_SOURCE/stage_fixed_artifact.py"
+          --source "$CCC_PRIVATE_SOURCE" --source-manifest-sha256 "$FIXED_SOURCE_PIN"
+          --pin "$GITHUB_WORKSPACE/integrations/herdr-fixed-restore/reviewed-build/APP-PIN.json"
+          --pin-sha256 "$FIXED_APP_PIN_HASH"
+          --metadata "$GITHUB_WORKSPACE/integrations/herdr-fixed-restore/reviewed-build"
+          --output "$RUNNER_TEMP/fixed-app-inputs"
+      - name: Prepare pinned tiny simulation compiler
+        run: rustup toolchain install 1.99.1 --profile minimal --no-self-update
+      - name: Admit original fixed app and exercise unassisted nine-session restore
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python3 -BE "$CCC_PRIVATE_SOURCE/run_nested_actions.py"
+          --source-manifest-sha256 "$FIXED_SOURCE_PIN"
+          --fixed-app-inputs "$RUNNER_TEMP/fixed-app-inputs"
+          --fixed-app-pin "$GITHUB_WORKSPACE/integrations/herdr-fixed-restore/reviewed-build/APP-PIN.json"
+          --fixed-app-pin-sha256 "$FIXED_APP_PIN_HASH"
+      - name: Seal exact original diagnostics
+        if: always() && env.NESTED_PRIVATE_ROOT != '' && env.CCC_PRIVATE_SOURCE != ''
+        env:
+          CCC_PRIVATE_FIXTURE_KEY: ${{ secrets.CCC_NATIVE300_FIXTURE_INPUT_KEY_20261106 }}
+        run: >-
+          python3 -BE integrations/herdr-fixed-restore/seal_nested.py
+          --private-root "$NESTED_PRIVATE_ROOT" --output "$RUNNER_TEMP/nested-evidence"
+      - name: Preserve original attempt evidence
+        if: always() && env.NESTED_PRIVATE_ROOT != '' && env.CCC_PRIVATE_SOURCE != ''
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: fixed-nested-cold-restore-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/nested-evidence/
+          include-hidden-files: false
+          if-no-files-found: warn
+          retention-days: 14
