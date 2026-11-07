@@ -1,0 +1,75 @@
+# Original build API pins are supplied externally; the success gate remains mandatory.
+# This independent consumer preserves original bytes; it never starts the app.
+name: Export original nested build small evidence
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - ccc/nested-original-evidence-export-20261107-r3
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: nested-original-evidence-export-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  export:
+    runs-on: macos-26
+    timeout-minutes: 30
+    env:
+      EXPORT_SOURCE_MANIFEST_SHA256: 7ac8e38d90df40ec1b41a2c35ee1b000807235650197baccc98c632ac30fbc56
+      EXPORT_CONTRACT_SHA256: 884f1cf249c99d5e7e7ac77656304423380a03624416cba5128ed47b1ed1bb25
+    steps:
+      - name: Require actual disposable GitHub runner
+        env:
+          NESTED_RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          test "$NESTED_RUNNER_KIND" = github-hosted
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Reject pending inputs before dependency or artifact transfers
+        working-directory: ci/nested-artifact-evidence-export
+        run: |
+          python3 -BE - <<'PY'
+          import hashlib, json, os, pathlib, re
+          for key in ('EXPORT_SOURCE_MANIFEST_SHA256', 'EXPORT_CONTRACT_SHA256'):
+              if not re.fullmatch('[0-9a-f]{64}', os.environ[key]):
+                  raise SystemExit('Original successful artifact contract remains pending')
+          import export_original as export
+          export.source_closure(pathlib.Path.cwd(), os.environ['EXPORT_SOURCE_MANIFEST_SHA256'])
+          contract = pathlib.Path('reviewed-original/EXPORT-CONTRACT.json').resolve(strict=True)
+          export.prepare(contract, os.environ['EXPORT_CONTRACT_SHA256'], contract.parent)
+          PY
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.14.7'
+      - name: Install checksum-pinned encryption dependency and run pure rejection tests
+        working-directory: ci/nested-artifact-evidence-export
+        run: |
+          python3 -m pip install --only-binary=:all: --no-deps --require-hashes -r requirements-macos.txt
+          python3 -BE -W error::ResourceWarning -m unittest -v test_export_original
+      - name: Verify whole original artifact on runner and export only sealed small evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CCC_PRIVATE_FIXTURE_KEY: ${{ secrets.CCC_NATIVE300_FIXTURE_INPUT_KEY_20261106 }}
+        run: >-
+          python3 -BE "$GITHUB_WORKSPACE/ci/nested-artifact-evidence-export/export_original.py"
+          --source "$GITHUB_WORKSPACE/ci/nested-artifact-evidence-export"
+          --source-manifest-sha256 "$EXPORT_SOURCE_MANIFEST_SHA256"
+          --contract "$GITHUB_WORKSPACE/ci/nested-artifact-evidence-export/reviewed-original/EXPORT-CONTRACT.json"
+          --contract-sha256 "$EXPORT_CONTRACT_SHA256"
+          --metadata "$GITHUB_WORKSPACE/ci/nested-artifact-evidence-export/reviewed-original"
+          --workspace "$RUNNER_TEMP/nested-original-export-scratch"
+          --output "$RUNNER_TEMP/nested-original-small-evidence"
+      - name: Preserve bounded original evidence export
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: nested-original-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/nested-original-small-evidence/ENVELOPE.json
+            ${{ runner.temp }}/nested-original-small-evidence/evidence.aesgcm
+          if-no-files-found: error
+          retention-days: 14

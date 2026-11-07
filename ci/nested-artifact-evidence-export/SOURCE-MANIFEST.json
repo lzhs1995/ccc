@@ -1,0 +1,18 @@
+{
+  "schema": "original-build-export-source-v1",
+  "files": {
+    "EXPECTED-TREES.json": "984e63d15f71988535ec94dba0b366480c2a95fdc1729c5c244a722630f7a43d",
+    "EXPORT-CONTRACT.pending.json": "a3c0183e3b356e5fab9d06d38cc23a8d26198d93ce2c01bcd7a83e6e9981a415",
+    "ORIGINAL-TEST-CONTRACT.json": "d7b91a9ecaf6ed7e8013a790b7438c327ad11186e5f2a0bb6ebb6a9d38a7fa82",
+    "SUPPORT-PINS.json": "a7f93e3a9e53a2772dd4c313a0a9b608113c3cf666ec8d665a0ad5d13c499198",
+    "export_original.py": "d782edaead268a6fdecb828c33ffc57a06297350ab90d91fd0e45629dacf009e",
+    "requirements-macos.txt": "0b6e6dbf9893f23656bf0cef3e9939d4e074e3a3eacfe701d8f72612c7a34eb1",
+    "reviewed-original/ARTIFACT.json": "571bab8f33bbb8a44caec9ccedd34d35ec8c1134aeb9167c8850847bb24bf764",
+    "reviewed-original/BUILD-JOBS.json": "32d82fe90ad8b4caaac0dc354c0b7d4bd9606c8636fdd325bf5c606aee9665c6",
+    "reviewed-original/BUILD-RUN.json": "975504c86292388989c152e640d63d5b9fd1143ed1fb02cbf0d8f4dc13427727",
+    "reviewed-original/EXPORT-CONTRACT.json": "884f1cf249c99d5e7e7ac77656304423380a03624416cba5128ed47b1ed1bb25",
+    "support/fixed_app_admission.py": "07846c5d4d1271397d9b1c3470412fc3856e37615539e2aec1a9959f5e50e4e8",
+    "support/stage_fixed_artifact.py": "d80d84c2edc394c66fd1d53c1b454183b5bd107e2f9b2ea4324e0398af0b0302",
+    "test_export_original.py": "02e93436192086a5adac121824fcb50738d6b8bf0747a3f6140a28f9fc326ea2"
+  }
+}

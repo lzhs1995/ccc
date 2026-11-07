@@ -1,0 +1,14 @@
+{
+  "upstream_commit": "2e109a1739d320fe36220afb3e7775b59c1acd47",
+  "upstream_tree": "558d4a3e6ed749477de08df5ceeb22fce6e9fe62",
+  "expected_trees": {
+    "red": "37c9e76cc2798bbe1a28314792fd9778ce4cf334",
+    "green": "40e8ea03ce1435f11e90b35f98d554a13b9b8685"
+  },
+  "entries_verified": 25062,
+  "subtrees_verified": 2592,
+  "base_blobs_verified": 7,
+  "change": "Only the third original binding test result and its two property references; avoids duplicate snapshot declaration.",
+  "native_result": "NOT_RUN",
+  "helper_sha256": "97283b75a6ef0e5e2ef82f743bbdbefe011428fab446457bd82350557dd59c05"
+}

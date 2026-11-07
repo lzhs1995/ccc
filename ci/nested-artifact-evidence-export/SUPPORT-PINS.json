@@ -1,0 +1,10 @@
+{
+  "stage_fixed_artifact.py": {
+    "original": "/Users/lzhs/Documents/Herdr会话恢复/compat-20261104/cmux-nested-fixed-gui-preparation-r3/assembled/stage_fixed_artifact.py",
+    "sha256": "d80d84c2edc394c66fd1d53c1b454183b5bd107e2f9b2ea4324e0398af0b0302"
+  },
+  "fixed_app_admission.py": {
+    "original": "/Users/lzhs/Documents/Herdr会话恢复/compat-20261104/cmux-nested-fixed-gui-preparation-r3/assembled/fixed_app_admission.py",
+    "sha256": "07846c5d4d1271397d9b1c3470412fc3856e37615539e2aec1a9959f5e50e4e8"
+  }
+}

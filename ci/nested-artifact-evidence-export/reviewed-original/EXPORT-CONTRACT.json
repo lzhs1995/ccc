@@ -1,0 +1,22 @@
+{
+  "schema": "original-cmux-build-artifact-export-v1",
+  "status": "PINNED_ORIGINAL_SUCCESSFUL_ARTIFACT",
+  "repository": "lzhs1995/ccc",
+  "original_run_id": 42357868916,
+  "original_run_attempt": 1,
+  "original_head_sha": "87b499a87a45a3dcdc58794d4ab43d4bd05bcc94",
+  "workflow_path": ".github/workflows/nested-native-red-green.yml",
+  "artifact_id": 13574318692,
+  "artifact_name": "nested-native-42357868916-1",
+  "artifact_size_in_bytes": 265719998,
+  "artifact_api_digest_sha256": "6e2c7e695e43c0351d8b546c6d2974886f4427dfe27b2eec213aaa646b101a42",
+  "original_run_json_sha256": "975504c86292388989c152e640d63d5b9fd1143ed1fb02cbf0d8f4dc13427727",
+  "original_jobs_json_sha256": "32d82fe90ad8b4caaac0dc354c0b7d4bd9606c8636fdd325bf5c606aee9665c6",
+  "original_artifact_json_sha256": "571bab8f33bbb8a44caec9ccedd34d35ec8c1134aeb9167c8850847bb24bf764",
+  "upstream_commit": "2e109a1739d320fe36220afb3e7775b59c1acd47",
+  "tests_patch_sha256": "bdebf64e054476f3ea0476df3ec7acb91ddbfe86fc2927bb85686720c6a7bf8e",
+  "fix_patch_sha256": "db4f2c96ff9e06fd47ddb55a102f0ccb45d00c691e9e3681ca722f3f97144422",
+  "app_pin_created": false,
+  "original_job_id": 128359814637,
+  "expected_green_tree": "40e8ea03ce1435f11e90b35f98d554a13b9b8685"
+}
