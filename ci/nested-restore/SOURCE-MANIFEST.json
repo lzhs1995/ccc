@@ -1,0 +1,58 @@
+{
+  "upstream_commit": "2e109a1739d320fe36220afb3e7775b59c1acd47",
+  "files": {
+    "README.md": {
+      "sha256": "e796fa2084459c32435edf6c80d7c25ac49aa374510307d9a4da1de7c23e78ab",
+      "bytes": 1811
+    },
+    "attest-app.py": {
+      "sha256": "09cf5622a9bca99b1715d0fa8fe4386c39afddcbe530c480f3df148aacccb095",
+      "bytes": 6571
+    },
+    "compile-focused.sh": {
+      "sha256": "9ca5e2c8c5b0aefd57537bedd9a9c35ff15b82dcb0be8f6f80c584a9c03ed836",
+      "bytes": 550
+    },
+    "console-in-source.sh": {
+      "sha256": "bf0330c93d582613fe56e8fba7a5b9cc3bece7706802f8e1a305495d0fe28bc4",
+      "bytes": 528
+    },
+    "contract.json": {
+      "sha256": "d7b91a9ecaf6ed7e8013a790b7438c327ad11186e5f2a0bb6ebb6a9d38a7fa82",
+      "bytes": 3861
+    },
+    "contract.py": {
+      "sha256": "d738a45e550c8a72ed0916a30bcd80fc959393c05e6f935424822cefec6f4682",
+      "bytes": 9416
+    },
+    "fix.patch": {
+      "sha256": "db4f2c96ff9e06fd47ddb55a102f0ccb45d00c691e9e3681ca722f3f97144422",
+      "bytes": 32711
+    },
+    "nested-native-red-green.yml": {
+      "sha256": "c26afbef704b9faf8d6a7a1ab286112d9882caaf9b18af085482041dd5aa5a86",
+      "bytes": 7514
+    },
+    "preflight-app-host.sh": {
+      "sha256": "12c90ff683a35a18ac143bbc7e5452db21be7657399903c2d39abd45e66d9177",
+      "bytes": 931
+    },
+    "preserve-app.sh": {
+      "sha256": "4648eca463db895e55728adf5969abb0c337cd45d39a745eb3dbc8a3f54d9c45",
+      "bytes": 1789
+    },
+    "run-focused.sh": {
+      "sha256": "4899c6012b495bc81980d9e92e9c0a608a823a516202bc7e5985bdc875a5b32b",
+      "bytes": 2300
+    },
+    "run-package.sh": {
+      "sha256": "1bb97edbd7f38794f894d072376ccdb199ca2566fd823f3b908b9b67951208d0",
+      "bytes": 1008
+    },
+    "tests.patch": {
+      "sha256": "bdebf64e054476f3ea0476df3ec7acb91ddbfe86fc2927bb85686720c6a7bf8e",
+      "bytes": 14377
+    }
+  },
+  "native_test_execution": "not yet run"
+}
