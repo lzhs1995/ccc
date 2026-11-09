@@ -1,0 +1,45 @@
+{
+  "at": "2026-11-10T01:57:33.016300+08:00",
+  "status": "ROOT_ACCEPTED_ORIGINAL_REAL_CMUX_EMPTY_INBOX_AND_NORMAL_CLEANUP",
+  "run": 42659904239,
+  "attempt": 1,
+  "head": "8c12cc35479903c65ca2e4f7eaa4f17287398944",
+  "artifact": 13694325650,
+  "independent_review": "/Users/lzhs/Documents/Herdr会话恢复/compat-20261104/continuation-20261109-coverage-followup-r1/native-cmux-success-runtime-review-r2/VERIFICATION.json",
+  "independent_review_sha256": "898c4f2585a2ac86d5f8edde21cb2425a5d08c0b1d8295da0ce66b33c8cdefea",
+  "pins_sha256": "9183eb9d775f567be7bfe88af696c4af00cf28b82d81328943126acec69856e6",
+  "review_pins_verified": 99,
+  "artifact_members": 76,
+  "actual_result_sha256": "03ccc85e86efa7a9c9601b42cd8b7c2411a320909dd4b7212b51388d2acaad3d",
+  "runner_result_sha256": "304018655bac93efadc1e20e978222dc28c56a481ac19bcaf357f24794b814cf",
+  "task_and_cleanup_seconds": 6.486070084000005,
+  "six_checks": {
+    "original_attempt_and_artifact_bound": true,
+    "actual_fixed_aqua_host_and_client_bound": true,
+    "real_root_child_native_automatic_hooks_and_tool_pairs": true,
+    "root_full_reader_empty_child_refused": true,
+    "complete_one_close_and_bounded_same_peer_tree_evidence": true,
+    "normal_owned_cleanup_and_120_second_gate": true
+  },
+  "not_proven": {
+    "nonempty_context": true,
+    "full_body_read": true,
+    "bidirectional_receipt": true,
+    "live_business_hook_loading": true,
+    "physical_power_loss_or_cold_recovery": true,
+    "original_failed_run_root_cause": true
+  },
+  "limitations": [
+    "Acceptance is limited to this isolated real-cmux empty-inbox fixture; no current business client or reboot was exercised.",
+    "The actual parsed root host reply messages=[] is preserved; raw inbox CLI stdout remains unuploaded.",
+    "Capability SHA binds the native original observation; NATIVE-CAPABILITY.json is a parsed copy with a different file SHA.",
+    "Actual Aqua validation follows the pinned original launch path and runtime admission; raw launchctl manager output is not separately uploaded.",
+    "The first after-close tree retains the workspace and the second omits it. This proves the observed sequence, not a particular cache-generation cause.",
+    "Old run42612783279/1 remains failed with unknown missing close/tree originals; new successful evidence does not repair that history."
+  ],
+  "old_run_replayed": false,
+  "tests_rerun": 0,
+  "runtime_invocations_by_root_adoption": 0,
+  "production_changes": 0,
+  "whole_goal_complete": false
+}

@@ -1,0 +1,78 @@
+name: Native caller real cmux duplex context and body fixture
+
+on:
+  push:
+    branches: [ccc/native-cmux-duplex-20261110-r2]
+    paths:
+      - .github/workflows/codex-native-cmux-inbox.yml
+      - integrations/native-cmux-inbox/**
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: native-cmux-inbox-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  cmux-inbox-macos:
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          path: ccc
+          persist-credentials: false
+      - name: Admit original artifacts and verify two native roots exchanging complete bodies
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HOST_CONTRACT_SHA256: a75114d2b3e8b13237feb459340855376f051316280354a171ea32e8a6610758
+          HOST_SOURCE_MANIFEST_SHA256: 16c082deb9b8d0c6fd91418412c4e85cd7b500cf8b7567505767a0a13381132d
+        run: >-
+          python3 -BE ccc/integrations/native-cmux-inbox/bundle/runner.py
+          --contract "$GITHUB_WORKSPACE/ccc/integrations/native-cmux-inbox/CONTRACT.json"
+          --contract-sha256 "$HOST_CONTRACT_SHA256"
+          --native-contract "$GITHUB_WORKSPACE/ccc/integrations/native-cmux-inbox/NATIVE-CONTRACT.json"
+          --automatic-hook-result "$GITHUB_WORKSPACE/ccc/integrations/native-cmux-inbox/AUTOMATIC-HOOK-RESULT.json"
+          --source-manifest-sha256 "$HOST_SOURCE_MANIFEST_SHA256"
+      - name: Preserve both native actors, complete bodies and bounded original cleanup evidence
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: native-cmux-duplex-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/h/*.json
+            ${{ runner.temp }}/h/*.jsonl
+            ${{ runner.temp }}/h/*.log
+            ${{ runner.temp }}/h/REJECTED-REQUEST.body
+            ${{ runner.temp }}/h/a/*.json
+            ${{ runner.temp }}/h/g/*.json
+            ${{ runner.temp }}/h/g/*.log
+            ${{ runner.temp }}/h/host-hook-*/*.json
+            ${{ runner.temp }}/h/host-hook-*/*.stdout
+            ${{ runner.temp }}/h/host-hook-*/*.stderr
+            ${{ runner.temp }}/h/h/.codex/sessions/**/*.jsonl
+            ${{ runner.temp }}/h/prerequisites/*.json
+            ${{ runner.temp }}/h/bodies/*.txt
+            ${{ runner.temp }}/h/x/*.json
+            ${{ runner.temp }}/h/x/*.jsonl
+            ${{ runner.temp }}/h/x/*.log
+            ${{ runner.temp }}/h/x/REJECTED-REQUEST.body
+            ${{ runner.temp }}/h/x/host-hook-*/*.json
+            ${{ runner.temp }}/h/x/host-hook-*/*.stdout
+            ${{ runner.temp }}/h/x/host-hook-*/*.stderr
+            ${{ runner.temp }}/h/x/cursor/*.json
+            ${{ runner.temp }}/h/x/h/.codex/sessions/**/*.jsonl
+            ${{ runner.temp }}/h/y/*.json
+            ${{ runner.temp }}/h/y/*.jsonl
+            ${{ runner.temp }}/h/y/*.log
+            ${{ runner.temp }}/h/y/REJECTED-REQUEST.body
+            ${{ runner.temp }}/h/y/host-hook-*/*.json
+            ${{ runner.temp }}/h/y/host-hook-*/*.stdout
+            ${{ runner.temp }}/h/y/host-hook-*/*.stderr
+            ${{ runner.temp }}/h/y/cursor/*.json
+            ${{ runner.temp }}/h/y/h/.codex/sessions/**/*.jsonl
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 14

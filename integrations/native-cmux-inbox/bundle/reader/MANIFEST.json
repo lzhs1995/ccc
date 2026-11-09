@@ -1,0 +1,77 @@
+{
+  "schema": "private-native-duplex-reader-source-v1",
+  "files": {
+    "FIXED-TEST-EXPECTATIONS.json": {
+      "bytes": 3646,
+      "sha256": "95549620100de2f8baa5732160801ef2cf2efd57841a0f919208635cbb140465"
+    },
+    "cmux_daemon_identity.py": {
+      "bytes": 31772,
+      "sha256": "1be219785f329a68b82bcb52b4b6d45b35468af9b26f54cf4f32f5ac1fe8c47f"
+    },
+    "cmux_darwin_fds.py": {
+      "bytes": 4568,
+      "sha256": "022c576dfb4190f1d5f0563818a2ce1d02888df12686e4f63f115b8d53582983"
+    },
+    "cmux_foreground_thread.py": {
+      "bytes": 5169,
+      "sha256": "892cd5f401703e8b7f833cc1dd3a2aba2886fc1859b56b7bed681f5fd92b39b3"
+    },
+    "cmux_hook_identity.py": {
+      "bytes": 2720,
+      "sha256": "f9a3394af64661199270144f76ee20eb0680be6a1645155ed691da255177411d"
+    },
+    "cmux_hook_thread.py": {
+      "bytes": 3956,
+      "sha256": "4fe791985ca184ec3ed5d85b631f1305ca77e0176d2936a0cddc3c85a1ca630e"
+    },
+    "cmux_identity_budget.py": {
+      "bytes": 835,
+      "sha256": "542dacf1d8e2452fe13c5d950dcd1f7d32be27bb18d9f2c050f08ce1b2a5a91d"
+    },
+    "cmux_inbox_context.py": {
+      "bytes": 12986,
+      "sha256": "35501dd67c50920f95bb3ae81b380e31b325976c36b8d54104bc1402a083414c"
+    },
+    "cmux_native_hook_caller.py": {
+      "bytes": 15869,
+      "sha256": "8bd85f2fcf1b8cb69b280a8e383ce5e7f7063d426f7b2d8e5ac51fc237866161"
+    },
+    "cmux_workspace_guard.py": {
+      "bytes": 16819,
+      "sha256": "cf6a6e607dc4422f9fb353fc01189785a24f754903ff223c1f9fcad7d86c41da"
+    },
+    "duplex_capture.py": {
+      "bytes": 3868,
+      "sha256": "c68a9f408a6a45cee6ef5feafa141e7c4e2d7b648ac35a2ba6ce325691bdc0ce"
+    },
+    "duplex_probe.py": {
+      "bytes": 8013,
+      "sha256": "629c64da80c3029641693d1a98925cb377422252c0a2c0f566185b2928d7bc17"
+    },
+    "duplex_protocol.py": {
+      "bytes": 8275,
+      "sha256": "769dd38cf84647f7bf53d4ba7c70eef0953b8d57b385047065b805e969226e43"
+    },
+    "fixed_app_admission.py": {
+      "bytes": 18119,
+      "sha256": "07846c5d4d1271397d9b1c3470412fc3856e37615539e2aec1a9959f5e50e4e8"
+    },
+    "fixture_common.py": {
+      "bytes": 6384,
+      "sha256": "8283fded6ff263f4ec7a46ceb9379b2c86b11dfe71f8bafcb0e942ff295c4268"
+    },
+    "host_probe.py": {
+      "bytes": 15408,
+      "sha256": "2b8498a145f359fff0a6344d9982ab28a0314b87251f2cb2f4792686d7709d1b"
+    },
+    "host_registration.py": {
+      "bytes": 1918,
+      "sha256": "858c5e7f6494ab0a621e45c3d51fb94c4b6aca72d9c636048d185d118a8d805a"
+    },
+    "official_signature_cache.py": {
+      "bytes": 10017,
+      "sha256": "efa269bee92f2a88bbb31bec5a04c88aa0d215512456fe6dc04631e4325b23bb"
+    }
+  }
+}
