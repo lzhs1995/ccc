@@ -1,0 +1,150 @@
+{
+  "schema": "original-r28-pure-function-extraction-v1",
+  "original_bundle": "remote-publication-20261106/native300-shared-pending-accounting-r28/bundle",
+  "functions": [
+    {
+      "original_module": "private_once_handoff.py",
+      "original_module_sha256": "ea1ac2526011368f3732cfd562d7d68e8435afdd82ce76741529bffb4937bbb1",
+      "function": "contained",
+      "start_line": 30,
+      "end_line": 34,
+      "original_excerpt_sha256": "b010f321ba743b62c778e3bb7919c584f67bda13ac4c74122f62958b95ef4d58",
+      "extracted_excerpt_sha256": "b010f321ba743b62c778e3bb7919c584f67bda13ac4c74122f62958b95ef4d58",
+      "changes": []
+    },
+    {
+      "original_module": "private_once_handoff.py",
+      "original_module_sha256": "ea1ac2526011368f3732cfd562d7d68e8435afdd82ce76741529bffb4937bbb1",
+      "function": "require_runner",
+      "start_line": 37,
+      "end_line": 47,
+      "original_excerpt_sha256": "38459557989ed838e891517d8995caf60b7b15e47cfc860ca6e51dd994ef914f",
+      "extracted_excerpt_sha256": "38459557989ed838e891517d8995caf60b7b15e47cfc860ca6e51dd994ef914f",
+      "changes": []
+    },
+    {
+      "original_module": "private_once_handoff.py",
+      "original_module_sha256": "ea1ac2526011368f3732cfd562d7d68e8435afdd82ce76741529bffb4937bbb1",
+      "function": "save_once",
+      "start_line": 50,
+      "end_line": 60,
+      "original_excerpt_sha256": "0e081f3f90b3f7d2e47256fb405f338c98c4229078b3e4909aff4d5a89472539",
+      "extracted_excerpt_sha256": "0e081f3f90b3f7d2e47256fb405f338c98c4229078b3e4909aff4d5a89472539",
+      "changes": []
+    },
+    {
+      "original_module": "private_factory.py",
+      "original_module_sha256": "7cebdecbd40242ea0bf10d1044e0b1b967c58bec99b2fedcedb9af52218f3633",
+      "function": "sha",
+      "start_line": 28,
+      "end_line": 29,
+      "original_excerpt_sha256": "4e627faf4b903521e935f7c6f3ae93545856f821d0e2565ba7ea6cf97d3d0e6c",
+      "extracted_excerpt_sha256": "4e627faf4b903521e935f7c6f3ae93545856f821d0e2565ba7ea6cf97d3d0e6c",
+      "changes": []
+    },
+    {
+      "original_module": "private_factory.py",
+      "original_module_sha256": "7cebdecbd40242ea0bf10d1044e0b1b967c58bec99b2fedcedb9af52218f3633",
+      "function": "strict_file",
+      "start_line": 32,
+      "end_line": 47,
+      "original_excerpt_sha256": "881285f1d4da78cfc3131e2b0d59bbf420d35be004102dc95177e18de3e21a9d",
+      "extracted_excerpt_sha256": "881285f1d4da78cfc3131e2b0d59bbf420d35be004102dc95177e18de3e21a9d",
+      "changes": []
+    },
+    {
+      "original_module": "private_factory.py",
+      "original_module_sha256": "7cebdecbd40242ea0bf10d1044e0b1b967c58bec99b2fedcedb9af52218f3633",
+      "function": "pinned",
+      "start_line": 50,
+      "end_line": 56,
+      "original_excerpt_sha256": "4aebb13895c9c241eaf7599967e1eed4394d995b0e78cc46da180ef9625b64d5",
+      "extracted_excerpt_sha256": "4aebb13895c9c241eaf7599967e1eed4394d995b0e78cc46da180ef9625b64d5",
+      "changes": []
+    },
+    {
+      "original_module": "private_factory.py",
+      "original_module_sha256": "7cebdecbd40242ea0bf10d1044e0b1b967c58bec99b2fedcedb9af52218f3633",
+      "function": "write_new",
+      "start_line": 59,
+      "end_line": 66,
+      "original_excerpt_sha256": "fe27060bd55845783768ba18a89ccbebfa735bdee1ee079045484aa369762a71",
+      "extracted_excerpt_sha256": "fe27060bd55845783768ba18a89ccbebfa735bdee1ee079045484aa369762a71",
+      "changes": []
+    },
+    {
+      "original_module": "private_factory.py",
+      "original_module_sha256": "7cebdecbd40242ea0bf10d1044e0b1b967c58bec99b2fedcedb9af52218f3633",
+      "function": "prepare_native_home",
+      "start_line": 158,
+      "end_line": 170,
+      "original_excerpt_sha256": "068cb91318fe0b11a91d72808295b250fb088b2309a4f4d3e8e50d63ffc2e061",
+      "extracted_excerpt_sha256": "e9db61926cc46645a5f0b2d054b610a12294445cfda7b74acd32a3c69a0fa7d1",
+      "changes": [
+        "Remove same-module handoff qualifier for require_runner and contained; behavior unchanged."
+      ]
+    },
+    {
+      "original_module": "compaction_provider.py",
+      "original_module_sha256": "a0a9d6d06796a4737d92aad16c3f52855c4377dd224c361c993c13b543f98eda",
+      "function": "need",
+      "start_line": 22,
+      "end_line": 23,
+      "original_excerpt_sha256": "d6dfd074276547e497076cbc8903ce4fa1c2881d711be6b5e49fbd3cd94c22fd",
+      "extracted_excerpt_sha256": "d6dfd074276547e497076cbc8903ce4fa1c2881d711be6b5e49fbd3cd94c22fd",
+      "changes": []
+    },
+    {
+      "original_module": "compaction_provider.py",
+      "original_module_sha256": "a0a9d6d06796a4737d92aad16c3f52855c4377dd224c361c993c13b543f98eda",
+      "function": "items",
+      "start_line": 26,
+      "end_line": 27,
+      "original_excerpt_sha256": "7fa597d213da568a2e0f09e8b17ddebf548c8deafb996415e313084ff108f101",
+      "extracted_excerpt_sha256": "7fa597d213da568a2e0f09e8b17ddebf548c8deafb996415e313084ff108f101",
+      "changes": []
+    },
+    {
+      "original_module": "compaction_provider.py",
+      "original_module_sha256": "a0a9d6d06796a4737d92aad16c3f52855c4377dd224c361c993c13b543f98eda",
+      "function": "tool_entries",
+      "start_line": 30,
+      "end_line": 41,
+      "original_excerpt_sha256": "b7bdd899308cea57195f01c841c5bffac1b0a70591df25ef04f14e48e15c5740",
+      "extracted_excerpt_sha256": "b7bdd899308cea57195f01c841c5bffac1b0a70591df25ef04f14e48e15c5740",
+      "changes": []
+    },
+    {
+      "original_module": "compaction_provider.py",
+      "original_module_sha256": "a0a9d6d06796a4737d92aad16c3f52855c4377dd224c361c993c13b543f98eda",
+      "function": "tool",
+      "start_line": 44,
+      "end_line": 58,
+      "original_excerpt_sha256": "a85079b53726272b0a21092eb3d92d42a671525b6a6a7f4add6f64724cbfadff",
+      "extracted_excerpt_sha256": "a85079b53726272b0a21092eb3d92d42a671525b6a6a7f4add6f64724cbfadff",
+      "changes": []
+    },
+    {
+      "original_module": "compaction_provider.py",
+      "original_module_sha256": "a0a9d6d06796a4737d92aad16c3f52855c4377dd224c361c993c13b543f98eda",
+      "function": "completed_events",
+      "start_line": 61,
+      "end_line": 68,
+      "original_excerpt_sha256": "748cc62624ea4eeb4992f3e6edc319efadd47782786ff079a67e17304dd3e8bf",
+      "extracted_excerpt_sha256": "748cc62624ea4eeb4992f3e6edc319efadd47782786ff079a67e17304dd3e8bf",
+      "changes": []
+    },
+    {
+      "original_module": "compaction_provider.py",
+      "original_module_sha256": "a0a9d6d06796a4737d92aad16c3f52855c4377dd224c361c993c13b543f98eda",
+      "function": "sse",
+      "start_line": 100,
+      "end_line": 101,
+      "original_excerpt_sha256": "598878713c6ca1d5aa6033a8500640961e12dc1f5775f0e43ef779b326af3d0d",
+      "extracted_excerpt_sha256": "598878713c6ca1d5aa6033a8500640961e12dc1f5775f0e43ef779b326af3d0d",
+      "changes": []
+    }
+  ],
+  "full_original_modules_shipped": false,
+  "business_input_or_private_report_copied": false
+}

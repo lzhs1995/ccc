@@ -1,0 +1,43 @@
+{
+  "schema": "native-caller-minimal-fixture-bundle-v1",
+  "status": "FROZEN_PREPARED_RUNTIME_NOT_RUN",
+  "files": [
+    {
+      "path": "EXTRACTION.json",
+      "bytes": 6862,
+      "sha256": "263caaa009b37f37644260bc41e5a9678869111b8cd9a30ac0cf7cde25492d17"
+    },
+    {
+      "path": "OFFICIAL-HOST-CONTRACT.json",
+      "bytes": 685,
+      "sha256": "ffb445c77271c97888b958390ef9be84019c2380f18bbe45b867c24f6ed00550"
+    },
+    {
+      "path": "README.md",
+      "bytes": 5963,
+      "sha256": "88d5fec21652a4897e12626ab5ac5465b88467635d0c06f6717ee3b61f96f67a"
+    },
+    {
+      "path": "fixture.py",
+      "bytes": 23567,
+      "sha256": "bd2dbcfab786c926206979c7a14ede757cb55420e31467ec3d90055ef4df80f0"
+    },
+    {
+      "path": "fixture_common.py",
+      "bytes": 6384,
+      "sha256": "8283fded6ff263f4ec7a46ceb9379b2c86b11dfe71f8bafcb0e942ff295c4268"
+    },
+    {
+      "path": "tool_probe.py",
+      "bytes": 8487,
+      "sha256": "90443a61204b6687777e32b37feb4a05b53f004beef78bf7d16bf13feb2225c7"
+    }
+  ],
+  "runtime_python_members": [
+    "fixture.py",
+    "tool_probe.py",
+    "fixture_common.py"
+  ],
+  "independent_artifact_admission_required": true,
+  "automatic_hook_coverage": false
+}
