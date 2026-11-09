@@ -1,0 +1,1129 @@
+diff --git a/codex-rs/app-server-client/src/lib.rs b/codex-rs/app-server-client/src/lib.rs
+--- a/codex-rs/app-server-client/src/lib.rs
++++ b/codex-rs/app-server-client/src/lib.rs
+@@ -62,6 +62,9 @@
+ use codex_config::LoaderOverrides;
+ use codex_config::NoopThreadConfigLoader;
+ use codex_core::config::Config;
++/// Observe a kernel-verified peer in this embedded Core process.
++/// This does not query remote backends or grant input/foreground authority.
++pub use codex_core::native_caller::observe_peer as observe_native_caller_peer;
+ pub use codex_core::otel_init::build_provider as build_otel_provider;
+ pub use codex_exec_server::EnvironmentManager;
+ pub use codex_exec_server::ExecServerRuntimeOptions;
+diff --git a/codex-rs/core/src/lib.rs b/codex-rs/core/src/lib.rs
+--- a/codex-rs/core/src/lib.rs
++++ b/codex-rs/core/src/lib.rs
+@@ -16,6 +16,7 @@
+ mod realtime_prompt;
+ mod responses_headers;
+ pub use responses_headers::CodexResponsesHeaders;
++pub mod native_caller;
+ mod responses_metadata;
+ mod responses_retry;
+ pub(crate) mod session;
+diff --git a/codex-rs/core/src/native_caller.rs b/codex-rs/core/src/native_caller.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/core/src/native_caller.rs
+@@ -0,0 +1,149 @@
++//! Read-only actual caller identity. Never foreground, input, or Goal authority.
++//! The registry is in this Core process; remote/daemon data is not imported.
++mod registry;
++use codex_utils_pty::{NativeProcessIdentity, native_process_identity};
++use registry::{Binding, Identity, Registry};
++use serde_json::{Value, json};
++use std::io;
++use std::sync::{Mutex, OnceLock};
++
++static SPAWNS: OnceLock<Mutex<Registry>> = OnceLock::new();
++fn registry() -> &'static Mutex<Registry> {
++    SPAWNS.get_or_init(Mutex::default)
++}
++fn identity(value: NativeProcessIdentity) -> Identity {
++    Identity {
++        pid: value.pid,
++        ppid: value.ppid,
++        uid: value.uid,
++        birth: value.birth,
++    }
++}
++fn read(pid: u32) -> Result<Identity, &'static str> {
++    native_process_identity(pid)
++        .map(identity)
++        .map_err(|_| "native process identity unavailable")
++}
++
++pub(crate) struct Registration(Binding);
++impl Drop for Registration {
++    fn drop(&mut self) {
++        if let Ok(mut state) = registry().lock() {
++            state.remove(&self.0);
++        }
++    }
++}
++
++pub(crate) fn register(
++    context: Option<&crate::tools::sandboxing::ToolCtx>,
++    child: Option<NativeProcessIdentity>,
++) -> Option<Registration> {
++    let context = context?;
++    let child = identity(child?);
++    let owner = read(std::process::id()).ok()?;
++    // Only native context supplies thread/call; neither comes from child env.
++    registry()
++        .lock()
++        .ok()?
++        .insert(
++            owner,
++            child,
++            context.session.thread_id.to_string(),
++            context.call_id.clone(),
++            read,
++        )
++        .ok()
++        .map(Registration)
++}
++
++/// Called only by the original TUI's kernel-peer-checked native socket worker.
++/// The request contains a nonce and expected server identity, never a caller SID.
++pub fn observe_peer(
++    peer_pid: u32,
++    peer_uid: u32,
++    peer_birth: &Value,
++    request: &Value,
++) -> io::Result<Value> {
++    let error = |message: &str| io::Error::other(message.to_owned());
++    let object = request
++        .as_object()
++        .ok_or_else(|| error("caller query must be an object"))?;
++    let fields = [
++        "method",
++        "challenge",
++        "expectedClientPid",
++        "expectedClientBirth",
++        "expectedClientEpoch",
++    ];
++    if object.len() != fields.len()
++        || !fields.iter().all(|key| object.contains_key(*key))
++        || request["method"] != "caller/thread/observe"
++    {
++        return Err(error("unexpected caller query fields"));
++    }
++    let challenge = request["challenge"]
++        .as_str()
++        .ok_or_else(|| error("caller challenge missing"))?;
++    if uuid::Uuid::parse_str(challenge)
++        .map(|v| v.to_string() != challenge)
++        .unwrap_or(true)
++    {
++        return Err(error("invalid caller challenge"));
++    }
++    let owner = read(std::process::id()).map_err(error)?;
++    let peer = read(peer_pid).map_err(error)?;
++    if peer.uid != peer_uid
++        || peer_birth != &json!(peer.birth)
++        || request["expectedClientPid"] != json!(owner.pid)
++        || request["expectedClientBirth"] != json!(owner.birth)
++    {
++        return Err(error("caller query generation mismatch"));
++    }
++    let state = registry()
++        .lock()
++        .map_err(|_| error("native caller registry unavailable"))?;
++    let binding = state.resolve(owner, peer, read).map_err(error)?;
++    Ok(
++        json!({"schema":1,"purpose":"native_caller_thread","scope":"caller-thread-readonly",
++        "challenge":challenge,"clientPid":owner.pid,"clientBirth":owner.birth,
++        "peerPid":peer.pid,"peerBirth":peer.birth,"spawnPid":binding.child.pid,
++        "spawnBirth":binding.child.birth,"threadId":binding.thread_id,"callId":binding.call_id,
++        "foreground":null,"sendAuthority":false,"controllerAuthority":false,
++        "inboxAuthority":false,"source":"same-process-native-spawn"}),
++    )
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn query() -> Value {
++        json!({"method":"caller/thread/observe","challenge":"11111111-1111-4111-8111-111111111111",
++            "expectedClientPid":100,"expectedClientBirth":[100,42],
++            "expectedClientEpoch":"22222222-2222-4222-8222-222222222222"})
++    }
++
++    #[test]
++    fn caller_supplied_thread_is_rejected_before_kernel_lookup() {
++        let mut body = query();
++        body["threadId"] = json!("root");
++        assert!(
++            observe_peer(0, 0, &Value::Null, &body)
++                .unwrap_err()
++                .to_string()
++                .contains("unexpected caller query fields")
++        );
++    }
++
++    #[test]
++    fn malformed_challenge_is_rejected_before_kernel_lookup() {
++        let mut body = query();
++        body["challenge"] = json!("not-a-native-query-nonce");
++        assert!(
++            observe_peer(0, 0, &Value::Null, &body)
++                .unwrap_err()
++                .to_string()
++                .contains("invalid caller challenge")
++        );
++    }
++}
+diff --git a/codex-rs/core/src/native_caller/registry.rs b/codex-rs/core/src/native_caller/registry.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/core/src/native_caller/registry.rs
+@@ -0,0 +1,287 @@
++//! Same-process spawn membership only. This module has no environment or I/O.
++use std::collections::BTreeMap;
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
++pub(super) struct Identity {
++    pub pid: u32,
++    pub ppid: u32,
++    pub uid: u32,
++    pub birth: [u64; 2],
++}
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub(super) struct Binding {
++    pub owner: Identity,
++    pub child: Identity,
++    pub thread_id: String,
++    pub call_id: String,
++    pub token: u64,
++}
++
++#[derive(Default)]
++pub(super) struct Registry {
++    entries: BTreeMap<(u32, [u64; 2]), Binding>,
++    next: u64,
++}
++
++impl Registry {
++    pub fn insert(
++        &mut self,
++        owner: Identity,
++        child: Identity,
++        thread: String,
++        call: String,
++        mut read: impl FnMut(u32) -> Result<Identity, &'static str>,
++    ) -> Result<Binding, &'static str> {
++        if child.ppid != owner.pid
++            || child.uid != owner.uid
++            || child.birth < owner.birth
++            || read(owner.pid)? != owner
++            || read(child.pid)? != child
++            || thread.is_empty()
++            || call.is_empty()
++            || call.len() > 256
++        {
++            return Err("spawn identity is not owned by this native process");
++        }
++        let key = (child.pid, child.birth);
++        if self.entries.len() >= 1024 || self.entries.contains_key(&key) {
++            return Err("native caller registry full or ambiguous");
++        }
++        self.next = self
++            .next
++            .checked_add(1)
++            .ok_or("native caller generation exhausted")?;
++        let value = Binding {
++            owner,
++            child,
++            thread_id: thread,
++            call_id: call,
++            token: self.next,
++        };
++        self.entries.insert(key, value.clone());
++        Ok(value)
++    }
++
++    pub fn remove(&mut self, binding: &Binding) {
++        let key = (binding.child.pid, binding.child.birth);
++        if self
++            .entries
++            .get(&key)
++            .is_some_and(|v| v.token == binding.token)
++        {
++            self.entries.remove(&key);
++        }
++    }
++
++    pub fn resolve(
++        &self,
++        owner: Identity,
++        peer: Identity,
++        mut read: impl FnMut(u32) -> Result<Identity, &'static str>,
++    ) -> Result<Binding, &'static str> {
++        if peer.uid != owner.uid
++            || peer.pid == owner.pid
++            || read(peer.pid)? != peer
++            || read(owner.pid)? != owner
++        {
++            return Err("peer does not match this native process");
++        }
++        let mut chain = Vec::new();
++        let mut current = peer;
++        let mut binding = None;
++        for _ in 0..32 {
++            if current.pid == owner.pid {
++                if current != owner {
++                    return Err("native owner generation changed");
++                }
++                break;
++            }
++            if current.pid <= 1
++                || current.uid != owner.uid
++                || chain.iter().any(|p: &Identity| p.pid == current.pid)
++            {
++                return Err("invalid caller ancestry");
++            }
++            if let Some(found) = self.entries.get(&(current.pid, current.birth)) {
++                if binding.is_some() || found.child != current || found.owner != owner {
++                    return Err("ambiguous caller spawn");
++                }
++                binding = Some(found.clone());
++            }
++            chain.push(current);
++            let parent = read(current.ppid)?;
++            if parent.birth > current.birth {
++                return Err("caller parent generation changed");
++            }
++            current = parent;
++        }
++        if current != owner {
++            return Err("caller ancestry exceeds bound");
++        }
++        let found = binding.ok_or("no same-process native caller spawn")?;
++        for seen in chain.iter().rev() {
++            if read(seen.pid)? != *seen {
++                return Err("caller ancestry changed during read");
++            }
++        }
++        if read(owner.pid)? != owner {
++            return Err("native owner changed during read");
++        }
++        Ok(found)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    fn identity(pid: u32, ppid: u32) -> Identity {
++        Identity {
++            pid,
++            ppid,
++            uid: 501,
++            birth: [u64::from(pid), 42],
++        }
++    }
++    fn tree() -> BTreeMap<u32, Identity> {
++        [
++            identity(100, 1),
++            identity(110, 100),
++            identity(120, 100),
++            identity(130, 100),
++            identity(121, 120),
++            identity(122, 121),
++        ]
++        .into_iter()
++        .map(|p| (p.pid, p))
++        .collect()
++    }
++    fn get(t: &BTreeMap<u32, Identity>, pid: u32) -> Result<Identity, &'static str> {
++        t.get(&pid).copied().ok_or("unavailable")
++    }
++    fn registered(t: &BTreeMap<u32, Identity>) -> Registry {
++        let mut r = Registry::default();
++        for (pid, thread) in [(110, "root"), (120, "child-a"), (130, "child-b")] {
++            r.insert(
++                t[&100],
++                t[&pid],
++                thread.into(),
++                format!("exec-{pid}"),
++                |p| get(t, p),
++            )
++            .unwrap();
++        }
++        r
++    }
++    #[test]
++    fn root_and_two_children_keep_separate_spawn_ownership() {
++        let t = tree();
++        let r = registered(&t);
++        for (pid, thread) in [(110, "root"), (120, "child-a"), (130, "child-b")] {
++            assert_eq!(
++                r.resolve(t[&100], t[&pid], |p| get(&t, p))
++                    .unwrap()
++                    .thread_id,
++                thread
++            );
++        }
++    }
++    #[test]
++    fn child_exec_and_all_env_overrides_do_not_change_native_thread() {
++        let t = tree();
++        let r = registered(&t);
++        // exec keeps kernel PID/birth/parent; no argv/env selectors enter resolve.
++        let found = r.resolve(t[&100], t[&122], |p| get(&t, p)).unwrap();
++        assert_eq!(found.thread_id, "child-a");
++        assert_ne!(found.thread_id, "root");
++    }
++    #[test]
++    fn changed_birth_cannot_reuse_old_binding() {
++        let mut t = tree();
++        let r = registered(&t);
++        t.get_mut(&120).unwrap().birth[1] += 1;
++        assert!(r.resolve(t[&100], t[&120], |p| get(&t, p)).is_err());
++    }
++    #[test]
++    fn missing_parent_is_unknown_not_a_fallback_to_root() {
++        let mut t = tree();
++        let r = registered(&t);
++        t.remove(&121);
++        assert!(r.resolve(t[&100], t[&122], |p| get(&t, p)).is_err());
++    }
++    #[test]
++    fn foreign_uid_refuses() {
++        let mut t = tree();
++        let r = registered(&t);
++        t.get_mut(&122).unwrap().uid = 502;
++        assert!(r.resolve(t[&100], t[&122], |p| get(&t, p)).is_err());
++    }
++    #[test]
++    fn daemon_or_other_process_has_no_shared_binding() {
++        let t = tree();
++        let r = Registry::default();
++        assert!(r.resolve(t[&100], t[&122], |p| get(&t, p)).is_err());
++    }
++    #[test]
++    fn released_registration_cannot_authorize_live_descendant() {
++        let t = tree();
++        let mut r = registered(&t);
++        let b = r.resolve(t[&100], t[&122], |p| get(&t, p)).unwrap();
++        r.remove(&b);
++        assert!(r.resolve(t[&100], t[&122], |p| get(&t, p)).is_err());
++    }
++    #[test]
++    fn duplicate_spawn_is_rejected_and_original_preserved() {
++        let t = tree();
++        let mut r = registered(&t);
++        assert!(
++            r.insert(t[&100], t[&120], "root".into(), "forged".into(), |p| get(
++                &t, p
++            ))
++            .is_err()
++        );
++        assert_eq!(
++            r.resolve(t[&100], t[&120], |p| get(&t, p))
++                .unwrap()
++                .thread_id,
++            "child-a"
++        );
++    }
++    #[test]
++    fn changed_owner_refuses() {
++        let mut t = tree();
++        let r = registered(&t);
++        t.get_mut(&100).unwrap().birth[1] += 1;
++        assert!(r.resolve(t[&100], t[&122], |p| get(&t, p)).is_err());
++    }
++    #[test]
++    fn changed_ancestry_during_second_read_refuses() {
++        let t = tree();
++        let r = registered(&t);
++        let mut reads = 0;
++        assert!(
++            r.resolve(t[&100], t[&122], |p| {
++                let mut v = get(&t, p)?;
++                if p == 121 {
++                    reads += 1;
++                    if reads == 2 {
++                        v.birth[1] += 1;
++                    }
++                }
++                Ok(v)
++            })
++            .is_err()
++        );
++    }
++    #[test]
++    fn capture_must_be_actual_direct_child() {
++        let t = tree();
++        let mut r = Registry::default();
++        assert!(
++            r.insert(t[&100], t[&122], "root".into(), "call".into(), |p| get(
++                &t, p
++            ))
++            .is_err()
++        );
++    }
++}
+diff --git a/codex-rs/core/src/unified_exec/process.rs b/codex-rs/core/src/unified_exec/process.rs
+--- a/codex-rs/core/src/unified_exec/process.rs
++++ b/codex-rs/core/src/unified_exec/process.rs
+@@ -97,6 +97,7 @@
+ /// Unified wrapper over directly spawned PTY sessions and exec-server-backed
+ /// processes.
+ pub(crate) struct UnifiedExecProcess {
++    pub(super) native_caller_registration: Option<crate::native_caller::Registration>,
+     process_handle: ProcessHandle,
+     output_tx: broadcast::Sender<Vec<u8>>,
+     output: OutputHandles,
+@@ -143,6 +144,7 @@
+         let (state_tx, state_rx) = watch::channel(ProcessState::default());
+ 
+         Self {
++            native_caller_registration: None,
+             process_handle,
+             output_tx,
+             output,
+diff --git a/codex-rs/core/src/unified_exec/process_manager.rs b/codex-rs/core/src/unified_exec/process_manager.rs
+--- a/codex-rs/core/src/unified_exec/process_manager.rs
++++ b/codex-rs/core/src/unified_exec/process_manager.rs
+@@ -1389,8 +1389,17 @@
+             } else {
+                 OutputDrainPolicy::BoundedAfterExit
+             };
+-            return UnifiedExecProcess::from_exec_server_started(started, output_drain_policy)
+-                .await;
++            // Remote values never enter the local registry. The optional identity
++            // is carried only by the in-process LocalExecProcess implementation.
++            let registration = if environment.is_remote() {
++                None
++            } else {
++                crate::native_caller::register(tool_ctx, started.process.native_child_identity())
++            };
++            let mut process =
++                UnifiedExecProcess::from_exec_server_started(started, output_drain_policy).await?;
++            process.native_caller_registration = registration;
++            return Ok(process);
+         }
+ 
+         // TODO(anp): Keep PathUri through the local PTY/process launch boundary.
+@@ -1461,7 +1470,11 @@
+         .await;
+         let spawned =
+             spawn_result.map_err(|err| UnifiedExecError::create_process(err.to_string()))?;
+-        UnifiedExecProcess::from_spawned(spawned, request.sandbox).await
++        let registration =
++            crate::native_caller::register(tool_ctx, spawned.session.native_child_identity());
++        let mut process = UnifiedExecProcess::from_spawned(spawned, request.sandbox).await?;
++        process.native_caller_registration = registration;
++        Ok(process)
+     }
+ 
+     #[tracing::instrument(
+diff --git a/codex-rs/exec-server/src/local_process.rs b/codex-rs/exec-server/src/local_process.rs
+--- a/codex-rs/exec-server/src/local_process.rs
++++ b/codex-rs/exec-server/src/local_process.rs
+@@ -174,6 +174,7 @@
+ }
+ 
+ struct LocalExecProcess {
++    native_child_identity: Option<codex_utils_pty::NativeProcessIdentity>,
+     process_id: ProcessId,
+     backend: LocalProcess,
+     wake_tx: watch::Sender<u64>,
+@@ -279,7 +280,15 @@
+         &self,
+         params: ExecParams,
+         mut telemetry: ProcessTelemetry,
+-    ) -> Result<(ExecResponse, watch::Sender<u64>, ExecProcessEventLog), JSONRPCErrorError> {
++    ) -> Result<
++        (
++            ExecResponse,
++            watch::Sender<u64>,
++            ExecProcessEventLog,
++            Option<codex_utils_pty::NativeProcessIdentity>,
++        ),
++        JSONRPCErrorError,
++    > {
+         telemetry.launch_context = telemetry.launch_context.filter(SpanContext::is_valid);
+         let metadata = params.metadata.as_ref();
+         telemetry.thread_id = metadata
+@@ -448,6 +457,7 @@
+                 return Err(internal_error(err.to_string()));
+             }
+         };
++        let native_child_identity = spawned.session.native_child_identity();
+         let metrics = self.inner.telemetry.process_started(&process_id);
+ 
+         let output_notify = Arc::new(Notify::new());
+@@ -538,6 +548,7 @@
+             },
+             wake_tx,
+             events,
++            native_child_identity,
+         ))
+     }
+ 
+@@ -548,7 +559,7 @@
+     ) -> Result<ExecResponse, JSONRPCErrorError> {
+         self.start_process(params, telemetry)
+             .await
+-            .map(|(response, _, _)| response)
++            .map(|(response, _, _, _)| response)
+     }
+ 
+     pub(crate) async fn exec_read(
+@@ -803,13 +814,14 @@
+ 
+ impl LocalProcess {
+     async fn start(&self, params: ExecParams) -> Result<StartedExecProcess, ExecServerError> {
+-        let (response, wake_tx, events) = self
++        let (response, wake_tx, events, native_child_identity) = self
+             .start_process(params, ProcessTelemetry::default())
+             .await
+             .map_err(map_handler_error)?;
+         let sandbox_type = sandbox_type_from_protocol(response.sandbox_type);
+         Ok(StartedExecProcess {
+             process: Arc::new(LocalExecProcess {
++                native_child_identity,
+                 process_id: response.process_id,
+                 backend: self.clone(),
+                 wake_tx,
+@@ -889,6 +901,10 @@
+ }
+ 
+ impl ExecProcess for LocalExecProcess {
++    fn native_child_identity(&self) -> Option<codex_utils_pty::NativeProcessIdentity> {
++        self.native_child_identity
++    }
++
+     fn process_id(&self) -> &ProcessId {
+         &self.process_id
+     }
+diff --git a/codex-rs/exec-server/src/process.rs b/codex-rs/exec-server/src/process.rs
+--- a/codex-rs/exec-server/src/process.rs
++++ b/codex-rs/exec-server/src/process.rs
+@@ -199,6 +199,11 @@
+ pub trait ExecProcess: Send + Sync {
+     fn process_id(&self) -> &ProcessId;
+ 
++    /// In-process local handle only. Remote protocol implementations keep None.
++    fn native_child_identity(&self) -> Option<codex_utils_pty::NativeProcessIdentity> {
++        None
++    }
++
+     fn subscribe_wake(&self) -> watch::Receiver<u64>;
+ 
+     fn subscribe_events(&self) -> ExecProcessEventReceiver;
+diff --git a/codex-rs/tui/src/app/foreground_observation.rs b/codex-rs/tui/src/app/foreground_observation.rs
+--- a/codex-rs/tui/src/app/foreground_observation.rs
++++ b/codex-rs/tui/src/app/foreground_observation.rs
+@@ -424,13 +424,14 @@
+                 Err(_) => return,
+             };
+             let tx = self.app_event_tx.clone();
+-            match ccc_native_client_foreground::compaction_socket::NativeControlServer::open(
++            match ccc_native_client_foreground::compaction_socket::NativeControlServer::open_with_caller_observer(
+                 &self.config.codex_home,
+                 &epoch,
+                 self.foreground.observer.clone(),
+                 move |request| {
+                     tx.send(crate::app_event::AppEvent::NativeCompactionControl(request));
+                 },
++                Some(std::sync::Arc::new(codex_app_server_client::observe_native_caller_peer)),
+             ) {
+                 Ok(control) => self.foreground.control = Some(control),
+                 Err(error) => self
+diff --git a/codex-rs/utils/pty/src/lib.rs b/codex-rs/utils/pty/src/lib.rs
+--- a/codex-rs/utils/pty/src/lib.rs
++++ b/codex-rs/utils/pty/src/lib.rs
+@@ -8,8 +8,11 @@
+ pub use child_command::SpawnFallback;
+ #[cfg(target_os = "linux")]
+ mod linux_fds;
++mod local_identity;
+ pub mod pipe;
+ mod process;
++pub use local_identity::NativeProcessIdentity;
++pub use local_identity::native_process_identity;
+ pub mod process_group;
+ pub mod pty;
+ pub use pty::ChildFds;
+diff --git a/codex-rs/utils/pty/src/local_identity.rs b/codex-rs/utils/pty/src/local_identity.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/utils/pty/src/local_identity.rs
+@@ -0,0 +1,119 @@
++//! A native local child's identity, captured before its owner starts reaping it.
++//! No environment, argv, process-group inference, or remote wire identity.
++use std::io;
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct NativeProcessIdentity {
++    pub pid: u32,
++    pub ppid: u32,
++    pub uid: u32,
++    pub birth: [u64; 2],
++}
++
++#[cfg(target_os = "macos")]
++pub fn native_process_identity(pid: u32) -> io::Result<NativeProcessIdentity> {
++    #[repr(C)]
++    struct BsdInfo {
++        flags: u32,
++        status: u32,
++        xstatus: u32,
++        pid: u32,
++        ppid: u32,
++        ids: [u32; 7],
++        comm: [u8; 16],
++        name: [u8; 32],
++        misc: [u32; 6],
++        start_sec: u64,
++        start_usec: u64,
++    }
++    unsafe extern "C" {
++        fn proc_pidinfo(
++            pid: i32,
++            flavor: i32,
++            arg: u64,
++            buffer: *mut libc::c_void,
++            size: i32,
++        ) -> i32;
++    }
++    if pid <= 1 || pid > i32::MAX as u32 {
++        return Err(io::Error::other("invalid native process PID"));
++    }
++    let mut b: BsdInfo = unsafe { std::mem::zeroed() };
++    let size = std::mem::size_of::<BsdInfo>();
++    let count = unsafe {
++        proc_pidinfo(
++            pid as i32,
++            3,
++            0,
++            (&mut b as *mut BsdInfo).cast(),
++            size as i32,
++        )
++    };
++    if size != 136
++        || count != size as i32
++        || b.pid != pid
++        || b.status == 5
++        || b.start_sec == 0
++        || b.start_usec >= 1_000_000
++        || b.ids[0] != unsafe { libc::getuid() }
++    {
++        return Err(io::Error::other("native process identity unavailable"));
++    }
++    Ok(NativeProcessIdentity {
++        pid,
++        ppid: b.ppid,
++        uid: b.ids[0],
++        birth: [b.start_sec, b.start_usec],
++    })
++}
++
++#[cfg(not(target_os = "macos"))]
++pub fn native_process_identity(_pid: u32) -> io::Result<NativeProcessIdentity> {
++    Err(io::Error::other("native caller identity unsupported"))
++}
++
++pub(crate) fn capture_child(pid: u32) -> Option<NativeProcessIdentity> {
++    let identity = native_process_identity(pid).ok()?;
++    (identity.ppid == std::process::id()).then_some(identity)
++}
++
++#[cfg(all(test, target_os = "macos"))]
++mod tests {
++    use super::*;
++    use std::io::{BufRead, Write};
++    use std::process::{Command, Stdio};
++
++    #[test]
++    fn local_spawn_birth_is_preserved_across_exec_and_thread_env_override() {
++        let mut child = Command::new("/bin/sh")
++            .args([
++                "-c",
++                "exec /usr/bin/env CODEX_THREAD_ID=not-the-native-thread /bin/cat",
++            ])
++            .stdin(Stdio::piped())
++            .stdout(Stdio::piped())
++            .stderr(Stdio::null())
++            .spawn()
++            .unwrap();
++        // Always reap our own private child before evaluating assertions.
++        let before = capture_child(child.id());
++        let write = child
++            .stdin
++            .as_mut()
++            .unwrap()
++            .write_all(b"native-caller-ready\n");
++        let mut ready = String::new();
++        let read = std::io::BufReader::new(child.stdout.take().unwrap()).read_line(&mut ready);
++        let after = native_process_identity(child.id());
++        drop(child.stdin.take());
++        let status = child.wait().unwrap();
++        write.unwrap();
++        read.unwrap();
++        assert_eq!(ready, "native-caller-ready\n");
++        assert!(status.success());
++        let before = before.expect("real local child identity");
++        assert_eq!(before, after.unwrap());
++        assert_eq!(before.ppid, std::process::id());
++        assert_ne!(native_process_identity(before.pid).ok(), Some(before));
++    }
++}
+diff --git a/codex-rs/utils/pty/src/pipe.rs b/codex-rs/utils/pty/src/pipe.rs
+--- a/codex-rs/utils/pty/src/pipe.rs
++++ b/codex-rs/utils/pty/src/pipe.rs
+@@ -210,6 +210,8 @@
+         .id()
+         .ok_or_else(|| io::Error::other("missing child pid"))?;
+ 
++    // Capture while the original child handle still owns this PID, before wait/reap.
++    let native_child_identity = child.id().and_then(crate::local_identity::capture_child);
+     let stdin = child.stdin.take();
+     let stdout = child.stdout.take();
+     let stderr = child.stderr.take();
+@@ -306,7 +308,8 @@
+         exit_code,
+         /*pty_handles*/ None,
+         /*resizer*/ None,
+-    );
++    )
++    .with_native_child_identity(native_child_identity);
+ 
+     Ok(SpawnedProcess {
+         session: handle,
+diff --git a/codex-rs/utils/pty/src/process.rs b/codex-rs/utils/pty/src/process.rs
+--- a/codex-rs/utils/pty/src/process.rs
++++ b/codex-rs/utils/pty/src/process.rs
+@@ -117,6 +117,7 @@
+     wait_handle: StdMutex<Option<JoinHandle<()>>>,
+     exit_status: Arc<AtomicBool>,
+     exit_code: Arc<StdMutex<Option<i32>>>,
++    native_child_identity: Option<crate::NativeProcessIdentity>,
+     // PtyHandles must be preserved because the process will receive Control+C if the
+     // slave is closed
+     _pty_handles: StdMutex<Option<PtyHandles>>,
+@@ -154,9 +155,23 @@
+             wait_handle: StdMutex::new(Some(wait_handle)),
+             exit_status,
+             exit_code,
++            native_child_identity: None,
+             _pty_handles: StdMutex::new(pty_handles),
+             resizer: StdMutex::new(resizer),
+         }
++    }
++
++    /// Only local spawn implementations can attach this pre-reap kernel identity.
++    pub(crate) fn with_native_child_identity(
++        mut self,
++        identity: Option<crate::NativeProcessIdentity>,
++    ) -> Self {
++        self.native_child_identity = identity;
++        self
++    }
++
++    pub fn native_child_identity(&self) -> Option<crate::NativeProcessIdentity> {
++        self.native_child_identity
+     }
+ 
+     /// Returns a channel sender for writing raw bytes to the child stdin.
+diff --git a/codex-rs/utils/pty/src/pty.rs b/codex-rs/utils/pty/src/pty.rs
+--- a/codex-rs/utils/pty/src/pty.rs
++++ b/codex-rs/utils/pty/src/pty.rs
+@@ -214,6 +214,10 @@
+     // Unix, so PID == PGID and we can reuse the pipe backend's process-group
+     // hard-kill semantics for descendants.
+     let process_group_id = child.process_id();
++    #[cfg(unix)]
++    let native_child_identity = process_group_id.and_then(crate::local_identity::capture_child);
++    #[cfg(not(unix))]
++    let native_child_identity = None;
+     let killer = child.clone_killer();
+ 
+     let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>(128);
+@@ -308,7 +312,8 @@
+         exit_code,
+         Some(handles),
+         /*resizer*/ None,
+-    );
++    )
++    .with_native_child_identity(native_child_identity);
+ 
+     Ok(SpawnedProcess {
+         session: handle,
+@@ -418,6 +423,7 @@
+         .ok_or_else(|| std::io::Error::other("missing child pid"))?;
+     #[cfg(not(target_os = "linux"))]
+     let process_group_id = child.id();
++    let native_child_identity = crate::local_identity::capture_child(process_group_id);
+ 
+     let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>(128);
+     let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(128);
+@@ -467,7 +473,8 @@
+         exit_code,
+         Some(handles),
+         /*resizer*/ None,
+-    );
++    )
++    .with_native_child_identity(native_child_identity);
+ 
+     Ok(SpawnedProcess {
+         session: handle,
+diff --git a/native/client-foreground/src/caller_socket_tests.rs b/native/client-foreground/src/caller_socket_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/native/client-foreground/src/caller_socket_tests.rs
+@@ -0,0 +1,146 @@
++use super::*;
++use std::io::BufRead;
++
++fn namespace() -> tempfile::TempDir {
++    let home = tempfile::Builder::new()
++        .prefix("ncc-")
++        .tempdir_in("/private/tmp")
++        .unwrap();
++    let dir = home
++        .path()
++        .join("credential-observations/compaction-recovery");
++    fs::create_dir_all(&dir).unwrap();
++    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
++    let mut marker = OpenOptions::new()
++        .write(true)
++        .create_new(true)
++        .mode(0o600)
++        .open(dir.join("enabled-v1"))
++        .unwrap();
++    marker
++        .write_all(b"ccc-native-compaction-recovery-v1\n")
++        .unwrap();
++    home
++}
++
++fn query(home: &Path, body: &Value) -> Value {
++    let path = home.join(format!(
++        "credential-observations/compaction-recovery/client-{}-control.json",
++        std::process::id()
++    ));
++    let capability: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
++    let mut stream = UnixStream::connect(capability["socket"].as_str().unwrap()).unwrap();
++    stream
++        .set_read_timeout(Some(Duration::from_secs(2)))
++        .unwrap();
++    stream.write_all(format!("{body}\n").as_bytes()).unwrap();
++    let mut reply = String::new();
++    std::io::BufReader::new(stream)
++        .read_line(&mut reply)
++        .unwrap();
++    serde_json::from_str(&reply).unwrap()
++}
++
++#[test]
++fn caller_route_uses_kernel_peer_and_never_dispatches_input() {
++    let home = namespace();
++    let epoch = uuid::Uuid::new_v4().to_string();
++    let challenge = uuid::Uuid::new_v4().to_string();
++    let dispatched = Arc::new(AtomicUsize::new(0));
++    let count = dispatched.clone();
++    let (tx, rx) = mpsc::sync_channel(1);
++    let _server = NativeControlServer::open_with_caller_observer(
++        home.path(),
++        &epoch,
++        ForegroundObserver::disabled(),
++        move |_| {
++            count.fetch_add(1, Ordering::SeqCst);
++        },
++        Some(Arc::new(move |pid, uid, birth, body| {
++            tx.send((pid, uid, birth.clone())).unwrap();
++            Ok(
++                json!({"scope":"caller-thread-readonly","challenge":body["challenge"],
++                "threadId":"fixture-child","foreground":null,"sendAuthority":false}),
++            )
++        })),
++    )
++    .unwrap();
++    let capability_path = home.path().join(format!(
++        "credential-observations/compaction-recovery/client-{}-control.json",
++        std::process::id()
++    ));
++    let capability: Value = serde_json::from_slice(&fs::read(capability_path).unwrap()).unwrap();
++    assert_eq!(
++        capability["methods"],
++        json!(["compaction/recovery/query", "compaction/recovery/control"])
++    );
++    assert_eq!(
++        capability["callerObservation"],
++        json!({
++        "schema":1,"method":"caller/thread/observe","scope":"caller-thread-readonly",
++        "requiresSameProcessSpawn":true})
++    );
++    let reply = query(
++        home.path(),
++        &json!({"method":"caller/thread/observe",
++        "challenge":challenge,"expectedClientEpoch":epoch}),
++    );
++    assert_eq!(reply["challenge"], challenge);
++    assert_eq!(reply["clientEpoch"], epoch);
++    assert_eq!(reply["threadId"], "fixture-child");
++    let (pid, uid, birth) = rx.recv_timeout(Duration::from_secs(2)).unwrap();
++    assert_eq!(pid, std::process::id());
++    assert_eq!(uid, unsafe { libc::getuid() });
++    assert_eq!(birth, process_birth(pid).unwrap());
++    assert_eq!(dispatched.load(Ordering::SeqCst), 0);
++}
++
++#[test]
++fn caller_epoch_mismatch_refuses_before_callback_or_dispatch() {
++    let home = namespace();
++    let calls = Arc::new(AtomicUsize::new(0));
++    let count = calls.clone();
++    let dispatch = calls.clone();
++    let _server = NativeControlServer::open_with_caller_observer(
++        home.path(),
++        &uuid::Uuid::new_v4().to_string(),
++        ForegroundObserver::disabled(),
++        move |_| {
++            dispatch.fetch_add(1, Ordering::SeqCst);
++        },
++        Some(Arc::new(move |_, _, _, _| {
++            count.fetch_add(1, Ordering::SeqCst);
++            Ok(json!({}))
++        })),
++    )
++    .unwrap();
++    let reply = query(
++        home.path(),
++        &json!({"method":"caller/thread/observe",
++        "expectedClientEpoch":uuid::Uuid::new_v4().to_string()}),
++    );
++    assert!(reply["error"].as_str().unwrap().contains("epoch"));
++    assert_eq!(calls.load(Ordering::SeqCst), 0);
++}
++
++#[test]
++fn legacy_open_keeps_original_methods_without_caller_advertisement() {
++    let home = namespace();
++    let _server = NativeControlServer::open(
++        home.path(),
++        &uuid::Uuid::new_v4().to_string(),
++        ForegroundObserver::disabled(),
++        |_| {},
++    )
++    .unwrap();
++    let capability_path = home.path().join(format!(
++        "credential-observations/compaction-recovery/client-{}-control.json",
++        std::process::id()
++    ));
++    let capability: Value = serde_json::from_slice(&fs::read(capability_path).unwrap()).unwrap();
++    assert_eq!(
++        capability["methods"],
++        json!(["compaction/recovery/query", "compaction/recovery/control"])
++    );
++    assert!(capability.get("callerObservation").is_none());
++}
+diff --git a/native/client-foreground/src/compaction_socket.rs b/native/client-foreground/src/compaction_socket.rs
+--- a/native/client-foreground/src/compaction_socket.rs
++++ b/native/client-foreground/src/compaction_socket.rs
+@@ -111,6 +111,13 @@
+     pub reply: mpsc::SyncSender<Value>,
+ }
+ 
++/// A callback into the same Core instance; no wire-supplied caller identity.
++pub type CallerObserver = Arc<dyn Fn(u32, u32, &Value, &Value) -> io::Result<Value> + Send + Sync>;
++
++#[cfg(all(test, target_os = "macos"))]
++#[path = "caller_socket_tests.rs"]
++mod caller_tests;
++
+ pub struct NativeControlServer {
+     stop: Arc<AtomicBool>,
+     path: PathBuf,
+@@ -171,6 +178,16 @@
+         observer: ForegroundObserver,
+         dispatch: impl Fn(NativeControlRequest) + Send + Sync + 'static,
+     ) -> io::Result<Self> {
++        Self::open_with_caller_observer(home, client_epoch, observer, dispatch, None)
++    }
++
++    pub fn open_with_caller_observer(
++        home: &Path,
++        client_epoch: &str,
++        observer: ForegroundObserver,
++        dispatch: impl Fn(NativeControlRequest) + Send + Sync + 'static,
++        caller_observer: Option<CallerObserver>,
++    ) -> io::Result<Self> {
+         let root = home.join("credential-observations/compaction-recovery");
+         if read_private(&root.join("enabled-v1"))? != b"ccc-native-compaction-recovery-v1\n" {
+             return Err(invalid("native control not enabled"));
+@@ -212,11 +229,20 @@
+         };
+         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+         listener.set_nonblocking(true)?;
+-        let bytes=serde_json::to_vec(&json!({"schema":1,"purpose":"native_compaction_recovery_control",
++        // Original consumers require this exact two-method array. Advertise
++        // caller observation separately without widening that control contract.
++        let mut capability_record = json!({"schema":1,"purpose":"native_compaction_recovery_control",
+             "pid":std::process::id(),"birth":process_birth(std::process::id())?,"client_epoch":client_epoch,
+             "socket":path,"socket_device":m.dev(),"socket_inode":m.ino(),
+             "methods":["compaction/recovery/query","compaction/recovery/control"],
+-            "controlRequiresNativeBackend":true})).map_err(|_|invalid("native capability encoding failed"))?;
++            "controlRequiresNativeBackend":true});
++        if caller_observer.is_some() {
++            capability_record["callerObservation"] = json!({
++                "schema":1,"method":"caller/thread/observe","scope":"caller-thread-readonly",
++                "requiresSameProcessSpawn":true});
++        }
++        let bytes = serde_json::to_vec(&capability_record)
++            .map_err(|_| invalid("native capability encoding failed"))?;
+         let mut publication = OpenOptions::new()
+             .write(true)
+             .create_new(true)
+@@ -229,6 +255,7 @@
+         publication.sync_all()?;
+         dir.sync_all()?;
+         observer.register_compaction_socket(path.clone(), inode.0, inode.1)?;
++        let caller_client_epoch = client_epoch.to_owned();
+         let worker_stop = owned.stop.clone();
+         let dispatch = Arc::new(dispatch);
+         let active = Arc::new(AtomicUsize::new(0));
+@@ -242,6 +269,8 @@
+                                 active.fetch_sub(1, Ordering::SeqCst);
+                                 continue;
+                             }
++                            let caller_observer = caller_observer.clone();
++                            let caller_client_epoch = caller_client_epoch.clone();
+                             let dispatch = dispatch.clone();
+                             let observer = observer.clone();
+                             let active = active.clone();
+@@ -268,6 +297,26 @@
+                                     }
+                                     if stop.load(Ordering::SeqCst) {
+                                         return Err(invalid("native control listener revoked"));
++                                    }
++                                    if body["method"] == "caller/thread/observe" {
++                                        if body["expectedClientEpoch"].as_str()
++                                            != Some(caller_client_epoch.as_str())
++                                        {
++                                            return Err(invalid(
++                                                "native caller client epoch differs",
++                                            ));
++                                        }
++                                        let query = caller_observer.as_ref().ok_or_else(|| {
++                                            invalid("native caller observer unavailable")
++                                        })?;
++                                        let mut result = query(peer_pid, peer_uid, &birth, &body)?;
++                                        if stop.load(Ordering::SeqCst)
++                                            || process_birth(peer_pid)? != birth
++                                        {
++                                            return Err(invalid("native caller peer changed"));
++                                        }
++                                        result["clientEpoch"] = json!(caller_client_epoch);
++                                        return Ok(result);
+                                     }
+                                     if body["method"] == "authority/verify" {
+                                         let path = body["proofPath"]
