@@ -1,0 +1,126 @@
+{
+  "schema": "native-caller-runner-original-artifact-functions-v1",
+  "original_bundle": "remote-publication-20261106/native300-shared-pending-accounting-r28/bundle",
+  "functions": [
+    {
+      "original": "artifact-proof/native_proof.py",
+      "original_sha256": "8198d43f3fe8a96dbd0ac5fca9330d8a8c42e0fab000e92a7995e7e883f1b3f3",
+      "function": "need",
+      "line": 71,
+      "end_line": 73,
+      "excerpt_sha256": "69dbc0c6ce4d2b459f8108b21cea76ef69aa5a341f5fe02626d8eacc7af25e71",
+      "changes": []
+    },
+    {
+      "original": "artifact-proof/native_proof.py",
+      "original_sha256": "8198d43f3fe8a96dbd0ac5fca9330d8a8c42e0fab000e92a7995e7e883f1b3f3",
+      "function": "sha",
+      "line": 76,
+      "end_line": 78,
+      "excerpt_sha256": "2cc0fde0e63eccef63730c984e5ea35748e8cf8c3d1af9bcd94b20e8ee8bc525",
+      "changes": []
+    },
+    {
+      "original": "artifact-proof/native_proof.py",
+      "original_sha256": "8198d43f3fe8a96dbd0ac5fca9330d8a8c42e0fab000e92a7995e7e883f1b3f3",
+      "function": "canonical",
+      "line": 81,
+      "end_line": 82,
+      "excerpt_sha256": "46f62bb6eeef234a4762cb7cb3ac7d8e19fbdb4a780a0af07a2ff5536855d1d8",
+      "changes": []
+    },
+    {
+      "original": "artifact-proof/native_proof.py",
+      "original_sha256": "8198d43f3fe8a96dbd0ac5fca9330d8a8c42e0fab000e92a7995e7e883f1b3f3",
+      "function": "private_file",
+      "line": 93,
+      "end_line": 98,
+      "excerpt_sha256": "fec2639bd30c954dc941e6cdf11fb01c0dc4b0a474537728313b960e3e0b964e",
+      "changes": []
+    },
+    {
+      "original": "artifact-proof/native_proof.py",
+      "original_sha256": "8198d43f3fe8a96dbd0ac5fca9330d8a8c42e0fab000e92a7995e7e883f1b3f3",
+      "function": "validate_zip",
+      "line": 189,
+      "end_line": 204,
+      "excerpt_sha256": "239a073266bb5ab5c091c128e4de918b8f08f9c147b18a95cdf9ff0e9606d35f",
+      "changes": []
+    },
+    {
+      "original": "artifact-proof/native_proof.py",
+      "original_sha256": "8198d43f3fe8a96dbd0ac5fca9330d8a8c42e0fab000e92a7995e7e883f1b3f3",
+      "function": "extract_zip",
+      "line": 207,
+      "end_line": 218,
+      "excerpt_sha256": "3e0710c850299a89401b271e924b85a07af29ac076026eb15d992d56e31ada48",
+      "changes": []
+    },
+    {
+      "original": "artifact-proof/native_proof.py",
+      "original_sha256": "8198d43f3fe8a96dbd0ac5fca9330d8a8c42e0fab000e92a7995e7e883f1b3f3",
+      "function": "junit",
+      "line": 221,
+      "end_line": 235,
+      "excerpt_sha256": "81bff3d1555d7230a4c73feb2aeac2fa63a8f57a247ca54ca98fbd7786aec2b6",
+      "changes": []
+    },
+    {
+      "original": "artifact_admission.py",
+      "original_sha256": "f65bd25e1a2fbd13d26898487f57a1a7142ed58e321438001b00a9ebf0384b13",
+      "function": "save",
+      "line": 42,
+      "end_line": 42,
+      "excerpt_sha256": "c75375c550e3717ee4ce0496d581930242c090abf3766cf7c0975194386d6046",
+      "changes": []
+    },
+    {
+      "original": "artifact_admission.py",
+      "original_sha256": "f65bd25e1a2fbd13d26898487f57a1a7142ed58e321438001b00a9ebf0384b13",
+      "function": "gh_json",
+      "line": 48,
+      "end_line": 50,
+      "excerpt_sha256": "18cff520b41cfeed7e1ea6c8bd074385a5b17da33685e18027a9dc8e42037b21",
+      "changes": []
+    },
+    {
+      "original": "artifact_admission.py",
+      "original_sha256": "f65bd25e1a2fbd13d26898487f57a1a7142ed58e321438001b00a9ebf0384b13",
+      "function": "capacity",
+      "line": 52,
+      "end_line": 54,
+      "excerpt_sha256": "57afd4b824c3465046c3fae41738932dbcbf4d4d06049342fcc6258b3ddb45de",
+      "changes": []
+    },
+    {
+      "original": "artifact_admission.py",
+      "original_sha256": "f65bd25e1a2fbd13d26898487f57a1a7142ed58e321438001b00a9ebf0384b13",
+      "function": "current_runner",
+      "line": 56,
+      "end_line": 58,
+      "excerpt_sha256": "94213a7de0c26fbe6da89d032cb270888dda2edb55a657a49f607cb886e79d4b",
+      "changes": []
+    },
+    {
+      "original": "artifact_admission.py",
+      "original_sha256": "f65bd25e1a2fbd13d26898487f57a1a7142ed58e321438001b00a9ebf0384b13",
+      "function": "download_artifact",
+      "line": 83,
+      "end_line": 93,
+      "excerpt_sha256": "772ae74d55196694b552d8b886bcec31b59898b60c68b226957cde187774b38b",
+      "changes": []
+    },
+    {
+      "original": "artifact_admission.py",
+      "original_sha256": "f65bd25e1a2fbd13d26898487f57a1a7142ed58e321438001b00a9ebf0384b13",
+      "function": "official_host",
+      "line": 95,
+      "end_line": 125,
+      "excerpt_sha256": "4692e83487f523c458f3175af7823c36c3500ee474d0d9dd5c53dde25cf56553",
+      "changes": []
+    }
+  ],
+  "function_count": 13,
+  "original_body_changes": 0,
+  "module_adapter": "Imports only; HERE points to unchanged fixture host contract, f/h use already-extracted pure fixture_common. Constants match originals."
+}

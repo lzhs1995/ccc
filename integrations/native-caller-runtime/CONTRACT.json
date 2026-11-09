@@ -1,0 +1,81 @@
+{
+  "schema": "native-caller-single-runtime-contract-v1",
+  "status": "ROOT_REVIEWED_ACTUAL_BUILD",
+  "repository": "lzhs1995/ccc",
+  "run_id": 42557187399,
+  "run_attempt": 1,
+  "head": "14e8870b4e032809fb5effcb0d657016f503296b",
+  "branch": "ccc/native-caller-spawn-20261109-r2",
+  "build_conclusion": "success",
+  "fixture_manifest_sha256": "0f9c64f49b5daca5b5df315c2a84d114aa2abe90476b82618890ebca7a1b3a3f",
+  "fixture_source_review_sha256": "95fbc42597a5d691f1323ef154a527a3b294fcd91da0b8bdf9c9b733b5e0373c",
+  "root_artifact_review_sha256": "68d684cf8418aa86fb369a202f74701491c37ba82b51359bb8b9d4a2e0d3544f",
+  "result_sha256": "0f1d17b4b612b2d269819562e4e6b03370e5d72e6b59f6a7ae0625b7872816ac",
+  "effective_source_file_sha256": "2627250448e9a4baefafdef31cf3099caa917ebe16f748de570c231b6fa69709",
+  "effective_source_sha256": "9aab6a1f42633359fdf9d21a5e4774d824ba6c2e07d499a6a19d825303ea37c5",
+  "binary_sha256": "8b65ff11cc0e9d507bfd3c50698a10ae22127d9404baa45e2f18670152364991",
+  "binary_bytes": 360284632,
+  "artifacts": {
+    "evidence": {
+      "id": 13651497523,
+      "name": "native-caller-spawn-evidence-42557187399-1",
+      "digest": "sha256:40ebd4c5a85745c16077db99d4917f47eebd85b9c40a34113d6cf774bebdb5db",
+      "size_in_bytes": 1461435
+    },
+    "binary": {
+      "id": 13651711300,
+      "name": "native-caller-spawn-arm64-42557187399-1",
+      "digest": "sha256:2d46faf28a7c97fdd6dad1e568e4e74e0fd867693271589e10395b4bae5d4287",
+      "size_in_bytes": 118181793
+    }
+  },
+  "evidence_files": {
+    "ACTUAL-SCHEMA.json": "245d8435210db7217c3424f0efb78bcd37561bd127670d873bddc4dbcaeed549",
+    "BUILD-COMMAND.json": "5f9df848727ac95de7d8aac6069bdc04a6b4c656d570799c614bac0e8aa477f3",
+    "CHECK-COMMAND.json": "7ddad167467d960bfc1e546d53cc8d106819dd4dea51993293504b3b2fae6eca",
+    "DELTA-SOURCE.json": "2627250448e9a4baefafdef31cf3099caa917ebe16f748de570c231b6fa69709",
+    "DELTA-TEST-RESULT.json": "efacf4ad6b8ef17f65d2dafa65017ba348c71f9a4ccd2c961ce4f4f1037cbc3d",
+    "EFFECTIVE-SOURCE.json": "2627250448e9a4baefafdef31cf3099caa917ebe16f748de570c231b6fa69709",
+    "FORMAT-COMMANDS.json": "27b7d6f258c0e6755198cede6f09bc3ab383505fa9be04ea337ae0a7b8e8d828",
+    "FORMAT-RESULT.json": "28ccf5fdf4f0dcb4ff1f9ba4aa8c288c331b7f3111dca13169f8b4adca14c2cd",
+    "ORIGINAL-R9-SOURCE.json": "b4a90f2d18f06937a8641fa35a0626c6dd9e802663578b2335de884bfecead59",
+    "REQUEST.json": "f5f3544f20b0a5b52e898d9dd79a4c5466f1aeffb76530d52399efbaeb5764df",
+    "RESULT.json": "0f1d17b4b612b2d269819562e4e6b03370e5d72e6b59f6a7ae0625b7872816ac",
+    "RUSTFMT.patch": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "V8-ARTIFACTS.json": "b6e643c10decfc69f8574a4b0bc72f187155751f43444e7753121c996ff59812",
+    "V8-RELEASE-CHECKSUMS.log": "5cebc5830127b460ae8af23004430fd70b535bb22d599d68d024b60df08400d8",
+    "base-application.log": "09d3f874ed5a1c87c454aa1f2a517446449199da3e2d14ae76ee834f2149ba37",
+    "check-changed-targets.log": "775e92c8571c470fb8c4c432de5e4c4b90643655b2c05449003eefdd36a2f5d6",
+    "native-command.json": "ad3afc2e0203315050d1a074d9cd28954eb68c4a095f5e6fec75abfc5b33667d",
+    "native-nextest.toml": "6844427fe7a96149de335822d7afdcd77a8710f0023dc7c553e2af1f29f18e7e",
+    "native-tests.log": "8402a3dea760e8d13adf642c666065c5f68d446a3b1ab01cfff6e39f038ebab4",
+    "native-tests.xml": "c41f8e64bf1524e1303615632f388dea006d272a89e05a545283506663d05e75",
+    "release-build.log": "cf7bc7da3c7e175966bfe7b5dee634cbad2089d8816e51b38112cdc96e6b2109",
+    "schema-export.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "workspace-command.json": "88085f9d718df3d6f842cf2d4c4975a0a3f256edf9c8552e07df1c54264a7056",
+    "workspace-nextest.toml": "c805758e239480c808ae8471d516078f6c09685a1d18674821301d4b6dc87ae4",
+    "workspace-tests.log": "a45a51474034e56ddf370193d4654384bf0f78513c741fa9d4d44e080d0d4c65",
+    "workspace-tests.xml": "dfa564505bedf160c0cf67489f0189d1843a43db78b8ad23924a4b381c6f7a40"
+  },
+  "source_files": {
+    "integrations/native-spawn-readonly/ci.py": "5f34fb129ce12d70925c9eff8eac81645a440740e5aba2a7c28c35be6a438d07",
+    "integrations/native-spawn-readonly/REQUEST.json": "f5f3544f20b0a5b52e898d9dd79a4c5466f1aeffb76530d52399efbaeb5764df",
+    "integrations/native-spawn-readonly/native-spawn.patch": "825c6897569f43d986e719377b9bee93f1497183fbfb65f1a6cbdf31e25dd38c",
+    ".github/workflows/codex-native-spawn.yml": "fad7787a458021733d0974748282fc1a33a8527e7edb40728aedd6f143f6bcd0"
+  },
+  "runner_files": {
+    "EXTRACTION.json": "379ce74624c27ecd53cb3f4ba7e906dbe0028fa8256e7d0598199054c088446c",
+    "artifact_io.py": "f5fe951edfdb089719c71937aa53ebd2d3cee7f697f4654a2e04ab65b71ffce0",
+    "fixture/EXTRACTION.json": "263caaa009b37f37644260bc41e5a9678869111b8cd9a30ac0cf7cde25492d17",
+    "fixture/MANIFEST.json": "0f9c64f49b5daca5b5df315c2a84d114aa2abe90476b82618890ebca7a1b3a3f",
+    "fixture/OFFICIAL-HOST-CONTRACT.json": "ffb445c77271c97888b958390ef9be84019c2380f18bbe45b867c24f6ed00550",
+    "fixture/README.md": "88d5fec21652a4897e12626ab5ac5465b88467635d0c06f6717ee3b61f96f67a",
+    "fixture/fixture.py": "bd2dbcfab786c926206979c7a14ede757cb55420e31467ec3d90055ef4df80f0",
+    "fixture/fixture_common.py": "8283fded6ff263f4ec7a46ceb9379b2c86b11dfe71f8bafcb0e942ff295c4268",
+    "fixture/tool_probe.py": "90443a61204b6687777e32b37feb4a05b53f004beef78bf7d16bf13feb2225c7",
+    "runner.py": "1576ffa44529c1579ff3c7c5eefddd7eeb1f7b892f9487c4c54c3c559dea3610"
+  },
+  "production_installation": false,
+  "retries": 0,
+  "runtime_attempt": 1
+}
