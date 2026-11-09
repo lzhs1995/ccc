@@ -1,0 +1,84 @@
+[
+  {
+    "source": "/Users/lzhs/Documents/Herdr\u4f1a\u8bdd\u6062\u590d/compat-20261104/continuation-20261109-coverage-followup-r1/native-spawn-candidate-r3/real-toolctx-package-r1/bundle/fixture_common.py",
+    "destination": "fixture_common.py",
+    "sha256": "8283fded6ff263f4ec7a46ceb9379b2c86b11dfe71f8bafcb0e942ff295c4268",
+    "mode": "whole_file_exact"
+  },
+  {
+    "source": "/Users/lzhs/Documents/Herdr\u4f1a\u8bdd\u6062\u590d/compat-20261104/continuation-20261109-coverage-followup-r1/native-spawn-candidate-r3/real-toolctx-package-r1/bundle/OFFICIAL-HOST-CONTRACT.json",
+    "destination": "OFFICIAL-HOST-CONTRACT.json",
+    "sha256": "ffb445c77271c97888b958390ef9be84019c2380f18bbe45b867c24f6ed00550",
+    "mode": "whole_file_exact"
+  },
+  {
+    "source": "/Users/lzhs/Documents/Herdr\u4f1a\u8bdd\u6062\u590d/compat-20261104/continuation-20261109-coverage-followup-r1/native-spawn-candidate-r3/real-toolctx-package-r1/bundle/tool_probe.py",
+    "source_sha256": "90443a61204b6687777e32b37feb4a05b53f004beef78bf7d16bf13feb2225c7",
+    "destination": "native_query.py",
+    "name": "need",
+    "line": 18,
+    "end_line": 20,
+    "sha256": "8680f80235c972cf17cb7f830193aea0427aa91802793896cbf9ba584a48cdcc",
+    "mode": "function_exact"
+  },
+  {
+    "source": "/Users/lzhs/Documents/Herdr\u4f1a\u8bdd\u6062\u590d/compat-20261104/continuation-20261109-coverage-followup-r1/native-spawn-candidate-r3/real-toolctx-package-r1/bundle/tool_probe.py",
+    "source_sha256": "90443a61204b6687777e32b37feb4a05b53f004beef78bf7d16bf13feb2225c7",
+    "destination": "native_query.py",
+    "name": "identity",
+    "line": 23,
+    "end_line": 41,
+    "sha256": "1c8ffad08ce8c01fa1faf9e202b763f904b0b3ccd69463ca26961582b35ca0b3",
+    "mode": "function_exact"
+  },
+  {
+    "source": "/Users/lzhs/Documents/Herdr\u4f1a\u8bdd\u6062\u590d/compat-20261104/continuation-20261109-coverage-followup-r1/native-spawn-candidate-r3/real-toolctx-package-r1/bundle/tool_probe.py",
+    "source_sha256": "90443a61204b6687777e32b37feb4a05b53f004beef78bf7d16bf13feb2225c7",
+    "destination": "native_query.py",
+    "name": "capability",
+    "line": 44,
+    "end_line": 57,
+    "sha256": "0e398e25cb89bbc2268d5608cb84dcffb3176c34c45b110dd962fe2f0827ad6c",
+    "mode": "function_exact"
+  },
+  {
+    "source": "/Users/lzhs/Documents/Herdr\u4f1a\u8bdd\u6062\u590d/compat-20261104/continuation-20261109-coverage-followup-r1/native-spawn-candidate-r3/real-toolctx-package-r1/bundle/tool_probe.py",
+    "source_sha256": "90443a61204b6687777e32b37feb4a05b53f004beef78bf7d16bf13feb2225c7",
+    "destination": "native_query.py",
+    "name": "observe",
+    "line": 60,
+    "end_line": 97,
+    "sha256": "0d1f9dd20e8fca27117991676acd7e36e2030e3724fa66fd726aecc2e6b3a399",
+    "mode": "function_exact"
+  },
+  {
+    "source": "/Users/lzhs/Documents/Herdr\u4f1a\u8bdd\u6062\u590d/compat-20261104/continuation-20261109-coverage-followup-r1/native-spawn-candidate-r4/python-candidate/cmux_native_hook_caller.py",
+    "source_sha256": "8bd85f2fcf1b8cb69b280a8e383ce5e7f7063d426f7b2d8e5ac51fc237866161",
+    "destination": "reader_acceptance.py",
+    "name": "need",
+    "line": 29,
+    "end_line": 31,
+    "sha256": "9669fa733a7ef2faad06267515b236300095c82b47c33f47f804c5ef85a855d9",
+    "mode": "function_exact"
+  },
+  {
+    "source": "/Users/lzhs/Documents/Herdr\u4f1a\u8bdd\u6062\u590d/compat-20261104/continuation-20261109-coverage-followup-r1/native-spawn-candidate-r4/python-candidate/cmux_native_hook_caller.py",
+    "source_sha256": "8bd85f2fcf1b8cb69b280a8e383ce5e7f7063d426f7b2d8e5ac51fc237866161",
+    "destination": "reader_acceptance.py",
+    "name": "canonical",
+    "line": 33,
+    "end_line": 37,
+    "sha256": "585babae9453f718c24ac95b53dc19f9d3976bd471ea3a9d7fa5d2daf05bdce3",
+    "mode": "function_exact"
+  },
+  {
+    "source": "/Users/lzhs/Documents/Herdr\u4f1a\u8bdd\u6062\u590d/compat-20261104/continuation-20261109-coverage-followup-r1/native-spawn-candidate-r4/python-candidate/cmux_native_hook_caller.py",
+    "source_sha256": "8bd85f2fcf1b8cb69b280a8e383ce5e7f7063d426f7b2d8e5ac51fc237866161",
+    "destination": "reader_acceptance.py",
+    "name": "validate_reply",
+    "line": 109,
+    "end_line": 141,
+    "sha256": "111f06e51a45993a770b38adce58db0b2818ceec095ac9a9acf7ca63cd230027",
+    "mode": "function_exact"
+  }
+]

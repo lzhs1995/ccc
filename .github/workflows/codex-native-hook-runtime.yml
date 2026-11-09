@@ -1,0 +1,51 @@
+name: Native caller real automatic hook fixture
+
+on:
+  push:
+    branches: [ccc/native-hook-runtime-20261109-r2]
+    paths:
+      - .github/workflows/codex-native-hook-runtime.yml
+      - integrations/native-hook-runtime/**
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: native-hook-runtime-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  caller-runtime-macos:
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          path: ccc
+          persist-credentials: false
+      - name: Admit exact successful artifacts and run one private automatic hook fixture
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CALLER_RUNTIME_CONTRACT_SHA256: 4494319d35c591ed07241f6f09cf018159deaac79faaf3e2970af2946e60749a
+        run: >-
+          python3 -BE ccc/integrations/native-hook-runtime/runner.py
+          --contract "$GITHUB_WORKSPACE/ccc/integrations/native-hook-runtime/CONTRACT.json"
+          --contract-sha256 "$CALLER_RUNTIME_CONTRACT_SHA256"
+          --root "$RUNNER_TEMP/ct"
+      - name: Preserve bounded fixture evidence including refusals
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: native-hook-runtime-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/ct/*.json
+            ${{ runner.temp }}/ct/a/*.json
+            ${{ runner.temp }}/ct/f/*.json
+            ${{ runner.temp }}/ct/f/*.jsonl
+            ${{ runner.temp }}/ct/f/hook-*/*.json
+            ${{ runner.temp }}/ct/f/n/sessions/**/*.jsonl
+            ${{ runner.temp }}/ct/f/PTY.bin
+            ${{ runner.temp }}/ct/f/REJECTED-REQUEST.body
+          if-no-files-found: warn
+          retention-days: 14
