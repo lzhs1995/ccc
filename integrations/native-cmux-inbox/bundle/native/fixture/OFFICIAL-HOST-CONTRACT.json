@@ -1,0 +1,13 @@
+{
+  "schema": "official-codex-code-mode-host-source-v1",
+  "package": "@openai/codex",
+  "version": "0.164.0-darwin-arm64",
+  "metadata_url": "https://registry.npmjs.org/@openai/codex/0.164.0-darwin-arm64",
+  "tarball": "https://registry.npmjs.org/@openai/codex/-/codex-0.164.0-darwin-arm64.tgz",
+  "integrity": "sha512-pDizgOUAtq3/k3AbUFHbaU19WpYKCja+oFpNSTLKrDQj4lTUNSDuTPJip4uQVn2/1EipQdpQrGMOQBVuI1znAA==",
+  "shasum": "562b9360ceda915e70d57864ebe845e0406f5b70",
+  "tar_member": "package/vendor/aarch64-apple-darwin/bin/codex-code-mode-host",
+  "bytes": 68543072,
+  "sha256": "416721e33af8822041dc650793512b3e58d43e0be4f3a5c6187eb4dfaad3148a",
+  "local_binary_downloaded": false
+}

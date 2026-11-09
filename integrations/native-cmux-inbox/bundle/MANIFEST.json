@@ -1,0 +1,181 @@
+{
+  "files": {
+    "NATIVE-CONTRACT.pending.json": {
+      "bytes": 3427,
+      "sha256": "899f33af54a616fa0a75865177779f5dbff7dc0fd77b72b51e50807f614656b0"
+    },
+    "emergency_cleanup.py": {
+      "bytes": 1699,
+      "sha256": "9343eedce7f57a103eced4211bdad6fec12dc66e1f26edc6cfb5b184a756631a"
+    },
+    "fixed-inputs/APP-PIN.json": {
+      "bytes": 2437,
+      "sha256": "cc1f7d5223d96b135955c39ee2955c27966d52f458918c7c2096546912f7a4b0"
+    },
+    "fixed-inputs/ARTIFACT.json": {
+      "bytes": 718,
+      "sha256": "571bab8f33bbb8a44caec9ccedd34d35ec8c1134aeb9167c8850847bb24bf764"
+    },
+    "fixed-inputs/BUILD-RUN.json": {
+      "bytes": 11695,
+      "sha256": "975504c86292388989c152e640d63d5b9fd1143ed1fb02cbf0d8f4dc13427727"
+    },
+    "fixed_stage.py": {
+      "bytes": 13522,
+      "sha256": "d80d84c2edc394c66fd1d53c1b454183b5bd107e2f9b2ea4324e0398af0b0302"
+    },
+    "host_runtime.py": {
+      "bytes": 21267,
+      "sha256": "db54f14e7781f7128cf69c533d0f85a4433a53eb5d0fa951061f9858d54854cb"
+    },
+    "native/EXTRACTION.json": {
+      "bytes": 4791,
+      "sha256": "379ce74624c27ecd53cb3f4ba7e906dbe0028fa8256e7d0598199054c088446c"
+    },
+    "native/artifact_io.py": {
+      "bytes": 7329,
+      "sha256": "f5fe951edfdb089719c71937aa53ebd2d3cee7f697f4654a2e04ab65b71ffce0"
+    },
+    "native/fixture/CONTRACT.json": {
+      "bytes": 3781,
+      "sha256": "69e543ca2a03f06f02db84e9a5f580c449e174c5c7d9888d0da074b91a8fccae"
+    },
+    "native/fixture/EXTRACTION.json": {
+      "bytes": 4309,
+      "sha256": "8a340141299058d9d4e4647c8155d84ad76e5950103c3095d046f293f08fe0d8"
+    },
+    "native/fixture/MANIFEST.json": {
+      "bytes": 1427,
+      "sha256": "43ff98159ad73410e43ad2de51665aa41d34893abe517fe2c887d21ddd05763b"
+    },
+    "native/fixture/OFFICIAL-HOST-CONTRACT.json": {
+      "bytes": 685,
+      "sha256": "ffb445c77271c97888b958390ef9be84019c2380f18bbe45b867c24f6ed00550"
+    },
+    "native/fixture/README.md": {
+      "bytes": 4704,
+      "sha256": "de75df101fa995ef3fa9c150d2cb18bdeb702d6b1d43c0bdb5211a2a1f98c53b"
+    },
+    "native/fixture/fixture.py": {
+      "bytes": 36130,
+      "sha256": "203b9f97d5df767ee530e83d2d950351f385b6683e3a6c1158c4eabe1d27a0a9"
+    },
+    "native/fixture/fixture_common.py": {
+      "bytes": 6384,
+      "sha256": "8283fded6ff263f4ec7a46ceb9379b2c86b11dfe71f8bafcb0e942ff295c4268"
+    },
+    "native/fixture/hook_probe.py": {
+      "bytes": 12114,
+      "sha256": "f3c3bf4f0538a7a616670c3b6c5c39128a64fd8379a8f9e708825de782f91a9b"
+    },
+    "native/fixture/native_query.py": {
+      "bytes": 4439,
+      "sha256": "7409cf2bfa6316370a0b04ecdb418889493f01d2e3588d985839d35e1aaecc8a"
+    },
+    "native/fixture/reader_acceptance.py": {
+      "bytes": 3190,
+      "sha256": "eef44dd05b32ad93b3e80f5710f07c134e079f1639514162d22dc380c35bf5da"
+    },
+    "native/runner.py": {
+      "bytes": 15696,
+      "sha256": "ea326cc58cd26f3239558f827891aaaa4f11d4ed73ea68627f5dd8dbfceeed40"
+    },
+    "native_surface.py": {
+      "bytes": 1472,
+      "sha256": "49ad047077ae7ff4c866d0ca3aa5671d840154a5d636d8ba8e69a36f711b1c27"
+    },
+    "original_aqua.py": {
+      "bytes": 939,
+      "sha256": "77a0bab26aa84bfdcae247e4dde06f9b899021bb393fdb2f68064678ec15d9f0"
+    },
+    "original_args.py": {
+      "bytes": 960,
+      "sha256": "629f677fd25f57e358675859ae798defe668e7085156cc1e2ec2fd1c6f18d7ed"
+    },
+    "original_gui.py": {
+      "bytes": 6036,
+      "sha256": "7d39795c045530db55507e151c8069f8376d2138ed82bb0f6b233359479b3662"
+    },
+    "original_workspace.py": {
+      "bytes": 1021,
+      "sha256": "88ca8390e0dda1ca924678f83577f1729a79a24ba415c7358abd6da773bf9fd0"
+    },
+    "owned_host.py": {
+      "bytes": 6049,
+      "sha256": "ba71c83dea420bf13b396bfbe1f68384c83950fd0560906cd1182843b19a8e5b"
+    },
+    "reader/FIXED-TEST-EXPECTATIONS.json": {
+      "bytes": 3646,
+      "sha256": "95549620100de2f8baa5732160801ef2cf2efd57841a0f919208635cbb140465"
+    },
+    "reader/MANIFEST.json": {
+      "bytes": 2210,
+      "sha256": "9892a166d463f11050ce500adbb5c7838e86429de291ab37b8999a22756168f7"
+    },
+    "reader/cmux_daemon_identity.py": {
+      "bytes": 31772,
+      "sha256": "1be219785f329a68b82bcb52b4b6d45b35468af9b26f54cf4f32f5ac1fe8c47f"
+    },
+    "reader/cmux_darwin_fds.py": {
+      "bytes": 4568,
+      "sha256": "022c576dfb4190f1d5f0563818a2ce1d02888df12686e4f63f115b8d53582983"
+    },
+    "reader/cmux_foreground_thread.py": {
+      "bytes": 5169,
+      "sha256": "892cd5f401703e8b7f833cc1dd3a2aba2886fc1859b56b7bed681f5fd92b39b3"
+    },
+    "reader/cmux_hook_identity.py": {
+      "bytes": 2720,
+      "sha256": "f9a3394af64661199270144f76ee20eb0680be6a1645155ed691da255177411d"
+    },
+    "reader/cmux_hook_thread.py": {
+      "bytes": 3956,
+      "sha256": "4fe791985ca184ec3ed5d85b631f1305ca77e0176d2936a0cddc3c85a1ca630e"
+    },
+    "reader/cmux_identity_budget.py": {
+      "bytes": 835,
+      "sha256": "542dacf1d8e2452fe13c5d950dcd1f7d32be27bb18d9f2c050f08ce1b2a5a91d"
+    },
+    "reader/cmux_inbox_context.py": {
+      "bytes": 12986,
+      "sha256": "35501dd67c50920f95bb3ae81b380e31b325976c36b8d54104bc1402a083414c"
+    },
+    "reader/cmux_native_hook_caller.py": {
+      "bytes": 15869,
+      "sha256": "8bd85f2fcf1b8cb69b280a8e383ce5e7f7063d426f7b2d8e5ac51fc237866161"
+    },
+    "reader/cmux_workspace_guard.py": {
+      "bytes": 16819,
+      "sha256": "cf6a6e607dc4422f9fb353fc01189785a24f754903ff223c1f9fcad7d86c41da"
+    },
+    "reader/fixed_app_admission.py": {
+      "bytes": 18119,
+      "sha256": "07846c5d4d1271397d9b1c3470412fc3856e37615539e2aec1a9959f5e50e4e8"
+    },
+    "reader/fixture_common.py": {
+      "bytes": 6384,
+      "sha256": "8283fded6ff263f4ec7a46ceb9379b2c86b11dfe71f8bafcb0e942ff295c4268"
+    },
+    "reader/host_probe.py": {
+      "bytes": 15361,
+      "sha256": "4522ad900b92ef740e15fc66ab2da798719f3c1d213b873db1bfdffb0b00a12d"
+    },
+    "reader/host_registration.py": {
+      "bytes": 1918,
+      "sha256": "858c5e7f6494ab0a621e45c3d51fb94c4b6aca72d9c636048d185d118a8d805a"
+    },
+    "reader/official_signature_cache.py": {
+      "bytes": 10017,
+      "sha256": "efa269bee92f2a88bbb31bec5a04c88aa0d215512456fe6dc04631e4325b23bb"
+    },
+    "rtk_admission.py": {
+      "bytes": 2895,
+      "sha256": "ea2dde1dcd208ee8977e1e638f1b53afdda1824cca756cb18254fbd33439fbc3"
+    },
+    "runner.py": {
+      "bytes": 11330,
+      "sha256": "5652f2099a723a1c1c42a5f39af2fd5b7e7b3961ca80b710deeed975ac58a227"
+    }
+  },
+  "schema": "single-real-cmux-empty-runtime-source-v1"
+}
