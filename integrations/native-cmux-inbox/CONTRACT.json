@@ -1,0 +1,22 @@
+{
+  "attempt": 1,
+  "automatic_hook_result_sha256": "dd5b8b9b283784a5c92d9e7933787584959003dbdcb0dfc6f073d5400ab7844d",
+  "business_operations": 0,
+  "fixed_app_pin_sha256": "cc1f7d5223d96b135955c39ee2955c27966d52f458918c7c2096546912f7a4b0",
+  "host_source_review_sha256": "ead155f5f646311092fac3ccb2f708d4fb5b2d019046b58368495a3f2513c8be",
+  "native_build": {
+    "attempt": 1,
+    "head": "b977911d8596c311b70d43a0c8b9c920aa2f4fd1",
+    "run": 42561656291
+  },
+  "native_contract_sha256": "4494319d35c591ed07241f6f09cf018159deaac79faaf3e2970af2946e60749a",
+  "reader_manifest_sha256": "9892a166d463f11050ce500adbb5c7838e86429de291ab37b8999a22756168f7",
+  "repository": "lzhs1995/ccc",
+  "retries": 0,
+  "runtime_branch": "ccc/native-cmux-inbox-20261109-r2",
+  "schema": "real-cmux-empty-inbox-runtime-v1",
+  "scope": "one real root, one real child, actual full reader with messages=[]; no send/body/bidirectional or production loading claim",
+  "send_operations": 0,
+  "source_manifest_sha256": "5a791200ee8bdfca90604479302fe375cd6c7709ff3f6bcac51af13beeb1a9fb",
+  "status": "ROOT_REVIEWED_NATIVE_BUILD_READY"
+}

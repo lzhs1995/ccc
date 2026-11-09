@@ -1,0 +1,58 @@
+name: Native caller real cmux empty inbox fixture
+
+on:
+  push:
+    branches: [ccc/native-cmux-inbox-20261109-r2]
+    paths:
+      - .github/workflows/codex-native-cmux-inbox.yml
+      - integrations/native-cmux-inbox/**
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: native-cmux-inbox-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  cmux-inbox-macos:
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          path: ccc
+          persist-credentials: false
+      - name: Admit original native and fixed cmux artifacts and observe one empty inbox
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HOST_CONTRACT_SHA256: 76ea48f3c0c268730b5a14463a87334b468bb25efc1a29377d2830fd937e60b3
+          HOST_SOURCE_MANIFEST_SHA256: 5a791200ee8bdfca90604479302fe375cd6c7709ff3f6bcac51af13beeb1a9fb
+        run: >-
+          python3 -BE ccc/integrations/native-cmux-inbox/bundle/runner.py
+          --contract "$GITHUB_WORKSPACE/ccc/integrations/native-cmux-inbox/CONTRACT.json"
+          --contract-sha256 "$HOST_CONTRACT_SHA256"
+          --native-contract "$GITHUB_WORKSPACE/ccc/integrations/native-cmux-inbox/NATIVE-CONTRACT.json"
+          --automatic-hook-result "$GITHUB_WORKSPACE/ccc/integrations/native-cmux-inbox/AUTOMATIC-HOOK-RESULT.json"
+          --source-manifest-sha256 "$HOST_SOURCE_MANIFEST_SHA256"
+      - name: Preserve bounded original host evidence and cleanup
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: native-cmux-inbox-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/h/*.json
+            ${{ runner.temp }}/h/*.jsonl
+            ${{ runner.temp }}/h/*.log
+            ${{ runner.temp }}/h/REJECTED-REQUEST.body
+            ${{ runner.temp }}/h/a/*.json
+            ${{ runner.temp }}/h/g/*.json
+            ${{ runner.temp }}/h/g/*.log
+            ${{ runner.temp }}/h/host-hook-*/*.json
+            ${{ runner.temp }}/h/host-hook-*/*.stdout
+            ${{ runner.temp }}/h/host-hook-*/*.stderr
+            ${{ runner.temp }}/h/h/.codex/sessions/**/*.jsonl
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 14

@@ -1,0 +1,72 @@
+{
+  "schema": "native-auto-hook-single-runtime-contract-v1",
+  "status": "PENDING_ACTUAL_BUILD_ARTIFACT_REVIEW",
+  "repository": "lzhs1995/ccc",
+  "run_id": 42561656291,
+  "run_attempt": 1,
+  "head": "b977911d8596c311b70d43a0c8b9c920aa2f4fd1",
+  "branch": "ccc/native-hook-caller-20261109-r1",
+  "build_conclusion": null,
+  "fixture_manifest_sha256": "39667326f4f3ab350b47ba7e383f672fdd5bff2572752d067de270e6faaaf14f",
+  "fixture_source_review_sha256": "97b55b0e79718bcdb16d86e20d60cbf2a20d952f01e92453405b3210c6ab11f8",
+  "root_artifact_review_sha256": null,
+  "result_sha256": null,
+  "effective_source_file_sha256": null,
+  "effective_source_sha256": null,
+  "binary_sha256": null,
+  "binary_bytes": null,
+  "artifacts": {
+    "evidence": {
+      "id": null,
+      "name": "native-caller-spawn-evidence-42561656291-1",
+      "digest": null,
+      "size_in_bytes": null
+    },
+    "binary": {
+      "id": null,
+      "name": "native-caller-spawn-arm64-42561656291-1",
+      "digest": null,
+      "size_in_bytes": null
+    }
+  },
+  "evidence_files": {
+    "ACTUAL-SCHEMA.json": null,
+    "BUILD-COMMAND.json": null,
+    "CHECK-COMMAND.json": null,
+    "DELTA-SOURCE.json": null,
+    "DELTA-TEST-RESULT.json": null,
+    "EFFECTIVE-SOURCE.json": null,
+    "FORMAT-RESULT.json": null,
+    "REQUEST.json": "5cd620c961a3ebc6f7655a474b601387b7295ace06d8e1444f2f65580e0edfea",
+    "RESULT.json": null,
+    "RUSTFMT.patch": null,
+    "check-changed-targets.log": null,
+    "native-tests.xml": null,
+    "release-build.log": null,
+    "workspace-tests.xml": null
+  },
+  "source_files": {
+    "integrations/native-spawn-readonly/ci.py": "37f21bf099ca7b960712a27dc10925271e14e4f15ee9b719bacf2856c80696a2",
+    "integrations/native-spawn-readonly/REQUEST.json": "5cd620c961a3ebc6f7655a474b601387b7295ace06d8e1444f2f65580e0edfea",
+    "integrations/native-spawn-readonly/native-spawn.patch": "d8beecc8f83f9f340de746b69f94275e294ccf8e2f6fa501a38fb840426fb1ca",
+    ".github/workflows/codex-native-spawn.yml": "f9072e9807a006f689fc76e10703f1c959cc716687641466c068d0d1f6caf6c4"
+  },
+  "runner_files": {
+    "EXTRACTION.json": "379ce74624c27ecd53cb3f4ba7e906dbe0028fa8256e7d0598199054c088446c",
+    "artifact_io.py": "f5fe951edfdb089719c71937aa53ebd2d3cee7f697f4654a2e04ab65b71ffce0",
+    "fixture/CONTRACT.json": "69e543ca2a03f06f02db84e9a5f580c449e174c5c7d9888d0da074b91a8fccae",
+    "fixture/EXTRACTION.json": "8a340141299058d9d4e4647c8155d84ad76e5950103c3095d046f293f08fe0d8",
+    "fixture/MANIFEST.json": "39667326f4f3ab350b47ba7e383f672fdd5bff2572752d067de270e6faaaf14f",
+    "fixture/OFFICIAL-HOST-CONTRACT.json": "ffb445c77271c97888b958390ef9be84019c2380f18bbe45b867c24f6ed00550",
+    "fixture/README.md": "de75df101fa995ef3fa9c150d2cb18bdeb702d6b1d43c0bdb5211a2a1f98c53b",
+    "fixture/fixture.py": "39675c96c669cb678c261f110611545acda6a25f76594b700cc36055ea6a0047",
+    "fixture/fixture_common.py": "8283fded6ff263f4ec7a46ceb9379b2c86b11dfe71f8bafcb0e942ff295c4268",
+    "fixture/hook_probe.py": "f3c3bf4f0538a7a616670c3b6c5c39128a64fd8379a8f9e708825de782f91a9b",
+    "fixture/native_query.py": "7409cf2bfa6316370a0b04ecdb418889493f01d2e3588d985839d35e1aaecc8a",
+    "fixture/reader_acceptance.py": "eef44dd05b32ad93b3e80f5710f07c134e079f1639514162d22dc380c35bf5da",
+    "runner.py": "6c1f9f9b2c17ea0f69798f20bec29711e440484cb24176cd2d275a0216f46134"
+  },
+  "production_installation": false,
+  "retries": 0,
+  "runtime_attempt": 1
+}
