@@ -1,0 +1,85 @@
+name: Native hook caller proof delta
+
+on:
+  push:
+    branches: [ccc/native-hook-caller-20261109-r1]
+    paths:
+      - .github/workflows/codex-native-spawn.yml
+      - integrations/native-spawn-readonly/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-caller-spawn-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  delta-macos:
+    runs-on: macos-15
+    timeout-minutes: 300
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "none"
+      CARGO_PROFILE_TEST_DEBUG: "none"
+      CARGO_PROFILE_RELEASE_DEBUG: "none"
+      CARGO_BUILD_JOBS: "3"
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      RUST_MIN_STACK: "8388608"
+      INSTA_UPDATE: "no"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          path: ccc
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          repository: lzhs1995/ccc
+          ref: a0f7fa7216673009375405ca99ca5c0a4b8a997f
+          path: ccc-base
+          persist-credentials: false
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          repository: openai/codex
+          ref: 6aaac694803004a63c6f393d153c96d22521a6b9
+          path: codex
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8
+        with:
+          toolchain: "1.99.1"
+          targets: aarch64-apple-darwin
+          components: rustfmt, rust-src
+      - uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532
+        with:
+          tool: nextest@0.9.103
+      - name: Verify and compile the reviewed new caller proof
+        env:
+          NATIVE_SPAWN_REQUEST_SHA256: 5cd620c961a3ebc6f7655a474b601387b7295ace06d8e1444f2f65580e0edfea
+        run: >-
+          python3 -BE ccc/integrations/native-spawn-readonly/ci.py
+          --ccc ccc --base ccc-base --codex codex
+          --request ccc/integrations/native-spawn-readonly/REQUEST.json
+          --request-sha256 "$NATIVE_SPAWN_REQUEST_SHA256"
+          --output "$RUNNER_TEMP/native-spawn-evidence"
+      - name: Preserve original delta evidence including failures
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: native-caller-spawn-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/native-spawn-evidence/*.json
+            ${{ runner.temp }}/native-spawn-evidence/*.log
+            ${{ runner.temp }}/native-spawn-evidence/*.xml
+            ${{ runner.temp }}/native-spawn-evidence/*.toml
+            ${{ runner.temp }}/native-spawn-evidence/*.patch
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Preserve changed candidate binary without installation
+        if: success()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: native-caller-spawn-arm64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/native-spawn-evidence/package/
+          if-no-files-found: error
+          retention-days: 14

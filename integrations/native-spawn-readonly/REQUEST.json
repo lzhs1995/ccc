@@ -1,0 +1,304 @@
+{
+  "schema": "ccc-native-spawn-delta-build-v1",
+  "status": "FROZEN_FOR_DELTA_BUILD",
+  "branch": "ccc/native-hook-caller-20261109-r1",
+  "r9_head": "996025e9a2527ed9a1f03049e60c40c2ab94c145",
+  "base_head": "a0f7fa7216673009375405ca99ca5c0a4b8a997f",
+  "r9_freeze_sha256": "ac04b248df2eee7ae8f73a6f873b7053610fa2bc639c0779729cac344f2db194",
+  "r9_release_source_sha256": "9fc26034e72e4b99aa6576a706491d298e0c7eda8750368f0de391c75587084b",
+  "candidate_freeze_sha256": "e333cafe279e9fd687bf5084bbdbb1499da23d43610551e933a807b4ddef2f99",
+  "independent_review_sha256": "f62691923d8f8bad21da3efc7cc93b72609b38b8f6cf43f1c2691fd56ebcf809",
+  "patch_sha256": "d8beecc8f83f9f340de746b69f94275e294ccf8e2f6fa501a38fb840426fb1ca",
+  "expected_release_source_sha256": "8ecd440430df76df73f7e242dbb05d9c0acbb18cf4bbcb2e1f42c725903aced1",
+  "files": [
+    {
+      "path": "codex-rs/app-server-client/src/lib.rs",
+      "before_sha256": "4e2e15fb5cbd8e9bfa0322e12b579251a89ed1b74007c83cd8512b6a8829b39e",
+      "after_sha256": "614894b760bc965d6c3a3c79995bdba102244b8ada043ec57d941b26422d0f8f"
+    },
+    {
+      "path": "codex-rs/core/src/lib.rs",
+      "before_sha256": "fddfaeeae2202bf5c1a5b66e5442b45d13a24047ec82b1e80177866333009d2c",
+      "after_sha256": "565c8f85f004c9eed5365b769d442f8eb4371639fbe7cef03ec38d478363ff2d"
+    },
+    {
+      "path": "codex-rs/core/src/native_caller.rs",
+      "before_sha256": null,
+      "after_sha256": "6829b47ac25a380ca85557beba9a1e53f134d17b198850910f823ac1c6dcdd69"
+    },
+    {
+      "path": "codex-rs/core/src/native_caller/registry.rs",
+      "before_sha256": null,
+      "after_sha256": "e5d6536b3fa0537c764fbfa2009386f7c7f7de2e79adb04082277c6f389b85cf"
+    },
+    {
+      "path": "codex-rs/core/src/session/session.rs",
+      "before_sha256": "fc6300f5d123e950b8b16ed48374aaba5cb0cc1ea2011a79eb7f767be231e3b3",
+      "after_sha256": "580f2b978c829b23f5faab34703043480fd5d76a74bf79e29e3249886714290f"
+    },
+    {
+      "path": "codex-rs/core/src/unified_exec/process.rs",
+      "before_sha256": "866ccb594923f6d2b7a8cb46e06bc23cc49da0db9f5971e95b9e58c4ef7fa27d",
+      "after_sha256": "a35d9326990fae88ae1aebb0763bc2ab09d3c7c7fdb3a7f77f55570311da714f"
+    },
+    {
+      "path": "codex-rs/core/src/unified_exec/process_manager.rs",
+      "before_sha256": "662d418a98fb2ecf8e27ecb2f73b5d0ca8363ad77ec40e285b286e124555d504",
+      "after_sha256": "2f9ebab74d0bf9162efac519e9314596bff1a7753c2efe955fe30e2b9e329721"
+    },
+    {
+      "path": "codex-rs/exec-server/src/local_process.rs",
+      "before_sha256": "d87815dc07d6528761f76aa5ff683c72ba6a77acd3d4f1d2a5418dbca4ea59c7",
+      "after_sha256": "4ec63f31954cc0d65840e2fcff1cd267d3eec6776278f403e0bfa0895d734628"
+    },
+    {
+      "path": "codex-rs/exec-server/src/process.rs",
+      "before_sha256": "63b2029f79a5bc7f07575c66afe4025f888173f2932041b30e6d94315c356dc4",
+      "after_sha256": "ab33c91b04f03557999b6fcb00990321235a0dbd9602bc0daa189503b8713303"
+    },
+    {
+      "path": "codex-rs/hooks/src/engine/command_runner.rs",
+      "before_sha256": "4dc62f137cc8aec5cbecfdb02cc4baf78241c1616a95f9d632a4a57a30afd6e0",
+      "after_sha256": "92c4222358f7bce3ad07c331dd071b99ba617957b794d239acbd53407a075405"
+    },
+    {
+      "path": "codex-rs/hooks/src/engine/native_spawn_tests.rs",
+      "before_sha256": null,
+      "after_sha256": "00ad589b97a4da5310fb9712000dc606922b49d2f71494efdf88e78bf4cc72ba"
+    },
+    {
+      "path": "codex-rs/hooks/src/events/post_tool_use.rs",
+      "before_sha256": "9bc9423dfa957c09048adbc0a2528eb72f7cde0a3372066b3946ccb81baa1a72",
+      "after_sha256": "8adb2265a18da7ccdec3c353842ca476b70332c886f79fe0178a5700b6af85af"
+    },
+    {
+      "path": "codex-rs/hooks/src/events/pre_tool_use.rs",
+      "before_sha256": "4b97b6d9439ecacf09cbf5f95032562412fb2f9d41786eaff1031016d210c96f",
+      "after_sha256": "80baca05ee2bca94b23fe586a7d86c803db7cc2397f5af1cbe9cd65a9cf10db9"
+    },
+    {
+      "path": "codex-rs/hooks/src/lib.rs",
+      "before_sha256": "e3baa2dd98061653b053964d8b097dc76a9a80523a44577d0862f58e385228e8",
+      "after_sha256": "d185593e139d00dff4b8ea4c115d4357e5fb3ae551763d09a5bd4eccbf424ed3"
+    },
+    {
+      "path": "codex-rs/hooks/src/native_spawn.rs",
+      "before_sha256": null,
+      "after_sha256": "db8ad5c610c9529bf161651cfcf068f6f7fc9b1d09c010df5a7de8905ad93e1d"
+    },
+    {
+      "path": "codex-rs/hooks/src/registry.rs",
+      "before_sha256": "be0352f4bd7b51496c2e8e3e0a15c908ea7b3e2e93649aad021c7d93990831da",
+      "after_sha256": "81988396eaaac02dd9316d0c1361313b7614e6971a603d0d7118315517803740"
+    },
+    {
+      "path": "codex-rs/tui/src/app/foreground_observation.rs",
+      "before_sha256": "97b6249331b014ec44aa26d460aff83d97ed665e703a3960d7c56a1c11fbd64a",
+      "after_sha256": "faa9e37b6e9a5ebc99ab8d88b1a39966d2541095a8cb3aceab5990721e094c73"
+    },
+    {
+      "path": "codex-rs/utils/pty/src/lib.rs",
+      "before_sha256": "5479ac5337702f15345e0c74c9a8712e65cfbe8849505da0312937f7246b6eb6",
+      "after_sha256": "d4d67b97c7a5b671abc47954dda683cb8b11e4f5e6d70d22ac37e20d75ad9c2a"
+    },
+    {
+      "path": "codex-rs/utils/pty/src/local_identity.rs",
+      "before_sha256": null,
+      "after_sha256": "2757c8550b7888b8443e52397d721f3ffee831110a65d188b17fb8fb409812a1"
+    },
+    {
+      "path": "codex-rs/utils/pty/src/pipe.rs",
+      "before_sha256": "c147cbbf3c9bde1f15c83ded3c4641a6b5ca290f3639256b2cf5b4f7efe5d820",
+      "after_sha256": "40fa36991771e72a641cddcf063adf4e2dadfc8639bf1960208810cb38b3027c"
+    },
+    {
+      "path": "codex-rs/utils/pty/src/process.rs",
+      "before_sha256": "f6dca08eec90266e43c7bebe9d1e651611d8d074614bae9df707c11c1c64d71c",
+      "after_sha256": "6efe82ca55ab1fd5f80a467be9b70f5fa5c5d3a08a72e8a763a5a64e3c827185"
+    },
+    {
+      "path": "codex-rs/utils/pty/src/pty.rs",
+      "before_sha256": "840f07e5875466ae2da0182c36f7041cebd6f11ce7b73e265b48d738c6ebac80",
+      "after_sha256": "e7b85d9995bfd0bf482442d781e864a77e76b457b4530129d74b4d3da75b86e6"
+    },
+    {
+      "path": "native/client-foreground/src/caller_socket_tests.rs",
+      "before_sha256": null,
+      "after_sha256": "acd3210b7dc22c1c420c7adcf36410b15babbd5d9d4b998c9fdb0521ce1a6420"
+    },
+    {
+      "path": "native/client-foreground/src/compaction_socket.rs",
+      "before_sha256": "6e63ed49728f198891318cfc58cd6da551ba48640f72db3b1cdcf46f7cc7331a",
+      "after_sha256": "62094d4628143a6c178d04489162f55f309a87832698ae5f960280dd27aa58cd"
+    }
+  ],
+  "required_cases": [
+    {
+      "package": "codex-core",
+      "binary": "codex_core",
+      "name": "native_caller::tests::hook_observer_actual_child_is_revoked_with_its_registration_scope"
+    },
+    {
+      "package": "codex-core",
+      "binary": "codex_core",
+      "name": "native_caller::registry::tests::hook_origin_keeps_child_thread_and_native_trigger_distinct_from_exec"
+    },
+    {
+      "package": "codex-core",
+      "binary": "codex_core",
+      "name": "native_caller::registry::tests::native_hook_missing_turn_or_handler_is_not_registered"
+    },
+    {
+      "package": "codex-hooks",
+      "binary": "codex_hooks",
+      "name": "engine::command_runner::native_spawn_tests::native_pre_and_post_bind_runtime_thread_not_shared_session_or_environment"
+    },
+    {
+      "package": "codex-hooks",
+      "binary": "codex_hooks",
+      "name": "engine::command_runner::native_spawn_tests::concurrent_root_and_async_child_hook_views_keep_distinct_native_triggers"
+    },
+    {
+      "package": "codex-hooks",
+      "binary": "codex_hooks",
+      "name": "engine::command_runner::native_spawn_tests::forged_stdin_and_mismatched_event_do_not_create_native_hook_provenance"
+    },
+    {
+      "package": "codex-hooks",
+      "binary": "codex_hooks",
+      "name": "engine::command_runner::native_spawn_tests::hook_scope_revokes_registration_on_timeout_and_cancellation"
+    },
+    {
+      "package": "codex-hooks",
+      "binary": "codex_hooks",
+      "name": "engine::command_runner::native_spawn_tests::reconfigured_runtime_keeps_native_owner_but_discards_invocation_trigger"
+    },
+    {
+      "package": "codex-core",
+      "binary": "codex_core",
+      "name": "native_caller::tests::caller_supplied_thread_is_rejected_before_kernel_lookup"
+    },
+    {
+      "package": "codex-core",
+      "binary": "codex_core",
+      "name": "native_caller::tests::malformed_challenge_is_rejected_before_kernel_lookup"
+    },
+    {
+      "package": "codex-core",
+      "binary": "codex_core",
+      "name": "native_caller::registry::tests::root_and_two_children_keep_separate_spawn_ownership"
+    },
+    {
+      "package": "codex-core",
+      "binary": "codex_core",
+      "name": "native_caller::registry::tests::child_exec_and_all_env_overrides_do_not_change_native_thread"
+    },
+    {
+      "package": "codex-core",
+      "binary": "codex_core",
+      "name": "native_caller::registry::tests::changed_birth_cannot_reuse_old_binding"
+    },
+    {
+      "package": "codex-core",
+      "binary": "codex_core",
+      "name": "native_caller::registry::tests::missing_parent_is_unknown_not_a_fallback_to_root"
+    },
+    {
+      "package": "codex-core",
+      "binary": "codex_core",
+      "name": "native_caller::registry::tests::foreign_uid_refuses"
+    },
+    {
+      "package": "codex-core",
+      "binary": "codex_core",
+      "name": "native_caller::registry::tests::daemon_or_other_process_has_no_shared_binding"
+    },
+    {
+      "package": "codex-core",
+      "binary": "codex_core",
+      "name": "native_caller::registry::tests::released_registration_cannot_authorize_live_descendant"
+    },
+    {
+      "package": "codex-core",
+      "binary": "codex_core",
+      "name": "native_caller::registry::tests::duplicate_spawn_is_rejected_and_original_preserved"
+    },
+    {
+      "package": "codex-core",
+      "binary": "codex_core",
+      "name": "native_caller::registry::tests::changed_owner_refuses"
+    },
+    {
+      "package": "codex-core",
+      "binary": "codex_core",
+      "name": "native_caller::registry::tests::changed_ancestry_during_second_read_refuses"
+    },
+    {
+      "package": "codex-core",
+      "binary": "codex_core",
+      "name": "native_caller::registry::tests::capture_must_be_actual_direct_child"
+    },
+    {
+      "package": "ccc-native-client-foreground",
+      "binary": "ccc_native_client_foreground",
+      "name": "compaction_socket::caller_tests::caller_route_uses_kernel_peer_and_never_dispatches_input"
+    },
+    {
+      "package": "ccc-native-client-foreground",
+      "binary": "ccc_native_client_foreground",
+      "name": "compaction_socket::caller_tests::caller_epoch_mismatch_refuses_before_callback_or_dispatch"
+    },
+    {
+      "package": "ccc-native-client-foreground",
+      "binary": "ccc_native_client_foreground",
+      "name": "compaction_socket::caller_tests::legacy_open_keeps_original_methods_without_caller_advertisement"
+    }
+  ],
+  "selected_case_counts": {
+    "new": 8,
+    "affected_prior": 16
+  },
+  "old_atomic_tests_rerun": false,
+  "production_installation": false,
+  "formatting": {
+    "toolchain": "1.99.1",
+    "allowed_changes": [
+      "codex-rs/app-server-client/src/lib.rs",
+      "codex-rs/core/src/lib.rs",
+      "codex-rs/core/src/native_caller.rs",
+      "codex-rs/core/src/native_caller/registry.rs",
+      "codex-rs/core/src/session/session.rs",
+      "codex-rs/core/src/unified_exec/process.rs",
+      "codex-rs/core/src/unified_exec/process_manager.rs",
+      "codex-rs/exec-server/src/local_process.rs",
+      "codex-rs/exec-server/src/process.rs",
+      "codex-rs/hooks/src/engine/command_runner.rs",
+      "codex-rs/hooks/src/engine/native_spawn_tests.rs",
+      "codex-rs/hooks/src/events/post_tool_use.rs",
+      "codex-rs/hooks/src/events/pre_tool_use.rs",
+      "codex-rs/hooks/src/lib.rs",
+      "codex-rs/hooks/src/native_spawn.rs",
+      "codex-rs/hooks/src/registry.rs",
+      "codex-rs/tui/src/app/foreground_observation.rs",
+      "codex-rs/utils/pty/src/lib.rs",
+      "codex-rs/utils/pty/src/local_identity.rs",
+      "codex-rs/utils/pty/src/pipe.rs",
+      "codex-rs/utils/pty/src/process.rs",
+      "codex-rs/utils/pty/src/pty.rs",
+      "native/client-foreground/src/caller_socket_tests.rs",
+      "native/client-foreground/src/compaction_socket.rs"
+    ],
+    "full_delta_and_effective_source_review_required": true
+  },
+  "historical_acceptance": {
+    "run": 42035343213,
+    "attempt": 1,
+    "affected_tests": 10215,
+    "required_tests": 115,
+    "schema_files": 464
+  },
+  "limits": [
+    "New tests and build do not prove active-client loading or live inbox delivery.",
+    "The candidate is not an OpenAI-signed complete distribution."
+  ]
+}
