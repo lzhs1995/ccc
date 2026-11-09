@@ -1,0 +1,50 @@
+{
+  "files": [
+    {
+      "bytes": 3781,
+      "path": "CONTRACT.json",
+      "sha256": "69e543ca2a03f06f02db84e9a5f580c449e174c5c7d9888d0da074b91a8fccae"
+    },
+    {
+      "bytes": 4309,
+      "path": "EXTRACTION.json",
+      "sha256": "8a340141299058d9d4e4647c8155d84ad76e5950103c3095d046f293f08fe0d8"
+    },
+    {
+      "bytes": 685,
+      "path": "OFFICIAL-HOST-CONTRACT.json",
+      "sha256": "ffb445c77271c97888b958390ef9be84019c2380f18bbe45b867c24f6ed00550"
+    },
+    {
+      "bytes": 4704,
+      "path": "README.md",
+      "sha256": "de75df101fa995ef3fa9c150d2cb18bdeb702d6b1d43c0bdb5211a2a1f98c53b"
+    },
+    {
+      "bytes": 33985,
+      "path": "fixture.py",
+      "sha256": "f33c43a5b19aab1815af00c67c5ebfa3d0d2e51d12df781297a62c663a6d018b"
+    },
+    {
+      "bytes": 6384,
+      "path": "fixture_common.py",
+      "sha256": "8283fded6ff263f4ec7a46ceb9379b2c86b11dfe71f8bafcb0e942ff295c4268"
+    },
+    {
+      "bytes": 12114,
+      "path": "hook_probe.py",
+      "sha256": "f3c3bf4f0538a7a616670c3b6c5c39128a64fd8379a8f9e708825de782f91a9b"
+    },
+    {
+      "bytes": 4439,
+      "path": "native_query.py",
+      "sha256": "7409cf2bfa6316370a0b04ecdb418889493f01d2e3588d985839d35e1aaecc8a"
+    },
+    {
+      "bytes": 3190,
+      "path": "reader_acceptance.py",
+      "sha256": "eef44dd05b32ad93b3e80f5710f07c134e079f1639514162d22dc380c35bf5da"
+    }
+  ],
+  "schema": "native-auto-hook-fixture-manifest-r1"
+}
