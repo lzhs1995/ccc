@@ -1,0 +1,22 @@
+{
+  "schema": "original-empty-inbox-prerequisites-v1",
+  "copied_at": "2026-11-09T18:43:39.683349+00:00",
+  "run": 42659904239,
+  "attempt": 1,
+  "members": {
+    "AGY-REVIEW.json": {
+      "source": "/Users/lzhs/Documents/Herdr会话恢复/compat-20261104/continuation-20261109-coverage-followup-r1/native-cmux-success-runtime-review-r2/VERIFICATION.json",
+      "sha256": "898c4f2585a2ac86d5f8edde21cb2425a5d08c0b1d8295da0ce66b33c8cdefea",
+      "bytes": 7857
+    },
+    "ROOT-ACCEPTANCE.json": {
+      "source": "/Users/lzhs/Documents/Herdr会话恢复/compat-20261104/remote-publication-20261106/native-cmux-inbox-api-r2/run-42659904239-1/ROOT-ACCEPTANCE.json",
+      "sha256": "6e5f93eb5574af5237f8fc00a203d20be65afd580ec9d630f509eb4ae9f5aeed",
+      "bytes": 2504
+    }
+  },
+  "originals_modified": false,
+  "old_tests_rerun": 0,
+  "runtime_invocations": 0,
+  "accepted_scope": "Original isolated real-cmux empty-inbox and owned cleanup; not new nonempty body or bidirectional proof."
+}

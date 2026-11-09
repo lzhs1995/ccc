@@ -1,0 +1,29 @@
+{
+  "schema": "real-cmux-duplex-body-runtime-v1",
+  "status": "ROOT_REVIEWED_NATIVE_BUILD_READY",
+  "repository": "lzhs1995/ccc",
+  "attempt": 1,
+  "retries": 0,
+  "runtime_branch": "ccc/native-cmux-duplex-20261110-r1",
+  "expected_native_roots": 2,
+  "expected_automatic_post_hooks": 9,
+  "total_task_limit_seconds": 120,
+  "business_operations": 0,
+  "send_operations": 2,
+  "scope": "One isolated A-to-B-to-A exchange between two real native roots; automatic additionalContext and complete ToolCtx body evidence.",
+  "native_user_receipt_verified": false,
+  "live_business_hook_verified": false,
+  "native_contract_sha256": "4494319d35c591ed07241f6f09cf018159deaac79faaf3e2970af2946e60749a",
+  "automatic_hook_result_sha256": "dd5b8b9b283784a5c92d9e7933787584959003dbdcb0dfc6f073d5400ab7844d",
+  "fixed_app_pin_sha256": "cc1f7d5223d96b135955c39ee2955c27966d52f458918c7c2096546912f7a4b0",
+  "empty_inbox_agy_review_sha256": "898c4f2585a2ac86d5f8edde21cb2425a5d08c0b1d8295da0ce66b33c8cdefea",
+  "empty_inbox_root_acceptance_sha256": "6e5f93eb5574af5237f8fc00a203d20be65afd580ec9d630f509eb4ae9f5aeed",
+  "host_source_review_sha256": "27a1a7b3ffde5679bb11e4fd1098673a2bc3e93d8b12cadf0b2f34cb47f9e756",
+  "source_manifest_sha256": "9dd156a836802a5cfa24af52353a2bd6f5236b4c2aa714e5786392145adf8d0e",
+  "reader_manifest_sha256": "46137c4252e28e6c93439c2b0b7b41049c88bb2537f5c9941b99517cf859ae40",
+  "native_build": {
+    "run": 42561656291,
+    "attempt": 1,
+    "head": "b977911d8596c311b70d43a0c8b9c920aa2f4fd1"
+  }
+}

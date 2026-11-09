@@ -1,0 +1,67 @@
+{
+  "base": "/Users/lzhs/Documents/Herdr会话恢复/compat-20261104/continuation-20261109-coverage-followup-r1/native-spawn-candidate-r3/real-toolctx-package-r1",
+  "bounds": {
+    "automatic_event_targets": 4,
+    "exec_per_thread": 1,
+    "old_180_300_rerun": false,
+    "old_rust_cases_rerun": 0,
+    "one_child": 1,
+    "one_root": 1,
+    "runtime_seconds": 120
+  },
+  "build": {
+    "binary_sha256": null,
+    "branch": "ccc/native-hook-caller-20261109-r1",
+    "effective_source_sha256": null,
+    "head": "b977911d8596c311b70d43a0c8b9c920aa2f4fd1",
+    "request_sha256": "5cd620c961a3ebc6f7655a474b601387b7295ace06d8e1444f2f65580e0edfea",
+    "run_attempt": 1,
+    "run_id": "42561656291",
+    "success_artifact": null
+  },
+  "cases": [
+    "root actual exec automatically runs Pre and Post",
+    "native spawn_agent fork none starts one child; child actual exec automatically runs Pre and Post",
+    "each automatic hook mutates child CODEX_THREAD_ID and execs same Python again; native source still original thread",
+    "Post root pure original reader validator accepts actual proof; child cannot borrow root shared session_id or root metadata",
+    "root actual exec caller cannot pass automatic hook provenance even using same original Pre payload adapted to Post; explicitly negative, no inbox helper invocation"
+  ],
+  "durability": "private per-invocation stdin/raw socket/ancestry/config pins; native root+child rollout headers and original tool call/output pairs; provider next request must contain automatic Pre/Post additionalContext markers",
+  "hook_configuration": {
+    "events": [
+      "PreToolUse",
+      "PostToolUse"
+    ],
+    "feature": "features.hooks=true",
+    "file": "private CODEX_HOME/hooks.json",
+    "handler": "one synchronous command per event, exec private Python hook_probe.py; timeout 10s",
+    "handler_id": "pre-tool-use:0:<private hooks.json>; post-tool-use:1:<private hooks.json>; derived from native ConfiguredHandler::run_id/event enumeration, verified from actual socket",
+    "hook_trust": "private user hooks.state exact normalized declaration trusted_hash; no bypass flag",
+    "matcher": "Bash",
+    "matcher_source": "core/src/tools/handlers/unified_exec/exec_command.rs:499-508 and unified_exec.rs:86-93 explicitly use HookToolName::bash(); code-mode delegates to this handler",
+    "project_trust": "only private fixture project trusted"
+  },
+  "inbox_scope": {
+    "excluded": [
+      "NativeHookCaller full host binding",
+      "cmux identify/tree/TTY proof",
+      "installed hook trust or active reload",
+      "inbox policy selection/cursor/mail consumption",
+      "bidirectional body reception"
+    ],
+    "included": "exact pure validate_reply acceptance extracted from frozen r4 reader with real kernel/native/transcript facts; no patched fake dependencies",
+    "reason": "bare private PTY has no cmux host; full original reader must continue refusing absent host binding"
+  },
+  "native_chain": "Core real thread_id -> Hooks::new -> native Pre/Post request trigger -> command_runner actual child spawn -> Core observer before stdin -> existing registry/socket -> kernel peer, PID/full birth/epoch/nonce",
+  "prohibited": [
+    "manual hook/helper invocation presented as automatic",
+    "registry injection",
+    "new sender/controller/ledger",
+    "business process restart/input",
+    "local runtime execution or publication"
+  ],
+  "runtime": "GitHub macOS lzhs1995/ccc only, distinct private RUNNER_TEMP root, new admitted binary --no-daemon PTY; loopback Responses provider; no business or supplier",
+  "schema": "actual-native-auto-hook-fixture-contract-r1",
+  "status": "PREPARATION_ONLY_NOT_EXECUTED",
+  "supersedes_contract_sha256": "9dc65cfa054066d012cb7be10e07ee48a91efd46a828d983c48db6648a0327f2"
+}

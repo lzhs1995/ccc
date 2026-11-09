@@ -1,0 +1,220 @@
+{
+  "status": "PASS_ORIGINAL_R2_REAL_CMUX_AUTOMATIC_EMPTY_INBOX_AND_OWNED_CLEANUP",
+  "passed": true,
+  "run": 42659904239,
+  "attempt": 1,
+  "head": "8c12cc35479903c65ca2e4f7eaa4f17287398944",
+  "branch": "ccc/native-cmux-inbox-20261109-r2",
+  "job": 129308339383,
+  "artifact": 13694325650,
+  "artifact_members": 76,
+  "artifact_sha256": "32f62fd57e825172b828cd67114b8efdba699545afd5c5bef5b5c30b8e3badcc",
+  "artifact_bytes": 398952,
+  "expanded_bytes": 1597602,
+  "actual_result_sha256": "03ccc85e86efa7a9c9601b42cd8b7c2411a320909dd4b7212b51388d2acaad3d",
+  "runner_result_sha256": "304018655bac93efadc1e20e978222dc28c56a481ac19bcaf357f24794b814cf",
+  "six_checks": {
+    "original_attempt_and_artifact_bound": true,
+    "actual_fixed_aqua_host_and_client_bound": true,
+    "real_root_child_native_automatic_hooks_and_tool_pairs": true,
+    "root_full_reader_empty_child_refused": true,
+    "complete_one_close_and_bounded_same_peer_tree_evidence": true,
+    "normal_owned_cleanup_and_120_second_gate": true
+  },
+  "root_sid": "01a1c13f-ec3d-70e3-86ce-6bada5dd971b",
+  "child_sid": "01a1c13f-f799-7871-9e1f-b8bb2b7c6d0d",
+  "native_tool_pairs": [
+    {
+      "role": "root",
+      "sid": "01a1c13f-ec3d-70e3-86ce-6bada5dd971b",
+      "outer_call_id": "host_root_5e2c808187a746ceb047262ddc1f17d6",
+      "native_call_id": "exec-9bc1dd6f-d101-4d1b-8cef-cb28603a2c1a",
+      "call_line": 14,
+      "native_command_completed_line": 16,
+      "output_line": 17,
+      "task_complete_line": 30,
+      "transcript_sha256": "a3ee8bb75c499637976693e9d4ba9753d6c94644caa950af574c89f03a542cf5",
+      "transcript_path": "/Users/lzhs/Documents/Herdr会话恢复/compat-20261104/remote-publication-20261106/native-cmux-inbox-api-r2/run-42659904239-1/evidence/h/.codex/sessions/2026/11/09/rollout-2026-11-09T16-59-14-01a1c13f-ec3d-70e3-86ce-6bada5dd971b.jsonl",
+      "provider_request": 2
+    },
+    {
+      "role": "child",
+      "sid": "01a1c13f-f799-7871-9e1f-b8bb2b7c6d0d",
+      "outer_call_id": "host_child_5e2c808187a746ceb047262ddc1f17d6",
+      "native_call_id": "exec-90d6494c-27f8-4b66-a385-0b99d54764d0",
+      "call_line": 14,
+      "native_command_completed_line": 16,
+      "output_line": 17,
+      "task_complete_line": 23,
+      "transcript_sha256": "ffd4ac5e37ac1870f6da045763d66861a2dcc9d336259b2663d4eca54bb8bc28",
+      "transcript_path": "/Users/lzhs/Documents/Herdr会话恢复/compat-20261104/remote-publication-20261106/native-cmux-inbox-api-r2/run-42659904239-1/evidence/h/.codex/sessions/2026/11/09/rollout-2026-11-09T16-59-17-01a1c13f-f799-7871-9e1f-b8bb2b7c6d0d.jsonl",
+      "provider_request": 5
+    }
+  ],
+  "gui_peer": {
+    "birth": [
+      1794243512,
+      4313
+    ],
+    "executable": "/Users/runner/work/_temp/h/fixed-app/cmux Nested Restore 42357868916-1.app/Contents/MacOS/cmux DEV",
+    "pid": 2073,
+    "socket_device": 16777231,
+    "socket_inode": 3508054
+  },
+  "native_client": {
+    "pid": 3026,
+    "birth": [
+      1794243553,
+      654685
+    ]
+  },
+  "private_source_checks": {
+    "HOOK-REGISTRATION.json": {
+      "bytes": 2108,
+      "sha256": "cdd6d712d5c77966b49478154faacc03582e9d5171c02bef00fd1b9b40bb1d11",
+      "exact_bytes_unchanged": true
+    },
+    "config.toml": {
+      "bytes": 835,
+      "sha256": "495944fc94cad85c4211726eaea673e2ac41467664721125082b41f48c952489",
+      "exact_bytes_unchanged": true
+    },
+    "hooks.json": {
+      "bytes": 497,
+      "sha256": "7a42c59fb1c889b9f279e5c6958f48ca6c284367ba088207576ea9e55f4ac8af",
+      "exact_bytes_unchanged": true
+    }
+  },
+  "close_commands": [
+    {
+      "label": "WORKSPACE-BEFORE-CLOSE",
+      "result_sha256": "15dc2a33d040de6b09fc67a1f24655d27cb60fe1263a7b8eead11e7c722484b6",
+      "began": 173.014497958,
+      "ended": 173.094574833,
+      "returncode": 0
+    },
+    {
+      "label": "WORKSPACE-CLOSE",
+      "result_sha256": "b2423721af563fc582fb1616554b1227ae2d1b3a3ecdd2247708f92f621b37db",
+      "began": 173.100185291,
+      "ended": 173.182381791,
+      "returncode": 0
+    },
+    {
+      "label": "WORKSPACE-AFTER-CLOSE-00",
+      "result_sha256": "372d105c147cf6c3e032768fad3a224fe89c1cbb7dcd9f426f169b8ca94320fc",
+      "began": 173.187653166,
+      "ended": 173.251265791,
+      "returncode": 0
+    },
+    {
+      "label": "WORKSPACE-AFTER-CLOSE-01",
+      "result_sha256": "12a08963e5bbea1e489bb717370f714c1cae2ca020d345ab0e48a41ce21c4b47",
+      "began": 173.51170175,
+      "ended": 173.570250208,
+      "returncode": 0
+    }
+  ],
+  "close_observations": [
+    {
+      "index": 0,
+      "observed_monotonic": 173.255433625,
+      "original_present": true,
+      "result_sha256": "372d105c147cf6c3e032768fad3a224fe89c1cbb7dcd9f426f169b8ca94320fc",
+      "workspace_ids": [
+        "EE933679-3282-4E29-B0DA-E520A79432D1",
+        "FCDDE749-5234-4583-84A2-4DF018227845"
+      ]
+    },
+    {
+      "index": 1,
+      "observed_monotonic": 173.572750375,
+      "original_present": false,
+      "result_sha256": "12a08963e5bbea1e489bb717370f714c1cae2ca020d345ab0e48a41ce21c4b47",
+      "workspace_ids": [
+        "EE933679-3282-4E29-B0DA-E520A79432D1"
+      ]
+    }
+  ],
+  "close_stage_seconds": 0.5612202920000016,
+  "task_and_cleanup_seconds": 6.486070084000005,
+  "tracked_cleanup": {
+    "native": {
+      "last_birth": null,
+      "original_gone": true,
+      "tracked": true
+    },
+    "workspace": {
+      "close_invocations": 1,
+      "close_result_sha256": "b2423721af563fc582fb1616554b1227ae2d1b3a3ecdd2247708f92f621b37db",
+      "original_workspace_absent": true,
+      "passed": true,
+      "replay_allowed": false,
+      "tree_queries": 2
+    }
+  },
+  "gui_cleanup": {
+    "birth": [
+      1794243512,
+      4313
+    ],
+    "exact_gui_process_gone": true,
+    "native_and_workspace_cleanup_proven": false,
+    "pid": 2073,
+    "returncode": -15
+  },
+  "actual_hooks": [
+    {
+      "role": "root",
+      "thread_id": "01a1c13f-ec3d-70e3-86ce-6bada5dd971b",
+      "pid": 3164,
+      "birth": [
+        1794243556,
+        232927
+      ],
+      "native_call_id": "exec-9bc1dd6f-d101-4d1b-8cef-cb28603a2c1a",
+      "status": "FULL_READER_CALLED_NO_NEW_CONTEXT",
+      "full_reader_calls": 1,
+      "parsed_host_queries": [
+        {
+          "messages": []
+        }
+      ]
+    },
+    {
+      "role": "child",
+      "thread_id": "01a1c13f-f799-7871-9e1f-b8bb2b7c6d0d",
+      "pid": 3205,
+      "birth": [
+        1794243557,
+        483118
+      ],
+      "native_call_id": "exec-90d6494c-27f8-4b66-a385-0b99d54764d0",
+      "status": "ACTUAL_CHILD_REFUSED_BEFORE_INBOX",
+      "full_reader_calls": 0,
+      "parsed_host_queries": []
+    }
+  ],
+  "not_proven": {
+    "nonempty_context": true,
+    "full_body_read": true,
+    "bidirectional_receipt": true,
+    "live_business_hook_loading": true,
+    "physical_power_loss_or_cold_recovery": true,
+    "original_failed_run_root_cause": true
+  },
+  "limitations": [
+    "Acceptance is limited to this isolated real-cmux empty-inbox fixture; no current business client or reboot was exercised.",
+    "The actual parsed root host reply messages=[] is preserved; raw inbox CLI stdout remains unuploaded.",
+    "Capability SHA binds the native original observation; NATIVE-CAPABILITY.json is a parsed copy with a different file SHA.",
+    "Actual Aqua validation follows the pinned original launch path and runtime admission; raw launchctl manager output is not separately uploaded.",
+    "The first after-close tree retains the workspace and the second omits it. This proves the observed sequence, not a particular cache-generation cause.",
+    "Old run42612783279/1 remains failed with unknown missing close/tree originals; new successful evidence does not repair that history."
+  ],
+  "original_files_modified": false,
+  "old_tests_rerun": 0,
+  "runtime_invocations_by_reviewer": 0,
+  "network_calls_by_reviewer": 0,
+  "terminal_inputs": 0,
+  "production_changes": 0
+}
