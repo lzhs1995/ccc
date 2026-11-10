@@ -1,0 +1,21 @@
+# CCC
+
+> A macOS terminal-agent recovery manager. Current runtime: guarded cmux paths
+> for Codex and Claude Code. Direction: cmux outer sessions and Herdr inner panes.
+> This index is documentation, not an executable integration or discovery guarantee.
+
+## Start here
+
+- [English README](README.md): capabilities, setup and recovery boundaries.
+- [繁體中文 README](README.zh-TW.md): the same quick start in Traditional Chinese.
+- [Shared agent instructions](AGENTS.md): working rules for coding assistants.
+- [Agent quick start](docs/agent-quickstart.md): verified entry points and task scope.
+
+## Operations
+
+- [Operations](docs/operations.md): enrollment, evidence and installation.
+- [Registration and observation](docs/registration-observation.md): identity and readiness.
+- [Codex Hooks](docs/codex-hooks.md): native Hook integration.
+- [Network guard](docs/network-guard.md): optional networking component.
+- [Advanced reference](docs/advanced-operations.md): preserved detailed operations.
+- [Changelog](CHANGELOG.md): changes by revision.
