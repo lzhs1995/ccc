@@ -974,7 +974,7 @@ class ColumnContractTests(unittest.TestCase):
 
         from cmux_supervisor_tui import AGENT_LABELS, WATCH_LABELS
 
-        readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
+        readme = (Path(__file__).resolve().parent.parent / "docs" / "advanced-operations.md").read_text(encoding="utf-8")
         bullets = {line.split("**")[1]: line
                    for line in readme.splitlines()
                    if line.startswith("- **") and "**：" in line}
@@ -1015,7 +1015,7 @@ class ColumnContractTests(unittest.TestCase):
         self.assertIn("error_superseded", kinds)
         self.assertIn("claude_stopped", kinds)
 
-        readme = (root / "README.md").read_text(encoding="utf-8")
+        readme = (root / "docs" / "advanced-operations.md").read_text(encoding="utf-8")
         bullet = next(line for line in readme.splitlines()
                       if line.startswith("- **画面**"))
         # Only the slash enumeration counts, not the prose after it.  Matching
@@ -1125,7 +1125,7 @@ class ColumnContractTests(unittest.TestCase):
         """发现 ≠ 授权 is the project's red line; R only rescans."""
         from pathlib import Path
 
-        readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
+        readme = (Path(__file__).resolve().parent.parent / "docs" / "advanced-operations.md").read_text(encoding="utf-8")
         self.assertIn("`R` 只是重扫，不会登记任何东西", readme)
 
 
@@ -1767,7 +1767,7 @@ class ReadmeThresholdConsistencyTests(unittest.TestCase):
     """
 
     def test_readme_states_the_threshold_the_code_uses(self):
-        readme = Path(__file__).resolve().parents[1] / "README.md"
+        readme = Path(__file__).resolve().parents[1] / "docs" / "advanced-operations.md"
         text = readme.read_text(encoding="utf-8")
         # Match the number the README prints beside the constant's name.  The
         # earlier version of this test hard-coded a phrasing that no longer
@@ -1782,7 +1782,7 @@ class ReadmeThresholdConsistencyTests(unittest.TestCase):
             )
 
     def test_readme_does_not_still_claim_the_old_threshold(self):
-        readme = Path(__file__).resolve().parents[1] / "README.md"
+        readme = Path(__file__).resolve().parents[1] / "docs" / "advanced-operations.md"
         text = readme.read_text(encoding="utf-8")
         self.assertNotIn("读数超过 300 秒才追加", text)
 
