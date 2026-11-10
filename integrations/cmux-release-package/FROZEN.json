@@ -1,0 +1,86 @@
+{
+  "schema": "cmux-local-release-preparation-freeze-v1",
+  "frozen_at_utc": "2026-11-10T05:36:40.003192+00:00",
+  "status": "SOURCE_PREPARATION_FROZEN_NO_BUILD_OR_RUNTIME_ACCEPTANCE",
+  "source_manifest_sha256": "44601f0812514c12d7c64ce5cdad346763b642453159aa98f1e4ae9f51c7323a",
+  "source_manifest_bytes": 7619,
+  "payload_entries": 25,
+  "payload_bytes": 759550,
+  "reviews": [
+    {
+      "file": "build-source-review-r1/AUTHOR-REPORT.json",
+      "sha256": "ba4b73bbb701b5bdf6007cd13a82df3aecf009020957fd0a3489e57333ec3350"
+    },
+    {
+      "file": "host-build-delta-review-r1/REPORT.json",
+      "sha256": "d749a575784ef2b78e3c12510bac9cb35f6a20664291688c64f4ed98e8bf7f50"
+    },
+    {
+      "file": "root-shared-build-review-r1/REPORT.json",
+      "sha256": "2b7ff6c04b22a3a359b1e309d32a8d75145c5b9db27e4c7492ed428cca54e9f6"
+    },
+    {
+      "file": "root-package-review-r2/REPORT.json",
+      "sha256": "8772140fd34a9d6ceabebfc9ef620dd6a797932364a75a06284503ebe235a932"
+    },
+    {
+      "file": "runtime-independent-review-r1/REPORT.json",
+      "sha256": "f9e17f3af3f8db2802d6dab44516c035af37756ab34aef4e91e73fd41eadc416"
+    }
+  ],
+  "receipts": [
+    {
+      "file": "build-source-review-r1/new-tests-r1/RESULT.json",
+      "sha256": "98f0f6b942e67ef1d1b27212e70141b4d12ab3c485328dd53e92589a0c753040"
+    },
+    {
+      "file": "reader-package-delta-r1/TEST-RESULT.json",
+      "sha256": "7107b03f389ea0a78871caa424efd3a220ba3427073793f6f975a4f35908d653"
+    },
+    {
+      "file": "reader-package-delta-r2/TEST-RESULT.json",
+      "sha256": "33df24b7e8d304a05c903fa231dcb84cb4d448210ab4aea5d584bb13bd5ca6d7"
+    },
+    {
+      "file": "reader-package-delta-r3/REPORT.json",
+      "sha256": "5f6e3ee3fe92a1dc22853ce169444bf380d751ca1cacceca48101e6ed29f5a99"
+    },
+    {
+      "file": "runtime-selfcheck-r2/RESULT.json",
+      "sha256": "724ca2313d3509bf0dca5b2612a9e40b0a2668676133398cbf0173993221f5f4"
+    },
+    {
+      "file": "runtime-arm64-delta-r1/RESULT.json",
+      "sha256": "69837c311c080aa8ff98e878b1cc018686085a416979dcac347b3958f20ebac1"
+    },
+    {
+      "file": "runner-architecture-source-r1/RESULT.json",
+      "sha256": "26cbd13151ad9be19ec1e7bb891923942f2d224e754df6f93ee1a37f451fbcbe"
+    }
+  ],
+  "parser_projection_sha256": "07a8309bd110fb9abbfc26a49a04b1cba36da6711254e3a746a91d436496f268",
+  "signature_and_actual_runtime_acceptance": false,
+  "business_adoption_ready": false,
+  "built": false,
+  "published": false,
+  "installed_on_user_machine": false,
+  "active_app_operations": 0,
+  "old_upstream_tests_rerun": 0,
+  "original_immutable_evidence_preserved": true,
+  "final_arm64_preflight": {
+    "source_sha256": "2d7a7ec937aeda55116dd78bf7c33ce60514620c4c9e7cfd796e77e0a9f7be2a",
+    "receipt": "runtime-arm64-delta-r1/RESULT.json",
+    "official_label_evidence": "runner-architecture-source-r1/RESULT.json",
+    "root_handles_final_delta_acceptance": true
+  },
+  "publication": [
+    "Apply each exact file to its listed public_path; workflow fixture and executable workflow are intentionally the same bytes.",
+    "Publish SOURCE-MANIFEST.json and this FROZEN.json at the additional listed control paths; verify this freeze by its externally supplied SHA.",
+    "Root handles final actual-machine preflight and public mapping acceptance before the one authorized workflow run."
+  ],
+  "remaining": [
+    "Actual isolated GitHub Release build, signing, archive readback and new package runtime acceptance.",
+    "Final completed run/head/attempt and both independent artifact API digests; small evidence inventory and app binding review.",
+    "Current original CCC guarded transport continuity and original four Herdr ownership admission at natural first adoption."
+  ]
+}
