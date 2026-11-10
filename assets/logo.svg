@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160" viewBox="0 0 160 160" role="img" aria-labelledby="title desc">
+  <title id="title">CCC</title><desc id="desc">Three nested terminal panels with a green continuation arrow.</desc>
+  <rect width="160" height="160" rx="36" fill="#101b2b"/>
+  <rect x="28" y="28" width="76" height="58" rx="10" fill="none" stroke="#7185a6" stroke-width="6"/>
+  <rect x="44" y="46" width="76" height="58" rx="10" fill="#101b2b" stroke="#b4c7e6" stroke-width="6"/>
+  <rect x="60" y="64" width="76" height="58" rx="10" fill="#101b2b" stroke="#59e3ba" stroke-width="6"/>
+  <path d="m76 81 12 12-12 12m23-12h19m-7-7 7 7-7 7" fill="none" stroke="#59e3ba" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

@@ -1,0 +1,15 @@
+{
+  "description": "Exact synthetic credential sentinels used to assert non-disclosure. No directory-wide exemptions.",
+  "api_secret": {
+    "tests/test_cmux_stack.py": [
+      "64facc7a6c35ad544ffebfd598751f108941c401e309040c038f71d745566f18"
+    ],
+    "tests/test_supervisor.py": [
+      "8c55a8b2e1c30c3d1d58ec48233dd59efcd036e78e5861f0e9e08d8a98e24062",
+      "43d07caa657254ccb10925cf48c8b9a63a7c2eea8d80ecb0720f8b70403baf8b"
+    ],
+    "tools/ccp_pty_stress.py": [
+      "a1979c32952bf534b659c1e6fb9e6286283a31152b33497cabe9f9586f08e878"
+    ]
+  }
+}

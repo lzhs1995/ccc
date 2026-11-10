@@ -1,0 +1,24 @@
+name: Public content
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  public-content:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Check detector controls
+        run: python3 -B scripts/check_public_content.py --self-test
+      - name: Scan current public tree
+        run: python3 -B scripts/check_public_content.py
