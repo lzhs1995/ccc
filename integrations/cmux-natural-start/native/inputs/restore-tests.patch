@@ -1,0 +1,106 @@
+diff --git a/cmuxTests/SessionPersistenceTests.swift b/cmuxTests/SessionPersistenceTests.swift
+--- a/cmuxTests/SessionPersistenceTests.swift
++++ b/cmuxTests/SessionPersistenceTests.swift
+@@ -437,10 +437,102 @@
+             arguments: ["/Applications/cmux.app/Contents/MacOS/cmux", "-psn_0_12345"],
+             environment: [:]
+         )
+ 
+         XCTAssertTrue(shouldRestore)
++    }
++
++    func testRestorePolicyAllowsPlainLaunch() {
++        XCTAssertTrue(SessionRestorePolicy.shouldAttemptRestore(
++            arguments: ["/Applications/cmux.app/Contents/MacOS/cmux"],
++            environment: [:]
++        ))
++    }
++
++    func testRestorePolicyAllowsBundleIconConfigurationArgument() {
++        XCTAssertTrue(SessionRestorePolicy.shouldAttemptRestore(
++            arguments: ["/Applications/cmux.app/Contents/MacOS/cmux",
++                        "--cmux-disable-bundle-icon-persistence"],
++            environment: [:]
++        ))
++    }
++
++    func testRestorePolicyAllowsFinderStyleLaunchWithBundleIconConfigurationArgument() {
++        XCTAssertTrue(SessionRestorePolicy.shouldAttemptRestore(
++            arguments: ["/Applications/cmux.app/Contents/MacOS/cmux", "-psn_0_12345",
++                        "--cmux-disable-bundle-icon-persistence"],
++            environment: [:]
++        ))
++    }
++
++    func testRestorePolicyRejectsBundleIconConfigurationArgumentWithValue() {
++        for extraArguments in [
++            ["--cmux-disable-bundle-icon-persistence=true"],
++            ["--cmux-disable-bundle-icon-persistence", "true"],
++        ] {
++            XCTAssertFalse(SessionRestorePolicy.shouldAttemptRestore(
++                arguments: ["/Applications/cmux.app/Contents/MacOS/cmux"] + extraArguments,
++                environment: [:]
++            ), "Unexpected restore for \(extraArguments)")
++        }
++    }
++
++    func testRestorePolicyRejectsUnknownArgumentsAlongsideBundleIconConfiguration() {
++        for extraArguments in [
++            ["--unknown"],
++            ["--cmux-disable-bundle-icon-persistence", "--unknown"],
++            ["--cmux-disable-bundle-icon-persistence-extra"],
++        ] {
++            XCTAssertFalse(SessionRestorePolicy.shouldAttemptRestore(
++                arguments: ["/Applications/cmux.app/Contents/MacOS/cmux"] + extraArguments,
++                environment: [:]
++            ), "Unexpected restore for \(extraArguments)")
++        }
++    }
++
++    func testRestorePolicyRejectsExplicitOpenWithBundleIconConfiguration() {
++        for explicitArguments in [
++            ["--window", "window:1"],
++            ["--open", "/tmp/restore-policy-input"],
++            ["/tmp/restore-policy-input"],
++            ["cmux://open/workspace"],
++        ] {
++            XCTAssertFalse(SessionRestorePolicy.shouldAttemptRestore(
++                arguments: ["/Applications/cmux.app/Contents/MacOS/cmux",
++                            "--cmux-disable-bundle-icon-persistence"] + explicitArguments,
++                environment: [:]
++            ), "Unexpected restore for \(explicitArguments)")
++        }
++    }
++
++    func testRestorePolicyKeepsDisableGateWithBundleIconConfiguration() {
++        XCTAssertFalse(SessionRestorePolicy.shouldAttemptRestore(
++            arguments: ["/Applications/cmux.app/Contents/MacOS/cmux",
++                        "--cmux-disable-bundle-icon-persistence"],
++            environment: ["CMUX_DISABLE_SESSION_RESTORE": "1"]
++        ))
++    }
++
++    func testRestorePolicyKeepsAutomatedTestGatesWithBundleIconConfiguration() {
++        let automatedEnvironments: [[String: String]] = [
++            ["CMUX_TEST_PROCESS": "1"],
++            ["CMUX_UI_TEST_MODE": "1"],
++            ["CMUX_UI_TEST_PROBE": ""],
++            ["XCTestConfigurationFilePath": "/tmp/xctest.xctestconfiguration"],
++            ["XCTestBundlePath": "/tmp/example.xctest"],
++            ["XCTestSessionIdentifier": "restore-policy-test"],
++            ["XCInjectBundle": "/tmp/example.xctest"],
++            ["XCInjectBundleInto": "/Applications/cmux.app/Contents/MacOS/cmux"],
++            ["DYLD_INSERT_LIBRARIES": "/tmp/libXCTest.dylib"],
++        ]
++        for environment in automatedEnvironments {
++            XCTAssertFalse(SessionRestorePolicy.shouldAttemptRestore(
++                arguments: ["/Applications/cmux.app/Contents/MacOS/cmux",
++                            "--cmux-disable-bundle-icon-persistence"],
++                environment: environment
++            ), "Unexpected restore for \(environment.keys.sorted())")
++        }
+     }
+ 
+     func testRestorePolicySkipsWhenRunningUnderXCTest() {
+         let shouldRestore = SessionRestorePolicy.shouldAttemptRestore(
+             arguments: ["/Applications/cmux.app/Contents/MacOS/cmux"],

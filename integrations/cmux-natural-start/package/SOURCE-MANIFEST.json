@@ -1,0 +1,118 @@
+{
+  "schema": "cmux-natural-start-package-source-manifest-v1",
+  "files": {
+    "source_contract.py": {
+      "bytes": 7533,
+      "sha256": "5a6242490e78eebb617eac02d44629c5bb94458a80f1d235cdaaabeb491e7661"
+    },
+    "natural_source_admission.py": {
+      "bytes": 11066,
+      "sha256": "07e08c3dd5de5b6acb7e8c19801a0bd677652a6ef4d0665ab55d30f462baaafe"
+    },
+    "release_build.py": {
+      "bytes": 18021,
+      "sha256": "468c2012e83a1ce514b629b0c28151d4a932954861fe9a53930c6cd7058abe1c"
+    },
+    "release_package.py": {
+      "bytes": 28557,
+      "sha256": "3e9a94e33ae4c541a90bec4302346878d0e5115fa600cb85c9f7f94b6cbc17a1"
+    },
+    "release_paired.py": {
+      "bytes": 30689,
+      "sha256": "8e2f586f9d3bb6cb1329f404416dfa7b27f341140804d4a45cd9d85072815f61"
+    },
+    "release_smoke.py": {
+      "bytes": 30274,
+      "sha256": "4a07fe5b13e3b643b9949270b5566f7b167d5c134398d595da91e695c46b4d58"
+    },
+    "ci_release.py": {
+      "bytes": 7583,
+      "sha256": "2b25cfbeed59789f7c6927b6bc4085dda7312cc78a655a4a5bd060f5fa6bd6fd"
+    },
+    "evidence_release.py": {
+      "bytes": 14322,
+      "sha256": "9260593583ad50e29b3a3978ef2ecfbde978c03cbb1da4c0373a36aac6ffcd00"
+    },
+    "test_release_build.py": {
+      "bytes": 7630,
+      "sha256": "df300a32555031fd25cf96c0213d7dc15af20984e252a72fa20d1e06e559a124"
+    },
+    "test_release_package.py": {
+      "bytes": 32642,
+      "sha256": "f8948dd196e46c27ee2ef54689d8f56e5bfb94eb75fd90bf4a7f6614b2ca074f"
+    },
+    "test_release_runtime.py": {
+      "bytes": 12792,
+      "sha256": "db205a142ae5e6fcca931e96dccec8e2a83b974104636bdc2728bb848224c169"
+    },
+    "test_rust_path.py": {
+      "bytes": 3872,
+      "sha256": "e3c4ba6a76439c4858a1ee0d4c8c3a1e9159b878c779b27c0252121343bb44b5"
+    },
+    "test_prior_cli_size.py": {
+      "bytes": 2281,
+      "sha256": "d337c52b208b0fa986386c69b9ffdf6f4de184b313c7b5d277026dae20b6ba24"
+    },
+    "test_inventory_diagnostics.py": {
+      "bytes": 13195,
+      "sha256": "fbd414e049ff6684cb8106db0babdbda745c53664e84e437e31770f88746c3a8"
+    },
+    "test_natural_source_admission.py": {
+      "bytes": 10657,
+      "sha256": "c192c73873d9bda50ef839d5239e225cfe87a8c4de55c54ee2b984edbd1e6cd1"
+    },
+    "test_natural_build_integration.py": {
+      "bytes": 9618,
+      "sha256": "8e9b44ac1898515e99d20725f00679830b3cb41359b213135e19d271d92d6051"
+    },
+    "PLAN.md": {
+      "bytes": 6578,
+      "sha256": "994a10d0dfdfe846640224fd533d50dff7133accc3688522a8c3c50c8adba76f"
+    },
+    "inputs/fix.patch": {
+      "bytes": 32711,
+      "sha256": "db4f2c96ff9e06fd47ddb55a102f0ccb45d00c691e9e3681ca722f3f97144422"
+    },
+    "inputs/tests.patch": {
+      "bytes": 14377,
+      "sha256": "bdebf64e054476f3ea0476df3ec7acb91ddbfe86fc2927bb85686720c6a7bf8e"
+    },
+    "prerequisites/APP-PIN.json": {
+      "bytes": 2437,
+      "sha256": "cc1f7d5223d96b135955c39ee2955c27966d52f458918c7c2096546912f7a4b0"
+    },
+    "prerequisites/ARTIFACT.json": {
+      "bytes": 718,
+      "sha256": "571bab8f33bbb8a44caec9ccedd34d35ec8c1134aeb9167c8850847bb24bf764"
+    },
+    "prerequisites/BUILD-RUN.json": {
+      "bytes": 11695,
+      "sha256": "975504c86292388989c152e640d63d5b9fd1143ed1fb02cbf0d8f4dc13427727"
+    },
+    "prerequisites/FIXED-TEST-EXPECTATIONS.json": {
+      "bytes": 3646,
+      "sha256": "95549620100de2f8baa5732160801ef2cf2efd57841a0f919208635cbb140465"
+    },
+    "prerequisites/ORIGINAL-ARGS-PIN.json": {
+      "bytes": 345,
+      "sha256": "973032cfaa317d8ff598beab78addd9ace835993bcf9969cbcc62e7d4683308d"
+    },
+    "prerequisites/PROVENANCE.json": {
+      "bytes": 494389,
+      "sha256": "b6cdceac06171954c09041ce35f4b65a821b3be9cc442694141ea5c8f3a0bb06"
+    },
+    "prerequisites/Release-Resources.entitlements": {
+      "bytes": 602,
+      "sha256": "885d57276cecaa416e20a06c9662d237637cb18e1e111c9bdf33b63427fc94eb"
+    },
+    "prerequisites/original_args.py": {
+      "bytes": 960,
+      "sha256": "629f677fd25f57e358675859ae798defe668e7085156cc1e2ec2fd1c6f18d7ed"
+    },
+    "prerequisites/original_fixed_app_admission.py": {
+      "bytes": 18119,
+      "sha256": "07846c5d4d1271397d9b1c3470412fc3856e37615539e2aec1a9959f5e50e4e8"
+    }
+  },
+  "scope": "Current portable package sources and immutable original-base prerequisites"
+}

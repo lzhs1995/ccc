@@ -1,0 +1,13 @@
+{
+  "schema": "cmux-natural-start-package-source-freeze-v1",
+  "status": "PREPARED_CURRENT_SOURCE_NATIVE_AND_RELEASE_EXECUTION_REQUIRED",
+  "source_manifest_sha256": "203c1cd3dcd4727b344d5f3452ee22e6941966354022cf83e40e2d896b523c0c",
+  "native_source_freeze_sha256": "dbcf98c3b53c95b8c7fa503e4583325d23aac6748822e12a1cb1ae1213d95969",
+  "source_base_tree": "40e8ea03ce1435f11e90b35f98d554a13b9b8685",
+  "source_tree": "f0e2d0f26d1d5dde021ef2729aeb3f987993fe0a",
+  "original_source_evidence_reused_as_current_success": false,
+  "native_executed": false,
+  "release_built": false,
+  "runtime_verified": false,
+  "installed_on_user_machine": false
+}

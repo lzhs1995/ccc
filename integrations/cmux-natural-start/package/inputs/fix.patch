@@ -1,0 +1,608 @@
+--- a/Packages/macOS/CmuxTerminal/Sources/CmuxTerminal/Lifecycle/TerminalSurface+StartupRestoreAdmission.swift
++++ b/Packages/macOS/CmuxTerminal/Sources/CmuxTerminal/Lifecycle/TerminalSurface+StartupRestoreAdmission.swift
+@@ -1,3 +1,5 @@
++public import Foundation
++
+ extension TerminalSurface {
+     /// Whether the owning container still holds this terminal for restore admission.
+     public var isAwaitingStartupRestoreAdmission: Bool {
+@@ -16,10 +18,10 @@
+         guard startupRestoreAdmissionPhase == .awaitingAdmission else { return false }
+         if let initialInput {
+             prepareNextRuntimeInitialInput(initialInput)
++            suppressConfiguredInitialInput = false
+         }
+         startupRestoreAdmissionCommandOverride = nil
+         hasStartupRestoreAdmissionCommandOverride = false
+-        suppressConfiguredInitialInput = false
+         startupRestoreAdmissionPhase = .admitted
+         scheduleHeadlessRuntimeStartIfNeeded(reason: "startup-restore-admitted")
+         return true
+@@ -38,6 +40,20 @@
+         suppressConfiguredInitialInput = true
+         startupRestoreAdmissionPhase = .admitted
+         scheduleHeadlessRuntimeStartIfNeeded(reason: "startup-restore-cancelled")
++    }
++
++    /// Cancels only unsent restore input belonging to the expected runtime.
++    /// An owner may expire after admission but before this shell reports a prompt.
++    /// Input already delivered to the PTY cannot be recalled by this operation.
++    @MainActor
++    public func cancelStartupRestoreInput(expectedLifecycleID: UUID) {
++        guard terminalLifecycleId == expectedLifecycleID,
++              startupRestoreAdmissionPhase != .unrestricted else { return }
++        startupInputGate.cancel(generation: expectedLifecycleID)
++        nextRuntimeInitialInput = nil
++        suppressConfiguredInitialInput = true
++        // Keep an uncommitted topology gated. Its normal commit can admit a
++        // plain shell, but must not reinstate the cancelled configured bytes.
+     }
+ 
+     @MainActor
+--- a/Packages/macOS/CmuxTerminal/Tests/CmuxTerminalTests/TerminalSurfaceStartupRestorePolicyTests.swift
++++ b/Packages/macOS/CmuxTerminal/Tests/CmuxTerminalTests/TerminalSurfaceStartupRestorePolicyTests.swift
+@@ -116,16 +116,87 @@
+         #expect(surface.suppressConfiguredInitialInput)
+     }
+ 
++    @Test("Expired restore input stays cancelled across topology commit")
++    func expiredInputPreservesTopologyGateAndCannotRearm() {
++        let nativeView = FakeTerminalSurfaceNativeView(frame: NSRect(x: 0, y: 0, width: 800, height: 600))
++        let paneHost = FakeTerminalSurfacePaneHost(surfaceView: nativeView, attachesThroughSurfaceModel: true)
++        let scheduler = RecordingRestoreSpawnScheduler()
++        let surface = makeSurface(
++            policy: .pacedSessionRestore.requiringStartupRestoreAdmission(),
++            scheduler: scheduler, nativeView: nativeView, paneHost: paneHost,
++            initialInput: "cmux restore herdr original\n"
++        )
++        surface.agentCommandShimInstallCompleted = true
++        defer { surface.closeHeadlessStartupWindowIfNeeded() }
++        let generation = surface.terminalLifecycleId
++        surface.nextRuntimeInitialInput = "queued override\n"
++        surface.cancelStartupRestoreInput(expectedLifecycleID: generation)
++        #expect(surface.isAwaitingStartupRestoreAdmission)
++        #expect(scheduler.scheduledSurfaceIds.isEmpty)
++        #expect(surface.nextRuntimeInitialInput == nil)
++        #expect(surface.suppressConfiguredInitialInput)
++        surface.admitStartupRestoreRuntime()
++        #expect(scheduler.scheduledSurfaceIds == [surface.id])
++        #expect(surface.suppressConfiguredInitialInput)
++        surface.startupInputGate.stage(surface.initialInput, generation: generation)
++        #expect(surface.startupInputGate.takeForPrompt(generation: generation) == nil)
++    }
++
++    @Test("Cancellation after admission removes unsent prompt input")
++    func cancellationAfterAdmissionDropsPromptInput() {
++        let nativeView = FakeTerminalSurfaceNativeView(frame: NSRect(x: 0, y: 0, width: 800, height: 600))
++        let paneHost = FakeTerminalSurfacePaneHost(surfaceView: nativeView, attachesThroughSurfaceModel: true)
++        let scheduler = RecordingRestoreSpawnScheduler()
++        let surface = makeSurface(
++            policy: .pacedSessionRestore.requiringStartupRestoreAdmission(),
++            scheduler: scheduler, nativeView: nativeView, paneHost: paneHost,
++            initialInput: "cmux restore herdr original\n"
++        )
++        surface.agentCommandShimInstallCompleted = true
++        defer { surface.closeHeadlessStartupWindowIfNeeded() }
++        surface.admitStartupRestoreRuntime()
++        let generation = surface.terminalLifecycleId
++        surface.startupInputGate.stage(surface.initialInput, generation: generation)
++        surface.cancelStartupRestoreInput(expectedLifecycleID: generation)
++        #expect(surface.startupInputGate.takeForPrompt(generation: generation) == nil)
++        #expect(surface.suppressConfiguredInitialInput)
++        #expect(scheduler.scheduledSurfaceIds == [surface.id])
++    }
++
++    @Test("A stale cancellation cannot suppress replacement runtime input")
++    func staleCancellationDoesNotTouchReplacementRuntime() {
++        let nativeView = FakeTerminalSurfaceNativeView(frame: NSRect(x: 0, y: 0, width: 800, height: 600))
++        let paneHost = FakeTerminalSurfacePaneHost(surfaceView: nativeView, attachesThroughSurfaceModel: true)
++        let scheduler = RecordingRestoreSpawnScheduler()
++        let surface = makeSurface(
++            policy: .pacedSessionRestore.requiringStartupRestoreAdmission(),
++            scheduler: scheduler, nativeView: nativeView, paneHost: paneHost
++        )
++        defer { surface.closeHeadlessStartupWindowIfNeeded() }
++        let old = surface.terminalLifecycleId
++        surface.advanceTerminalLifecycleForRuntimeReplacement()
++        let current = surface.terminalLifecycleId
++        #expect(current != old)
++        surface.nextRuntimeInitialInput = "replacement\n"
++        surface.startupInputGate.stage("replacement\n", generation: current)
++        surface.cancelStartupRestoreInput(expectedLifecycleID: old)
++        #expect(surface.nextRuntimeInitialInput == "replacement\n")
++        #expect(!surface.suppressConfiguredInitialInput)
++        #expect(surface.startupInputGate.takeForPrompt(generation: current) == "replacement\n")
++    }
++
+     private func makeSurface(
+         policy: TerminalSurfaceRuntimeSpawnPolicy,
+         scheduler: RecordingRestoreSpawnScheduler,
+         nativeView: FakeTerminalSurfaceNativeView,
+-        paneHost: FakeTerminalSurfacePaneHost
++        paneHost: FakeTerminalSurfacePaneHost,
++        initialInput: String? = nil
+     ) -> TerminalSurface {
+         TerminalSurface(
+             tabId: UUID(),
+             context: GHOSTTY_SURFACE_CONTEXT_SPLIT,
+             configTemplate: nil,
++            initialInput: initialInput,
+             runtimeSpawnPolicy: policy,
+             dependencies: makeDependencies(
+                 scheduler: scheduler,
+--- a/Sources/HerdrResumeBinding.swift
++++ b/Sources/HerdrResumeBinding.swift
+@@ -28,3 +28,86 @@
+         )
+     }
+ }
++
++
++extension SurfaceResumeBindingSnapshot {
++    var isHerdrProcessDetectedBinding: Bool {
++        isProcessDetected && kind == "herdr"
++    }
++}
++
++/// One approved attach, bounded from staging through the first process observation.
++/// Keep the full binding and terminal generation so stale callbacks cannot retire
++/// a replacement attach or suppress another runtime's startup input.
++struct PendingHerdrStartupRestore {
++    let token = UUID()
++    let binding: SurfaceResumeBindingSnapshot
++    let terminalLifecycleID: UUID
++    let deadline: TimeInterval
++}
++
++@MainActor
++extension Workspace {
++    static let herdrStartupRestoreTimeout: TimeInterval = 120
++
++    func beginHerdrStartupRestore(binding: SurfaceResumeBindingSnapshot, panel: TerminalPanel) {
++        let pending = PendingHerdrStartupRestore(
++            binding: binding,
++            terminalLifecycleID: panel.surface.terminalLifecycleId,
++            deadline: herdrStartupRestoreUptime() + Self.herdrStartupRestoreTimeout
++        )
++        pendingHerdrStartupRestoresByPanelId[panel.id] = pending
++        let previousExplicitInput = panel.surface.onExplicitInput
++        panel.surface.onExplicitInput = { [weak self, weak panel] in
++            previousExplicitInput?()
++            guard let self, let panel, panel.workspaceId == self.id else { return }
++            self.retireHerdrStartupRestore(panelId: panel.id, token: pending.token)
++        }
++        let panelID = panel.id
++        Task { @MainActor [weak self] in
++            do {
++                try await Task.sleep(for: .seconds(Self.herdrStartupRestoreTimeout))
++            } catch { return }
++            guard let self,
++                  self.pendingHerdrStartupRestoresByPanelId[panelID]?.token == pending.token else { return }
++            self.expireHerdrStartupRestores()
++        }
++    }
++
++    func preservesHerdrStartupBinding(_ binding: SurfaceResumeBindingSnapshot, panelId: UUID) -> Bool {
++        guard binding.isHerdrProcessDetectedBinding else { return false }
++        // A failed restore keeps its outer owner for explicit retry, including
++        // after another save/relaunch. Never let its inner agent become fallback.
++        if binding.autoResume == false, binding.approvalPolicy == .manual { return true }
++        guard let pending = pendingHerdrStartupRestoresByPanelId[panelId],
++              pending.binding == binding,
++              let panel = terminalPanel(for: panelId), panel.workspaceId == id else { return false }
++        return pending.terminalLifecycleID == panel.surface.terminalLifecycleId
++    }
++
++    func expireHerdrStartupRestores() {
++        let now = herdrStartupRestoreUptime()
++        for (panelId, pending) in pendingHerdrStartupRestoresByPanelId where now >= pending.deadline {
++            retireHerdrStartupRestore(panelId: panelId, token: pending.token)
++        }
++    }
++
++    /// Shared failure transition for expiry, uncertainty, and accepted input.
++    func retireHerdrStartupRestore(panelId: UUID, token: UUID) {
++        guard let pending = pendingHerdrStartupRestoresByPanelId[panelId], pending.token == token else { return }
++        pendingHerdrStartupRestoresByPanelId.removeValue(forKey: panelId)
++        guard surfaceResumeBindingsByPanelId[panelId] == pending.binding,
++              let panel = terminalPanel(for: panelId), panel.workspaceId == id,
++              panel.surface.terminalLifecycleId == pending.terminalLifecycleID else { return }
++        panel.surface.cancelStartupRestoreInput(expectedLifecycleID: pending.terminalLifecycleID)
++        surfaceResumeBindingsByPanelId[panelId] = pending.binding.forcingManualRestore()
++    }
++
++    /// Detection, explicit replacement and clear invalidate the old queued selector.
++    func discardHerdrStartupRestore(panelId: UUID) {
++        guard let pending = pendingHerdrStartupRestoresByPanelId.removeValue(forKey: panelId),
++              surfaceResumeBindingsByPanelId[panelId] == pending.binding,
++              let panel = terminalPanel(for: panelId), panel.workspaceId == id else { return }
++        panel.surface.cancelStartupRestoreInput(expectedLifecycleID: pending.terminalLifecycleID)
++    }
++}
+--- a/Sources/PendingTerminalStartupRestore.swift
++++ b/Sources/PendingTerminalStartupRestore.swift
+@@ -16,7 +16,10 @@
+     let chatResumeBinding: PendingTerminalStartupRestoreChatBinding?
+     let ownedResumeLaunchClaim: SessionRestorableAgentSnapshot?
+ 
++    /// Includes non-agent selectors such as Herdr, without seeding agent lifecycle.
++    var startupWorkOverride: Bool? = nil
++
+     var willRunStartupWork: Bool {
+-        willRunStartupInput
++        startupWorkOverride ?? willRunStartupInput
+     }
+ }
+--- a/Sources/TerminalStartupRestoreCoordinator.swift
++++ b/Sources/TerminalStartupRestoreCoordinator.swift
+@@ -32,7 +32,7 @@
+     ///
+     /// - Parameters:
+     ///   - requestedPolicy: Timing policy selected by the terminal creation path.
+-    ///   - willRunStartupInput: Whether a restored agent selector will be queued.
++    ///   - willRunStartupInput: Whether approved restore input will be queued.
+     ///   - awaitsDeferredAgentResume: Whether the ownership scan must decide
+     ///     the first runtime's resume command after topology commit.
+     /// - Returns: The requested policy with a restore gate when one is required.
+@@ -61,6 +61,7 @@
+     ///   - resumeBinding: Hook-owned fallback identity for snapshots without an agent payload.
+     ///   - manualResumeAvailable: Whether the terminal retains a manual continuation.
+     ///   - willRunStartupInput: Whether an agent restore selector is queued as terminal input.
++    ///   - willRunStartupWork: Whether any approved restore input is queued. Defaults to agent input.
+     ///   - resumeWorkingDirectory: Working directory owned by the resumed agent launch.
+     ///   - chatWorkingDirectory: Working directory used to resolve the resumed transcript.
+     ///   - agentSessionAlreadyActive: Whether another surface already owns the live session.
+@@ -77,7 +78,8 @@
+         chatWorkingDirectory: String? = nil,
+         agentSessionAlreadyActive: Bool = false,
+         ownsResumeLaunchClaim: Bool = false,
+-        defersStartupRestoreAdmission: Bool = false
++        defersStartupRestoreAdmission: Bool = false,
++        willRunStartupWork: Bool? = nil
+     ) {
+         pendingRestoresByPanelID[panel.id] = PendingTerminalStartupRestore(
+             panel: panel,
+@@ -93,7 +95,8 @@
+                 workingDirectory: chatWorkingDirectory ?? resumeWorkingDirectory,
+                 agentSessionAlreadyActive: agentSessionAlreadyActive
+             ),
+-            ownedResumeLaunchClaim: ownsResumeLaunchClaim ? snapshot : nil
++            ownedResumeLaunchClaim: ownsResumeLaunchClaim ? snapshot : nil,
++            startupWorkOverride: willRunStartupWork
+         )
+         StartupBreadcrumbLog.append(
+             "session.restore.panel.staged",
+--- a/Sources/Workspace.swift
++++ b/Sources/Workspace.swift
+@@ -274,6 +274,9 @@
+ #endif
+         terminalStartupRestoreCoordinator.removeAllRestores()
+         clearDeferredAgentResumeRestores(startRuntime: false)
++        for panelId in Array(pendingHerdrStartupRestoresByPanelId.keys) {
++            discardHerdrStartupRestore(panelId: panelId)
++        }
+         surfaceResumeBindingsByPanelId.removeAll(keepingCapacity: false)
+         surfaceResumeRestoreClaimsByPanelId.removeAll(keepingCapacity: false)
+         pendingPlainSSHRestorePanelIds.removeAll(keepingCapacity: false)
+@@ -1471,10 +1474,14 @@
+         using surfaceResumeBindingIndex: SurfaceResumeBindingIndex,
+         restorableAgentIndex: RestorableAgentSessionIndex? = nil
+     ) {
++        expireHerdrStartupRestores()
+         guard surfaceResumeBindingIndex.isAvailable else { return }; for panelId in panels.keys {
+             let storedBinding = surfaceResumeBindingsByPanelId[panelId]
+             let detectedBinding = surfaceResumeBindingIndex.binding(workspaceId: id, panelId: panelId)
+             if surfaceResumeBindingIndex.hasAmbiguousPanel(panelId), detectedBinding == nil {
++                if let pending = pendingHerdrStartupRestoresByPanelId[panelId] {
++                    retireHerdrStartupRestore(panelId: panelId, token: pending.token)
++                }
+                 // A missing panel-only winner is uncertainty, not proof that a
+                 // process-backed binding exited; preserve the existing binding.
+                 continue
+@@ -1503,6 +1510,9 @@
+                 continue
+             }
+             guard let detectedBinding else {
++                if preservesHerdrStartupBinding(storedBinding, panelId: panelId) {
++                    continue
++                }
+                 if storedBinding.isPlainSSHProcessDetectedBinding {
+                     if pendingPlainSSHRestorePanelIds.contains(panelId) {
+                         // The restored PTY may not have exec'd `ssh` yet. Keep
+@@ -1551,17 +1561,7 @@
+                 continue
+             }
+             if storedBinding.shouldYieldToDetectedSurfaceResumeBinding(detectedBinding) {
+-                guard surfaceResumeBindingMutationAllowed(
+-                    detectedBinding,
+-                    panelId: panelId
+-                ) else {
+-                    continue
+-                }
+-                invalidateRestoredAgentLifecycleIfBindingIsReplaced(
+-                    by: detectedBinding,
+-                    panelId: panelId
+-                )
+-                surfaceResumeBindingsByPanelId[panelId] = detectedBinding
++                _ = applyDetectedSurfaceResumeBinding(detectedBinding, panelId: panelId)
+             } else if storedBinding.isProcessDetected {
+                 guard surfaceResumeBindingRemovalAllowed(panelId: panelId) else {
+                     continue
+@@ -1574,11 +1574,24 @@
+         }
+     }
+ 
++    @discardableResult
++    func applyDetectedSurfaceResumeBinding(_ binding: SurfaceResumeBindingSnapshot, panelId: UUID) -> Bool {
++        guard surfaceResumeBindingMutationAllowed(binding, panelId: panelId) else { return false }
++        discardHerdrStartupRestore(panelId: panelId)
++        invalidateRestoredAgentLifecycleIfBindingIsReplaced(by: binding, panelId: panelId)
++        surfaceResumeBindingsByPanelId[panelId] = binding
++        return true
++    }
++
+     func effectiveSurfaceResumeBinding(
+         panelId: UUID,
+         surfaceResumeBindingIndex: SurfaceResumeBindingIndex?,
+         downgradeStoredProcessDetectedResumeBindingWhenDetectionUnavailable: Bool = false
+     ) -> SurfaceResumeBindingSnapshot? {
++        // Expiry can retire this generation during the read below. Retain its
++        // identity so a simultaneous successful observation still completes it.
++        let pendingHerdrBeforeExpiry = pendingHerdrStartupRestoresByPanelId[panelId]
++        expireHerdrStartupRestores()
+         let storedBinding = surfaceResumeBindingsByPanelId[panelId]
+         // An unavailable index (the synchronous update-relaunch save, or the
+         // quit fallback after a timed-out fresh scan) carries no process
+@@ -1592,6 +1605,10 @@
+                   downgradeStoredProcessDetectedResumeBindingWhenDetectionUnavailable else {
+                 return storedBinding
+             }
++            if let pending = pendingHerdrStartupRestoresByPanelId[panelId] {
++                retireHerdrStartupRestore(panelId: panelId, token: pending.token)
++                return surfaceResumeBindingsByPanelId[panelId]?.forcingManualRestore()
++            }
+             // A windowless recovery freeze cannot synchronously verify process
+             // detection after it releases this workspace graph. Preserve the
+             // command for manual recovery without trusting it to auto-run.
+@@ -1604,12 +1621,19 @@
+ 
+         let detectedBinding = surfaceResumeBindingIndex.binding(workspaceId: id, panelId: panelId)
+         if surfaceResumeBindingIndex.hasAmbiguousPanel(panelId), detectedBinding == nil {
++            if let pending = pendingHerdrStartupRestoresByPanelId[panelId] {
++                retireHerdrStartupRestore(panelId: panelId, token: pending.token)
++                return surfaceResumeBindingsByPanelId[panelId]?.forcingManualRestore()
++            }
+             // Keep an uncertain binding available for explicit manual resume,
+             // but never carry process-detected auto-launch through ambiguity.
+             return storedBinding?.disablingAutomaticResume()
+         }
+         guard let storedBinding else { return detectedBinding }
+         guard let detectedBinding else {
++            if preservesHerdrStartupBinding(storedBinding, panelId: panelId) {
++                return storedBinding
++            }
+             if storedBinding.isPlainSSHProcessDetectedBinding {
+                 let misses = plainSSHDetectionMissesByPanelId[panelId] ?? 0
+                 if pendingPlainSSHRestorePanelIds.contains(panelId) || misses < 2 {
+@@ -1619,7 +1643,15 @@
+             }
+             return storedBinding.isProcessDetected ? nil : storedBinding
+         }
+-        if storedBinding.shouldYieldToDetectedSurfaceResumeBinding(detectedBinding) { return detectedBinding }
++        if storedBinding.shouldYieldToDetectedSurfaceResumeBinding(detectedBinding) {
++            if pendingHerdrStartupRestoresByPanelId[panelId] != nil ||
++                pendingHerdrBeforeExpiry?.binding.forcingManualRestore() == storedBinding {
++                // A successful read is also a real observation. Complete the
++                // same transition as reconciliation before a timer can expire.
++                _ = applyDetectedSurfaceResumeBinding(detectedBinding, panelId: panelId)
++            }
++            return detectedBinding
++        }
+         if storedBinding.isProcessDetected { return nil }
+         return storedBinding
+     }
+@@ -2045,6 +2077,9 @@
+             }()
+             let requestedWorkingDirectory =
+                 localWorkingDirectory ?? hostShellWorkingDirectory
++            // Topology admission applies to every approved selector; agent
++            // lifecycle and replay bookkeeping remain specific to agent input.
++            let restoredWillRunStartupWork = restoredStartupInput != nil
+             let restoredAgentWillRunStartupInput =
+                 restoredAgentResumeLaunch?.initialInput != nil ||
+                 (restoredBindingLaunch?.initialInput != nil && resumeBinding?.isAgentHookBinding == true) ||
+@@ -2101,7 +2136,7 @@
+                 startupEnvironment: replayEnvironment,
+                 runtimeSpawnPolicy: terminalStartupRestoreCoordinator.runtimeSpawnPolicy(
+                     requestedPolicy: .pacedSessionRestore,
+-                    willRunStartupInput: restoredAgentWillRunStartupInput,
++                    willRunStartupInput: restoredWillRunStartupWork,
+                     awaitsDeferredAgentResume: deferredAgentResumeAdmission
+                 ),
+                 remotePTYSessionID: restoredRemotePTYSessionID,
+@@ -2166,6 +2201,10 @@
+                     panelId: terminalPanel.id
+                 ) {
+                     surfaceResumeBindingsByPanelId[terminalPanel.id] = restoredBinding
++                    if restoredBinding.isHerdrProcessDetectedBinding,
++                       restoredBindingLaunch?.initialInput != nil {
++                        beginHerdrStartupRestore(binding: restoredBinding, panel: terminalPanel)
++                    }
+                 }
+                 if restoredBinding.isPlainSSHProcessDetectedBinding,
+                    restoredBindingLaunch != nil {
+@@ -2227,7 +2266,8 @@
+                         : (restoreIndexUnavailable ? false : agentSessionAlreadyActive)),
+                 ownsResumeLaunchClaim: restoredAgentResumeLaunch != nil &&
+                     restoresRemoteWorkspaceTerminalSnapshot,
+-                defersStartupRestoreAdmission: deferredAgentResumeAdmission
++                defersStartupRestoreAdmission: deferredAgentResumeAdmission,
++                willRunStartupWork: restoredWillRunStartupWork
+             )
+             if let liveSessionOwner {
+                 AgentRestoreSuppressionJournal().record(
+@@ -3525,6 +3565,8 @@
+         restoredAgentLifecycle.snapshotsByPanelId
+     }
+     var surfaceResumeBindingsByPanelId: [UUID: SurfaceResumeBindingSnapshot] = [:]
++    var pendingHerdrStartupRestoresByPanelId: [UUID: PendingHerdrStartupRestore] = [:]
++    var herdrStartupRestoreUptime: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
+     /// Restored notifications of panes whose agent died with the previous app
+     /// process; pruned by `pruneOrphanedRestoredAgentNotifications(store:)`.
+     var restoredAgentNotificationIdsByPanelId: [UUID: Set<UUID>] = [:]
+@@ -6584,6 +6626,7 @@
+             restoredAgentLifecycle.setSnapshot(restorableAgent, panelId: panelId)
+             invalidatedRestoredAgentFingerprintsByPanelId.removeValue(forKey: panelId)
+         }
++        discardHerdrStartupRestore(panelId: panelId)
+         surfaceResumeBindingsByPanelId[panelId] = binding
+         if binding.isPlainSSHProcessDetectedBinding {
+             observedPlainSSHPanelIds.insert(panelId)
+@@ -6686,6 +6729,7 @@
+         panelId: UUID,
+         agentSessionEnded: Bool = false
+     ) -> Bool {
++        discardHerdrStartupRestore(panelId: panelId)
+         let removedBinding = surfaceResumeBindingsByPanelId.removeValue(forKey: panelId)
+         surfaceResumeRestoreClaimsByPanelId.removeValue(forKey: panelId)
+         if let removedBinding,
+@@ -7010,6 +7054,9 @@
+             validSurfaceIds.contains($0.key)
+         }
+         surfaceResumeRestoreClaimsByPanelId = surfaceResumeRestoreClaimsByPanelId.filter {
++            validSurfaceIds.contains($0.key)
++        }
++        pendingHerdrStartupRestoresByPanelId = pendingHerdrStartupRestoresByPanelId.filter {
+             validSurfaceIds.contains($0.key)
+         }
+         pendingPlainSSHRestorePanelIds = pendingPlainSSHRestorePanelIds.intersection(validSurfaceIds)
+@@ -11909,7 +11956,9 @@
+         )
+         let transferredResumeBinding: SurfaceResumeBindingSnapshot? = {
+             if let resumeBinding = detached.resumeBinding,
+-               !resumeBinding.isProcessDetected {
++               !resumeBinding.isProcessDetected ||
++                (resumeBinding.isHerdrProcessDetectedBinding &&
++                 resumeBinding.autoResume == false && resumeBinding.approvalPolicy == .manual) {
+                 return resumeBinding
+             }
+             return detached.resolvedManagedAgentResumeBinding
+@@ -14866,6 +14915,11 @@
+         _ = consumeCloseHistoryEligibility(tabId: tabId, panelId: panelId)
+         let transferredRemoteCleanupConfiguration = transferredRemoteCleanupConfigurationsByPanelId[panelId]
+         let preservesSurfaceForDetach = isDetaching && panel != nil
++        if let pending = pendingHerdrStartupRestoresByPanelId[panelId] {
++            // A new workspace must not inherit the old owner's queued selector.
++            // Detach transfers only the manual outer intent; close discards it.
++            retireHerdrStartupRestore(panelId: panelId, token: pending.token)
++        }
+         if isDetaching, let panel {
+             owningTabManager?.flushPendingPanelTitleUpdatesForWorkspaceSnapshot()
+             let browserPanel = panel as? BrowserPanel
+--- a/cmuxTests/HerdrResumeBindingTests.swift
++++ b/cmuxTests/HerdrResumeBindingTests.swift
+@@ -291,3 +291,104 @@
+         }
+     }
+ }
++
++
++/// Deterministic deadline tests run only on the fixed head. No sleeps or live PTY required.
++@Suite(.serialized)
++@MainActor
++struct HerdrStartupRestoreBoundaryTests {
++    private let fixture = HerdrStartupRestoreRegressionTests()
++
++    @Test func deadlineCancelsBeforeTopologyCommitAndKeepsManualOuter() throws {
++        let (workspace, panelID, panel) = try fixture.restore(fixture.herdrBinding(), includeInnerAgent: true)
++        defer { fixture.close(workspace) }
++        let pending = try #require(workspace.pendingHerdrStartupRestoresByPanelId[panelID])
++        workspace.herdrStartupRestoreUptime = { pending.deadline }
++        workspace.expireHerdrStartupRestores()
++        #expect(workspace.pendingHerdrStartupRestoresByPanelId[panelID] == nil)
++        #expect(panel.surface.isAwaitingStartupRestoreAdmission)
++        #expect(workspace.surfaceResumeBinding(panelId: panelID)?.autoResume == false)
++        for _ in 0..<4 { workspace.reconcileSurfaceResumeBindings(using: .empty) }
++        let manual = try #require(workspace.surfaceResumeBinding(panelId: panelID))
++        #expect(manual.approvalPolicy == .manual)
++        workspace.terminalStartupRestoreCoordinator.commitPendingRestores()
++        #expect(!panel.surface.isAwaitingStartupRestoreAdmission)
++        #expect(workspace.surfaceResumeBinding(panelId: panelID) == manual)
++    }
++
++    @Test func readsDoNotExtendFixedDeadline() throws {
++        let (workspace, panelID, _) = try fixture.restore(fixture.herdrBinding())
++        defer { fixture.close(workspace) }
++        let pending = try #require(workspace.pendingHerdrStartupRestoresByPanelId[panelID])
++        workspace.herdrStartupRestoreUptime = { pending.deadline - 1 }
++        for _ in 0..<4 {
++            _ = workspace.effectiveSurfaceResumeBinding(panelId: panelID, surfaceResumeBindingIndex: .empty)
++        }
++        #expect(workspace.pendingHerdrStartupRestoresByPanelId[panelID]?.deadline == pending.deadline)
++        workspace.herdrStartupRestoreUptime = { pending.deadline }
++        #expect(workspace.effectiveSurfaceResumeBinding(panelId: panelID, surfaceResumeBindingIndex: .empty)?.autoResume == false)
++        #expect(workspace.surfaceResumeBinding(panelId: panelID)?.approvalPolicy == .manual)
++    }
++
++    @Test func staleTimerCannotRetireNewPendingGeneration() throws {
++        let (workspace, panelID, panel) = try fixture.restore(fixture.herdrBinding())
++        defer { fixture.close(workspace) }
++        let old = try #require(workspace.pendingHerdrStartupRestoresByPanelId[panelID])
++        let replacement = try fixture.herdrBinding(session: "new-owner", capturedAt: 50)
++        #expect(workspace.setSurfaceResumeBinding(replacement, panelId: panelID))
++        workspace.beginHerdrStartupRestore(binding: replacement, panel: panel)
++        let current = try #require(workspace.pendingHerdrStartupRestoresByPanelId[panelID])
++        workspace.retireHerdrStartupRestore(panelId: panelID, token: old.token)
++        #expect(workspace.surfaceResumeBinding(panelId: panelID) == replacement)
++        #expect(workspace.pendingHerdrStartupRestoresByPanelId[panelID]?.token == current.token)
++    }
++
++    @Test func unavailableSaveDowngradeCancelsPendingAndStaysManual() throws {
++        let (workspace, panelID, _) = try fixture.restore(fixture.herdrBinding())
++        defer { fixture.close(workspace) }
++        let saved = workspace.sessionSnapshot(
++            includeScrollback: false, surfaceResumeBindingIndex: .unavailable,
++            downgradeStoredProcessDetectedResumeBindingsWhenDetectionUnavailable: true
++        )
++        #expect(saved.panels.first?.terminal?.resumeBinding?.autoResume == false)
++        #expect(workspace.pendingHerdrStartupRestoresByPanelId[panelID] == nil)
++        workspace.reconcileSurfaceResumeBindings(using: .empty)
++        #expect(workspace.surfaceResumeBinding(panelId: panelID)?.approvalPolicy == .manual)
++    }
++
++    @Test func observedProcessWinsAtDeadlineAndOldTimerCannotDowngradeIt() throws {
++        let (workspace, panelID, _) = try fixture.restore(fixture.herdrBinding())
++        defer { fixture.close(workspace) }
++        let pending = try #require(workspace.pendingHerdrStartupRestoresByPanelId[panelID])
++        let live = try fixture.herdrBinding(capturedAt: 60)
++        workspace.herdrStartupRestoreUptime = { pending.deadline }
++        workspace.reconcileSurfaceResumeBindings(using: SurfaceResumeBindingIndex(bindingsByPanel: [
++            .init(workspaceId: workspace.id, panelId: panelID): live
++        ]))
++        workspace.retireHerdrStartupRestore(panelId: panelID, token: pending.token)
++        #expect(workspace.surfaceResumeBinding(panelId: panelID) == live)
++        #expect(workspace.pendingHerdrStartupRestoresByPanelId[panelID] == nil)
++        workspace.reconcileSurfaceResumeBindings(using: .empty)
++        #expect(workspace.surfaceResumeBinding(panelId: panelID) == nil)
++    }
++
++
++    @Test func freshProcessReadAtDeadlineCommitsObservedBindingAndLaterExit() throws {
++        let (workspace, panelID, _) = try fixture.restore(fixture.herdrBinding())
++        defer { fixture.close(workspace) }
++        let pending = try #require(workspace.pendingHerdrStartupRestoresByPanelId[panelID])
++        let live = try fixture.herdrBinding(capturedAt: 70)
++        workspace.herdrStartupRestoreUptime = { pending.deadline }
++        #expect(workspace.effectiveSurfaceResumeBinding(
++            panelId: panelID,
++            surfaceResumeBindingIndex: SurfaceResumeBindingIndex(bindingsByPanel: [
++                .init(workspaceId: workspace.id, panelId: panelID): live
++            ])
++        ) == live)
++        #expect(workspace.surfaceResumeBinding(panelId: panelID) == live)
++        #expect(workspace.pendingHerdrStartupRestoresByPanelId[panelID] == nil)
++        workspace.reconcileSurfaceResumeBindings(using: .empty)
++        #expect(workspace.surfaceResumeBinding(panelId: panelID) == nil)
++    }
++
++}

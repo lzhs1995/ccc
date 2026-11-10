@@ -1,0 +1,28 @@
+{
+  "schema": "cmux-natural-source-correction-public-projection-v1",
+  "original_correction_sha256": "6f2dba34b033c27ad96a1ed8804270b1467cfa9251946f2d485ea261704c660a",
+  "original_freeze_sha256": "40e64aa4d69d465cd0139dc2f39ecac7921b03124c24bc9e361615097b6df598",
+  "omitted_fields": [
+    "original_freeze.path"
+  ],
+  "corrected_fields": [
+    {
+      "path": "CANDIDATE.json",
+      "field": "source_tree"
+    },
+    {
+      "path": "FROZEN.json",
+      "field": "source_tree"
+    },
+    {
+      "path": "STATIC-CHECKS.json",
+      "field": "original_source_tree"
+    }
+  ],
+  "recorded_value": "2e109a1739d320fe36220afb3e7775b59c1acd47",
+  "correct_meaning": "Fixed upstream commit OID. This value was mislabeled as a tree OID and must not be used as the build base or new tree OID.",
+  "upstream_commit": "2e109a1739d320fe36220afb3e7775b59c1acd47",
+  "source_artifact_bytes_affected": false,
+  "actual_tree_authority": "expected-trees.json",
+  "not_the_original_correction_bytes": true
+}

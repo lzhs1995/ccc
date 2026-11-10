@@ -1,0 +1,137 @@
+{
+  "schema": "cmux-natural-native-source-manifest-v1",
+  "files": {
+    "README.md": {
+      "bytes": 5701,
+      "sha256": "efe0c15317eee2e014f8b1153d28e7ecbf8cf33cc1f43ff6106be605da76406c"
+    },
+    "artifact_io.py": {
+      "bytes": 3494,
+      "sha256": "929e93bf49d53791b9b81ec6bf64aceca17a092eaf914fff8d205dd1f953a771"
+    },
+    "compile-focused.sh": {
+      "bytes": 1002,
+      "sha256": "ee9535f52d27c9fc6a734d45733c97f4a706465a7ed069aeae2de1ddaeccbada"
+    },
+    "console-in-source.sh": {
+      "bytes": 528,
+      "sha256": "bf0330c93d582613fe56e8fba7a5b9cc3bece7706802f8e1a305495d0fe28bc4"
+    },
+    "contract.json": {
+      "bytes": 13265,
+      "sha256": "46c9b3f15b087be92262ff2e3f3591fba8580ec532339d1c6130ee66ec38d01d"
+    },
+    "contract.py": {
+      "bytes": 14177,
+      "sha256": "ed9d9cfc5c8bd57432f45c505e7c606688878a988600c66e7c71fa85956a2012"
+    },
+    "download_native.py": {
+      "bytes": 4323,
+      "sha256": "0e2d8d64319eeca7fd090b64593da52412bf2877a8cbc42a32df83a632cd6661"
+    },
+    "evidence_native.py": {
+      "bytes": 13304,
+      "sha256": "167e04493755cd17083669fc286b0be7f61e1bfb89f626398256b7c1651099fc"
+    },
+    "inputs/expected-trees.json": {
+      "bytes": 3861,
+      "sha256": "d112d09cab944d6a5a078bac9fe7d69ec1f2fbeddb1e9c99d1acc846c44e6f37"
+    },
+    "inputs/full-fix.patch": {
+      "bytes": 10785,
+      "sha256": "40092c6b45f0c773e241035eba032b20a9d16b9e1574bc53f40d4c9afc24250b"
+    },
+    "inputs/original-contract.json": {
+      "bytes": 3861,
+      "sha256": "d7b91a9ecaf6ed7e8013a790b7438c327ad11186e5f2a0bb6ebb6a9d38a7fa82"
+    },
+    "inputs/original-fix.patch": {
+      "bytes": 32711,
+      "sha256": "db4f2c96ff9e06fd47ddb55a102f0ccb45d00c691e9e3681ca722f3f97144422"
+    },
+    "inputs/original-tests.patch": {
+      "bytes": 14377,
+      "sha256": "bdebf64e054476f3ea0476df3ec7acb91ddbfe86fc2927bb85686720c6a7bf8e"
+    },
+    "inputs/restore-tests.patch": {
+      "bytes": 4728,
+      "sha256": "a36c6c5b14c515b4e10b46dc642639aa7416968b79448f7579d5f49f4d9d06b1"
+    },
+    "inputs/source-correction.json": {
+      "bytes": 994,
+      "sha256": "8799f239727e966704b58e87758b266003ca2c9f4db21f0b71773237ed242ebd"
+    },
+    "inputs/source-freeze.json": {
+      "bytes": 8171,
+      "sha256": "40e64aa4d69d465cd0139dc2f39ecac7921b03124c24bc9e361615097b6df598"
+    },
+    "inputs/test-plan.json": {
+      "bytes": 9625,
+      "sha256": "5d881d6a31cac56659a683e655b464cfe3af07cfbd282add513484e29e5b6f82"
+    },
+    "preflight-app-host.sh": {
+      "bytes": 931,
+      "sha256": "12c90ff683a35a18ac143bbc7e5452db21be7657399903c2d39abd45e66d9177"
+    },
+    "run-focused.sh": {
+      "bytes": 2599,
+      "sha256": "ca7a9d38ee220f24a55c250216dd59bc616b4c7cced84eafa104045967525201"
+    },
+    "run-package.sh": {
+      "bytes": 1132,
+      "sha256": "012b82adaa867fb475c68cf3f676e5a68bdd7006fd0b2de90cdd7ca54e7bea45"
+    },
+    "source_chain.py": {
+      "bytes": 4175,
+      "sha256": "238a3c47dea46feac68e9a377c4010928e0fe77f6d7e990786e79229fb008b53"
+    },
+    "test_native.py": {
+      "bytes": 18298,
+      "sha256": "63edf5a8a2b920a2cef0e21eca04b844e837caba80ecf0db1d0db80aa95188dd"
+    },
+    "upstream/app_host_result_accounting.py": {
+      "bytes": 24117,
+      "sha256": "826c5789e8112eb0dac52ce6ce1cce23194deda3881654bbd1dd78182e9abfdb"
+    },
+    "upstream/require_swift_test_execution.py": {
+      "bytes": 3688,
+      "sha256": "0b251902dee3de974d56300c61f675acf7b277f4f7a264f9305501707086db7e"
+    }
+  },
+  "file_count": 24,
+  "native_tests_executed": false,
+  "public_projection_private_path_check": {
+    "checked_files": 24,
+    "hits": [],
+    "preserved_generic_test_fixture_paths": [
+      {
+        "file": "inputs/original-tests.patch",
+        "token": "/Users/test"
+      },
+      {
+        "file": "inputs/original-tests.patch",
+        "token": "/Users/test"
+      },
+      {
+        "file": "inputs/original-tests.patch",
+        "token": "/Users/test"
+      },
+      {
+        "file": "inputs/original-tests.patch",
+        "token": "/Users/test"
+      }
+    ]
+  },
+  "source": {
+    "upstream_commit": "2e109a1739d320fe36220afb3e7775b59c1acd47",
+    "base_green_tree": "40e8ea03ce1435f11e90b35f98d554a13b9b8685",
+    "red_tree": "2ac402069e1c937b23be75126c0fdb663f5905cd",
+    "green_tree": "f0e2d0f26d1d5dde021ef2729aeb3f987993fe0a",
+    "patches": {
+      "original_tests": "bdebf64e054476f3ea0476df3ec7acb91ddbfe86fc2927bb85686720c6a7bf8e",
+      "original_fix": "db4f2c96ff9e06fd47ddb55a102f0ccb45d00c691e9e3681ca722f3f97144422",
+      "restore_tests": "a36c6c5b14c515b4e10b46dc642639aa7416968b79448f7579d5f49f4d9d06b1",
+      "full_fix": "40092c6b45f0c773e241035eba032b20a9d16b9e1574bc53f40d4c9afc24250b"
+    }
+  }
+}

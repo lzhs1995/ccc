@@ -1,0 +1,198 @@
+{
+  "schema": "cmux-natural-start-policy-source-freeze-v1",
+  "status": "FROZEN_SOURCE_CANDIDATE_READY_FOR_ROOT_REVIEW_SWIFT_TESTS_NOT_RUN",
+  "source_upstream": "2e109a1739d320fe36220afb3e7775b59c1acd47",
+  "source_tree": "2e109a1739d320fe36220afb3e7775b59c1acd47",
+  "member_count": 29,
+  "members": {
+    "CANDIDATE.json": {
+      "sha256": "310dc7596aa779d02e7ddb5dfce4fb77f73d53b8913f84d3c4b896c8937995f0",
+      "bytes": 7034
+    },
+    "EXISTING-APPEARANCE-TEST-SOURCE.json": {
+      "sha256": "d01132c043473285d327745ec025b6b763a3ec09e3d00afa56a12ff15bf8036e",
+      "bytes": 1045
+    },
+    "EXISTING-ICON-TEST-SOURCE.json": {
+      "sha256": "a1e8fac1cef277f19c864e5392cf7dbce92124d0454f0c16594a80a324c63c74",
+      "bytes": 1054
+    },
+    "HANDOFF.md": {
+      "sha256": "4052f3d75213a994b18e5287632d332c8fa76144073f04ba6bb628931964823a",
+      "bytes": 3796
+    },
+    "INTENT.json": {
+      "sha256": "831a379f952dd835ae8b3a6a784d344f0d33f470bb674a7880e559102d745c69",
+      "bytes": 3903
+    },
+    "PATCH-CHECK.stderr": {
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    "PATCH-CHECK.stdout": {
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    "SOURCE-DIFF.patch": {
+      "sha256": "93d7fae4c0f476b760d50d206cc48b887ddb8ebd4493f8b988ceca42be8673ae",
+      "bytes": 15513
+    },
+    "STATIC-CHECKS.json": {
+      "sha256": "98d7b0c8b53c34800ebe73c89e84b45f429424ff20c1fecc434e243cac072a28",
+      "bytes": 1012
+    },
+    "TEST-PLAN.json": {
+      "sha256": "5d881d6a31cac56659a683e655b464cfe3af07cfbd282add513484e29e5b6f82",
+      "bytes": 9625
+    },
+    "appearance-policy-tests.transport.stderr": {
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    "appearance-policy-tests.transport.stdout": {
+      "sha256": "2568f13ab738fd44802a8f6c0968adae04131246bafbdbd99ab28bf0d49e514c",
+      "bytes": 542
+    },
+    "candidate/Sources/App/AppBundleIconPersistencePolicy.swift": {
+      "sha256": "ace4e8e5c6440448cf56e447c327811c4b48be667ae307ba13a9e987f3f839f6",
+      "bytes": 1954
+    },
+    "candidate/Sources/AppIconDockTilePlugin.swift": {
+      "sha256": "06e7e3e63fda3530b5e27dd257d3c780cdb1d81d890a70e9c187a7ad117db1c8",
+      "bytes": 6232
+    },
+    "candidate/Sources/SessionPersistence.swift": {
+      "sha256": "616655040b02ce036d16379b9bcfe1bfda95ff151a3ab34384fa5fecf712fb79",
+      "bytes": 92107
+    },
+    "candidate/Sources/cmuxApp.swift": {
+      "sha256": "aae292cfeb457b3b866b89e099469d97116637675b586e2de8e54b187e73636a",
+      "bytes": 232442
+    },
+    "candidate/cmuxTests/AppearanceSettingsTests.swift": {
+      "sha256": "78677e137e34fd30cb9875d87ff5f472fd389f0517f6ee73209e57cf40ee8c4b",
+      "bytes": 28755
+    },
+    "candidate/cmuxTests/SessionPersistenceTests.swift": {
+      "sha256": "54b70c01052ee5a07973cf51a6d0a50b34b9d475e24c95ac507c29feeb194939",
+      "bytes": 346092
+    },
+    "existing-icon-tests.transport.stderr": {
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    "existing-icon-tests.transport.stdout": {
+      "sha256": "680e208541f04120efa8284dcda36eab09094805f3ced0a041f7926281560977",
+      "bytes": 537
+    },
+    "full-fix.patch": {
+      "sha256": "40092c6b45f0c773e241035eba032b20a9d16b9e1574bc53f40d4c9afc24250b",
+      "bytes": 10785
+    },
+    "original/Sources/App/AppBundleIconPersistencePolicy.swift": {
+      "sha256": "30930b6f34cd56e555d63efd39203ddd06499c713aeb0331490a26774914ca5e",
+      "bytes": 1233
+    },
+    "original/Sources/AppIconDockTilePlugin.swift": {
+      "sha256": "85230eff268099d1df32ee5863bbf7be8ab20e6a36b5018815394b1dc7b4e77d",
+      "bytes": 6095
+    },
+    "original/Sources/SessionPersistence.swift": {
+      "sha256": "5631da6efccc9605d526632551ddf22fc5c502cd65a9ec32db2bea05d902499c",
+      "bytes": 92005
+    },
+    "original/Sources/cmuxApp.swift": {
+      "sha256": "5f58d7f5022bba207b51f519db8875f5fd3f019bc3f4bdef307462ae1cc515be",
+      "bytes": 232380
+    },
+    "original/cmuxTests/AppIconAppearanceObserverTests.swift": {
+      "sha256": "4ed1d142a24366061c1155cdef1ec95b3d64b4b948c33bbcc27f5192bb70c83f",
+      "bytes": 5239
+    },
+    "original/cmuxTests/AppearanceSettingsTests.swift": {
+      "sha256": "f6a8534325502417e6b4227b172b957f471edffcef28453ed88486fef3f5980f",
+      "bytes": 23650
+    },
+    "original/cmuxTests/SessionPersistenceTests.swift": {
+      "sha256": "25865a11f21d6cb169a3056c348f3760d8664ae52b60322958fcfccbdec3f79b",
+      "bytes": 342047
+    },
+    "restore-tests.patch": {
+      "sha256": "a36c6c5b14c515b4e10b46dc642639aa7416968b79448f7579d5f49f4d9d06b1",
+      "bytes": 4728
+    }
+  },
+  "files": {
+    "Sources/App/AppBundleIconPersistencePolicy.swift": {
+      "upstream_git_blob": "a484c63832293f155dc3e74c1aab430ec2868b5f",
+      "original_sha256": "30930b6f34cd56e555d63efd39203ddd06499c713aeb0331490a26774914ca5e",
+      "original_bytes": 1233,
+      "candidate_sha256": "ace4e8e5c6440448cf56e447c327811c4b48be667ae307ba13a9e987f3f839f6",
+      "candidate_bytes": 1954
+    },
+    "Sources/AppIconDockTilePlugin.swift": {
+      "upstream_git_blob": "44ed50796b77cabe0fdf7ec1fa14d59e0253582b",
+      "original_sha256": "85230eff268099d1df32ee5863bbf7be8ab20e6a36b5018815394b1dc7b4e77d",
+      "original_bytes": 6095,
+      "candidate_sha256": "06e7e3e63fda3530b5e27dd257d3c780cdb1d81d890a70e9c187a7ad117db1c8",
+      "candidate_bytes": 6232
+    },
+    "Sources/SessionPersistence.swift": {
+      "upstream_git_blob": "cdd197d1afe3439ca19435dafca79f18e1844d8c",
+      "original_sha256": "5631da6efccc9605d526632551ddf22fc5c502cd65a9ec32db2bea05d902499c",
+      "original_bytes": 92005,
+      "candidate_sha256": "616655040b02ce036d16379b9bcfe1bfda95ff151a3ab34384fa5fecf712fb79",
+      "candidate_bytes": 92107
+    },
+    "Sources/cmuxApp.swift": {
+      "upstream_git_blob": "309a68fd03da747ac5828f1dfd2f344c082da874",
+      "original_sha256": "5f58d7f5022bba207b51f519db8875f5fd3f019bc3f4bdef307462ae1cc515be",
+      "original_bytes": 232380,
+      "candidate_sha256": "aae292cfeb457b3b866b89e099469d97116637675b586e2de8e54b187e73636a",
+      "candidate_bytes": 232442
+    },
+    "cmuxTests/AppearanceSettingsTests.swift": {
+      "upstream_git_blob": "fd565d6f93312cd9922f730f49a3657878e14dd6",
+      "original_sha256": "f6a8534325502417e6b4227b172b957f471edffcef28453ed88486fef3f5980f",
+      "original_bytes": 23650,
+      "candidate_sha256": "78677e137e34fd30cb9875d87ff5f472fd389f0517f6ee73209e57cf40ee8c4b",
+      "candidate_bytes": 28755
+    },
+    "cmuxTests/SessionPersistenceTests.swift": {
+      "upstream_git_blob": "e8d3be03d21a9847302c888578ed85ffeff3fb1d",
+      "original_sha256": "25865a11f21d6cb169a3056c348f3760d8664ae52b60322958fcfccbdec3f79b",
+      "original_bytes": 342047,
+      "candidate_sha256": "54b70c01052ee5a07973cf51a6d0a50b34b9d475e24c95ac507c29feeb194939",
+      "candidate_bytes": 346092
+    }
+  },
+  "patches": {
+    "restore-tests.patch": {
+      "paths": [
+        "cmuxTests/SessionPersistenceTests.swift"
+      ],
+      "sha256": "a36c6c5b14c515b4e10b46dc642639aa7416968b79448f7579d5f49f4d9d06b1",
+      "bytes": 4728
+    },
+    "full-fix.patch": {
+      "paths": [
+        "Sources/App/AppBundleIconPersistencePolicy.swift",
+        "Sources/AppIconDockTilePlugin.swift",
+        "Sources/SessionPersistence.swift",
+        "Sources/cmuxApp.swift",
+        "cmuxTests/AppearanceSettingsTests.swift"
+      ],
+      "sha256": "40092c6b45f0c773e241035eba032b20a9d16b9e1574bc53f40d4c9afc24250b",
+      "bytes": 10785
+    }
+  },
+  "candidate_report_sha256": "310dc7596aa779d02e7ddb5dfce4fb77f73d53b8913f84d3c4b896c8937995f0",
+  "test_plan_sha256": "5d881d6a31cac56659a683e655b464cfe3af07cfbd282add513484e29e5b6f82",
+  "static_checks_sha256": "98d7b0c8b53c34800ebe73c89e84b45f429424ff20c1fecc434e243cac072a28",
+  "handoff_sha256": "4052f3d75213a994b18e5287632d332c8fa76144073f04ba6bb628931964823a",
+  "tests_run": false,
+  "builds": 0,
+  "new_runtime_runs": 0,
+  "root_independent_review_required": true,
+  "old_App_fixed": false
+}

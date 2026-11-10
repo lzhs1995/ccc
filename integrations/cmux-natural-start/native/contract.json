@@ -1,0 +1,220 @@
+{
+  "schema": "cmux-natural-start-native-contract-v1",
+  "status": "FROZEN_READY_FOR_NATIVE_EXECUTION",
+  "source": {
+    "upstream_commit": "2e109a1739d320fe36220afb3e7775b59c1acd47",
+    "base_green_tree": "40e8ea03ce1435f11e90b35f98d554a13b9b8685",
+    "red_tree": "2ac402069e1c937b23be75126c0fdb663f5905cd",
+    "green_tree": "f0e2d0f26d1d5dde021ef2729aeb3f987993fe0a",
+    "patches": {
+      "original_tests": "bdebf64e054476f3ea0476df3ec7acb91ddbfe86fc2927bb85686720c6a7bf8e",
+      "original_fix": "db4f2c96ff9e06fd47ddb55a102f0ccb45d00c691e9e3681ca722f3f97144422",
+      "restore_tests": "a36c6c5b14c515b4e10b46dc642639aa7416968b79448f7579d5f49f4d9d06b1",
+      "full_fix": "40092c6b45f0c773e241035eba032b20a9d16b9e1574bc53f40d4c9afc24250b"
+    }
+  },
+  "input_pins": {
+    "inputs/original-tests.patch": {
+      "sha256": "bdebf64e054476f3ea0476df3ec7acb91ddbfe86fc2927bb85686720c6a7bf8e",
+      "bytes": 14377
+    },
+    "inputs/original-fix.patch": {
+      "sha256": "db4f2c96ff9e06fd47ddb55a102f0ccb45d00c691e9e3681ca722f3f97144422",
+      "bytes": 32711
+    },
+    "inputs/original-contract.json": {
+      "sha256": "d7b91a9ecaf6ed7e8013a790b7438c327ad11186e5f2a0bb6ebb6a9d38a7fa82",
+      "bytes": 3861
+    },
+    "inputs/source-freeze.json": {
+      "sha256": "40e64aa4d69d465cd0139dc2f39ecac7921b03124c24bc9e361615097b6df598",
+      "bytes": 8171
+    },
+    "inputs/test-plan.json": {
+      "sha256": "5d881d6a31cac56659a683e655b464cfe3af07cfbd282add513484e29e5b6f82",
+      "bytes": 9625
+    },
+    "inputs/source-correction.json": {
+      "sha256": "8799f239727e966704b58e87758b266003ca2c9f4db21f0b71773237ed242ebd",
+      "bytes": 994
+    },
+    "inputs/restore-tests.patch": {
+      "sha256": "a36c6c5b14c515b4e10b46dc642639aa7416968b79448f7579d5f49f4d9d06b1",
+      "bytes": 4728
+    },
+    "inputs/full-fix.patch": {
+      "sha256": "40092c6b45f0c773e241035eba032b20a9d16b9e1574bc53f40d4c9afc24250b",
+      "bytes": 10785
+    },
+    "upstream/app_host_result_accounting.py": {
+      "sha256": "826c5789e8112eb0dac52ce6ce1cce23194deda3881654bbd1dd78182e9abfdb",
+      "bytes": 24117
+    },
+    "upstream/require_swift_test_execution.py": {
+      "sha256": "0b251902dee3de974d56300c61f675acf7b277f4f7a264f9305501707086db7e",
+      "bytes": 3688
+    },
+    "inputs/expected-trees.json": {
+      "sha256": "d112d09cab944d6a5a078bac9fe7d69ec1f2fbeddb1e9c99d1acc846c44e6f37",
+      "bytes": 3861
+    }
+  },
+  "phases": {
+    "red": {
+      "selectors": [
+        "cmuxTests/SessionPersistenceTests/testRestorePolicySkipsWhenLaunchHasExplicitArguments",
+        "cmuxTests/SessionPersistenceTests/testRestorePolicyAllowsFinderStyleLaunchArgumentsOnly",
+        "cmuxTests/SessionPersistenceTests/testRestorePolicyAllowsPlainLaunch",
+        "cmuxTests/SessionPersistenceTests/testRestorePolicyAllowsBundleIconConfigurationArgument",
+        "cmuxTests/SessionPersistenceTests/testRestorePolicyAllowsFinderStyleLaunchWithBundleIconConfigurationArgument",
+        "cmuxTests/SessionPersistenceTests/testRestorePolicyRejectsBundleIconConfigurationArgumentWithValue",
+        "cmuxTests/SessionPersistenceTests/testRestorePolicyRejectsUnknownArgumentsAlongsideBundleIconConfiguration",
+        "cmuxTests/SessionPersistenceTests/testRestorePolicyRejectsExplicitOpenWithBundleIconConfiguration",
+        "cmuxTests/SessionPersistenceTests/testRestorePolicyKeepsDisableGateWithBundleIconConfiguration",
+        "cmuxTests/SessionPersistenceTests/testRestorePolicyKeepsAutomatedTestGatesWithBundleIconConfiguration",
+        "cmuxTests/SessionPersistenceTests/testRestorePolicySkipsWhenRunningUnderXCTest"
+      ],
+      "required_test_ids": [
+        "SessionPersistenceTests/testRestorePolicySkipsWhenLaunchHasExplicitArguments()",
+        "SessionPersistenceTests/testRestorePolicyAllowsFinderStyleLaunchArgumentsOnly()",
+        "SessionPersistenceTests/testRestorePolicyAllowsPlainLaunch()",
+        "SessionPersistenceTests/testRestorePolicyAllowsBundleIconConfigurationArgument()",
+        "SessionPersistenceTests/testRestorePolicyAllowsFinderStyleLaunchWithBundleIconConfigurationArgument()",
+        "SessionPersistenceTests/testRestorePolicyRejectsBundleIconConfigurationArgumentWithValue()",
+        "SessionPersistenceTests/testRestorePolicyRejectsUnknownArgumentsAlongsideBundleIconConfiguration()",
+        "SessionPersistenceTests/testRestorePolicyRejectsExplicitOpenWithBundleIconConfiguration()",
+        "SessionPersistenceTests/testRestorePolicyKeepsDisableGateWithBundleIconConfiguration()",
+        "SessionPersistenceTests/testRestorePolicyKeepsAutomatedTestGatesWithBundleIconConfiguration()",
+        "SessionPersistenceTests/testRestorePolicySkipsWhenRunningUnderXCTest()"
+      ],
+      "proof_scope": "current source behavior"
+    },
+    "green": {
+      "selectors": [
+        "cmuxTests/SessionPersistenceTests/testRestorePolicySkipsWhenLaunchHasExplicitArguments",
+        "cmuxTests/SessionPersistenceTests/testRestorePolicyAllowsFinderStyleLaunchArgumentsOnly",
+        "cmuxTests/SessionPersistenceTests/testRestorePolicyAllowsPlainLaunch",
+        "cmuxTests/SessionPersistenceTests/testRestorePolicyAllowsBundleIconConfigurationArgument",
+        "cmuxTests/SessionPersistenceTests/testRestorePolicyAllowsFinderStyleLaunchWithBundleIconConfigurationArgument",
+        "cmuxTests/SessionPersistenceTests/testRestorePolicyRejectsBundleIconConfigurationArgumentWithValue",
+        "cmuxTests/SessionPersistenceTests/testRestorePolicyRejectsUnknownArgumentsAlongsideBundleIconConfiguration",
+        "cmuxTests/SessionPersistenceTests/testRestorePolicyRejectsExplicitOpenWithBundleIconConfiguration",
+        "cmuxTests/SessionPersistenceTests/testRestorePolicyKeepsDisableGateWithBundleIconConfiguration",
+        "cmuxTests/SessionPersistenceTests/testRestorePolicyKeepsAutomatedTestGatesWithBundleIconConfiguration",
+        "cmuxTests/SessionPersistenceTests/testRestorePolicySkipsWhenRunningUnderXCTest"
+      ],
+      "required_test_ids": [
+        "SessionPersistenceTests/testRestorePolicySkipsWhenLaunchHasExplicitArguments()",
+        "SessionPersistenceTests/testRestorePolicyAllowsFinderStyleLaunchArgumentsOnly()",
+        "SessionPersistenceTests/testRestorePolicyAllowsPlainLaunch()",
+        "SessionPersistenceTests/testRestorePolicyAllowsBundleIconConfigurationArgument()",
+        "SessionPersistenceTests/testRestorePolicyAllowsFinderStyleLaunchWithBundleIconConfigurationArgument()",
+        "SessionPersistenceTests/testRestorePolicyRejectsBundleIconConfigurationArgumentWithValue()",
+        "SessionPersistenceTests/testRestorePolicyRejectsUnknownArgumentsAlongsideBundleIconConfiguration()",
+        "SessionPersistenceTests/testRestorePolicyRejectsExplicitOpenWithBundleIconConfiguration()",
+        "SessionPersistenceTests/testRestorePolicyKeepsDisableGateWithBundleIconConfiguration()",
+        "SessionPersistenceTests/testRestorePolicyKeepsAutomatedTestGatesWithBundleIconConfiguration()",
+        "SessionPersistenceTests/testRestorePolicySkipsWhenRunningUnderXCTest()"
+      ],
+      "proof_scope": "current source behavior"
+    },
+    "icon": {
+      "selectors": [
+        "cmuxTests/AppearanceSettingsTests/testBundleIconPersistenceAllowsStableReleaseBundle",
+        "cmuxTests/AppearanceSettingsTests/testBundleIconPersistenceSkipsNightlyBundles",
+        "cmuxTests/AppearanceSettingsTests/testBundleIconPersistenceRejectsMismatchedStableIdentifierAndPath",
+        "cmuxTests/AppearanceSettingsTests/testBundleIconPersistenceSkipsDebugBundles",
+        "cmuxTests/AppearanceSettingsTests/testBundleIconPersistenceHonorsDisableDefault",
+        "cmuxTests/AppearanceSettingsTests/testBundleIconPersistenceMirrorsSmokeLaunchArgumentToDefaults",
+        "cmuxTests/AppearanceSettingsTests/testBundleIconPersistenceRequiresBooleanPackageOptIn",
+        "cmuxTests/AppearanceSettingsTests/testBundleIconPersistenceSignedOptInAppliesBeforeAppDefaults",
+        "cmuxTests/AppearanceSettingsTests/testBundleIconPersistenceSignedOptInSurvivesArgumentFreeLaunch",
+        "cmuxTests/AppearanceSettingsTests/testBundleIconPersistenceAbsentOrFalseMetadataRestoresOfficialDefault",
+        "cmuxTests/AppearanceSettingsTests/testBundleIconPersistenceLaunchArgumentRemainsIndependentOfMetadata"
+      ],
+      "required_test_ids": [
+        "AppearanceSettingsTests/testBundleIconPersistenceAllowsStableReleaseBundle()",
+        "AppearanceSettingsTests/testBundleIconPersistenceSkipsNightlyBundles()",
+        "AppearanceSettingsTests/testBundleIconPersistenceRejectsMismatchedStableIdentifierAndPath()",
+        "AppearanceSettingsTests/testBundleIconPersistenceSkipsDebugBundles()",
+        "AppearanceSettingsTests/testBundleIconPersistenceHonorsDisableDefault()",
+        "AppearanceSettingsTests/testBundleIconPersistenceMirrorsSmokeLaunchArgumentToDefaults()",
+        "AppearanceSettingsTests/testBundleIconPersistenceRequiresBooleanPackageOptIn()",
+        "AppearanceSettingsTests/testBundleIconPersistenceSignedOptInAppliesBeforeAppDefaults()",
+        "AppearanceSettingsTests/testBundleIconPersistenceSignedOptInSurvivesArgumentFreeLaunch()",
+        "AppearanceSettingsTests/testBundleIconPersistenceAbsentOrFalseMetadataRestoresOfficialDefault()",
+        "AppearanceSettingsTests/testBundleIconPersistenceLaunchArgumentRemainsIndependentOfMetadata()"
+      ],
+      "proof_scope": "New signed-metadata API behavior; no original-API red claim"
+    },
+    "regression": {
+      "selectors": [
+        "cmuxTests/HerdrStartupRestoreRegressionTests"
+      ],
+      "required_test_ids": [
+        "HerdrStartupRestoreRegressionTests/emptyScanBeforeStartupPreservesOuterBindingInBothReadAndSave()",
+        "HerdrStartupRestoreRegressionTests/backgroundHerdrWaitsForTopologyCommitWithoutAgentLifecycle()",
+        "HerdrStartupRestoreRegressionTests/observedHerdrClosesGapAndLaterExitIsNotPreserved()",
+        "HerdrStartupRestoreRegressionTests/freshProcessReadClosesGapBeforeLaterEmptyScan()",
+        "HerdrStartupRestoreRegressionTests/newDetectedGenerationReplacesPendingOriginal()",
+        "HerdrStartupRestoreRegressionTests/explicitClearCannotBeResurrectedByPendingOriginal()",
+        "HerdrStartupRestoreRegressionTests/initialShellActivityDoesNotProveHerdrStartupFailed()",
+        "HerdrStartupRestoreRegressionTests/acceptedExplicitInputCancelsPendingAutomaticIntent()",
+        "HerdrStartupRestoreRegressionTests/manualOuterIntentSurvivesAnotherRestoreWithoutInnerAutoResume()",
+        "HerdrStartupRestoreRegressionTests/oldExplicitInputCallbackCannotRetireReplacementBinding()",
+        "HerdrStartupRestoreRegressionTests/manualAndUntrustedImportsNeverAcquireAutomaticStartupAdmission()"
+      ],
+      "proof_scope": "current source behavior"
+    },
+    "boundary": {
+      "selectors": [
+        "cmuxTests/HerdrStartupRestoreBoundaryTests"
+      ],
+      "required_test_ids": [
+        "HerdrStartupRestoreBoundaryTests/deadlineCancelsBeforeTopologyCommitAndKeepsManualOuter()",
+        "HerdrStartupRestoreBoundaryTests/readsDoNotExtendFixedDeadline()",
+        "HerdrStartupRestoreBoundaryTests/staleTimerCannotRetireNewPendingGeneration()",
+        "HerdrStartupRestoreBoundaryTests/unavailableSaveDowngradeCancelsPendingAndStaysManual()",
+        "HerdrStartupRestoreBoundaryTests/observedProcessWinsAtDeadlineAndOldTimerCannotDowngradeIt()",
+        "HerdrStartupRestoreBoundaryTests/freshProcessReadAtDeadlineCommitsObservedBindingAndLaterExit()"
+      ],
+      "proof_scope": "current source behavior"
+    },
+    "existing-binding": {
+      "selectors": [
+        "cmuxTests/HerdrResumeBindingTests"
+      ],
+      "required_test_ids": [
+        "HerdrResumeBindingTests/testNamedSessionAttachProducesAutomaticProcessDetectedBinding()",
+        "HerdrResumeBindingTests/testDefaultSessionAttachBindsWithoutCheckpoint()",
+        "HerdrResumeBindingTests/testClientsInsideAHerdrPaneYieldNoBinding()",
+        "HerdrResumeBindingTests/testProcessScanPrefersTheSurfaceClientOverAProcessInsideAHerdrPane()"
+      ],
+      "proof_scope": "current source behavior"
+    }
+  },
+  "expected_red_failed_ids": [
+    "SessionPersistenceTests/testRestorePolicyAllowsBundleIconConfigurationArgument()",
+    "SessionPersistenceTests/testRestorePolicyAllowsFinderStyleLaunchWithBundleIconConfigurationArgument()"
+  ],
+  "expected_red_assertion": "XCTAssertTrue failed",
+  "expected_red_assertions_per_failed_method": 1,
+  "package_test_display_names": [
+    "Restore admission composes with relaunch spawn pacing",
+    "Explicit input cancels a deferred agent resume before admission",
+    "Cancelling deferred admission drops the resume command",
+    "Expired restore input stays cancelled across topology commit",
+    "Cancellation after admission removes unsent prompt input",
+    "A stale cancellation cannot suppress replacement runtime input"
+  ],
+  "budgets": {
+    "native_job_minutes": 350,
+    "red_compile_minutes": 150,
+    "green_compile_minutes": 60,
+    "focused_minutes": 10,
+    "package_minutes": 17,
+    "small_evidence_bytes": 67108864
+  },
+  "compile_selection_note": "build-for-testing compiles the full cmuxTests target; only-testing filters execution only",
+  "original_source_commit_for_evidence_only": "febf361281fdc0f463e84d9d5e4dd65d107dd818"
+}
