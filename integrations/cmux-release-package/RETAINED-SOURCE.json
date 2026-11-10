@@ -1,0 +1,151 @@
+{
+  "app_artifact": {
+    "archive_download_url": "https://api.github.com/repos/lzhs1995/ccc/actions/artifacts/13766044692/zip",
+    "created_at": "2026-11-10T12:55:44Z",
+    "digest": "sha256:3fa491d793327a46f9ff48f76c06046287192cf127ad901b1e0edb80f215fe98",
+    "expired": false,
+    "expires_at": "2026-12-10T12:55:41Z",
+    "id": 13766044692,
+    "name": "cmux-release-app-42808450553-1",
+    "node_id": "MDg6QXJ0aWZhY3QxMzc2NjA0NDY5Mg==",
+    "size_in_bytes": 119754805,
+    "updated_at": "2026-11-10T12:55:44Z",
+    "url": "https://api.github.com/repos/lzhs1995/ccc/actions/artifacts/13766044692",
+    "workflow_run": {
+      "head_branch": "ccc/cmux-release-package-20261110-r3",
+      "head_repository_id": 1356084046,
+      "head_sha": "03540ebd2f4ff0c12b34eda5b2841623ce5b14ea",
+      "id": 42808450553,
+      "repository_id": 1356084046
+    }
+  },
+  "evidence_artifact": {
+    "archive_download_url": "https://api.github.com/repos/lzhs1995/ccc/actions/artifacts/13766885147/zip",
+    "created_at": "2026-11-10T12:55:48Z",
+    "digest": "sha256:c4d3ab991501c83035fd5fede67db661c95085a1836b8034be6495370bd77fe6",
+    "expired": false,
+    "expires_at": "2026-12-10T12:55:47Z",
+    "id": 13766885147,
+    "name": "cmux-release-evidence-42808450553-1",
+    "node_id": "MDg6QXJ0aWZhY3QxMzc2Njg4NTE0Nw==",
+    "size_in_bytes": 1152530,
+    "updated_at": "2026-11-10T12:55:48Z",
+    "url": "https://api.github.com/repos/lzhs1995/ccc/actions/artifacts/13766885147",
+    "workflow_run": {
+      "head_branch": "ccc/cmux-release-package-20261110-r3",
+      "head_repository_id": 1356084046,
+      "head_sha": "03540ebd2f4ff0c12b34eda5b2841623ce5b14ea",
+      "id": 42808450553,
+      "repository_id": 1356084046
+    }
+  },
+  "inner_archive": {
+    "bytes": 119754659,
+    "name": "cmux-release.zip",
+    "sha256": "67598b5654ebf8b634409075c3757c3a68b1b37aa051118ac9a88e4b3e6f05c4"
+  },
+  "members": {
+    "APP-ARTIFACT-API.json": {
+      "bytes": 800,
+      "sha256": "9c8d0e4a352612ac676bcde31a50275ec36ef7d8908d132dea863601136b6abc"
+    },
+    "APP-ARTIFACT-BINDING.json": {
+      "bytes": 1198,
+      "sha256": "ecf57e1ddfab6832b2f213b7c33edf5880768ab76fdcd3b447763854a508dea3"
+    },
+    "EVIDENCE-MANIFEST.json": {
+      "bytes": 76063,
+      "sha256": "827c0485a4f87a0eb47153d7756eeba8c3fd2fd0f151fa39d1e8a80d1b9bb84c"
+    },
+    "EXPORT.json": {
+      "bytes": 181502,
+      "sha256": "11279d4f471feef785c49d697b1cf9f00ef1e6096881375120cdaf0dea984eb8"
+    },
+    "FAILURE.json": {
+      "bytes": 383,
+      "sha256": "0d9590ea9bd1375659cec9bb89e985f6d7ae4233297643acdf68ed7bac7711af"
+    },
+    "RUN-ATTEMPT-API.json": {
+      "bytes": 13059,
+      "sha256": "269522c159499fcce89b930a0f8343a513617be21dcf45d7bc197ffb75f0c50f"
+    },
+    "build/BUILD-COMMAND.json": {
+      "bytes": 930,
+      "sha256": "d85f3dd0cc26225f9f524ec7c2bfee0d27b057a8a7547c1f0f68d9f7edf10f6d"
+    },
+    "build/RESOLVED-RELEASE-SETTINGS.json": {
+      "bytes": 705,
+      "sha256": "0076a52e3474f7a67dd6081ebe610dc108ec97604de5807c67cb1cab04664139"
+    },
+    "build/RESULT.json": {
+      "bytes": 916,
+      "sha256": "661bd152b2cc1c0390a92d5bcb3cf5475ff9064ff08151ebe00acd0a784730fc"
+    },
+    "build/SOURCE-CLOSURE.json": {
+      "bytes": 2140,
+      "sha256": "c3ef3c3678246251c62ff473c4bc61023414b989203f0dab22fe2b02faf20a3f"
+    },
+    "build/UNSIGNED-BUNDLE-MANIFEST.json": {
+      "bytes": 444622,
+      "sha256": "29249649a83d561c6c2845522b1543c8dac7675c20dcb4e15f1602c1ee3ea7be"
+    },
+    "package/PACKAGE-MANIFEST.json": {
+      "bytes": 446419,
+      "sha256": "4b60bb87ba3c5f2345a522eefd57b8f947d833b7095568cc1c329dc453899337"
+    },
+    "package/PACKAGE-PIN-SHA256.json": {
+      "bytes": 83,
+      "sha256": "ba966cc5436c9f2819f34a3a2933eabf9350abfad9fb4c5d11fefa9d10916b30"
+    },
+    "package/PACKAGE-PIN.json": {
+      "bytes": 9740,
+      "sha256": "7a8de8f7718d0be486eed9dc4f4f88e403e21e7925fdef6ad3869ab9b1582ffb"
+    },
+    "package/SIGNATURE-CLOSURE.json": {
+      "bytes": 31395,
+      "sha256": "861ca932e4324e4dc81d16685c2ddc83438c74c3baa703b9ca6d2da73a804e19"
+    },
+    "package/TRANSFORM.json": {
+      "bytes": 3420,
+      "sha256": "09f52512c4cbd1f1a15fe7535d0ccd084ae05626393f51f6a22939eb0fd45481"
+    },
+    "runtime/CLEANUP.json": {
+      "bytes": 318,
+      "sha256": "e4fa5602b7ea45c7eb84328d5bdffc262076b37fa78fdd2d19c760426c7bebc9"
+    },
+    "runtime/FAILURE.json": {
+      "bytes": 397,
+      "sha256": "6f7570537caa6fdd2fbbd25bc07c911082113264f6999620bcac7e1919ea4216"
+    },
+    "source-pins/FROZEN.json": {
+      "bytes": 1531,
+      "sha256": "2e2f2d6131fb9ba018fb25c8ed91a8d3029b23d0022409cdc9bf0ea246413886"
+    },
+    "source-pins/SOURCE-MANIFEST.json": {
+      "bytes": 8470,
+      "sha256": "f28946cc1e96ebaacf3d1e3c18aa940e63dc4ee3338d48969f6208a8fa050279"
+    }
+  },
+  "rebuilds_allowed": 0,
+  "repository_id": 1356084046,
+  "schema": "cmux-retained-release-source-v1",
+  "source_branch": "ccc/cmux-release-package-20261110-r3",
+  "source_conclusion": "failure",
+  "source_event": "push",
+  "source_failure_reason": "ValueError('GUI generation/socket changed during executable check')",
+  "source_failure_stage": "new-package-runtime",
+  "source_run": {
+    "head_sha": "03540ebd2f4ff0c12b34eda5b2841623ce5b14ea",
+    "repository": "lzhs1995/ccc",
+    "run_attempt": 1,
+    "run_id": 42808450553
+  },
+  "source_runtime_passed": false,
+  "source_status": "completed",
+  "source_tree": "40e8ea03ce1435f11e90b35f98d554a13b9b8685",
+  "source_upstream": "2e109a1739d320fe36220afb3e7775b59c1acd47",
+  "source_workflow": ".github/workflows/cmux-release-package.yml",
+  "validation_branch": "ccc/cmux-release-runtime-revalidation-20261111-r2",
+  "validation_run_attempt": 1,
+  "validation_workflow": ".github/workflows/cmux-release-runtime-revalidation.yml"
+}

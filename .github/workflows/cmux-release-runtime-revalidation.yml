@@ -1,0 +1,47 @@
+name: cmux retained Release runtime verification
+on:
+  push:
+    branches: [ccc/cmux-release-runtime-revalidation-20261111-r2]
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: cmux-retained-runtime-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  retained-package-runtime:
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - name: Checkout the exact reviewed validation source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ github.sha }}
+          path: preparation
+          persist-credentials: false
+      - name: Check distinct source and validation contexts and artifact rejection paths
+        working-directory: preparation/integrations/cmux-release-package
+        run: python3 -BE -m unittest test_retained_release -v
+      - name: Reuse the immutable App and run the complete two-generation acceptance
+        id: validation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python3 -BE preparation/integrations/cmux-release-package/ci_revalidate.py
+          --output "$RUNNER_TEMP/cmux-release-runtime-revalidation-r2"
+      - name: Export bounded validation evidence and the unchanged original failure
+        if: always() && steps.validation.outcome != 'skipped'
+        run: >-
+          python3 -BE preparation/integrations/cmux-release-package/evidence_revalidation.py
+          --attempt "$RUNNER_TEMP/cmux-release-runtime-revalidation-r2"
+          --output "$RUNNER_TEMP/cmux-release-runtime-evidence-r2"
+      - name: Retain small evidence for the distinct validation run
+        if: always() && steps.validation.outcome != 'skipped'
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: cmux-release-runtime-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cmux-release-runtime-evidence-r2
+          compression-level: 6
+          if-no-files-found: error
+          retention-days: 30

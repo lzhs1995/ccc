@@ -1,0 +1,42 @@
+{
+  "schema": "cmux-fixed-gui-artifact-pin-v1",
+  "status": "PINNED_ORIGINAL_BUILD",
+  "upstream_commit": "2e109a1739d320fe36220afb3e7775b59c1acd47",
+  "tests_patch_sha256": "bdebf64e054476f3ea0476df3ec7acb91ddbfe86fc2927bb85686720c6a7bf8e",
+  "fix_patch_sha256": "db4f2c96ff9e06fd47ddb55a102f0ccb45d00c691e9e3681ca722f3f97144422",
+  "build_repository": "lzhs1995/ccc",
+  "build_run_id": 42357868916,
+  "build_run_attempt": 1,
+  "build_preparation_commit": "87b499a87a45a3dcdc58794d4ab43d4bd05bcc94",
+  "green_source_commit": "febf361281fdc0f463e84d9d5e4dd65d107dd818",
+  "green_source_tree": "40e8ea03ce1435f11e90b35f98d554a13b9b8685",
+  "artifact_id": 13574318692,
+  "artifact_api_digest_sha256": "6e2c7e695e43c0351d8b546c6d2974886f4427dfe27b2eec213aaa646b101a42",
+  "artifact_download_zip_sha256": "6e2c7e695e43c0351d8b546c6d2974886f4427dfe27b2eec213aaa646b101a42",
+  "provenance_sha256": "b6cdceac06171954c09041ce35f4b65a821b3be9cc442694141ea5c8f3a0bb06",
+  "retained_app_zip_sha256": "3ece9f343a55097222b9ce4e8e062425b60c6f6267184025f7ddb7884fd1f527",
+  "retained_app_zip_bytes": 206589835,
+  "app_inventory_sha256": "e09b5d18b5522ca72c1459529b0e62e7dd74c36b728a3ce8e14b3060a7e0b825",
+  "application_sha256": "74dfe05cbe9d33cc157f27cf71f8ef12814a000fabf54de5f761fa9bb0de10ec",
+  "cli_sha256": "2c47f937d3f860c9e141486603d9db831de2c9cf2917ab0eb342b778237d4640",
+  "bundle_id": "com.cmuxterm.app.debug.nestedrestore.r42357868916a1",
+  "app_name": "cmux Nested Restore 42357868916-1.app",
+  "bundle_executable": "cmux DEV",
+  "tag": "nested-42357868916-1",
+  "code_directory_hash": "72ebe9643f661a0c14583a085387477c6eccbb51",
+  "architecture": [
+    "arm64"
+  ],
+  "signature_scope": "reload ad-hoc; do not assert Developer ID or notarization",
+  "source_shared_with_green_tests": true,
+  "same_binary_as_isolated_test_host": false,
+  "full_nested_restore_verified": false,
+  "build_run_json_sha256": "975504c86292388989c152e640d63d5b9fd1143ed1fb02cbf0d8f4dc13427727",
+  "artifact_json_sha256": "571bab8f33bbb8a44caec9ccedd34d35ec8c1134aeb9167c8850847bb24bf764",
+  "test_receipts_sha256": "631a6dbeefd21d921543e8214f17bfbba0d29b864ed38afad6850415f4f8ae2e",
+  "artifact_members": {
+    "provenance": "retained-app/PROVENANCE.json",
+    "app_archive": "retained-app/cmux-nested-fixed.zip"
+  },
+  "fix_patch_note": "Select only independently accepted successful original build; local fix-r3 exists but is not evidence of an app build."
+}

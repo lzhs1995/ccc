@@ -1,0 +1,19 @@
+此入口在隔離的 GitHub macOS 26 runner 驗證已保存的 Release App，不重新編譯或在使用者電腦安裝。原來源是 run `42808450553`／attempt `1`／head `03540ebd2f4ff0c12b34eda5b2841623ce5b14ea`：build 與簽名包完成，runtime 的 peer 檢查失敗。第一個獨立驗證 run `42844611650`／attempt `1` 也失敗，新增的前後觀測證明該次只有 socket ctime 改變。兩次失敗紀錄均保留。
+
+`RETAINED-SOURCE.json` 固定原 App artifact `13766044692` 的 API 身份、外 ZIP 大小及 digest、內 ZIP 大小及 SHA256，並固定原小型證據和 build/package/failure 來源鏈。驗證 job 先讀取並核對這些原件，再在全新 runner 帳戶執行完整原驗收：簽名與完整 bundle、LaunchServices 環境、舊與新 CLI、CCC viewport、同一路徑、兩代 GUI、原 workspace/surface UUID、自然快照寫入與清理。
+
+`source_run` 永久指向原 build；`validation_run` 指向獨立的新 job。原 run 的 failure 不會改寫。只有新 runtime 與清理全部成功，才形成新驗證結果；完成後仍須核對 GitHub 新 run 的終態。這不代表使用者業務會話已採用，也不代表 Herdr 原生恢復或實體斷電已驗證。
+
+固定版本的 cmux 會透過私有硬連結重申 socket 權限；macOS 實測確認相同 mode 的 chmod 仍會改變 ctime。這能產生同型差異，尚不能指認失敗 run 的唯一觸發者。r2 只在 `peer()` 的兩次 socket 比較中排除 ctime，仍記錄全部九個觀測欄位；其餘八欄、已驗證的 PID、程序出生時間、執行檔路徑與完整 hash，以及當前類型與權限檢查均保留。一般檔案仍使用原九欄 `file_identity`。
+
+其餘八欄仍是保守狀態門檻：若觀測恰好碰到硬連結維護期間的 nlink 變化，仍會拒絕。本次未新增 socket birthtime，也不宣稱容忍任意 metadata 競態。UNKNOWN、原始 partial 與原拒絕順序保留，沒有自動重試。`evidence_revalidation.py` 匯出有大小上限的小型證據，包含原 failure 及新驗證回執，排除完整 App ZIP。GH token 不會進入 GUI 子程序的環境。
+
+新 workflow 只匹配 `ccc/cmux-release-runtime-revalidation-20261111-r2`，只接受新 run 的 attempt `1`。舊建置 workflow 仍只匹配 `ccc/cmux-release-package-20261110-r3`，新分支不會觸發舊建置。
+
+This entry verifies the retained Release App on an isolated GitHub macOS 26 runner without rebuilding or installing on a user's machine. Source run `42808450553`, attempt `1`, head `03540ebd2f4ff0c12b34eda5b2841623ce5b14ea` completed its build and signed package, then failed its runtime peer check. The first independent validation run `42844611650`, attempt `1`, also failed; its added observations showed only socket ctime changed. Both failures remain unchanged.
+
+The pinned source contract binds App artifact `13766044692`, its API identity, both archive hashes and sizes, the original small evidence, and the build/package/failure chain. A separate validation run checks the complete original runtime contract, including signatures, both CLI generations, stable socket routing, two GUI generations, original workspace and surface identities, natural snapshot writes, viewport reads, and cleanup. The original failure remains unchanged.
+
+The pinned cmux source reapplies socket permissions through a private hard link. Native macOS observations confirm that same-mode chmod changes ctime; this explains how the observed difference can occur without identifying the failed run's unique actor. Revision r2 omits ctime only from the two socket comparisons in `peer()`. Diagnostics keep all nine fields. The other eight fields, authenticated PID, process birth, executable path and full hash, and current socket type and permissions remain checked. Regular files retain the original nine-field `file_identity`.
+
+These eight socket fields remain conservative state checks: a transient nlink change during hard-link maintenance can still refuse an observation. This revision adds no socket birthtime and does not accept arbitrary metadata races. UNKNOWN records, partial results and refusal order are preserved, with no automatic retry. The evidence export binds distinct source and validation runs and excludes full App archives. A successful validation still requires the final GitHub run check and does not establish adoption by existing business sessions. The new branch `ccc/cmux-release-runtime-revalidation-20261111-r2` runs only the runtime workflow, with validation attempt `1`.
