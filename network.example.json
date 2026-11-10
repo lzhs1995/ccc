@@ -3,7 +3,7 @@
   "mode": "observe",
   "state_dir": "/Users/you/Library/Application Support/cmux-codex-continue/network",
   "binary": "/Applications/Clash Verge.app/Contents/MacOS/verge-mihomo",
-  "controller_socket": "/var/run/clash-verge-service/users/501/verge-mihomo.sock",
+  "controller_socket": "/absolute/path/to/controller.sock",
   "interface": "en0",
   "service_host": "anyrouter.top",
   "group": "AnyRouter-Auto",

@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="480" viewBox="0 0 1280 480" role="img" aria-labelledby="title desc">
+  <title id="title">CCC — Continuation for cmux + Herdr</title>
+  <desc id="desc">CCC keeps recovery tied to the original session. A schematic shows cmux as the outer workspace and Herdr as an inner terminal split containing three agent CLIs. This is an architecture illustration, not a product screenshot.</desc>
+  <rect width="1280" height="480" rx="28" fill="#101f2a"/>
+  <g fill="none" stroke="#203541" stroke-width="1">
+    <path d="M640 0v480M704 0v480M768 0v480M832 0v480M896 0v480M960 0v480M1024 0v480M1088 0v480M1152 0v480M1216 0v480"/>
+    <path d="M608 48h672M608 112h672M608 176h672M608 240h672M608 304h672M608 368h672M608 432h672"/>
+  </g>
+  <g transform="translate(56 66) scale(.43)">
+    <rect x="8" y="8" width="240" height="240" rx="56" fill="#162c38"/>
+    <path d="M190 60H92a44 44 0 0 0-44 44v48a44 44 0 0 0 44 44h98" fill="none" stroke="#66e1be" stroke-width="16" stroke-linecap="round"/>
+    <path d="M177 91h-66a24 24 0 0 0-24 24v26a24 24 0 0 0 24 24h66" fill="none" stroke="#6cb9fa" stroke-width="14" stroke-linecap="round"/>
+    <path d="M165 119h-28a9 9 0 0 0 0 18h28" fill="none" stroke="#c3b4ff" stroke-width="12" stroke-linecap="round"/>
+    <path d="m189 113 21 15-21 15z" fill="#66e1be"/>
+  </g>
+  <g font-family="Arial, Helvetica, sans-serif">
+    <text x="190" y="154" fill="#f0f6fa" font-size="94" font-weight="700" letter-spacing="-5">CCC</text>
+    <text x="64" y="228" fill="#f0f6fa" font-size="28" font-weight="600">Continuation for cmux + Herdr</text>
+    <text x="64" y="274" fill="#b2c3cd" font-size="23">Keep the session. Continue the work.</text>
+    <rect x="64" y="334" width="108" height="34" rx="17" fill="#1d3e3d"/>
+    <text x="118" y="357" fill="#83e8c9" text-anchor="middle" font-size="15" font-weight="600">OBSERVE</text>
+    <rect x="184" y="334" width="118" height="34" rx="17" fill="#22394b"/>
+    <text x="243" y="357" fill="#a0d1fb" text-anchor="middle" font-size="15" font-weight="600">RECONCILE</text>
+    <rect x="314" y="334" width="102" height="34" rx="17" fill="#343249"/>
+    <text x="365" y="357" fill="#d4caff" text-anchor="middle" font-size="15" font-weight="600">RESUME</text>
+    <text x="64" y="427" fill="#829ba9" font-size="14" letter-spacing="2">SESSION CONTINUITY / TERMINAL COLLABORATION</text>
+  </g>
+  <g font-family="Arial, Helvetica, sans-serif">
+    <rect x="647" y="81" width="570" height="320" rx="20" fill="#142834" stroke="#517587" stroke-width="2"/>
+    <path d="M647 134h570" stroke="#35515f" stroke-width="2"/>
+    <circle cx="671" cy="108" r="4" fill="#66e1be"/>
+    <text x="687" y="114" fill="#d9e8ef" font-size="18" font-weight="600">cmux</text>
+    <text x="1192" y="114" fill="#99b1bf" font-size="14" text-anchor="end">OUTER WORKSPACE</text>
+    <rect x="670" y="156" width="524" height="219" rx="13" fill="#10212c" stroke="#66e1be" stroke-width="1.5"/>
+    <text x="692" y="190" fill="#83e8c9" font-size="19" font-weight="600">Herdr</text>
+    <text x="1173" y="189" fill="#93acae" font-size="13" text-anchor="end">INNER TERMINAL SPLIT</text>
+    <path d="M670 208h524" stroke="#294850"/>
+    <path d="M844 208v167M1019 208v167" stroke="#294850"/>
+    <g font-family="Menlo, Consolas, monospace" font-size="15">
+      <text x="692" y="243" fill="#d9e8ef">Agent CLI</text>
+      <text x="866" y="243" fill="#d9e8ef">Agent CLI</text>
+      <text x="1041" y="243" fill="#d9e8ef">Agent CLI</text>
+      <text x="692" y="276" fill="#66e1be">&gt;_</text>
+      <text x="866" y="276" fill="#6cb9fa">&gt;_</text>
+      <text x="1041" y="276" fill="#c3b4ff">&gt;_</text>
+    </g>
+    <g fill="none" stroke="#4b6372" stroke-width="5" stroke-linecap="round">
+      <path d="M692 302h104M692 318h68M866 302h104M866 318h72M1041 302h105M1041 318h64"/>
+    </g>
+    <text x="932" y="353" fill="#b7cbd5" font-size="13" text-anchor="middle">Original identity · Recorded intent · Verified receipt</text>
+    <text x="1216" y="427" fill="#829ba9" font-size="12" text-anchor="end">ARCHITECTURE ILLUSTRATION</text>
+  </g>
+</svg>
