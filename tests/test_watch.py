@@ -1700,33 +1700,34 @@ class WatchTests(unittest.TestCase):
         })
 
     def test_find_surface_reads_live_cmux_tree_shape(self):
+        # Synthetic identities retain the real API shape without user metadata.
         tree = {
             "windows": [{
                 "id": "window-uuid",
                 "ref": "window:1",
                 "workspaces": [{
-                    "id": "20791EB2-4A63-483A-9E98-72E25D4231A2",
+                    "id": "11111111-1111-4111-8111-111111111111",
                     "ref": "workspace:3",
-                    "title": "Sub2api",
+                    "title": "Demo workspace",
                     "panes": [{
-                        "id": "69846802-8A19-4BCA-B0B3-AF8840D3EC0D",
+                        "id": "22222222-2222-4222-8222-222222222222",
                         "ref": "pane:6",
                         "surfaces": [{
-                            "id": "7631C221-7422-441C-B340-5ADB5A81308D",
+                            "id": "33333333-3333-4333-8333-333333333333",
                             "ref": "surface:25",
                             "type": "terminal",
-                            "title": "cnm",
-                            "pane_id": "69846802-8A19-4BCA-B0B3-AF8840D3EC0D",
+                            "title": "Example project",
+                            "pane_id": "22222222-2222-4222-8222-222222222222",
                         }],
                     }],
                 }],
             }]
         }
-        self.assertEqual(find_surface(tree, "7631C221-7422-441C-B340-5ADB5A81308D"), {
-            "surface_id": "7631C221-7422-441C-B340-5ADB5A81308D",
-            "workspace_id": "20791EB2-4A63-483A-9E98-72E25D4231A2",
+        self.assertEqual(find_surface(tree, "33333333-3333-4333-8333-333333333333"), {
+            "surface_id": "33333333-3333-4333-8333-333333333333",
+            "workspace_id": "11111111-1111-4111-8111-111111111111",
             "ref": "surface:25",
-            "title": "cnm",
+            "title": "Example project",
         })
 
     def test_three_real_placeholder_prompts_are_empty_composer(self):

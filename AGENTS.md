@@ -3,6 +3,8 @@
 Read [README.md](README.md) or [繁體中文介紹](README.zh-TW.md), then
 [the agent guide](docs/agent-guide.md). These instructions apply to coding agents
 editing this repository. Installing CCC does not enroll an agent or authorize input.
+`CLAUDE.md`, `GEMINI.md` and `llms.txt` link here; clients without automatic
+discovery can read this file explicitly. Use the same rules through any client.
 
 ## Scope and source of truth
 

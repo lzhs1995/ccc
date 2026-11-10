@@ -1,10 +1,15 @@
-<p align="center"><img src="assets/logo.svg" width="96" alt="CCC：巢狀終端面板與續跑箭頭"></p>
+<p align="center"><img src="assets/logo.svg" width="96" alt="CCC：三層 C 形與續跑箭頭"></p>
 
 # CCC · 讓 agent 持續推進任務
 
 [English](README.md) · **繁體中文** · [Agent 操作指南](docs/agent-guide.md) · [Herdr 支援狀態](docs/herdr.md)
 
-![CCC 專案配圖](assets/banner.svg)
+<picture>
+  <source srcset="assets/banner.svg" type="image/svg+xml">
+  <img src="assets/banner.png" width="1280" alt="CCC 架構：cmux 外層工作區與 Herdr 內部 agent 面板">
+</picture>
+
+此圖為架構示意；Herdr 整合仍在開發。
 
 **CCC 是 macOS 上的 cmux 續跑管理器，支援 Claude Code 與 Codex。**
 它觀察已授權的會話，在操作前核對原生證據，並以終端管理介面呈現續跑狀態。
@@ -33,6 +38,8 @@
 需求：macOS 13 以上、Python 3.10 以上，以及 [cmux](https://cmuxterm.app/)。
 執行程式只使用 Python 標準函式庫；選用的 API 接入檢查模式需要 Python 3.11 以上。
 Codex／Claude Code 請另行安裝。
+目前安裝程式預期 cmux 與可寫入的命令別名位於 `/opt/homebrew/bin`；
+其他 Homebrew 路徑需另行核對安裝方式。
 
 ```sh
 git clone https://github.com/lzhs1995/ccc.git
@@ -58,22 +65,26 @@ python3 cmux_codex_watch.py install
 先核對完整 surface UUID，只登記你要管理的目標，再明確啟用：
 
 ```sh
-ccc track-surface FULL_SURFACE_UUID --allow-non-codex
+ccc track-surface FULL_SURFACE_UUID
 ccc status
 ccc arm
 ccc tui
 ```
 
-請將 `FULL_SURFACE_UUID` 換成已核驗的目標，不能靠標題或目前焦點猜測。
-Claude 還需要本機設定中的 `claude_enabled: true` 及有效原生 Hook 證據。
+請將 `FULL_SURFACE_UUID` 換成已核驗的 Codex 目標，不能靠標題或目前焦點猜測。
+`arm` 會啟用全域模式並解除全域暫停；請先檢查所有既有登記。
+Claude 登記另需 `--allow-non-codex`、本機設定中的 `claude_enabled: true`
+及有效原生 Hook 證據。
 詳見 [登記與觀察](docs/registration-observation.md)、[Codex Hooks](docs/codex-hooks.md)
 及[維運指南](docs/operations.md)。不要把外層 cmux surface 當成某個 Herdr 內部面板登記。
 
 ## 給各種 coding agent
 
 從 [AGENTS.md](AGENTS.md) 進入，再讀 [agent 操作指南](docs/agent-guide.md)。
-命令、操作影響、支援範圍、錯誤判讀與驗收標準都以一般 Markdown 提供；
-任何能讀檔及執行 CLI 的 agent 都能理解，不需要專屬外掛。
+`CLAUDE.md`、`GEMINI.md` 與 [llms.txt](llms.txt) 都指向同一套共用指南。
+命令、操作影響、支援範圍、錯誤判讀與驗收標準都以一般 Markdown 提供。
+是否自動讀取取決於客戶端；需要時請明確要求它閱讀 `AGENTS.md`。
+閱讀文件不會新增其他 agent 的執行階段支援。
 [設定範例](config.example.json) 僅供參考，不可覆蓋使用者的既有設定。
 
 ## 開發與公開發布
@@ -87,5 +98,5 @@ Claude 還需要本機設定中的 `claude_enabled: true` 及有效原生 Hook �
 公開內容檢查涵蓋目前版本及待提交檔案中的常見憑證、私人路徑與執行狀態資料模式，
 不等於已認證全部 Git 歷史安全。範例使用假資料；回報問題時請勿上傳真實會話或憑證。
 
-Logo 與配圖是本專案的原創 SVG，適用倉庫的 [MIT 授權](LICENSE)。
+[SVG／PNG Logo 與配圖](docs/branding.md)為本專案原創，適用倉庫的 [MIT 授權](LICENSE)。
 本專案獨立於 cmux、Herdr、OpenAI 與 Anthropic。

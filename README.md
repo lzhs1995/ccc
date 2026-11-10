@@ -1,10 +1,15 @@
-<p align="center"><img src="assets/logo.svg" width="96" alt="CCC: nested terminal panels and a continuation arrow"></p>
+<p align="center"><img src="assets/logo.svg" width="96" alt="CCC: three nested C shapes and a continuation arrow"></p>
 
 # CCC · Keep your agents moving
 
 [English](README.md) · [繁體中文](README.zh-TW.md) · [Agent guide](docs/agent-guide.md) · [Support status](docs/herdr.md)
 
-![CCC project banner](assets/banner.svg)
+<picture>
+  <source srcset="assets/banner.svg" type="image/svg+xml">
+  <img src="assets/banner.png" width="1280" alt="CCC architecture: cmux outer workspace and Herdr inner agent panels">
+</picture>
+
+Architecture illustration; Herdr integration is in development.
 
 **CCC manages guarded continuation for Claude Code and Codex in cmux on macOS.**
 It watches authorized sessions, checks native evidence before acting, and exposes
@@ -35,6 +40,8 @@ repair an exhausted provider balance or guarantee recovery from every upstream e
 Requirements: macOS 13+, Python 3.10+, and [cmux](https://cmuxterm.app/).
 Runtime Python code uses the standard library. The optional access-check mode
 requires Python 3.11+. Install Codex and/or Claude Code separately.
+The current installer expects cmux and writable aliases under `/opt/homebrew/bin`;
+an alternate Homebrew prefix needs a separate installation review.
 
 ```sh
 git clone https://github.com/lzhs1995/ccc.git
@@ -62,23 +69,27 @@ installations retain their current configuration. Verify the exact surface UUID,
 configure only the targets you intend to manage, then explicitly arm:
 
 ```sh
-ccc track-surface FULL_SURFACE_UUID --allow-non-codex
+ccc track-surface FULL_SURFACE_UUID
 ccc status
 ccc arm
 ccc tui
 ```
 
-Replace `FULL_SURFACE_UUID` with the verified target, never a title or assumed
-focused panel. Claude also needs `claude_enabled: true` in the local configuration
-and valid native Hook evidence. See [registration](docs/registration-observation.md),
+Replace `FULL_SURFACE_UUID` with the verified Codex target, never a title or assumed
+focused panel. `arm` enables the global mode and clears the global pause; review
+all existing enrollments first. Claude registration additionally requires
+`--allow-non-codex`, `claude_enabled: true` in the local configuration and valid
+native Hook evidence. See [registration](docs/registration-observation.md),
 [Codex Hooks](docs/codex-hooks.md) and [operations](docs/operations.md).
 Do not register an outer cmux surface as though it were a particular Herdr inner panel.
 
 ## For coding agents
 
 Start at [AGENTS.md](AGENTS.md), then [the agent guide](docs/agent-guide.md).
+`CLAUDE.md`, `GEMINI.md` and [llms.txt](llms.txt) point to the same shared guidance.
 Commands, side effects, supported agents and acceptance criteria are plain
-Markdown; no proprietary integration is required to read them.
+Markdown. Automatic discovery depends on the client; ask it to read `AGENTS.md`
+explicitly when needed. Reading these files does not add a runtime adapter.
 [config.example.json](config.example.json) is a reference, not a replacement
 for an existing user's configuration.
 
@@ -94,5 +105,5 @@ The public-content check scans the current tracked tree and proposed files for
 common credentials, private paths and runtime artifacts. It does not certify
 all Git history. Do not upload real sessions or credentials in bug reports.
 
-The SVG logo and banner are original project assets, included under the
+The [SVG/PNG logo and banner](docs/branding.md) are original project assets, included under the
 [MIT license](LICENSE). This project is independent of cmux, Herdr, OpenAI and Anthropic.
