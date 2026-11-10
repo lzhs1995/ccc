@@ -1,0 +1,24 @@
+{
+  "schema": "cmux-release-publication-projection-v1",
+  "purpose": "Publish only relative parser provenance metadata, keeping the original local locator receipt unchanged.",
+  "projections": [
+    {
+      "original": "prerequisites/ORIGINAL-ARGS-PIN.json",
+      "original_sha256": "da6046c07284bdeeb93789d93d232522b85280e13f8629599c63070758aff4a7",
+      "public_source": "publication-inputs/ORIGINAL-ARGS-PIN.json",
+      "public_sha256": "973032cfaa317d8ff598beab78addd9ace835993bcf9969cbcc62e7d4683308d",
+      "public_path": "integrations/cmux-release-package/prerequisites/ORIGINAL-ARGS-PIN.json",
+      "source_parser_sha256": "629f677fd25f57e358675859ae798defe668e7085156cc1e2ec2fd1c6f18d7ed",
+      "source_parser_bytes": 960,
+      "byte_identical_metadata": false,
+      "byte_identical_parser": true
+    }
+  ],
+  "unchanged_original_byte_pins": [
+    "prerequisites/APP-PIN.json",
+    "prerequisites/BUILD-RUN.json",
+    "prerequisites/ARTIFACT.json",
+    "prerequisites/PROVENANCE.json"
+  ],
+  "published": false
+}

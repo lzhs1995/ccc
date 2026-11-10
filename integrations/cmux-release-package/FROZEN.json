@@ -1,0 +1,25 @@
+{
+  "schema": "cmux-local-release-preparation-freeze-v2",
+  "frozen_at": "2026-11-10T14:36:56.962913+08:00",
+  "source_manifest_sha256": "36e584471a83b106e7fc79f85eb793b713283525d6380c9d6d74a9e3c888c0f4",
+  "payload_entries": 26,
+  "payload_bytes": 762709,
+  "original_r1_freeze_sha256": "c4f77a670a2a95684073f7e8fb0bfcbfad64a2ba983a1fae65c21f66e2e26953",
+  "original_failed_run": 42765017218,
+  "original_failed_run_attempt": 1,
+  "original_run_not_rerun": true,
+  "incremental_source_review": {
+    "reviewer": "/root/agy_identity_diagnosis",
+    "outcome": "PASS",
+    "delivery": "Original collaboration message and final answer; exact original size/hash plus three actual test logs reviewed; no additional code findings.",
+    "reviewed_source_sha256": "fa223e12537f971efd8b5e30ef3e14b9c509a8b2dcac439105b12744362f44dd",
+    "tests": 3,
+    "test_receipt_sha256": "c1464c53a98ee0f7b4e9b96c6fee69bfd6bd8549c32a81bcce30ddcb5676d9f2"
+  },
+  "workflow_delta": "Only branch/private attempt/evidence labels r1 to r2; actionlint exit0 chunk9f525f",
+  "original_build_and_runtime_semantics_preserved": true,
+  "published": false,
+  "built": false,
+  "installed": false,
+  "business_operations": 0
+}
