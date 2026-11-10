@@ -1,0 +1,281 @@
+{
+  "schema": "cmux-retained-release-validation-source-manifest-v1",
+  "source_base_commit": "2e109a1739d320fe36220afb3e7775b59c1acd47",
+  "accepted_green_tree": "40e8ea03ce1435f11e90b35f98d554a13b9b8685",
+  "source_run": {
+    "head_sha": "03540ebd2f4ff0c12b34eda5b2841623ce5b14ea",
+    "repository": "lzhs1995/ccc",
+    "run_attempt": 1,
+    "run_id": 42808450553
+  },
+  "validation_branch": "ccc/cmux-release-runtime-revalidation-20261111-r4",
+  "publication_parent": "a369955406018db2504adb9a39afe9c5265eca75",
+  "publication_parent_tree": "4f59d22ee55d4b3d6120b6f233e7bf354cddfa61",
+  "original_source_manifest_sha256": "f28946cc1e96ebaacf3d1e3c18aa940e63dc4ee3338d48969f6208a8fa050279",
+  "original_source_freeze_sha256": "2e2f2d6131fb9ba018fb25c8ed91a8d3029b23d0022409cdc9bf0ea246413886",
+  "retained_selection_sha256": "91749e91cb07e194ad9a826d0c7d6c3168c61bc942aee50fd4e8cb8ef152f10c",
+  "files": [
+    {
+      "file": ".github/workflows/cmux-release-package.yml",
+      "public_path": ".github/workflows/cmux-release-package.yml",
+      "sha256": "85ff1055ffef1dd493612672131571a48e004b2331f136c5d9e564bfd76597a5",
+      "bytes": 3845,
+      "mode": "100644"
+    },
+    {
+      "file": ".github/workflows/cmux-release-runtime-revalidation.yml",
+      "public_path": ".github/workflows/cmux-release-runtime-revalidation.yml",
+      "sha256": "a97eb92ff1471f58e66233011627a3debcd4052fdc07cb643df15150625aa1b5",
+      "bytes": 2076,
+      "mode": "100644"
+    },
+    {
+      "file": "integrations/cmux-release-package/PLAN.md",
+      "public_path": "integrations/cmux-release-package/PLAN.md",
+      "sha256": "bbe7e1bb963efe1b5892b5cbcc40c83b612adf502665d0ba2e48b0d67492ab5d",
+      "bytes": 5833,
+      "mode": "100644"
+    },
+    {
+      "file": "integrations/cmux-release-package/PUBLICATION-PROJECTION.json",
+      "public_path": "integrations/cmux-release-package/PUBLICATION-PROJECTION.json",
+      "sha256": "07a8309bd110fb9abbfc26a49a04b1cba36da6711254e3a746a91d436496f268",
+      "bytes": 1030,
+      "mode": "100644"
+    },
+    {
+      "file": "integrations/cmux-release-package/RETAINED-SOURCE.json",
+      "public_path": "integrations/cmux-release-package/RETAINED-SOURCE.json",
+      "sha256": "91749e91cb07e194ad9a826d0c7d6c3168c61bc942aee50fd4e8cb8ef152f10c",
+      "bytes": 5790,
+      "mode": "100644"
+    },
+    {
+      "file": "integrations/cmux-release-package/REVALIDATION.md",
+      "public_path": "integrations/cmux-release-package/REVALIDATION.md",
+      "sha256": "fe765204a1ee4a41b2d665a538768c87bcb211325cd1dece45a1425a7658f0b6",
+      "bytes": 8451,
+      "mode": "100644"
+    },
+    {
+      "file": "integrations/cmux-release-package/ci_release.py",
+      "public_path": "integrations/cmux-release-package/ci_release.py",
+      "sha256": "3f512356d5bbf54944a51937596864b6617f39e0b515d88dbea14e10e1eb0d12",
+      "bytes": 6436,
+      "mode": "100644"
+    },
+    {
+      "file": "integrations/cmux-release-package/ci_revalidate.py",
+      "public_path": "integrations/cmux-release-package/ci_revalidate.py",
+      "sha256": "179cdeb119399e9731e0ebdd6164bcfcaef78724cf24bce1c8f647eb9655078b",
+      "bytes": 7139,
+      "mode": "100644"
+    },
+    {
+      "file": "integrations/cmux-release-package/cmux-release-package.yml.draft",
+      "public_path": "integrations/cmux-release-package/cmux-release-package.yml.draft",
+      "sha256": "85ff1055ffef1dd493612672131571a48e004b2331f136c5d9e564bfd76597a5",
+      "bytes": 3845,
+      "mode": "100644"
+    },
+    {
+      "file": "integrations/cmux-release-package/evidence_release.py",
+      "public_path": "integrations/cmux-release-package/evidence_release.py",
+      "sha256": "9260593583ad50e29b3a3978ef2ecfbde978c03cbb1da4c0373a36aac6ffcd00",
+      "bytes": 14322,
+      "mode": "100644"
+    },
+    {
+      "file": "integrations/cmux-release-package/evidence_revalidation.py",
+      "public_path": "integrations/cmux-release-package/evidence_revalidation.py",
+      "sha256": "adf54e30e602c2da2bf049d3028137fdceabae3c3f498517532dc0d00f9a55a2",
+      "bytes": 5368,
+      "mode": "100644"
+    },
+    {
+      "file": "integrations/cmux-release-package/inputs/fix.patch",
+      "public_path": "integrations/cmux-release-package/inputs/fix.patch",
+      "sha256": "db4f2c96ff9e06fd47ddb55a102f0ccb45d00c691e9e3681ca722f3f97144422",
+      "bytes": 32711,
+      "mode": "100644"
+    },
+    {
+      "file": "integrations/cmux-release-package/inputs/tests.patch",
+      "public_path": "integrations/cmux-release-package/inputs/tests.patch",
+      "sha256": "bdebf64e054476f3ea0476df3ec7acb91ddbfe86fc2927bb85686720c6a7bf8e",
+      "bytes": 14377,
+      "mode": "100644"
+    },
+    {
+      "file": "integrations/cmux-release-package/prerequisites/APP-PIN.json",
+      "public_path": "integrations/cmux-release-package/prerequisites/APP-PIN.json",
+      "sha256": "cc1f7d5223d96b135955c39ee2955c27966d52f458918c7c2096546912f7a4b0",
+      "bytes": 2437,
+      "mode": "100644"
+    },
+    {
+      "file": "integrations/cmux-release-package/prerequisites/ARTIFACT.json",
+      "public_path": "integrations/cmux-release-package/prerequisites/ARTIFACT.json",
+      "sha256": "571bab8f33bbb8a44caec9ccedd34d35ec8c1134aeb9167c8850847bb24bf764",
+      "bytes": 718,
+      "mode": "100644"
+    },
+    {
+      "file": "integrations/cmux-release-package/prerequisites/BUILD-RUN.json",
+      "public_path": "integrations/cmux-release-package/prerequisites/BUILD-RUN.json",
+      "sha256": "975504c86292388989c152e640d63d5b9fd1143ed1fb02cbf0d8f4dc13427727",
+      "bytes": 11695,
+      "mode": "100644"
+    },
+    {
+      "file": "integrations/cmux-release-package/prerequisites/FIXED-TEST-EXPECTATIONS.json",
+      "public_path": "integrations/cmux-release-package/prerequisites/FIXED-TEST-EXPECTATIONS.json",
+      "sha256": "95549620100de2f8baa5732160801ef2cf2efd57841a0f919208635cbb140465",
+      "bytes": 3646,
+      "mode": "100644"
+    },
+    {
+      "file": "integrations/cmux-release-package/prerequisites/ORIGINAL-ARGS-PIN.json",
+      "public_path": "integrations/cmux-release-package/prerequisites/ORIGINAL-ARGS-PIN.json",
+      "sha256": "973032cfaa317d8ff598beab78addd9ace835993bcf9969cbcc62e7d4683308d",
+      "bytes": 345,
+      "mode": "100644"
+    },
+    {
+      "file": "integrations/cmux-release-package/prerequisites/PROVENANCE.json",
+      "public_path": "integrations/cmux-release-package/prerequisites/PROVENANCE.json",
+      "sha256": "b6cdceac06171954c09041ce35f4b65a821b3be9cc442694141ea5c8f3a0bb06",
+      "bytes": 494389,
+      "mode": "100644"
+    },
+    {
+      "file": "integrations/cmux-release-package/prerequisites/Release-Resources.entitlements",
+      "public_path": "integrations/cmux-release-package/prerequisites/Release-Resources.entitlements",
+      "sha256": "885d57276cecaa416e20a06c9662d237637cb18e1e111c9bdf33b63427fc94eb",
+      "bytes": 602,
+      "mode": "100644"
+    },
+    {
+      "file": "integrations/cmux-release-package/prerequisites/original_args.py",
+      "public_path": "integrations/cmux-release-package/prerequisites/original_args.py",
+      "sha256": "629f677fd25f57e358675859ae798defe668e7085156cc1e2ec2fd1c6f18d7ed",
+      "bytes": 960,
+      "mode": "100644"
+    },
+    {
+      "file": "integrations/cmux-release-package/prerequisites/original_fixed_app_admission.py",
+      "public_path": "integrations/cmux-release-package/prerequisites/original_fixed_app_admission.py",
+      "sha256": "07846c5d4d1271397d9b1c3470412fc3856e37615539e2aec1a9959f5e50e4e8",
+      "bytes": 18119,
+      "mode": "100644"
+    },
+    {
+      "file": "integrations/cmux-release-package/release_build.py",
+      "public_path": "integrations/cmux-release-package/release_build.py",
+      "sha256": "2a736a66d605b8d2e5f94d3a64ba648516e9aa147cb779cd4379e3d79f2d5d82",
+      "bytes": 15831,
+      "mode": "100644"
+    },
+    {
+      "file": "integrations/cmux-release-package/release_package.py",
+      "public_path": "integrations/cmux-release-package/release_package.py",
+      "sha256": "fa223e12537f971efd8b5e30ef3e14b9c509a8b2dcac439105b12744362f44dd",
+      "bytes": 26573,
+      "mode": "100644"
+    },
+    {
+      "file": "integrations/cmux-release-package/release_paired.py",
+      "public_path": "integrations/cmux-release-package/release_paired.py",
+      "sha256": "5918253f9eb809f7cba8c2ec3db8663cc23c691471fcc7cfa4197dd7cb349fe7",
+      "bytes": 29924,
+      "mode": "100644"
+    },
+    {
+      "file": "integrations/cmux-release-package/release_smoke.py",
+      "public_path": "integrations/cmux-release-package/release_smoke.py",
+      "sha256": "4a07fe5b13e3b643b9949270b5566f7b167d5c134398d595da91e695c46b4d58",
+      "bytes": 30274,
+      "mode": "100644"
+    },
+    {
+      "file": "integrations/cmux-release-package/retained_release.py",
+      "public_path": "integrations/cmux-release-package/retained_release.py",
+      "sha256": "3b70d8250419e8a706759c44114af077aa8e0bfb23384e41ec164c1c015a8a44",
+      "bytes": 19559,
+      "mode": "100644"
+    },
+    {
+      "file": "integrations/cmux-release-package/source_contract.py",
+      "public_path": "integrations/cmux-release-package/source_contract.py",
+      "sha256": "a440db411f3b85d5f2ace6f05ea19d4f8e7f381cf6a0a89ad3b743a3f29bd9ab",
+      "bytes": 6948,
+      "mode": "100644"
+    },
+    {
+      "file": "integrations/cmux-release-package/test_inventory_diagnostics.py",
+      "public_path": "integrations/cmux-release-package/test_inventory_diagnostics.py",
+      "sha256": "0a9fdf485918fbeff2f7774c9adce091928b5989b3941cd93ea5c0d71421b76a",
+      "bytes": 13435,
+      "mode": "100644"
+    },
+    {
+      "file": "integrations/cmux-release-package/test_prior_cli_size.py",
+      "public_path": "integrations/cmux-release-package/test_prior_cli_size.py",
+      "sha256": "d337c52b208b0fa986386c69b9ffdf6f4de184b313c7b5d277026dae20b6ba24",
+      "bytes": 2281,
+      "mode": "100644"
+    },
+    {
+      "file": "integrations/cmux-release-package/test_release_build.py",
+      "public_path": "integrations/cmux-release-package/test_release_build.py",
+      "sha256": "df300a32555031fd25cf96c0213d7dc15af20984e252a72fa20d1e06e559a124",
+      "bytes": 7630,
+      "mode": "100644"
+    },
+    {
+      "file": "integrations/cmux-release-package/test_release_package.py",
+      "public_path": "integrations/cmux-release-package/test_release_package.py",
+      "sha256": "da863414a64144b9aa2983d7a07e6d403c310341d91d74626c2f7cc4ad356b5c",
+      "bytes": 22291,
+      "mode": "100644"
+    },
+    {
+      "file": "integrations/cmux-release-package/test_release_runtime.py",
+      "public_path": "integrations/cmux-release-package/test_release_runtime.py",
+      "sha256": "92a9974f674059ea4e4c583c6e52ed5119c2f581b24e67f5b91a758b3faf839d",
+      "bytes": 12787,
+      "mode": "100644"
+    },
+    {
+      "file": "integrations/cmux-release-package/test_retained_release.py",
+      "public_path": "integrations/cmux-release-package/test_retained_release.py",
+      "sha256": "b3b4d205d0d0ee54422af1369ec2e3732cc802dbb9b33e93ee7d657f2bc9a583",
+      "bytes": 17212,
+      "mode": "100644"
+    },
+    {
+      "file": "integrations/cmux-release-package/test_rust_path.py",
+      "public_path": "integrations/cmux-release-package/test_rust_path.py",
+      "sha256": "e3c4ba6a76439c4858a1ee0d4c8c3a1e9159b878c779b27c0252121343bb44b5",
+      "bytes": 3872,
+      "mode": "100644"
+    }
+  ],
+  "payload_entries": 35,
+  "payload_bytes": 852751,
+  "workflow_executable_paths": [
+    ".github/workflows/cmux-release-package.yml",
+    ".github/workflows/cmux-release-runtime-revalidation.yml"
+  ],
+  "control_files_to_publish_additionally": [
+    {
+      "public_path": "integrations/cmux-release-package/SOURCE-MANIFEST.json",
+      "sha256_pinned_in": "FROZEN.json"
+    },
+    {
+      "public_path": "integrations/cmux-release-package/FROZEN.json",
+      "sha256_pinned_externally": true
+    }
+  ],
+  "no_full_app_or_local_diagnostic_cache": true
+}
