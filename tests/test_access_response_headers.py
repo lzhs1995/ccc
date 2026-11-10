@@ -171,9 +171,36 @@ class RealCookieGatewayTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('server-private', json.dumps(detail))
         self.assertTrue(all(b'upstream did not return Responses SSE' in raw for _, raw in results))
         self.assertTrue(all(b'server-private' not in raw for _, raw in results))
-        self.assertEqual(self.channel.snapshot()['blocked_slots'], list(range(50)))
         self.assertEqual((await native_request(self.port, self.channel, 0))[0], 409)
+        # The HTTP error is sent before the handler finishes durable accounting.
+        # Await those handlers, not a timing delay, before asserting final state.
+        await asyncio.wait_for(asyncio.gather(*tuple(self.gateway.tasks)), 10)
+        self.assertEqual(self.channel.snapshot()['blocked_slots'], list(range(50)))
         self.assertEqual(len(self.fixture.requests), 50)
+
+    async def test_html_failure_stays_closed_while_accounting_is_pending(self):
+        self.fixture.mode = 'html'
+        release = asyncio.Event()
+        original_storage = self.gateway.storage
+
+        async def delayed_storage(function, *args, **kwargs):
+            if function == self.channel.budget.finish:
+                await release.wait()
+            return await original_storage(function, *args, **kwargs)
+
+        self.gateway.storage = delayed_storage
+        try:
+            results = await self.wave()
+            self.assertEqual([code for code, _ in results], [502] * 50)
+            self.assertEqual(self.channel.snapshot()['blocked_slots'], [])
+            self.assertEqual(self.channel.snapshot()['in_flight'], 50)
+            self.assertEqual((await native_request(self.port, self.channel, 0))[0], 409)
+            self.assertEqual(len(self.fixture.requests), 50)
+        finally:
+            release.set()
+            await asyncio.wait_for(asyncio.gather(*tuple(self.gateway.tasks)), 10)
+        self.assertEqual(self.channel.snapshot()['blocked_slots'], list(range(50)))
+        self.assertEqual(self.channel.snapshot()['in_flight'], 0)
 
     async def test_non_protocol_exception_text_is_never_exposed(self):
         async def fail():
