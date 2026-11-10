@@ -1,0 +1,40 @@
+{
+  "schema": "cmux-local-release-preparation-freeze-v3",
+  "frozen_at": "2026-11-10T19:15:08.458376+08:00",
+  "source_manifest_sha256": "f28946cc1e96ebaacf3d1e3c18aa940e63dc4ee3338d48969f6208a8fa050279",
+  "payload_entries": 27,
+  "payload_bytes": 766881,
+  "original_r2_freeze_sha256": "e8808d909aef49a165b21e13492d53ff47e4ec2bd5922440d7ac73dc4b09a5f0",
+  "original_failed_runs": [
+    {
+      "run": 42765017218,
+      "attempt": 1
+    },
+    {
+      "run": 42794021853,
+      "attempt": 1
+    }
+  ],
+  "original_runs_not_rerun": true,
+  "incremental_source_review": {
+    "reviewer": "/root/agy_identity_diagnosis",
+    "outcome": "PASS",
+    "report_sha256": "b4dd4ca36c3957fec3aef5b30ad6f4004254af3c71bf1d74fcc33481a50b25f2",
+    "reviewed_source_sha256": "2a736a66d605b8d2e5f94d3a64ba648516e9aa147cb779cd4379e3d79f2d5d82",
+    "original_local_regression_result_sha256": "4cad100068503d10fc6e3ce804dcba7361b3dea61b0cbfdbc7303d1aecb97e68"
+  },
+  "portable_regression": {
+    "tests": 1,
+    "passed": true,
+    "test_sha256": "e3c4ba6a76439c4858a1ee0d4c8c3a1e9159b878c779b27c0252121343bb44b5",
+    "result_sha256": "ed5aa67e3fb073f2aaaac70758237db415f9905ef164ee67527e9e67c5a431b9",
+    "old_suites_rerun": 0
+  },
+  "workflow_delta": "Only branch, private output and evidence labels r2 to r3; actionlint passed.",
+  "accepted_source_and_compiler_pins_preserved": true,
+  "package_and_two_generation_runtime_semantics_preserved": true,
+  "published": false,
+  "built": false,
+  "installed": false,
+  "business_operations": 0
+}

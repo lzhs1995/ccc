@@ -1,0 +1,8 @@
+{
+  "schema": "cmux-original-darwin-parser-public-pin-v1",
+  "file": "original_args.py",
+  "sha256": "629f677fd25f57e358675859ae798defe668e7085156cc1e2ec2fd1c6f18d7ed",
+  "bytes": 960,
+  "original_locator_receipt_sha256": "da6046c07284bdeeb93789d93d232522b85280e13f8629599c63070758aff4a7",
+  "original_locator_receipt_preserved_locally": true
+}
