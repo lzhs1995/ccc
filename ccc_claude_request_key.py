@@ -39,9 +39,11 @@ def observe(result):
         root = directory.lstat()
         if (not directory.is_absolute() or not stat.S_ISDIR(root.st_mode)
                 or root.st_uid != os.getuid() or root.st_mode & 0o077):
+            result.api_key_observation_note = 'Claude 请求记录目录的类型、属主或权限未通过核验；已清除旧值。'
             return
         path = directory / f'claude-{pid}-request.json'
         initial = path.lstat()
+        result.api_key_observation_note = 'Claude 请求记录存在，但尚未核实本会话的实际 Key；已清除旧值。'
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(fd, 'rb') as stream:
             info = os.fstat(stream.fileno())
@@ -93,5 +95,6 @@ def observe(result):
             '不代表服务端接受或下一次请求。全局与 ccp-new 配置均以实际发送值为准。')
     except FileNotFoundError:
         result.api_key_observation_status = 'absent'
+        result.api_key_observation_note = '尚未采集该 Claude 进程的实际请求；不会以全局或独立配置值替代。'
     except (OSError, ValueError, TypeError, KeyError, RuntimeError):
         result.api_key_observation_note = 'Claude 请求记录读取或进程身份核验失败；已清除旧值。'
