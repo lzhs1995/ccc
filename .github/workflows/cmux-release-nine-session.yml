@@ -1,0 +1,118 @@
+# Original R5 consumer, exact successful producer inputs, sealed private source.
+name: Release cmux three Herdr nine synthetic sessions cold restore
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - ccc/cmux-release-nine-session-20261112-r5
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: cmux-release-nine-session-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  release-nine-session:
+    runs-on: macos-26
+    timeout-minutes: 45
+    env:
+      DEPLOYMENT_SHA256: 446c7426d02abcdd0305641e09a6cd6cd0f5b022b9c410e57a107496df92f9a1
+    steps:
+      - name: Verify actual GitHub hosted runner
+        env:
+          NESTED_RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          test "$NESTED_RUNNER_KIND" = github-hosted
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - name: Reject missing original success inputs before dependencies or keys
+        run: >-
+          python3 -BE integrations/cmux-release-nine-session/workflow_gate.py
+          --root integrations/cmux-release-nine-session
+          --original-root integrations/herdr-fixed-restore
+          --deployment-sha256 "$DEPLOYMENT_SHA256"
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.14.7'
+      - name: Install original hash pinned transport dependencies
+        run: |
+          python3 -m pip install --only-binary=:all: --no-deps --require-hashes -r integrations/herdr-fixed-restore/requirements-macos.txt
+      - name: Authenticate unchanged original R5 source
+        env:
+          CCC_PRIVATE_FIXTURE_KEY: ${{ secrets.CCC_NATIVE300_FIXTURE_INPUT_KEY_20261106 }}
+        run: python3 -BE integrations/herdr-fixed-restore/secure_bundle.py decrypt
+      - name: Authenticate new supplemental source
+        env:
+          CCC_PRIVATE_FIXTURE_KEY: ${{ secrets.CCC_NATIVE300_FIXTURE_INPUT_KEY_20261106 }}
+        run: >-
+          python3 -BE integrations/cmux-release-nine-session/supplemental_transport.py decrypt
+          --crypto integrations/herdr-fixed-restore/secure_bundle.py
+          --contract integrations/cmux-release-nine-session/SUPPLEMENTAL-TRANSPORT.json
+          --contract-sha256 "$SUPPLEMENTAL_PIN"
+          --payload integrations/cmux-release-nine-session/source.aesgcm
+          --output "$RUNNER_TEMP/nine-supplemental"
+      - name: Authenticate retained original producer receipts
+        id: decrypt_inputs
+        env:
+          CCC_PRIVATE_FIXTURE_KEY: ${{ secrets.CCC_NATIVE300_FIXTURE_INPUT_KEY_20261106 }}
+        run: >-
+          python3 -BE integrations/cmux-release-nine-session/supplemental_transport.py decrypt
+          --crypto integrations/herdr-fixed-restore/secure_bundle.py
+          --contract integrations/cmux-release-nine-session/INPUTS-TRANSPORT.json
+          --contract-sha256 "$INPUTS_TRANSPORT_PIN"
+          --payload integrations/cmux-release-nine-session/original-inputs.aesgcm
+          --output "$RUNNER_TEMP/nine-original-inputs"
+      - name: Stage original Release ZIP using original one shot transport
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python3 -BE integrations/cmux-release-nine-session/stage_original_app.py
+          --legacy "$CCC_PRIVATE_SOURCE"
+          --natural "$RUNNER_TEMP/nine-supplemental/natural"
+          --adapter "$RUNNER_TEMP/nine-supplemental/adapter"
+          --inputs "$RUNNER_TEMP/nine-original-inputs"
+          --input-contract-sha256 "$ORIGINAL_INPUT_PIN"
+          --record "$RUNNER_TEMP/nine-original-app-transfer"
+      - name: Prepare pinned tiny simulation compiler
+        run: rustup toolchain install 1.99.1 --profile minimal --no-self-update
+      - name: Run original full nine session contract on admitted Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python3 -BE "$RUNNER_TEMP/nine-supplemental/adapter/run_release_actions.py"
+          --legacy "$CCC_PRIVATE_SOURCE"
+          --package "$RUNNER_TEMP/nine-supplemental/natural/package"
+          --source-lock-sha256 76fcd85b8bc51f18eee43192e2e4a675e16a322ecd3669e3447ef21489775f2e
+          --inputs "$RUNNER_TEMP/nine-original-inputs"
+          --input-contract "$RUNNER_TEMP/nine-original-inputs/INPUT-CONTRACT.json"
+          --input-contract-sha256 "$ORIGINAL_INPUT_PIN"
+          --execute-root "$RUNNER_TEMP/nine-release-runtime"
+      - name: Seal original full runtime diagnostics
+        if: always() && steps.decrypt_inputs.outcome == 'success'
+        env:
+          CCC_PRIVATE_FIXTURE_KEY: ${{ secrets.CCC_NATIVE300_FIXTURE_INPUT_KEY_20261106 }}
+        run: |
+          if test -d "$RUNNER_TEMP/nine-release-runtime"; then
+            python3 -BE "$RUNNER_TEMP/nine-supplemental/adapter/seal_release_nested.py" --private-root "$RUNNER_TEMP/nine-release-runtime" --output "$RUNNER_TEMP/nine-sealed-evidence"
+          fi
+      - name: Seal original transfer intent and outcome
+        if: always() && steps.decrypt_inputs.outcome == 'success'
+        env:
+          CCC_PRIVATE_FIXTURE_KEY: ${{ secrets.CCC_NATIVE300_FIXTURE_INPUT_KEY_20261106 }}
+        run: |
+          if test -d "$RUNNER_TEMP/nine-original-app-transfer"; then
+            python3 -BE integrations/cmux-release-nine-session/seal_transfer.py --crypto integrations/herdr-fixed-restore/secure_bundle.py --private-root "$RUNNER_TEMP/nine-original-app-transfer" --output "$RUNNER_TEMP/nine-transfer-sealed"
+          fi
+      - name: Preserve encrypted original runtime evidence
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: release-nine-session-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/nine-sealed-evidence/
+            ${{ runner.temp }}/nine-transfer-sealed/
+          include-hidden-files: false
+          if-no-files-found: warn
+          retention-days: 14
