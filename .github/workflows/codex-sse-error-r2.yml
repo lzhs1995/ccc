@@ -138,7 +138,7 @@ jobs:
       - name: Verify frozen CLI smoke inputs and metadata validator
         shell: bash
         env:
-          CLI_SMOKE_PIN: 7e8e305bb0e2b323cf87182d51c8541ef68901fa1926f238d28d2f82ecb83f26
+          CLI_SMOKE_PIN: 8976e0f1b9af2fb9454ed09d0280175a2963692b0eeec7dd34556763ad2061a6
         run: |
           set -euo pipefail
           python3 -B - <<'PYIN'

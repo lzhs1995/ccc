@@ -53,3 +53,11 @@ The existing six R3 package files remain byte-identical. The branch remains
 synthetic fixtures. It is not real Codex execution evidence. The exact baseline
 parser regression remains in the original source-validation gates; this initial
 CLI smoke executes the candidate only and does not fabricate a CLI RED result.
+
+R2 preserves the first real CI failure. That run emitted exactly one pre-turn
+`item.completed` of type `error`: the fixed `gpt-test` metadata fallback
+diagnostic. The verifier now permits only that exact item at index 1, between
+`thread.started` and `turn.started`, once, with the original item id and message.
+Other item types, text, locations, duplicates or extra fields remain rejected.
+The supplier, CLI command, model, deadlines, build inputs and source are unchanged.
+The original run is not relabeled PASS; a new real CI attempt is required.

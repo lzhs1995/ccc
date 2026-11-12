@@ -15,6 +15,10 @@ import time
 
 MESSAGE = "SYNTHETIC_WRITER_REJECTED_NO_REAL_ACCOUNT"
 CODE = "continuation_writer_unavailable"
+METADATA_DIAGNOSTIC = (
+    "Model metadata for `gpt-test` not found. Defaulting to fallback metadata; "
+    "this can degrade performance and cause issues."
+)
 IDLE_MS = 60000
 ERROR_DEADLINE = 8.0
 START_DEADLINE = 60.0
@@ -176,7 +180,16 @@ def judge(returncode, events, records, exit_at, killed):
     failed = [e for e in events if e.get("type") == "turn.failed"]
     require(len(failed) == 1 and MESSAGE in failed[0].get("error", {}).get("message", ""), "original message or exact turn.failed terminal missing")
     require(events[-1].get("type") == "turn.failed", "events appeared after terminal failure")
-    require(not any(e.get("type") == "turn.completed" or e.get("type", "").startswith("item.") for e in events), "unexpected success, assistant output or tool activity")
+    items = [(index, event) for index, event in enumerate(events) if event.get("type", "").startswith("item.")]
+    if items:
+        require(len(items) == 1, "unexpected number of item events")
+        index, item = items[0]
+        require(index == 1 and events[0].get("type") == "thread.started"
+                and len(events) > 2 and events[2].get("type") == "turn.started"
+                and item == {"type": "item.completed", "item": {
+                    "id": "item_0", "type": "error", "message": METADATA_DIAGNOSTIC}},
+                "unexpected item; only the exact pre-turn gpt-test metadata diagnostic is permitted")
+    require(not any(e.get("type") == "turn.completed" for e in events), "unexpected completed turn")
     require(set(failed[0]["error"]) == {"message"}, "R3 CLI schema unexpectedly differs from the audited message-only schema")
     return {"accepted": True, "error_to_exit_seconds": elapsed, "supplier_calls": 1,
             "turn_failed_count": 1, "structured_code_observable_in_cli": False,

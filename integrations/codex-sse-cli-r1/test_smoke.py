@@ -24,6 +24,30 @@ class VerdictTests(unittest.TestCase):
         self.assertTrue(result["accepted"])
         self.assertFalse(result["structured_code_observable_in_cli"])
 
+    def test_accept_exact_startup_metadata_diagnostic(self):
+        value = valid()
+        value["events"].insert(1, {"type": "item.completed", "item": {
+            "id": "item_0", "type": "error", "message": smoke.METADATA_DIAGNOSTIC}})
+        self.assertTrue(smoke.judge(**value)["accepted"])
+
+    def test_reject_diagnostic_variations(self):
+        for mutation in (
+            lambda events: events[1]["item"].update(message="some other error"),
+            lambda events: events[1]["item"].update(type="agent_message"),
+            lambda events: events[1]["item"].update(type="command_execution"),
+            lambda events: events[1]["item"].update(id="item_1"),
+            lambda events: events[1].update(type="item.started"),
+            lambda events: events[1]["item"].update(extra="unexpected"),
+            lambda events: events.insert(2, copy.deepcopy(events[1])),
+            lambda events: events.__setitem__(slice(1, 3), [events[2], events[1]]),
+        ):
+            value = valid()
+            value["events"].insert(1, {"type": "item.completed", "item": {
+                "id": "item_0", "type": "error", "message": smoke.METADATA_DIAGNOSTIC}})
+            mutation(value["events"])
+            with self.subTest(events=value["events"]), self.assertRaises(RuntimeError):
+                smoke.judge(**value)
+
     def test_reject_bad_terminal(self):
         for change in (lambda v: v.update(returncode=0), lambda v: v.update(killed=True),
                        lambda v: v.update(exit_at=18.0), lambda v: v.update(exit_at=9.0),
