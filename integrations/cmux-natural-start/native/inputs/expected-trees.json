@@ -1,0 +1,77 @@
+{
+  "schema": "cmux-natural-start-expected-source-trees-v1",
+  "upstream_commit": "2e109a1739d320fe36220afb3e7775b59c1acd47",
+  "upstream_tree": "558d4a3e6ed749477de08df5ceeb22fce6e9fe62",
+  "base_green_commit": "febf361281fdc0f463e84d9d5e4dd65d107dd818",
+  "base_green_tree": "40e8ea03ce1435f11e90b35f98d554a13b9b8685",
+  "new_red_tree": "2ac402069e1c937b23be75126c0fdb663f5905cd",
+  "new_green_tree": "f0e2d0f26d1d5dde021ef2729aeb3f987993fe0a",
+  "new_red_commit": null,
+  "new_green_commit": null,
+  "new_commit_identity": "Must be recorded from actual CI commits; no metadata or SHA prediction.",
+  "original_patches": {
+    "tests.patch": "bdebf64e054476f3ea0476df3ec7acb91ddbfe86fc2927bb85686720c6a7bf8e",
+    "fix.patch": "db4f2c96ff9e06fd47ddb55a102f0ccb45d00c691e9e3681ca722f3f97144422"
+  },
+  "new_patches": {
+    "restore-tests.patch": "a36c6c5b14c515b4e10b46dc642639aa7416968b79448f7579d5f49f4d9d06b1",
+    "full-fix.patch": "40092c6b45f0c773e241035eba032b20a9d16b9e1574bc53f40d4c9afc24250b"
+  },
+  "source_freeze_sha256": "40e64aa4d69d465cd0139dc2f39ecac7921b03124c24bc9e361615097b6df598",
+  "paths": [
+    {
+      "path": "Sources/App/AppBundleIconPersistencePolicy.swift",
+      "mode": "100644",
+      "base_blob": "a484c63832293f155dc3e74c1aab430ec2868b5f",
+      "red_blob": "a484c63832293f155dc3e74c1aab430ec2868b5f",
+      "green_blob": "768b782c08b8da4646d27d1089fde7cca26b4c20",
+      "red_sha256": "30930b6f34cd56e555d63efd39203ddd06499c713aeb0331490a26774914ca5e",
+      "green_sha256": "ace4e8e5c6440448cf56e447c327811c4b48be667ae307ba13a9e987f3f839f6"
+    },
+    {
+      "path": "Sources/AppIconDockTilePlugin.swift",
+      "mode": "100644",
+      "base_blob": "44ed50796b77cabe0fdf7ec1fa14d59e0253582b",
+      "red_blob": "44ed50796b77cabe0fdf7ec1fa14d59e0253582b",
+      "green_blob": "32d756078f6ef5346ba38fdfeb66a607afbb75a4",
+      "red_sha256": "85230eff268099d1df32ee5863bbf7be8ab20e6a36b5018815394b1dc7b4e77d",
+      "green_sha256": "06e7e3e63fda3530b5e27dd257d3c780cdb1d81d890a70e9c187a7ad117db1c8"
+    },
+    {
+      "path": "Sources/SessionPersistence.swift",
+      "mode": "100644",
+      "base_blob": "cdd197d1afe3439ca19435dafca79f18e1844d8c",
+      "red_blob": "cdd197d1afe3439ca19435dafca79f18e1844d8c",
+      "green_blob": "d746a2158b6dbe1b10d3936eb94b12ef59744329",
+      "red_sha256": "5631da6efccc9605d526632551ddf22fc5c502cd65a9ec32db2bea05d902499c",
+      "green_sha256": "616655040b02ce036d16379b9bcfe1bfda95ff151a3ab34384fa5fecf712fb79"
+    },
+    {
+      "path": "Sources/cmuxApp.swift",
+      "mode": "100644",
+      "base_blob": "309a68fd03da747ac5828f1dfd2f344c082da874",
+      "red_blob": "309a68fd03da747ac5828f1dfd2f344c082da874",
+      "green_blob": "31a508f57072f37006e03f899967ba0080222864",
+      "red_sha256": "5f58d7f5022bba207b51f519db8875f5fd3f019bc3f4bdef307462ae1cc515be",
+      "green_sha256": "aae292cfeb457b3b866b89e099469d97116637675b586e2de8e54b187e73636a"
+    },
+    {
+      "path": "cmuxTests/AppearanceSettingsTests.swift",
+      "mode": "100644",
+      "base_blob": "fd565d6f93312cd9922f730f49a3657878e14dd6",
+      "red_blob": "fd565d6f93312cd9922f730f49a3657878e14dd6",
+      "green_blob": "432396952ae4c041dc37ebfb7fe122371eae03a8",
+      "red_sha256": "f6a8534325502417e6b4227b172b957f471edffcef28453ed88486fef3f5980f",
+      "green_sha256": "78677e137e34fd30cb9875d87ff5f472fd389f0517f6ee73209e57cf40ee8c4b"
+    },
+    {
+      "path": "cmuxTests/SessionPersistenceTests.swift",
+      "mode": "100644",
+      "base_blob": "e8d3be03d21a9847302c888578ed85ffeff3fb1d",
+      "red_blob": "f680605da8aa24298e4b65d9e529ce082d1eae6e",
+      "green_blob": "f680605da8aa24298e4b65d9e529ce082d1eae6e",
+      "red_sha256": "54b70c01052ee5a07973cf51a6d0a50b34b9d475e24c95ac507c29feeb194939",
+      "green_sha256": "54b70c01052ee5a07973cf51a6d0a50b34b9d475e24c95ac507c29feeb194939"
+    }
+  ]
+}

@@ -1,0 +1,28 @@
+{
+  "schema": "cmux-native-release-verifier-dependencies-v1",
+  "files": {
+    "evidence_native.py": {
+      "bytes": 13457,
+      "sha256": "160cd837b2fd53d106586cc33bae1b5f4ad8fa43109e287fc44fb64e0bb8331d"
+    },
+    "contract.py": {
+      "bytes": 14177,
+      "sha256": "ed9d9cfc5c8bd57432f45c505e7c606688878a988600c66e7c71fa85956a2012"
+    },
+    "contract.json": {
+      "bytes": 13265,
+      "sha256": "46c9b3f15b087be92262ff2e3f3591fba8580ec532339d1c6130ee66ec38d01d"
+    },
+    "upstream/app_host_result_accounting.py": {
+      "bytes": 24117,
+      "sha256": "826c5789e8112eb0dac52ce6ce1cce23194deda3881654bbd1dd78182e9abfdb"
+    },
+    "upstream/require_swift_test_execution.py": {
+      "bytes": 3688,
+      "sha256": "0b251902dee3de974d56300c61f675acf7b277f4f7a264f9305501707086db7e"
+    }
+  },
+  "contract_sha256": "46c9b3f15b087be92262ff2e3f3591fba8580ec532339d1c6130ee66ec38d01d",
+  "loader_root": "../native",
+  "artifact_code_imports_allowed": false
+}

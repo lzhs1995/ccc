@@ -1,0 +1,234 @@
+diff --git a/Sources/App/AppBundleIconPersistencePolicy.swift b/Sources/App/AppBundleIconPersistencePolicy.swift
+--- a/Sources/App/AppBundleIconPersistencePolicy.swift
++++ b/Sources/App/AppBundleIconPersistencePolicy.swift
+@@ -1,26 +1,43 @@
++import CoreFoundation
+ import Foundation
+ 
+ enum AppBundleIconPersistencePolicy {
+     private static let stableReleaseBundleIdentifier = "com.cmuxterm.app"
+     private static let stableReleaseAppBundleName = "cmux.app"
+     static let disablePersistenceArgument = "--cmux-disable-bundle-icon-persistence"
+     static let disablePersistenceDefaultsKey = "cmuxDisableBundleIconPersistence"
++    static let disablePersistenceInfoKey = "CMUXDisableBundleIconPersistence"
+ 
+-    static func updateDisableDefault(defaults: UserDefaults, launchArguments: [String]) {
++    static func isDisabledByBundleInfo(_ infoDictionary: [String: Any]?) -> Bool {
++        // Require a plist Boolean; numeric and string values are not an opt-in.
++        guard let value = infoDictionary?[disablePersistenceInfoKey] as? NSNumber,
++              CFGetTypeID(value) == CFBooleanGetTypeID() else {
++            return false
++        }
++        return value.boolValue
++    }
++
++    static func updateDisableDefault(
++        defaults: UserDefaults,
++        launchArguments: [String],
++        bundleInfoDictionary: [String: Any]? = nil
++    ) {
+         defaults.set(
+-            launchArguments.contains(disablePersistenceArgument),
++            isDisabledByBundleInfo(bundleInfoDictionary)
++                || launchArguments.contains(disablePersistenceArgument),
+             forKey: disablePersistenceDefaultsKey
+         )
+     }
+ 
+     static func shouldPersist(
+         bundleIdentifier: String?,
+         appBundleLastPathComponent: String?,
+-        persistenceDisabled: Bool = false
++        persistenceDisabled: Bool = false,
++        bundleInfoDictionary: [String: Any]? = nil
+     ) -> Bool {
+-        guard !persistenceDisabled else {
++        guard !persistenceDisabled, !isDisabledByBundleInfo(bundleInfoDictionary) else {
+             return false
+         }
+ 
+         // Channel variants own their identity through build-time bundle metadata.
+         // Persisted Finder icons would override that metadata and can leak into
+diff --git a/Sources/AppIconDockTilePlugin.swift b/Sources/AppIconDockTilePlugin.swift
+--- a/Sources/AppIconDockTilePlugin.swift
++++ b/Sources/AppIconDockTilePlugin.swift
+@@ -86,16 +86,18 @@
+         return Bundle(url: appBundleURL)
+     }
+ 
+     private var shouldPersistBundleIcon: Bool {
+         guard let appBundleURL else { return false }
++        // The Dock plugin may run before the app has updated its defaults.
+         return AppBundleIconPersistencePolicy.shouldPersist(
+             bundleIdentifier: appBundle?.bundleIdentifier,
+             appBundleLastPathComponent: appBundleURL.lastPathComponent,
+             persistenceDisabled: appDefaults?.bool(
+                 forKey: AppBundleIconPersistencePolicy.disablePersistenceDefaultsKey
+-            ) ?? false
++            ) ?? false,
++            bundleInfoDictionary: appBundle?.infoDictionary
+         )
+     }
+ 
+     private var appDefaults: UserDefaults? {
+         guard let bundleIdentifier = appBundle?.bundleIdentifier else { return nil }
+diff --git a/Sources/SessionPersistence.swift b/Sources/SessionPersistence.swift
+--- a/Sources/SessionPersistence.swift
++++ b/Sources/SessionPersistence.swift
+@@ -253,13 +253,16 @@
+             return false
+         }
+ 
+         let extraArgs = arguments
+             .dropFirst()
+-            .filter { !$0.hasPrefix("-psn_") }
+-
+-        // Any explicit launch argument is treated as an explicit open intent.
++            .filter {
++                !$0.hasPrefix("-psn_")
++                    && $0 != AppBundleIconPersistencePolicy.disablePersistenceArgument
++            }
++
++        // Remaining arguments represent an explicit open intent.
+         return extraArgs.isEmpty
+     }
+ }
+ 
+ struct SessionRectSnapshot: Codable, Equatable, Sendable {
+diff --git a/Sources/cmuxApp.swift b/Sources/cmuxApp.swift
+--- a/Sources/cmuxApp.swift
++++ b/Sources/cmuxApp.swift
+@@ -227,11 +227,12 @@
+         let workspaceCustomizationStore = WorkspaceCustomizationStore(
+             defaults: defaults
+         )
+         AppBundleIconPersistencePolicy.updateDisableDefault(
+             defaults: defaults,
+-            launchArguments: ProcessInfo.processInfo.arguments
++            launchArguments: ProcessInfo.processInfo.arguments,
++            bundleInfoDictionary: Bundle.main.infoDictionary
+         )
+         KeyboardShortcutSettings.settingsFileStore.applyDeferredManagedDefaultSideEffects()
+         StartupBreadcrumbLog.append("app.init.keyboardShortcuts.sideEffectsApplied")
+         StartupBreadcrumbLog.append("app.init.tabManager.begin")
+         let (cloudMachinePinStore, cloudWorkspaceCoordinator) = Self.makeCloudWorkspaceComposition(auth: authComposition)
+diff --git a/cmuxTests/AppearanceSettingsTests.swift b/cmuxTests/AppearanceSettingsTests.swift
+--- a/cmuxTests/AppearanceSettingsTests.swift
++++ b/cmuxTests/AppearanceSettingsTests.swift
+@@ -97,10 +97,116 @@
+         )
+         XCTAssertEqual(
+             defaults.object(forKey: AppBundleIconPersistencePolicy.disablePersistenceDefaultsKey) as? Bool,
+             false
+         )
++    }
++
++    func testBundleIconPersistenceRequiresBooleanPackageOptIn() throws {
++        XCTAssertFalse(AppBundleIconPersistencePolicy.isDisabledByBundleInfo(nil))
++        XCTAssertFalse(AppBundleIconPersistencePolicy.isDisabledByBundleInfo([:]))
++
++        let cases: [(value: Any, expected: Bool)] = [
++            (true, true),
++            (false, false),
++            (1, false),
++            (0, false),
++            ("true", false),
++            ("1", false),
++        ]
++        let formats: [PropertyListSerialization.PropertyListFormat] = [.xml, .binary]
++        for (value, expected) in cases {
++            for format in formats {
++                let data = try PropertyListSerialization.data(
++                    fromPropertyList: ["CMUXDisableBundleIconPersistence": value],
++                    format: format,
++                    options: 0
++                )
++                let plist = try PropertyListSerialization.propertyList(from: data, options: [], format: nil)
++                let info = try XCTUnwrap(plist as? [String: Any])
++                XCTAssertEqual(AppBundleIconPersistencePolicy.isDisabledByBundleInfo(info), expected)
++            }
++        }
++    }
++
++    func testBundleIconPersistenceSignedOptInAppliesBeforeAppDefaults() {
++        XCTAssertFalse(AppBundleIconPersistencePolicy.shouldPersist(
++            bundleIdentifier: "com.cmuxterm.app",
++            appBundleLastPathComponent: "cmux.app",
++            persistenceDisabled: false,
++            bundleInfoDictionary: [AppBundleIconPersistencePolicy.disablePersistenceInfoKey: true]
++        ))
++    }
++
++    func testBundleIconPersistenceSignedOptInSurvivesArgumentFreeLaunch() throws {
++        let suiteName = "AppearanceSettingsTests.SignedBundleIconPersistence.\(UUID().uuidString)"
++        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
++        defer { defaults.removePersistentDomain(forName: suiteName) }
++        defaults.set(false, forKey: AppBundleIconPersistencePolicy.disablePersistenceDefaultsKey)
++
++        AppBundleIconPersistencePolicy.updateDisableDefault(
++            defaults: defaults,
++            launchArguments: ["/Applications/cmux.app/Contents/MacOS/cmux"],
++            bundleInfoDictionary: [AppBundleIconPersistencePolicy.disablePersistenceInfoKey: true]
++        )
++
++        XCTAssertTrue(defaults.bool(forKey: AppBundleIconPersistencePolicy.disablePersistenceDefaultsKey))
++    }
++
++    func testBundleIconPersistenceAbsentOrFalseMetadataRestoresOfficialDefault() throws {
++        let suiteName = "AppearanceSettingsTests.DefaultBundleIconPersistence.\(UUID().uuidString)"
++        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
++        defer { defaults.removePersistentDomain(forName: suiteName) }
++        let metadata: [[String: Any]?] = [
++            nil,
++            [:],
++            [AppBundleIconPersistencePolicy.disablePersistenceInfoKey: false],
++        ]
++
++        for info in metadata {
++            defaults.set(true, forKey: AppBundleIconPersistencePolicy.disablePersistenceDefaultsKey)
++            AppBundleIconPersistencePolicy.updateDisableDefault(
++                defaults: defaults,
++                launchArguments: ["/Applications/cmux.app/Contents/MacOS/cmux"],
++                bundleInfoDictionary: info
++            )
++            XCTAssertFalse(defaults.bool(forKey: AppBundleIconPersistencePolicy.disablePersistenceDefaultsKey))
++            XCTAssertTrue(AppBundleIconPersistencePolicy.shouldPersist(
++                bundleIdentifier: "com.cmuxterm.app",
++                appBundleLastPathComponent: "cmux.app",
++                persistenceDisabled: defaults.bool(forKey: AppBundleIconPersistencePolicy.disablePersistenceDefaultsKey),
++                bundleInfoDictionary: info
++            ))
++        }
++    }
++
++    func testBundleIconPersistenceLaunchArgumentRemainsIndependentOfMetadata() throws {
++        let suiteName = "AppearanceSettingsTests.ArgumentBundleIconPersistence.\(UUID().uuidString)"
++        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
++        defer { defaults.removePersistentDomain(forName: suiteName) }
++        let metadata: [[String: Any]?] = [
++            nil,
++            [:],
++            [AppBundleIconPersistencePolicy.disablePersistenceInfoKey: false],
++        ]
++        let argument = AppBundleIconPersistencePolicy.disablePersistenceArgument
++
++        for info in metadata {
++            AppBundleIconPersistencePolicy.updateDisableDefault(
++                defaults: defaults,
++                launchArguments: ["/Applications/cmux.app/Contents/MacOS/cmux", argument],
++                bundleInfoDictionary: info
++            )
++            XCTAssertTrue(defaults.bool(forKey: AppBundleIconPersistencePolicy.disablePersistenceDefaultsKey))
++
++            AppBundleIconPersistencePolicy.updateDisableDefault(
++                defaults: defaults,
++                launchArguments: ["/Applications/cmux.app/Contents/MacOS/cmux", argument + "=true"],
++                bundleInfoDictionary: info
++            )
++            XCTAssertFalse(defaults.bool(forKey: AppBundleIconPersistencePolicy.disablePersistenceDefaultsKey))
++        }
+     }
+ 
+     // Regression: https://github.com/manaflow-ai/cmux/issues/8938
+     // Install the appearance-resolved config before changing Ghostty's surface
+     // color scheme. Applying the scheme to the stale config can emit its old

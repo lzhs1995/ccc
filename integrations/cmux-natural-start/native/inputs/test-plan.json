@@ -1,0 +1,136 @@
+{
+  "schema": "cmux-natural-start-native-test-plan-v1",
+  "execution_status": "NOT_RUN_NO_LOCAL_SWIFT_BUILD",
+  "new_tests": {
+    "SessionPersistenceTests": [
+      "testRestorePolicyAllowsPlainLaunch",
+      "testRestorePolicyAllowsBundleIconConfigurationArgument",
+      "testRestorePolicyAllowsFinderStyleLaunchWithBundleIconConfigurationArgument",
+      "testRestorePolicyRejectsBundleIconConfigurationArgumentWithValue",
+      "testRestorePolicyRejectsUnknownArgumentsAlongsideBundleIconConfiguration",
+      "testRestorePolicyRejectsExplicitOpenWithBundleIconConfiguration",
+      "testRestorePolicyKeepsDisableGateWithBundleIconConfiguration",
+      "testRestorePolicyKeepsAutomatedTestGatesWithBundleIconConfiguration"
+    ],
+    "AppearanceSettingsTests": [
+      "testBundleIconPersistenceRequiresBooleanPackageOptIn",
+      "testBundleIconPersistenceSignedOptInAppliesBeforeAppDefaults",
+      "testBundleIconPersistenceSignedOptInSurvivesArgumentFreeLaunch",
+      "testBundleIconPersistenceAbsentOrFalseMetadataRestoresOfficialDefault",
+      "testBundleIconPersistenceLaunchArgumentRemainsIndependentOfMetadata"
+    ]
+  },
+  "existing_tests_preserved": {
+    "SessionPersistenceTests": [
+      "testRestorePolicySkipsWhenLaunchHasExplicitArguments",
+      "testRestorePolicyAllowsFinderStyleLaunchArgumentsOnly",
+      "testRestorePolicySkipsWhenRunningUnderXCTest"
+    ],
+    "AppearanceSettingsTests": [
+      "testBundleIconPersistenceAllowsStableReleaseBundle",
+      "testBundleIconPersistenceSkipsNightlyBundles",
+      "testBundleIconPersistenceRejectsMismatchedStableIdentifierAndPath",
+      "testBundleIconPersistenceSkipsDebugBundles",
+      "testBundleIconPersistenceHonorsDisableDefault",
+      "testBundleIconPersistenceMirrorsSmokeLaunchArgumentToDefaults"
+    ]
+  },
+  "selectors": [
+    "cmuxTests/SessionPersistenceTests/testRestorePolicySkipsWhenLaunchHasExplicitArguments",
+    "cmuxTests/SessionPersistenceTests/testRestorePolicyAllowsFinderStyleLaunchArgumentsOnly",
+    "cmuxTests/SessionPersistenceTests/testRestorePolicyAllowsPlainLaunch",
+    "cmuxTests/SessionPersistenceTests/testRestorePolicyAllowsBundleIconConfigurationArgument",
+    "cmuxTests/SessionPersistenceTests/testRestorePolicyAllowsFinderStyleLaunchWithBundleIconConfigurationArgument",
+    "cmuxTests/SessionPersistenceTests/testRestorePolicyRejectsBundleIconConfigurationArgumentWithValue",
+    "cmuxTests/SessionPersistenceTests/testRestorePolicyRejectsUnknownArgumentsAlongsideBundleIconConfiguration",
+    "cmuxTests/SessionPersistenceTests/testRestorePolicyRejectsExplicitOpenWithBundleIconConfiguration",
+    "cmuxTests/SessionPersistenceTests/testRestorePolicyKeepsDisableGateWithBundleIconConfiguration",
+    "cmuxTests/SessionPersistenceTests/testRestorePolicyKeepsAutomatedTestGatesWithBundleIconConfiguration",
+    "cmuxTests/SessionPersistenceTests/testRestorePolicySkipsWhenRunningUnderXCTest",
+    "cmuxTests/AppearanceSettingsTests/testBundleIconPersistenceAllowsStableReleaseBundle",
+    "cmuxTests/AppearanceSettingsTests/testBundleIconPersistenceSkipsNightlyBundles",
+    "cmuxTests/AppearanceSettingsTests/testBundleIconPersistenceRejectsMismatchedStableIdentifierAndPath",
+    "cmuxTests/AppearanceSettingsTests/testBundleIconPersistenceSkipsDebugBundles",
+    "cmuxTests/AppearanceSettingsTests/testBundleIconPersistenceHonorsDisableDefault",
+    "cmuxTests/AppearanceSettingsTests/testBundleIconPersistenceMirrorsSmokeLaunchArgumentToDefaults",
+    "cmuxTests/AppearanceSettingsTests/testBundleIconPersistenceRequiresBooleanPackageOptIn",
+    "cmuxTests/AppearanceSettingsTests/testBundleIconPersistenceSignedOptInAppliesBeforeAppDefaults",
+    "cmuxTests/AppearanceSettingsTests/testBundleIconPersistenceSignedOptInSurvivesArgumentFreeLaunch",
+    "cmuxTests/AppearanceSettingsTests/testBundleIconPersistenceAbsentOrFalseMetadataRestoresOfficialDefault",
+    "cmuxTests/AppearanceSettingsTests/testBundleIconPersistenceLaunchArgumentRemainsIndependentOfMetadata"
+  ],
+  "source_assertions_are_not_runtime_proof": true,
+  "expected_selected_method_count": 22,
+  "phases": {
+    "tests_only_patch": "restore-tests.patch",
+    "fix_patch_after_tests_only": "full-fix.patch",
+    "red": {
+      "selectors": [
+        "cmuxTests/SessionPersistenceTests/testRestorePolicySkipsWhenLaunchHasExplicitArguments",
+        "cmuxTests/SessionPersistenceTests/testRestorePolicyAllowsFinderStyleLaunchArgumentsOnly",
+        "cmuxTests/SessionPersistenceTests/testRestorePolicyAllowsPlainLaunch",
+        "cmuxTests/SessionPersistenceTests/testRestorePolicyAllowsBundleIconConfigurationArgument",
+        "cmuxTests/SessionPersistenceTests/testRestorePolicyAllowsFinderStyleLaunchWithBundleIconConfigurationArgument",
+        "cmuxTests/SessionPersistenceTests/testRestorePolicyRejectsBundleIconConfigurationArgumentWithValue",
+        "cmuxTests/SessionPersistenceTests/testRestorePolicyRejectsUnknownArgumentsAlongsideBundleIconConfiguration",
+        "cmuxTests/SessionPersistenceTests/testRestorePolicyRejectsExplicitOpenWithBundleIconConfiguration",
+        "cmuxTests/SessionPersistenceTests/testRestorePolicyKeepsDisableGateWithBundleIconConfiguration",
+        "cmuxTests/SessionPersistenceTests/testRestorePolicyKeepsAutomatedTestGatesWithBundleIconConfiguration",
+        "cmuxTests/SessionPersistenceTests/testRestorePolicySkipsWhenRunningUnderXCTest"
+      ],
+      "expected_failed_selectors": [
+        "cmuxTests/SessionPersistenceTests/testRestorePolicyAllowsBundleIconConfigurationArgument",
+        "cmuxTests/SessionPersistenceTests/testRestorePolicyAllowsFinderStyleLaunchWithBundleIconConfigurationArgument"
+      ],
+      "expected_passed_selectors": [
+        "cmuxTests/SessionPersistenceTests/testRestorePolicySkipsWhenLaunchHasExplicitArguments",
+        "cmuxTests/SessionPersistenceTests/testRestorePolicyAllowsFinderStyleLaunchArgumentsOnly",
+        "cmuxTests/SessionPersistenceTests/testRestorePolicyAllowsPlainLaunch",
+        "cmuxTests/SessionPersistenceTests/testRestorePolicyRejectsBundleIconConfigurationArgumentWithValue",
+        "cmuxTests/SessionPersistenceTests/testRestorePolicyRejectsUnknownArgumentsAlongsideBundleIconConfiguration",
+        "cmuxTests/SessionPersistenceTests/testRestorePolicyRejectsExplicitOpenWithBundleIconConfiguration",
+        "cmuxTests/SessionPersistenceTests/testRestorePolicyKeepsDisableGateWithBundleIconConfiguration",
+        "cmuxTests/SessionPersistenceTests/testRestorePolicyKeepsAutomatedTestGatesWithBundleIconConfiguration",
+        "cmuxTests/SessionPersistenceTests/testRestorePolicySkipsWhenRunningUnderXCTest"
+      ],
+      "expected_failed_assertions_per_failed_method": 1,
+      "expected_failure_assertion": "XCTAssertTrue failed",
+      "compile_failure_is_valid_red": false
+    },
+    "green_restore": {
+      "selectors": [
+        "cmuxTests/SessionPersistenceTests/testRestorePolicySkipsWhenLaunchHasExplicitArguments",
+        "cmuxTests/SessionPersistenceTests/testRestorePolicyAllowsFinderStyleLaunchArgumentsOnly",
+        "cmuxTests/SessionPersistenceTests/testRestorePolicyAllowsPlainLaunch",
+        "cmuxTests/SessionPersistenceTests/testRestorePolicyAllowsBundleIconConfigurationArgument",
+        "cmuxTests/SessionPersistenceTests/testRestorePolicyAllowsFinderStyleLaunchWithBundleIconConfigurationArgument",
+        "cmuxTests/SessionPersistenceTests/testRestorePolicyRejectsBundleIconConfigurationArgumentWithValue",
+        "cmuxTests/SessionPersistenceTests/testRestorePolicyRejectsUnknownArgumentsAlongsideBundleIconConfiguration",
+        "cmuxTests/SessionPersistenceTests/testRestorePolicyRejectsExplicitOpenWithBundleIconConfiguration",
+        "cmuxTests/SessionPersistenceTests/testRestorePolicyKeepsDisableGateWithBundleIconConfiguration",
+        "cmuxTests/SessionPersistenceTests/testRestorePolicyKeepsAutomatedTestGatesWithBundleIconConfiguration",
+        "cmuxTests/SessionPersistenceTests/testRestorePolicySkipsWhenRunningUnderXCTest"
+      ],
+      "same_invocation_as_red_required": true,
+      "expected_failed_selectors": []
+    },
+    "green_icon": {
+      "selectors": [
+        "cmuxTests/AppearanceSettingsTests/testBundleIconPersistenceAllowsStableReleaseBundle",
+        "cmuxTests/AppearanceSettingsTests/testBundleIconPersistenceSkipsNightlyBundles",
+        "cmuxTests/AppearanceSettingsTests/testBundleIconPersistenceRejectsMismatchedStableIdentifierAndPath",
+        "cmuxTests/AppearanceSettingsTests/testBundleIconPersistenceSkipsDebugBundles",
+        "cmuxTests/AppearanceSettingsTests/testBundleIconPersistenceHonorsDisableDefault",
+        "cmuxTests/AppearanceSettingsTests/testBundleIconPersistenceMirrorsSmokeLaunchArgumentToDefaults",
+        "cmuxTests/AppearanceSettingsTests/testBundleIconPersistenceRequiresBooleanPackageOptIn",
+        "cmuxTests/AppearanceSettingsTests/testBundleIconPersistenceSignedOptInAppliesBeforeAppDefaults",
+        "cmuxTests/AppearanceSettingsTests/testBundleIconPersistenceSignedOptInSurvivesArgumentFreeLaunch",
+        "cmuxTests/AppearanceSettingsTests/testBundleIconPersistenceAbsentOrFalseMetadataRestoresOfficialDefault",
+        "cmuxTests/AppearanceSettingsTests/testBundleIconPersistenceLaunchArgumentRemainsIndependentOfMetadata"
+      ],
+      "expected_failed_selectors": [],
+      "proof_scope": "New signed-metadata API behavior; no original-API red claim"
+    }
+  },
+  "full_target_compilation_constraint": "The tests-only stage changes only SessionPersistenceTests.swift. New icon tests use added APIs and must arrive with the production fix, because the app-host lane compiles the full cmuxTests target."
+}
