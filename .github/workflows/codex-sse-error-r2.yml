@@ -1,0 +1,218 @@
+name: Codex SSE error R2 source validation
+
+on:
+  push:
+    branches: [ci/codex-sse-error-20261112]
+    paths:
+      - .github/workflows/codex-sse-error-r2.yml
+      - integrations/codex-sse-error-r2/**
+      - integrations/codex-sse-cli-r1/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codex-sse-error-r2-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  rust-source-validation:
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "3"
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      CARGO_PROFILE_DEV_DEBUG: "none"
+      CARGO_PROFILE_TEST_DEBUG: "none"
+      RUST_MIN_STACK: "8388608"
+      INSTA_UPDATE: "no"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          path: validation
+          persist-credentials: false
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          repository: openai/codex
+          ref: 6aaac694803004a63c6f393d153c96d22521a6b9
+          path: codex
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8
+        with:
+          toolchain: "1.99.1"
+          components: rustfmt
+      - name: Verify exact clean source and unchanged dependency lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/sse-evidence"
+          rustc --version | tee "$RUNNER_TEMP/sse-evidence/rustc.txt"
+          python3 validation/integrations/codex-sse-error-r2/verify.py initialize --source codex --evidence "$RUNNER_TEMP/sse-evidence"
+          python3 validation/integrations/codex-sse-error-r2/verify.py apply-red --source codex
+      - name: Prove the original parser fails the exact regression
+        working-directory: codex/codex-rs
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +e
+          cargo test --locked --profile dev-small -p codex-api --lib sse::responses::error_delivery_regression_tests::named_writer_error_is_delivered_before_idle_without_eof -- --exact --test-threads=1 2>&1 | tee "$RUNNER_TEMP/sse-evidence/baseline-red.log"
+          pipeline_status=("${PIPESTATUS[@]}")
+          set -e
+          if (( pipeline_status[1] != 0 )); then exit "${pipeline_status[1]}"; fi
+          result=${pipeline_status[0]}
+          python3 ../../validation/integrations/codex-sse-error-r2/verify.py log --kind baseline-red --log "$RUNNER_TEMP/sse-evidence/baseline-red.log" --returncode "$result"
+      - name: Apply the frozen candidate and identical regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 validation/integrations/codex-sse-error-r2/verify.py remove-red --source codex
+          python3 validation/integrations/codex-sse-error-r2/verify.py apply-candidate --source codex
+          python3 validation/integrations/codex-sse-error-r2/verify.py apply-red --source codex
+      - name: Run all eight exact fixtures
+        working-directory: codex/codex-rs
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +e
+          cargo test --locked --profile dev-small -p codex-api --lib sse::responses::structured_error_tests -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/sse-evidence/eight-fixtures.log"
+          pipeline_status=("${PIPESTATUS[@]}")
+          set -e
+          if (( pipeline_status[1] != 0 )); then exit "${pipeline_status[1]}"; fi
+          result=${pipeline_status[0]}
+          python3 ../../validation/integrations/codex-sse-error-r2/verify.py log --kind targeted --log "$RUNNER_TEMP/sse-evidence/eight-fixtures.log" --returncode "$result"
+      - name: Require the original regression to turn green
+        working-directory: codex/codex-rs
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +e
+          cargo test --locked --profile dev-small -p codex-api --lib sse::responses::error_delivery_regression_tests::named_writer_error_is_delivered_before_idle_without_eof -- --exact --test-threads=1 2>&1 | tee "$RUNNER_TEMP/sse-evidence/candidate-red.log"
+          pipeline_status=("${PIPESTATUS[@]}")
+          set -e
+          if (( pipeline_status[1] != 0 )); then exit "${pipeline_status[1]}"; fi
+          result=${pipeline_status[0]}
+          python3 ../../validation/integrations/codex-sse-error-r2/verify.py log --kind candidate-red --log "$RUNNER_TEMP/sse-evidence/candidate-red.log" --returncode "$result"
+      - name: Existing SSE and HTTP bridge regressions
+        working-directory: codex/codex-rs
+        shell: bash
+        run: |
+          set -euo pipefail
+          for filter in sse::responses api_bridge::; do
+            label=${filter//:/_}
+            set +e
+            cargo test --locked --profile dev-small -p codex-api --lib "$filter" -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/sse-evidence/$label.log"
+            pipeline_status=("${PIPESTATUS[@]}")
+            set -e
+            if (( pipeline_status[1] != 0 )); then exit "${pipeline_status[1]}"; fi
+            result=${pipeline_status[0]}
+            python3 ../../validation/integrations/codex-sse-error-r2/verify.py log --kind related --log "$RUNNER_TEMP/sse-evidence/$label.log" --returncode "$result" || exit 1
+          done
+      - name: Existing protocol errors and debug telemetry regressions
+        working-directory: codex/codex-rs
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +e
+          cargo test --locked --profile dev-small -p codex-protocol --lib error::tests -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/sse-evidence/protocol-errors.log"
+          pipeline_status=("${PIPESTATUS[@]}")
+          set -e
+          if (( pipeline_status[1] != 0 )); then exit "${pipeline_status[1]}"; fi
+          result=${pipeline_status[0]}
+          python3 ../../validation/integrations/codex-sse-error-r2/verify.py log --kind related --log "$RUNNER_TEMP/sse-evidence/protocol-errors.log" --returncode "$result" || exit 1
+          set +e
+          cargo test --locked --profile dev-small -p codex-response-debug-context --lib -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/sse-evidence/debug-context.log"
+          pipeline_status=("${PIPESTATUS[@]}")
+          set -e
+          if (( pipeline_status[1] != 0 )); then exit "${pipeline_status[1]}"; fi
+          result=${pipeline_status[0]}
+          python3 ../../validation/integrations/codex-sse-error-r2/verify.py log --kind related --log "$RUNNER_TEMP/sse-evidence/debug-context.log" --returncode "$result"
+      - name: Typecheck sibling API error consumers
+        working-directory: codex/codex-rs
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check --locked --profile dev-small -p codex-guardian-v2 -p codex-cli --lib 2>&1 | tee "$RUNNER_TEMP/sse-evidence/sibling-consumers.log"
+          cargo check --locked --profile dev-small -p codex-cli --bin codex 2>&1 | tee "$RUNNER_TEMP/sse-evidence/cli-doctor.log"
+      - name: Verify frozen CLI smoke inputs and metadata validator
+        shell: bash
+        env:
+          CLI_SMOKE_PIN: 8976e0f1b9af2fb9454ed09d0280175a2963692b0eeec7dd34556763ad2061a6
+        run: |
+          set -euo pipefail
+          python3 -B - <<'PYIN'
+          import hashlib, json, os
+          from pathlib import Path
+          root = Path('validation/integrations/codex-sse-cli-r1')
+          pin = root / 'PINNED-FILES.json'
+          assert hashlib.sha256(pin.read_bytes()).hexdigest() == os.environ['CLI_SMOKE_PIN']
+          for name, expected in json.loads(pin.read_text()).items():
+              rel = Path(name)
+              assert not rel.is_absolute() and '..' not in rel.parts
+              assert hashlib.sha256((root / rel).read_bytes()).hexdigest() == expected, name
+          PYIN
+          python3 -B -m unittest discover -s validation/integrations/codex-sse-cli-r1 -p test_smoke.py -v > "$RUNNER_TEMP/sse-evidence/cli-verifier.log" 2>&1
+      - name: Build the real pinned R3 CLI with monitored capacity
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B validation/integrations/codex-sse-cli-r1/build.py --source codex --output "$RUNNER_TEMP/sse-evidence/cli-build"
+      - name: Real CLI must fail promptly while fake SSE remains open
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B - <<'PYIN'
+          import json, os, subprocess
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'sse-evidence'
+          result = json.loads((root / 'cli-build/RESULT.json').read_text())
+          assert result['status'] == 'PASS' and result['returncode'] == 0
+          assert result['child_reaped'] and result['source_matches_after'] and not result['runner_error']
+          binary = Path('codex') / result['artifact']['path']
+          subprocess.run(['python3', '-B', 'validation/integrations/codex-sse-cli-r1/smoke.py',
+                          '--binary', str(binary), '--binary-sha256', result['artifact']['sha256'],
+                          '--output', str(root / 'cli-smoke')], check=True)
+          PYIN
+      - name: Verify no dependency upgrades
+        if: always()
+        run: python3 validation/integrations/codex-sse-error-r2/verify.py graph --source codex
+      - name: Save formatting check separately without altering source
+        if: always()
+        working-directory: codex/codex-rs
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --binary > "$RUNNER_TEMP/sse-evidence/source-before-format.patch"
+          python3 ../../validation/integrations/codex-sse-error-r2/verify.py snapshot --source .. --log "$RUNNER_TEMP/sse-evidence/source-before-format.json" || exit 1
+          set +e
+          cargo fmt -- --config imports_granularity=Item --check > "$RUNNER_TEMP/sse-evidence/format.log" 2>&1
+          result=$?
+          set -e
+          echo "$result" > "$RUNNER_TEMP/sse-evidence/format.exit"
+          git diff --binary > "$RUNNER_TEMP/sse-evidence/source-after-format.patch"
+          python3 ../../validation/integrations/codex-sse-error-r2/verify.py snapshot --source .. --log "$RUNNER_TEMP/sse-evidence/source-after-format.json" || exit 1
+          cmp "$RUNNER_TEMP/sse-evidence/source-before-format.patch" "$RUNNER_TEMP/sse-evidence/source-after-format.patch" || exit 1
+          cmp "$RUNNER_TEMP/sse-evidence/source-before-format.json" "$RUNNER_TEMP/sse-evidence/source-after-format.json" || exit 1
+          exit "$result"
+      - name: Preserve original compiler and test evidence including failure
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: codex-sse-r2-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/sse-evidence/*.json
+            ${{ runner.temp }}/sse-evidence/*.log
+            ${{ runner.temp }}/sse-evidence/*.txt
+            ${{ runner.temp }}/sse-evidence/*.exit
+            ${{ runner.temp }}/sse-evidence/*.patch
+            ${{ runner.temp }}/sse-evidence/*.toml
+            ${{ runner.temp }}/sse-evidence/*.lock
+            ${{ runner.temp }}/sse-evidence/cli-build/RESULT.json
+            ${{ runner.temp }}/sse-evidence/cli-build/build.log
+            ${{ runner.temp }}/sse-evidence/cli-smoke/RESULT.json
+            ${{ runner.temp }}/sse-evidence/cli-smoke/stdout.jsonl
+            ${{ runner.temp }}/sse-evidence/cli-smoke/stderr.log
+            ${{ runner.temp }}/sse-evidence/cli-smoke/codex.sb
+          if-no-files-found: error
+          retention-days: 14

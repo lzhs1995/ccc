@@ -1,0 +1,77 @@
+--- a/codex-rs/codex-api/src/sse/responses.rs
++++ b/codex-rs/codex-api/src/sse/responses.rs
+@@ -34,6 +34,10 @@
+ const OPENAI_MODEL_HEADER: &str = "openai-model";
+ const REQUEST_ID_HEADER: &str = "x-request-id";
+ const TRUSTED_ACCESS_FOR_CYBER_VERIFICATION: &str = "trusted_access_for_cyber";
++
++#[cfg(test)]
++#[path = "responses_error_delivery_regression_tests.rs"]
++mod error_delivery_regression_tests;
+ 
+ pub fn spawn_response_stream(
+     stream_response: StreamResponse,
+--- /dev/null
++++ b/codex-rs/codex-api/src/sse/responses_error_delivery_regression_tests.rs
+@@ -0,0 +1,61 @@
++//! Runs on the original API as well as the structured-error candidate.
++
++use super::process_sse;
++use bytes::Bytes;
++use codex_client::ByteStream;
++use codex_client::TransportError;
++use futures::StreamExt;
++use futures::stream;
++use std::time::Duration;
++use tokio::sync::mpsc;
++
++#[tokio::test(start_paused = true)]
++async fn named_writer_error_is_delivered_before_idle_without_eof() {
++    const MESSAGE: &str =
++        "Opaque continuation writer failed; unsafe cross-writer replay was withheld.";
++    let wire = concat!(
++        "event: error\n",
++        "data: {\"type\":\"error\",\"error\":{\"type\":\"server_error\",",
++        "\"code\":\"continuation_writer_unavailable\",",
++        "\"message\":\"Opaque continuation writer failed; unsafe cross-writer replay was withheld.\"}}\n\n"
++    );
++    let bytes: ByteStream = Box::pin(
++        stream::iter([Ok::<Bytes, TransportError>(Bytes::from_static(
++            wire.as_bytes(),
++        ))])
++        .chain(stream::pending()),
++    );
++    let idle = Duration::from_secs(60);
++    let deadline = Duration::from_secs(1);
++    let (tx, mut rx) = mpsc::channel(8);
++    let mut worker = tokio::spawn(process_sse(bytes, tx, idle, None));
++    let started = tokio::time::Instant::now();
++    let first = tokio::time::timeout(deadline, rx.recv()).await;
++
++    // Reap the actual reader on both green and red before reporting the assertion.
++    // The pending upstream intentionally supplies neither EOF nor a completion event.
++    drop(rx);
++    let stopped = tokio::time::timeout(deadline, &mut worker).await;
++    if stopped.is_err() {
++        worker.abort();
++        let _ = worker.await;
++        panic!("SSE reader did not stop after its receiver was closed");
++    }
++    stopped.unwrap().expect("SSE reader task panicked");
++
++    let error = match first {
++        Ok(Some(Err(error))) => error,
++        Err(_) => {
++            panic!("explicit SSE error was ignored until the 1-second assertion deadline")
++        }
++        other => panic!("expected the original terminal SSE error, got {other:?}"),
++    };
++    assert!(
++        started.elapsed() < idle,
++        "reader waited for its idle timeout"
++    );
++    assert!(
++        error.to_string().contains(MESSAGE),
++        "original error message was replaced: {error}"
++    );
++}

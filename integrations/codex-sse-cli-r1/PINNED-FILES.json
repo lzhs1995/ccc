@@ -1,0 +1,7 @@
+{
+  "BUILD-INPUTS.json": "2d4a381638619bba003a6fe5133318c1ba1f477695928d0719d7d372895a99de",
+  "README.md": "3bb06a82feaa27a041d39f4597f6fd62c5a65ed86eca4334cbb0363886f04f55",
+  "build.py": "2f83a63f02ed2342edede4b52e11d92b3b92c5bf519b3e5008f2a8d6db218e78",
+  "smoke.py": "0f3224008bf937c3134a976a8c4f16f88378d77036a1f7c2dc9729ffc966cd00",
+  "test_smoke.py": "c33112dacb3eed4725a63d8422d5c66ba4afa9ec8fb06140aee2bfcaffb139e6"
+}
