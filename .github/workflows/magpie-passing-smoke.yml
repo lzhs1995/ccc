@@ -23,7 +23,7 @@ jobs:
     timeout-minutes: 80
     env:
       PACKAGE_DIR: validation/magpie-passing-smoke-r1
-      PACKAGE_PIN: 697370dc3447c5726d5569dede793dead3575a789a61ca6f98826e6dc5917a3a
+      PACKAGE_PIN: dda665921f737aa3c014d2f6e33ff8f9520d26af2ed2ecdb611565e7e1bcdc9a
       GOTOOLCHAIN: local
       GOWORK: 'off'
       GOENV: 'off'

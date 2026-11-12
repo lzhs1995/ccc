@@ -19,7 +19,7 @@ import threading
 import time
 import uuid
 import fixture
-from common import FLOOR, SMOKE_HEADROOM, admit, capacity, digest, gha_only, pin, require, save, stop_owned, verify_package
+from common import FLOOR, SMOKE_HEADROOM, admit, capacity, digest, gha_only, no_portable_selector, pin, require, save, stop_owned, verify_package
 
 CASE_NAMES = ('baseline-comments', 'silent', 'comments', 'half-frame')
 
@@ -219,6 +219,7 @@ def run_case(name, binary, binary_pin, codex, private_parent, output, installati
     try:
         admit(output, SMOKE_HEADROOM, result['samples'])
         require(pin(binary) == binary_pin, 'binary changed before case')
+        no_portable_selector(binary)
         require(identity(installation) == installation_before, 'installation changed before case')
         private = Path(tempfile.mkdtemp(prefix='passing-case-', dir=private_parent)).resolve()
         for leaf in ['tmp', 'config', 'cache', 'data', 'state', 'runtime', 'codex-log', 'codex-sqlite']:
@@ -242,6 +243,7 @@ def run_case(name, binary, binary_pin, codex, private_parent, output, installati
         env = child_environment(private);env['MAGPIE_ADDR'] = f'127.0.0.1:{gateway}'
         sb = private / 'gateway.sb';sb.write_text(policy(binary, private, server.server_port, bind_port=gateway))
         reservation.close();reservation = None
+        no_portable_selector(binary)
         with (output / 'gateway.stdout').open('x') as out, (output / 'gateway.stderr').open('x') as err:
             gateway_child = subprocess.Popen(['/usr/bin/sandbox-exec', '-f', str(sb), str(binary), 'serve'],
                                             cwd=private, env=env, stdin=subprocess.DEVNULL, stdout=out,

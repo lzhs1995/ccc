@@ -37,6 +37,15 @@ def save(path, value):
     Path(path).write_text(json.dumps(value, indent=2) + '\n')
 
 
+def no_portable_selector(binary):
+    """Magpie's executable-adjacent portable selector takes precedence over XDG."""
+    binary = Path(binary).resolve(strict=True)
+    for name in ('data', '.portable'):
+        selector = binary.parent / name
+        require(not selector.exists() and not selector.is_symlink(),
+                'portable selector beside smoke binary would bypass private XDG configuration: ' + name)
+
+
 def gha_only():
     require(os.environ.get('GITHUB_ACTIONS') == 'true', 'execution requires the disposable GHA runner')
     require(platform.system() == 'Darwin' and platform.machine() == 'arm64', 'requires Darwin arm64')

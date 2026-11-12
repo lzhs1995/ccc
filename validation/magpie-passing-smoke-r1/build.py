@@ -4,7 +4,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
-from common import digest, gha_only, pin, require, run_guarded, save, verify_package, verify_source
+from common import digest, gha_only, no_portable_selector, pin, require, run_guarded, save, verify_package, verify_source
 
 
 def main():
@@ -34,7 +34,7 @@ def main():
         env = os.environ.copy()
         env.update(GOTOOLCHAIN='local', GOWORK='off', GOENV='off', GOFLAGS='', GOEXPERIMENT='',
                    GOOS='darwin', GOARCH='arm64', CGO_ENABLED='1', GOMAXPROCS='2')
-        for key, name in [('TMPDIR', 'tmp'), ('XDG_CONFIG_HOME', 'config'), ('XDG_CACHE_HOME', 'cache'), ('XDG_DATA_HOME', 'data')]:
+        for key, name in [('TMPDIR', 'tmp'), ('XDG_CONFIG_HOME', 'config'), ('XDG_CACHE_HOME', 'cache'), ('XDG_DATA_HOME', 'xdg-data')]:
             d = output / name
             d.mkdir()
             env[key] = str(d)
@@ -57,6 +57,7 @@ def main():
         argv = ['go', 'build', '-p=1', '-mod=readonly', '-tags=production', '-trimpath',
                 '-buildvcs=false', '-ldflags=-s -w -X main.version=' + version, '-o', str(binary), '.']
         result['build'] = run_guarded(argv, source, env, output / 'compile', 1200)
+        no_portable_selector(binary)
         result['binary'] = pin(binary)
         result['binary_name'] = binary.name
         result['version'] = version

@@ -12,7 +12,7 @@ import unittest
 from unittest.mock import Mock, patch
 import fixture
 import smoke
-from common import FLOOR, SMOKE_HEADROOM, admit, pin, stop_owned, verify_source
+from common import FLOOR, SMOKE_HEADROOM, admit, no_portable_selector, pin, stop_owned, verify_source
 from fetch_client import extract
 from audit import audit
 
@@ -150,6 +150,27 @@ class IsolationTests(unittest.TestCase):
 
 
 class CapacitySourceAndArchiveTests(unittest.TestCase):
+    def test_binary_without_portable_selector(self):
+        with tempfile.TemporaryDirectory() as d:
+            binary=Path(d)/'magpie';binary.write_text('synthetic')
+            (Path(d)/'xdg-data').mkdir()
+            no_portable_selector(binary)
+
+    def test_build_data_selector_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            binary=Path(d)/'magpie';binary.write_text('synthetic');(Path(d)/'data').mkdir()
+            with self.assertRaises(RuntimeError):no_portable_selector(binary)
+
+    def test_portable_marker_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            binary=Path(d)/'magpie';binary.write_text('synthetic');(Path(d)/'.portable').touch()
+            with self.assertRaises(RuntimeError):no_portable_selector(binary)
+
+    def test_dangling_selector_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            binary=Path(d)/'magpie';binary.write_text('synthetic');(Path(d)/'data').symlink_to(Path(d)/'missing')
+            with self.assertRaises(RuntimeError):no_portable_selector(binary)
+
     def test_floor_rejects_before_command(self):
         with patch('common.capacity', return_value={'free_bytes': FLOOR + SMOKE_HEADROOM - 1}), patch('common.time.sleep'):
             with self.assertRaises(RuntimeError): admit(Path('.'), SMOKE_HEADROOM, [])
