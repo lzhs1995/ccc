@@ -1,0 +1,43 @@
+{
+  "upstream_commit": "6aaac694803004a63c6f393d153c96d22521a6b9",
+  "upstream_tree": "d0caeb3c076fbeade281c18295fada090c52cf8f",
+  "candidate_patch_sha256": "46c6ba1e88b6653187b8eca2872005df42ae882d50d57cfdd3fd5a055a8fb49f",
+  "original_ci_manifest_sha256": "7799d884ffc208de82b80c1f651b0ce524bf40474176da6b63baa49993f9134b",
+  "toolchain": "1.99.1",
+  "profile": "dev-small",
+  "target": "aarch64-apple-darwin",
+  "source_files": {
+    "codex-rs/protocol/src/error.rs": "c294df189fd5db1c40be9f83cf5ad29a7b3670e492446ab17ece9375ca49f415",
+    "codex-rs/codex-api/src/error.rs": "b56c4cb22a47600b4f48c062405b5d0afc41e922db5e77194d88ed5b23d62718",
+    "codex-rs/codex-api/src/api_bridge.rs": "b8f09f0f1dd9c2fcd9c88e7df127e0720e04c900852ec7102e255516407e20fb",
+    "codex-rs/codex-api/src/sse/responses.rs": "e3a79139075bf427c4aaf25c28ba5b144ddc280d316d20a589173a03eb232b02",
+    "codex-rs/codex-api/src/sse/responses_error.rs": "25f103879fbf25bc8c270e45e5818d9e1f99e9eda48a198b42e911519d1f05b8",
+    "codex-rs/response-debug-context/src/lib.rs": "1a1edc5229341a6c3ea1672c57d778342f02c1cb2dd46b63519bc623b846b95c",
+    "codex-rs/cli/src/doctor.rs": "6dc3ca22b983c95809bb121c925a9140446d85e800d8cace7804a3b1168a5713",
+    "codex-rs/ext/guardian-v2/src/async_scorer/metrics.rs": "15ec543c9b2210153e74953beedb56c0c28c7256d44168f24d55bdf6f96cc4f0",
+    "codex-rs/ext/guardian-v2/src/async_scorer/sampler/execution.rs": "90b7416f5401702b8369a444da1c84b1d13e3cc144b430c4a8da5b9b6c060d4a",
+    "codex-rs/codex-api/src/sse/responses_structured_error_tests.rs": "5237a26cb0f75359ee9b1569d4a9a147dc2366af43c5ca1151cc9e86a1818e06",
+    "codex-rs/codex-api/src/sse/responses_error_delivery_regression_tests.rs": "df52fb18a73b56b406cdd0afbbe15668f549f218900a3ab9c33dd79faef69afe",
+    "codex-rs/Cargo.lock": "7ec2bfabf3b967c00409b85489076f8df3849745d3e469473d88288322adeb4a",
+    "codex-rs/Cargo.toml": "f68b00f9afaefe023edee94111659f0f583113ca7855115a1a892e054ded8f95",
+    "codex-rs/exec/src/exec_events.rs": "dafa872d7e86a099e56e28a329dcb9c03db90ed768c3b88cca8c91d46dc1d0e5",
+    "codex-rs/exec/src/event_processor_with_jsonl_output.rs": "bc296541b385f9b4ca2c28cc638e25a8d6b1332b2cd67f5a03eaa97a3d612b19",
+    "codex-rs/cli/Cargo.toml": "7ab9c3a99a5e500a6f62951bc1ade742e5885b3eaf50d005bbde6ce068cec20a"
+  },
+  "cli_json_error_fields": [
+    "message"
+  ],
+  "build_command": [
+    "cargo",
+    "build",
+    "--locked",
+    "--profile",
+    "dev-small",
+    "-p",
+    "codex-cli",
+    "--bin",
+    "codex"
+  ],
+  "test_workspace_version": "0.0.0",
+  "source_revision": "R3 with identical cfg(test) baseline regression present"
+}
