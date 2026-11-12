@@ -1,0 +1,67 @@
+{
+  "schema": "codex-sse-r2-ci-input-v1",
+  "upstream_repository": "openai/codex",
+  "upstream_commit": "6aaac694803004a63c6f393d153c96d22521a6b9",
+  "upstream_tree": "d0caeb3c076fbeade281c18295fada090c52cf8f",
+  "candidate_freeze_sha256": "dd2930d3f0f40a78255c617006ffebc18441b57be77222df3abd158338c25397",
+  "candidate_patch_sha256": "373da5673208f23e5f885cc355a9854862332fd892d1f92e52428a19b2f680a1",
+  "toolchain": "1.99.1",
+  "source_files": {
+    "codex-rs/protocol/src/error.rs": {
+      "before_sha256": "1d2d3c6099cc85ab36b86cbb81d740c10ce37ec8fe7c232c31845b6e68f08e05",
+      "after_sha256": "6c24c1ec843fa67fbb663cd23c1316c572cf5c0418ba07fc9b89382e2db584c6"
+    },
+    "codex-rs/codex-api/src/error.rs": {
+      "before_sha256": "58901fcb3f1e68584522f4f18a56a9ef9c5f1e782c6e778c0a80c0ca9ce250f7",
+      "after_sha256": "ddac990373d92d307583f228799147154fa5384a19e78ba12ffbc63e1133e6db"
+    },
+    "codex-rs/codex-api/src/api_bridge.rs": {
+      "before_sha256": "fe77e6d628a20d0f00b667e7a0e8fd454067d6b0fa9983f4e383828941925243",
+      "after_sha256": "0c3dca93591b071c7fb975a7300131425a7f21594fc6b4f899c9c7372596f0c6"
+    },
+    "codex-rs/codex-api/src/sse/responses.rs": {
+      "before_sha256": "c58b85803937e43eb66adf6148d8f8fcca8e7badf43c1e96a747c9e56ae4e618",
+      "after_sha256": "d112e7ca7455e193b0beaee6f1e63476b8449e8c947b016fd09150212cc2ffd7"
+    },
+    "codex-rs/codex-api/src/sse/responses_error.rs": {
+      "before_sha256": "c5236fe61f2a75e79b94b28565d69b7d1c00d208a6955ce173e799659a321f05",
+      "after_sha256": "67e2cc03490c143f2d5e98ce750d45be271068c203bae64030b2349960def78b"
+    },
+    "codex-rs/response-debug-context/src/lib.rs": {
+      "before_sha256": "3e18fbee99726713fd634d8ca901482ef376abf52bb52466451d0cf4fdba6ffe",
+      "after_sha256": "1a1edc5229341a6c3ea1672c57d778342f02c1cb2dd46b63519bc623b846b95c"
+    },
+    "codex-rs/cli/src/doctor.rs": {
+      "before_sha256": "abe13026f1d5ff05a78db167c79cba8c1cf67df89dd6068a5c1d1b1d5b6cf332",
+      "after_sha256": "6dc3ca22b983c95809bb121c925a9140446d85e800d8cace7804a3b1168a5713"
+    },
+    "codex-rs/ext/guardian-v2/src/async_scorer/metrics.rs": {
+      "before_sha256": "a6ff6d7d22332ad8da08350596ff23410dd8d5d3678c64a3cb7119f0bb553be1",
+      "after_sha256": "15ec543c9b2210153e74953beedb56c0c28c7256d44168f24d55bdf6f96cc4f0"
+    },
+    "codex-rs/ext/guardian-v2/src/async_scorer/sampler/execution.rs": {
+      "before_sha256": "cf7200b53b5a9fbe2ab4040444388e187c2e5c89ddbabcde69743754d35996e9",
+      "after_sha256": "90b7416f5401702b8369a444da1c84b1d13e3cc144b430c4a8da5b9b6c060d4a"
+    },
+    "codex-rs/codex-api/src/sse/responses_structured_error_tests.rs": {
+      "before_sha256": null,
+      "after_sha256": "fda9a1e4b91f2c5abb3e90e9c6dc2b7c2972735c558d3c91eea1e77ac67f7d1f"
+    }
+  },
+  "cargo_lock_sha256": "7ec2bfabf3b967c00409b85489076f8df3849745d3e469473d88288322adeb4a",
+  "workspace_manifest_sha256": "11ce75d44b3fdc2cf92770ba0dd9e642a214dbf230fb2ef609d0805049f0887f",
+  "test_workspace_manifest_sha256": "f68b00f9afaefe023edee94111659f0f583113ca7855115a1a892e054ded8f95",
+  "test_version": "0.0.0",
+  "expected_tests": [
+    "sse::responses::structured_error_tests::writer_error_is_preserved_for_http_and_sse",
+    "sse::responses::structured_error_tests::flat_and_nested_errors_end_before_later_completion",
+    "sse::responses::structured_error_tests::malformed_named_errors_are_not_ignored",
+    "sse::responses::structured_error_tests::error_at_eof_preserves_code_and_retry_deadline",
+    "sse::responses::structured_error_tests::flex_and_quota_keep_existing_terminal_semantics",
+    "sse::responses::structured_error_tests::receiver_cancellation_still_releases_pending_reader",
+    "sse::responses::structured_error_tests::malformed_http_diagnostic_does_not_create_structured_code",
+    "sse::responses::structured_error_tests::all_unit_constructors_and_annotations_preserve_error_metadata"
+  ],
+  "expected_fixture_count": 8,
+  "independent_review_sha256": "54b11bfbe369cec945127dc35079228a24c85727354a9ad7b2ef746dd89d46a4"
+}
