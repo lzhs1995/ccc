@@ -1,0 +1,13 @@
+{
+  "ACTIONS-READBACK.json": "9c674d311b1e49d4fbf7bf3835913e6221b648edc7091539534eaabbbf7ff906",
+  "README.md": "fea12ee73f9d3208fd9fda5a6b6d0e07e450883d10ba9d431795cb018b327e21",
+  "SOURCE-MANIFEST.json": "ec4dd2e01e444bf8128fdc531db3cb53c33f44f48a257b68c19bc7e4ba4e2cfb",
+  "UPSTREAM-READBACK.json": "8fe3383c0dcd69b99cd8b85298b05de5f12490d0e7b656ad0a775a90098266be",
+  "candidate.patch": "5ce6768f6f6bdc5eeaa7ac3fa2abfd9909809e0726b637fbb4d90581b1be2dd6",
+  "prepare_source.py": "79db03df16c7e56eb70be6b299e625e5d9f48c3a8b4395dea1b5b0d157bef323",
+  "red.patch": "4be739e3ad9d1a25c03f2b537582f6e5d5791ea47c1b60936ac0fe6cea37c202",
+  "run_case.py": "4a52c449a0a1be6c2005acdfa71cc3ab2d5cea9557b50636d6e5291463cb1798",
+  "summarize.py": "bc82dc8084b8e9abcfd1e960861777ece51a09a0461211c414410372674e4efd",
+  "test_verify.py": "432ccc356ec8e851c6a8de5969b6a87e24eb570aa6f0cb2335f2e1d6e716389a",
+  "verify.py": "e368ca18544fa9dda9440be587b48ff8b0399ceb490d25b9b22db7ca3f41bb07"
+}
