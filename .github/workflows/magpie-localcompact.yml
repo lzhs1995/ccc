@@ -1,0 +1,117 @@
+name: Magpie localcompact R5
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - ci/magpie-localcompact-20261112
+    paths:
+      - 'validation/magpie-localcompact-r1/**'
+      - '.github/workflows/magpie-localcompact.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: magpie-localcompact-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    if: github.ref == 'refs/heads/ci/magpie-localcompact-20261112'
+    runs-on: macos-15
+    timeout-minutes: 80
+    env:
+      PACKAGE_DIR: validation/magpie-localcompact-r1
+      PACKAGE_PIN: 03e4e15987b7b131d018413df8e845769d9fe87f6b56c74d1fb5ceb9519af881
+      GOTOOLCHAIN: local
+      GOWORK: 'off'
+      GOENV: 'off'
+      GOMAXPROCS: '2'
+      GOOS: darwin
+      GOARCH: arm64
+      CGO_ENABLED: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Checkout validation package
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Bootstrap public input hashes
+        run: |
+          python3 -B - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          root = Path(os.environ['PACKAGE_DIR'])
+          pin = root / 'PINNED-FILES.json'
+          assert hashlib.sha256(pin.read_bytes()).hexdigest() == os.environ['PACKAGE_PIN'], 'package manifest changed'
+          for name, expected in json.loads(pin.read_text()).items():
+              rel = Path(name)
+              assert not rel.is_absolute() and '..' not in rel.parts
+              assert hashlib.sha256((root / rel).read_bytes()).hexdigest() == expected, name
+          PY
+      - name: Test JSON verifier and owned-child cleanup
+        run: |
+          mkdir -p results
+          python3 -B -m unittest discover -s "$PACKAGE_DIR" -p test_verify.py -v > results/verifier-tests.log 2>&1
+          cat results/verifier-tests.log
+      - name: Checkout exact public Magpie base
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: yetone/magpie
+          ref: 86254d4049cb6be4a2ccdab02edf0bd59860c603
+          path: magpie
+          persist-credentials: false
+      - name: Install pinned Go toolchain
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version: '1.26.8'
+          check-latest: false
+          cache: false
+      - name: Apply candidate and verify every source file
+        run: |
+          python3 -B "$PACKAGE_DIR/prepare_source.py" --source magpie --package-pin "$PACKAGE_PIN" > results/source-preparation.log 2>&1
+          cat results/source-preparation.log
+      - name: Download locked public modules
+        id: dependencies
+        env:
+          GOFLAGS: -mod=readonly
+        run: |
+          python3 -B - <<'PY'
+          import platform, shutil
+          assert platform.system() == 'Darwin' and platform.machine() == 'arm64'
+          assert shutil.disk_usage('.').free >= 30 * 2**30, 'below 30 GiB floor before module download'
+          PY
+          cd magpie
+          go mod download > ../results/module-download.log 2>&1
+          git diff --exit-code -- go.mod go.sum
+      - name: Focused local compaction tests (11)
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
+        run: python3 -B "$PACKAGE_DIR/run_case.py" focused --source magpie --output results/focused --package-pin "$PACKAGE_PIN"
+      - name: Compatibility tests (36)
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
+        run: python3 -B "$PACKAGE_DIR/run_case.py" compat --source magpie --output results/compat --package-pin "$PACKAGE_PIN"
+      - name: Race detection (11 tests x 3)
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
+        run: python3 -B "$PACKAGE_DIR/run_case.py" race --source magpie --output results/race --package-pin "$PACKAGE_PIN"
+      - name: Genuine baseline missing-heartbeat RED
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
+        run: python3 -B "$PACKAGE_DIR/run_case.py" red --source magpie --output results/red --package-pin "$PACKAGE_PIN"
+      - name: Revalidate all four actual test JSON logs
+        if: ${{ !cancelled() }}
+        run: python3 -B "$PACKAGE_DIR/summarize.py" --results results --package-pin "$PACKAGE_PIN"
+      - name: Preserve exact inputs and all attempted results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: magpie-localcompact-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            results/**/*.json
+            results/**/*.jsonl
+            results/**/*.log
+            validation/magpie-localcompact-r1/PINNED-FILES.json
+            validation/magpie-localcompact-r1/SOURCE-MANIFEST.json
+            validation/magpie-localcompact-r1/candidate.patch
+            validation/magpie-localcompact-r1/red.patch
+          if-no-files-found: error
+          retention-days: 14

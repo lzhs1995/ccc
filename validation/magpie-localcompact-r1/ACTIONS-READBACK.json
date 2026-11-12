@@ -1,0 +1,11 @@
+{
+  "verified_via": "gh api, read-only",
+  "actions": {
+    "actions/checkout@v4": "11d5960a326750d5838078e36cf38b85af677262",
+    "actions/setup-go@v5": "40f1582b2485089dde7abd97c1529aa768e1baff",
+    "actions/upload-artifact@v4": "ea165f8d65b6e75b540449e92b4886f43607fa02"
+  },
+  "runner_label": "macos-15",
+  "runner_architecture": "arm64",
+  "runner_source": "https://github.com/actions/runner-images/blob/main/README.md"
+}
