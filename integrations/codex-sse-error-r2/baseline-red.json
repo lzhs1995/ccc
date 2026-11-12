@@ -1,7 +1,7 @@
 {
   "schema": "codex-sse-baseline-regression-ci-v1",
-  "patch_sha256": "6bc2c659a2f4c2206a877291c89939e75075433800028bb299e3330ae048d828",
-  "test_sha256": "e1b97bc85826c47bd1f2fd75e16224d70feb5ff555e9266262ede0278c6d8123",
+  "patch_sha256": "c9f287657f1c0ea9bf3cf91f881c554724119bc976f32b6eec340722b23955c5",
+  "test_sha256": "df52fb18a73b56b406cdd0afbbe15668f549f218900a3ab9c33dd79faef69afe",
   "test_name": "sse::responses::error_delivery_regression_tests::named_writer_error_is_delivered_before_idle_without_eof",
   "expected_panic": "explicit SSE error was ignored until the 1-second assertion deadline",
   "expected_count": 1,

@@ -54,9 +54,13 @@ jobs:
         working-directory: codex/codex-rs
         shell: bash
         run: |
-          set -uo pipefail
+          set -euo pipefail
+          set +e
           cargo test --locked --profile dev-small -p codex-api --lib sse::responses::error_delivery_regression_tests::named_writer_error_is_delivered_before_idle_without_eof -- --exact --test-threads=1 2>&1 | tee "$RUNNER_TEMP/sse-evidence/baseline-red.log"
-          result=${PIPESTATUS[0]}
+          pipeline_status=("${PIPESTATUS[@]}")
+          set -e
+          if (( pipeline_status[1] != 0 )); then exit "${pipeline_status[1]}"; fi
+          result=${pipeline_status[0]}
           python3 ../../validation/integrations/codex-sse-error-r2/verify.py log --kind baseline-red --log "$RUNNER_TEMP/sse-evidence/baseline-red.log" --returncode "$result"
       - name: Apply the frozen candidate and identical regression
         shell: bash
@@ -69,39 +73,59 @@ jobs:
         working-directory: codex/codex-rs
         shell: bash
         run: |
-          set -uo pipefail
+          set -euo pipefail
+          set +e
           cargo test --locked --profile dev-small -p codex-api --lib sse::responses::structured_error_tests -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/sse-evidence/eight-fixtures.log"
-          result=${PIPESTATUS[0]}
+          pipeline_status=("${PIPESTATUS[@]}")
+          set -e
+          if (( pipeline_status[1] != 0 )); then exit "${pipeline_status[1]}"; fi
+          result=${pipeline_status[0]}
           python3 ../../validation/integrations/codex-sse-error-r2/verify.py log --kind targeted --log "$RUNNER_TEMP/sse-evidence/eight-fixtures.log" --returncode "$result"
       - name: Require the original regression to turn green
         working-directory: codex/codex-rs
         shell: bash
         run: |
-          set -uo pipefail
+          set -euo pipefail
+          set +e
           cargo test --locked --profile dev-small -p codex-api --lib sse::responses::error_delivery_regression_tests::named_writer_error_is_delivered_before_idle_without_eof -- --exact --test-threads=1 2>&1 | tee "$RUNNER_TEMP/sse-evidence/candidate-red.log"
-          result=${PIPESTATUS[0]}
+          pipeline_status=("${PIPESTATUS[@]}")
+          set -e
+          if (( pipeline_status[1] != 0 )); then exit "${pipeline_status[1]}"; fi
+          result=${pipeline_status[0]}
           python3 ../../validation/integrations/codex-sse-error-r2/verify.py log --kind candidate-red --log "$RUNNER_TEMP/sse-evidence/candidate-red.log" --returncode "$result"
       - name: Existing SSE and HTTP bridge regressions
         working-directory: codex/codex-rs
         shell: bash
         run: |
-          set -uo pipefail
+          set -euo pipefail
           for filter in sse::responses api_bridge::; do
             label=${filter//:/_}
+            set +e
             cargo test --locked --profile dev-small -p codex-api --lib "$filter" -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/sse-evidence/$label.log"
-            result=${PIPESTATUS[0]}
+            pipeline_status=("${PIPESTATUS[@]}")
+            set -e
+            if (( pipeline_status[1] != 0 )); then exit "${pipeline_status[1]}"; fi
+            result=${pipeline_status[0]}
             python3 ../../validation/integrations/codex-sse-error-r2/verify.py log --kind related --log "$RUNNER_TEMP/sse-evidence/$label.log" --returncode "$result" || exit 1
           done
       - name: Existing protocol errors and debug telemetry regressions
         working-directory: codex/codex-rs
         shell: bash
         run: |
-          set -uo pipefail
+          set -euo pipefail
+          set +e
           cargo test --locked --profile dev-small -p codex-protocol --lib error::tests -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/sse-evidence/protocol-errors.log"
-          result=${PIPESTATUS[0]}
+          pipeline_status=("${PIPESTATUS[@]}")
+          set -e
+          if (( pipeline_status[1] != 0 )); then exit "${pipeline_status[1]}"; fi
+          result=${pipeline_status[0]}
           python3 ../../validation/integrations/codex-sse-error-r2/verify.py log --kind related --log "$RUNNER_TEMP/sse-evidence/protocol-errors.log" --returncode "$result" || exit 1
+          set +e
           cargo test --locked --profile dev-small -p codex-response-debug-context --lib -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/sse-evidence/debug-context.log"
-          result=${PIPESTATUS[0]}
+          pipeline_status=("${PIPESTATUS[@]}")
+          set -e
+          if (( pipeline_status[1] != 0 )); then exit "${pipeline_status[1]}"; fi
+          result=${pipeline_status[0]}
           python3 ../../validation/integrations/codex-sse-error-r2/verify.py log --kind related --log "$RUNNER_TEMP/sse-evidence/debug-context.log" --returncode "$result"
       - name: Typecheck sibling API error consumers
         working-directory: codex/codex-rs
@@ -118,11 +142,13 @@ jobs:
         working-directory: codex/codex-rs
         shell: bash
         run: |
-          set -uo pipefail
+          set -euo pipefail
           git diff --binary > "$RUNNER_TEMP/sse-evidence/source-before-format.patch"
           python3 ../../validation/integrations/codex-sse-error-r2/verify.py snapshot --source .. --log "$RUNNER_TEMP/sse-evidence/source-before-format.json" || exit 1
+          set +e
           cargo fmt -- --config imports_granularity=Item --check > "$RUNNER_TEMP/sse-evidence/format.log" 2>&1
           result=$?
+          set -e
           echo "$result" > "$RUNNER_TEMP/sse-evidence/format.exit"
           git diff --binary > "$RUNNER_TEMP/sse-evidence/source-after-format.patch"
           python3 ../../validation/integrations/codex-sse-error-r2/verify.py snapshot --source .. --log "$RUNNER_TEMP/sse-evidence/source-after-format.json" || exit 1
