@@ -1,31 +1,31 @@
 {
-  "schema": "codex-sse-r2-ci-input-v1",
+  "schema": "codex-sse-r3-ci-input-v1",
   "upstream_repository": "openai/codex",
   "upstream_commit": "6aaac694803004a63c6f393d153c96d22521a6b9",
   "upstream_tree": "d0caeb3c076fbeade281c18295fada090c52cf8f",
-  "candidate_freeze_sha256": "dd2930d3f0f40a78255c617006ffebc18441b57be77222df3abd158338c25397",
-  "candidate_patch_sha256": "373da5673208f23e5f885cc355a9854862332fd892d1f92e52428a19b2f680a1",
+  "candidate_freeze_sha256": "cb4f717af75eea6821199bd9fcf9de4859ea79691d5c95eabbda8e49d0f85053",
+  "candidate_patch_sha256": "46c6ba1e88b6653187b8eca2872005df42ae882d50d57cfdd3fd5a055a8fb49f",
   "toolchain": "1.99.1",
   "source_files": {
     "codex-rs/protocol/src/error.rs": {
       "before_sha256": "1d2d3c6099cc85ab36b86cbb81d740c10ce37ec8fe7c232c31845b6e68f08e05",
-      "after_sha256": "6c24c1ec843fa67fbb663cd23c1316c572cf5c0418ba07fc9b89382e2db584c6"
+      "after_sha256": "c294df189fd5db1c40be9f83cf5ad29a7b3670e492446ab17ece9375ca49f415"
     },
     "codex-rs/codex-api/src/error.rs": {
       "before_sha256": "58901fcb3f1e68584522f4f18a56a9ef9c5f1e782c6e778c0a80c0ca9ce250f7",
-      "after_sha256": "ddac990373d92d307583f228799147154fa5384a19e78ba12ffbc63e1133e6db"
+      "after_sha256": "b56c4cb22a47600b4f48c062405b5d0afc41e922db5e77194d88ed5b23d62718"
     },
     "codex-rs/codex-api/src/api_bridge.rs": {
       "before_sha256": "fe77e6d628a20d0f00b667e7a0e8fd454067d6b0fa9983f4e383828941925243",
-      "after_sha256": "0c3dca93591b071c7fb975a7300131425a7f21594fc6b4f899c9c7372596f0c6"
+      "after_sha256": "b8f09f0f1dd9c2fcd9c88e7df127e0720e04c900852ec7102e255516407e20fb"
     },
     "codex-rs/codex-api/src/sse/responses.rs": {
       "before_sha256": "c58b85803937e43eb66adf6148d8f8fcca8e7badf43c1e96a747c9e56ae4e618",
-      "after_sha256": "d112e7ca7455e193b0beaee6f1e63476b8449e8c947b016fd09150212cc2ffd7"
+      "after_sha256": "3b28a4a3dd5d96056276cf8b2d936c45a2d18cee8010d72403bf089ededd7430"
     },
     "codex-rs/codex-api/src/sse/responses_error.rs": {
       "before_sha256": "c5236fe61f2a75e79b94b28565d69b7d1c00d208a6955ce173e799659a321f05",
-      "after_sha256": "67e2cc03490c143f2d5e98ce750d45be271068c203bae64030b2349960def78b"
+      "after_sha256": "25f103879fbf25bc8c270e45e5818d9e1f99e9eda48a198b42e911519d1f05b8"
     },
     "codex-rs/response-debug-context/src/lib.rs": {
       "before_sha256": "3e18fbee99726713fd634d8ca901482ef376abf52bb52466451d0cf4fdba6ffe",
@@ -45,7 +45,7 @@
     },
     "codex-rs/codex-api/src/sse/responses_structured_error_tests.rs": {
       "before_sha256": null,
-      "after_sha256": "fda9a1e4b91f2c5abb3e90e9c6dc2b7c2972735c558d3c91eea1e77ac67f7d1f"
+      "after_sha256": "5237a26cb0f75359ee9b1569d4a9a147dc2366af43c5ca1151cc9e86a1818e06"
     }
   },
   "cargo_lock_sha256": "7ec2bfabf3b967c00409b85489076f8df3849745d3e469473d88288322adeb4a",
@@ -63,5 +63,12 @@
     "sse::responses::structured_error_tests::all_unit_constructors_and_annotations_preserve_error_metadata"
   ],
   "expected_fixture_count": 8,
-  "independent_review_sha256": "54b11bfbe369cec945127dc35079228a24c85727354a9ad7b2ef746dd89d46a4"
+  "previous_revision_independent_review_sha256": "54b11bfbe369cec945127dc35079228a24c85727354a9ad7b2ef746dd89d46a4",
+  "candidate_independent_review": "pending; R3 formatting-only review recorded separately, previous review applies to R2 only",
+  "format_origin": {
+    "run_id": "43182609727",
+    "log_sha256": "34101af702063632337d03f1a3a366a59c488a1abb2c1abd8464796614a46eb7",
+    "hunks": 22,
+    "files": 6
+  }
 }

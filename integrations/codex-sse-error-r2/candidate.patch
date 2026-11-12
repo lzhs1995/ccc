@@ -1,3 +1,4 @@
+diff --git a/codex-rs/cli/src/doctor.rs b/codex-rs/cli/src/doctor.rs
 --- a/codex-rs/cli/src/doctor.rs
 +++ b/codex-rs/cli/src/doctor.rs
 @@ -2433,6 +2433,7 @@
@@ -8,17 +9,18 @@
          ApiError::Transport(transport) => format!("handshake transport error: {transport}"),
          ApiError::Api { status, message } => {
              format!("handshake API error: {status} {message}")
+diff --git a/codex-rs/codex-api/src/api_bridge.rs b/codex-rs/codex-api/src/api_bridge.rs
 --- a/codex-rs/codex-api/src/api_bridge.rs
 +++ b/codex-rs/codex-api/src/api_bridge.rs
-@@ -12,6 +12,7 @@
+@@ -11,6 +11,7 @@
+ use codex_protocol::error::CodexErr;
  use codex_protocol::error::CodexErrorDetails;
  use codex_protocol::error::ConnectionFailedError;
- use codex_protocol::error::RetryLimitReachedError;
 +use codex_protocol::error::ResponseError;
+ use codex_protocol::error::RetryLimitReachedError;
  use codex_protocol::error::UnexpectedResponseError;
  use codex_protocol::error::UsageLimitReachedError;
- use codex_protocol::protocol::MisalignmentErrorDetails;
-@@ -20,12 +21,23 @@
+@@ -20,12 +21,25 @@
  use serde_json::Value;
  
  pub fn map_api_error(err: ApiError) -> CodexErr {
@@ -26,7 +28,9 @@
 +        return map_api_error(*source).with_response_error(error);
 +    }
 +    let response_error = match &err {
-+        ApiError::Transport(TransportError::Http { body: Some(body), .. })
++        ApiError::Transport(TransportError::Http {
++            body: Some(body), ..
++        })
 +        | ApiError::Api { message: body, .. } => serde_json::from_str::<Value>(body)
 +            .ok()
 +            .and_then(|value| value.get("error").and_then(ResponseError::from_value)),
@@ -43,7 +47,7 @@
          | ApiError::Api { .. }
          | ApiError::Stream(_)
          | ApiError::ContentFilter
-@@ -41,7 +53,10 @@
+@@ -41,7 +55,10 @@
          | ApiError::BioPolicy { .. }
          | ApiError::MisalignmentPolicyViolation { .. } => None,
      };
@@ -55,7 +59,7 @@
      match retry_after {
          Some(retry_after) => error.with_retry_after(retry_after),
          None => error,
-@@ -50,6 +65,9 @@
+@@ -50,6 +67,9 @@
  
  fn map_api_error_details(err: ApiError) -> CodexErr {
      match err {
@@ -65,16 +69,17 @@
          ApiError::ContextWindowExceeded => CodexErr::ContextWindowExceeded,
          ApiError::QuotaExceeded => CodexErr::QuotaExceeded,
          ApiError::UsageNotIncluded => CodexErr::UsageNotIncluded,
+diff --git a/codex-rs/codex-api/src/error.rs b/codex-rs/codex-api/src/error.rs
 --- a/codex-rs/codex-api/src/error.rs
 +++ b/codex-rs/codex-api/src/error.rs
-@@ -2,6 +2,7 @@
+@@ -1,6 +1,7 @@
+ use crate::rate_limits::RateLimitError;
  use codex_client::TransportError;
  use codex_http_client::RetryAfter;
- use codex_protocol::error::ResponseIncompleteError;
 +use codex_protocol::error::ResponseError;
+ use codex_protocol::error::ResponseIncompleteError;
  use codex_protocol::protocol::MisalignmentErrorDetails;
  use http::StatusCode;
- use serde_json::Value;
 @@ -9,6 +10,12 @@
  
  #[derive(Debug, Error)]
@@ -105,6 +110,7 @@
  impl From<RateLimitError> for ApiError {
      fn from(err: RateLimitError) -> Self {
          Self::RateLimit(err.to_string())
+diff --git a/codex-rs/codex-api/src/sse/responses.rs b/codex-rs/codex-api/src/sse/responses.rs
 --- a/codex-rs/codex-api/src/sse/responses.rs
 +++ b/codex-rs/codex-api/src/sse/responses.rs
 @@ -1,10 +1,10 @@
@@ -128,22 +134,24 @@
      item: Option<Value>,
      item_id: Option<String>,
      call_id: Option<String>,
-@@ -347,9 +349,11 @@
+@@ -347,9 +349,13 @@
  ) -> std::result::Result<Option<ResponseEvent>, ResponsesEventError> {
      match event.kind.as_str() {
          "error" => {
 -            if let Some(error) = event.error.as_ref().and_then(parse_flex_unavailable) {
 -                return Err(ResponsesEventError::Api(error));
 -            }
-+            let error = event.error.unwrap_or_else(|| serde_json::json!({
-+                "code": event.code,
-+                "message": event.message,
-+            }));
++            let error = event.error.unwrap_or_else(|| {
++                serde_json::json!({
++                    "code": event.code,
++                    "message": event.message,
++                })
++            });
 +            return Err(ResponsesEventError::Api(parse_error_event(Some(error))));
          }
          "response.output_item.done" => {
              if let Some(item_val) = event.item {
-@@ -589,6 +593,23 @@
+@@ -589,6 +595,30 @@
  
          trace!("SSE event: {}", &sse.data);
  
@@ -151,11 +159,18 @@
 +        // `type` or is malformed. Never let a later completion erase this failure.
 +        let raw_event = serde_json::from_str::<Value>(&sse.data);
 +        if sse.event == "error"
-+            || raw_event.as_ref().ok().and_then(|value| value.get("type")).and_then(Value::as_str) == Some("error")
++            || raw_event
++                .as_ref()
++                .ok()
++                .and_then(|value| value.get("type"))
++                .and_then(Value::as_str)
++                == Some("error")
 +        {
 +            let error = match raw_event {
-+                Ok(value) if value.get("type").is_none()
-+                    || value.get("type").and_then(Value::as_str) == Some("error") => {
++                Ok(value)
++                    if value.get("type").is_none()
++                        || value.get("type").and_then(Value::as_str) == Some("error") =>
++                {
 +                    parse_error_event(Some(value.get("error").cloned().unwrap_or(value)))
 +                }
 +                _ => ApiError::Stream("malformed Responses error event".to_string()),
@@ -167,7 +182,7 @@
          let event: ResponsesStreamEvent = match serde_json::from_str(&sse.data) {
              Ok(event) => event,
              Err(e) => {
-@@ -602,6 +623,13 @@
+@@ -602,6 +632,13 @@
                  continue;
              }
          };
@@ -181,7 +196,7 @@
          let model_verifications = event.model_verifications();
          let turn_moderation_metadata = event.turn_moderation_metadata();
          let safety_buffering = event.safety_buffering(&safety_buffering_treatment);
-@@ -657,7 +685,7 @@
+@@ -657,7 +694,7 @@
              Err(error) => {
                  let error = error.into_api_error();
                  if matches!(
@@ -190,7 +205,7 @@
                      ApiError::FlexUnavailable | ApiError::ResponseIncomplete(_)
                  ) {
                      let _ = tx_event.send(Err(error)).await;
-@@ -672,6 +700,10 @@
+@@ -672,6 +709,10 @@
  #[cfg(test)]
  #[path = "responses_error_tests.rs"]
  mod error_tests;
@@ -201,17 +216,18 @@
  
  #[cfg(test)]
  mod tests {
+diff --git a/codex-rs/codex-api/src/sse/responses_error.rs b/codex-rs/codex-api/src/sse/responses_error.rs
 --- a/codex-rs/codex-api/src/sse/responses_error.rs
 +++ b/codex-rs/codex-api/src/sse/responses_error.rs
-@@ -6,6 +6,7 @@
+@@ -5,6 +5,7 @@
+ use crate::error::parse_flex_unavailable;
  use crate::responses_headers::json_headers_to_http_headers;
  use codex_http_client::RetryAfter;
- use codex_protocol::protocol::MisalignmentErrorDetails;
 +use codex_protocol::error::ResponseError;
+ use codex_protocol::protocol::MisalignmentErrorDetails;
  use serde::Deserialize;
  use serde_json::Value;
- use std::time::Duration;
-@@ -21,6 +22,21 @@
+@@ -21,6 +22,23 @@
      resets_at: Option<i64>,
      #[serde(default)]
      misalignment: Option<Value>,
@@ -228,14 +244,18 @@
 +    };
 +    ApiError::ResponseError {
 +        error: fields,
-+        source: Box::new(parse_failed_response(Some(serde_json::json!({ "error": error })))),
++        source: Box::new(parse_failed_response(Some(
++            serde_json::json!({ "error": error }),
++        ))),
 +    }
  }
  
  pub(super) fn parse_failed_response(response: Option<Value>) -> ApiError {
+diff --git a/codex-rs/codex-api/src/sse/responses_structured_error_tests.rs b/codex-rs/codex-api/src/sse/responses_structured_error_tests.rs
+new file mode 100644
 --- /dev/null
 +++ b/codex-rs/codex-api/src/sse/responses_structured_error_tests.rs
-@@ -0,0 +1,180 @@
+@@ -0,0 +1,237 @@
 +//! Exercises the actual SSE reader and bridge, never a replacement parser.
 +
 +use super::process_sse;
@@ -264,8 +284,14 @@
 +        Box::pin(chunks)
 +    };
 +    let mut events = spawn_response_stream(
-+        StreamResponse { status: StatusCode::OK, headers: HeaderMap::new(), bytes },
-+        Duration::from_secs(60), None, None,
++        StreamResponse {
++            status: StatusCode::OK,
++            headers: HeaderMap::new(),
++            bytes,
++        },
++        Duration::from_secs(60),
++        None,
++        None,
 +    );
 +    // A hanging error stream must finish before its 60-second idle timeout.
 +    let error = tokio::time::timeout(Duration::from_secs(1), async {
@@ -276,7 +302,9 @@
 +                other => panic!("expected terminal error, got {other:?}"),
 +            }
 +        }
-+    }).await.expect("error event waited for EOF or idle timeout");
++    })
++    .await
++    .expect("error event waited for EOF or idle timeout");
 +    assert!(events.next().await.is_none());
 +    error
 +}
@@ -284,19 +312,28 @@
 +#[tokio::test(start_paused = true)]
 +async fn writer_error_is_preserved_for_http_and_sse() {
 +    for (status, code) in [
-+        (StatusCode::SERVICE_UNAVAILABLE, "continuation_writer_unavailable"),
++        (
++            StatusCode::SERVICE_UNAVAILABLE,
++            "continuation_writer_unavailable",
++        ),
 +        (StatusCode::UNAUTHORIZED, "continuation_writer_unauthorized"),
 +        (StatusCode::FORBIDDEN, "continuation_writer_forbidden"),
 +    ] {
 +        let error = json!({"type":"server_error", "code":code, "message":"writer unavailable"});
 +        let http = map_api_error(ApiError::Transport(TransportError::Http {
-+            status, url: None, headers: None, retry_after: None,
++            status,
++            url: None,
++            headers: None,
++            retry_after: None,
 +            body: Some(json!({"error":error}).to_string()),
 +        }));
 +        assert_eq!(http.http_status_code_value(), Some(status.as_u16()));
 +        assert_eq!(http.response_error().unwrap().code.as_deref(), Some(code));
 +        for prefix in ["event: error\n", ""] {
-+            let body = format!("{prefix}data: {}\n\n", json!({"type":"error", "error":error}));
++            let body = format!(
++                "{prefix}data: {}\n\n",
++                json!({"type":"error", "error":error})
++            );
 +            let sse = map_api_error(terminal_error(body, true).await);
 +            assert_eq!(sse.response_error(), http.response_error());
 +            assert!(matches!(sse.details(), CodexErrorDetails::Stream(_)));
@@ -313,23 +350,41 @@
 +        json!({"error":{"code":"writer_commit_unavailable", "message":"withheld"}}),
 +        json!({"type":"error", "error":{"code":"writer_commit_unavailable", "message":"withheld"}, "delta":7}),
 +    ] {
-+        let body = format!("event: error\ndata: {value}\n\ndata: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"must-not-complete\"}}}}\n\n");
++        let body = format!(
++            "event: error\ndata: {value}\n\ndata: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"must-not-complete\"}}}}\n\n"
++        );
 +        let err = map_api_error(terminal_error(body, true).await);
-+        assert_eq!(err.response_error().unwrap().code.as_deref(), Some("writer_commit_unavailable"));
++        assert_eq!(
++            err.response_error().unwrap().code.as_deref(),
++            Some("writer_commit_unavailable")
++        );
 +    }
 +    // Invalid unrelated optional fields must not swallow data-only error frames.
 +    let body = "data: {\"type\":\"error\",\"error\":{\"code\":\"writer_commit_unavailable\"},\"delta\":7}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"later\"}}\n\n";
-+    assert_eq!(map_api_error(terminal_error(body.to_owned(), false).await).response_error().unwrap().code.as_deref(), Some("writer_commit_unavailable"));
++    assert_eq!(
++        map_api_error(terminal_error(body.to_owned(), false).await)
++            .response_error()
++            .unwrap()
++            .code
++            .as_deref(),
++        Some("writer_commit_unavailable")
++    );
 +}
 +
 +#[tokio::test(start_paused = true)]
 +async fn malformed_named_errors_are_not_ignored() {
-+    for data in ["not json", "null", "[]", "{}",
++    for data in [
++        "not json",
++        "null",
++        "[]",
++        "{}",
 +        r#"{"type":"response.completed","response":{"id":"conflict"}}"#,
 +        r#"{"type":"error","error":{"code":42,"message":"bad code"}}"#,
 +        r#"{"type":"error","error":null}"#,
 +    ] {
-+        let body = format!("event: error\ndata: {data}\n\ndata: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"later\"}}}}\n\n");
++        let body = format!(
++            "event: error\ndata: {data}\n\ndata: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"later\"}}}}\n\n"
++        );
 +        let err = map_api_error(terminal_error(body, true).await);
 +        assert!(matches!(err.details(), CodexErrorDetails::Stream(_)));
 +        assert!(err.response_error().is_none());
@@ -340,15 +395,23 @@
 +async fn error_at_eof_preserves_code_and_retry_deadline() {
 +    let body = "data: {\"type\":\"error\",\"error\":{\"code\":\"continuation_writer_unavailable\",\"headers\":{\"retry-after\":\"7\"}}}\n\n";
 +    let err = map_api_error(terminal_error(body.to_owned(), false).await);
-+    assert_eq!(err.response_error().unwrap().code.as_deref(), Some("continuation_writer_unavailable"));
++    assert_eq!(
++        err.response_error().unwrap().code.as_deref(),
++        Some("continuation_writer_unavailable")
++    );
 +    assert_eq!(err.retry_delay(1), Some(Duration::from_secs(7)));
 +}
 +
 +#[tokio::test(start_paused = true)]
 +async fn flex_and_quota_keep_existing_terminal_semantics() {
-+    for (code, expected) in [("flex_unavailable", CodexErrorInfo::FlexUnavailable),
-+        ("insufficient_quota", CodexErrorInfo::UsageLimitExceeded)] {
-+        let body = format!("data: {}\n\n", json!({"type":"error", "error":{"code":code,"headers":{"retry-after":"7"}}}));
++    for (code, expected) in [
++        ("flex_unavailable", CodexErrorInfo::FlexUnavailable),
++        ("insufficient_quota", CodexErrorInfo::UsageLimitExceeded),
++    ] {
++        let body = format!(
++            "data: {}\n\n",
++            json!({"type":"error", "error":{"code":code,"headers":{"retry-after":"7"}}})
++        );
 +        let err = map_api_error(terminal_error(body, true).await);
 +        assert_eq!(err.to_codex_protocol_error(), expected);
 +        assert!(err.retry_delay(1).is_none());
@@ -358,15 +421,26 @@
 +#[tokio::test(start_paused = true)]
 +async fn receiver_cancellation_still_releases_pending_reader() {
 +    let (tx, rx) = mpsc::channel(1);
-+    let worker = tokio::spawn(process_sse(Box::pin(stream::pending()), tx, Duration::from_secs(60), None));
++    let worker = tokio::spawn(process_sse(
++        Box::pin(stream::pending()),
++        tx,
++        Duration::from_secs(60),
++        None,
++    ));
 +    drop(rx);
-+    tokio::time::timeout(Duration::from_secs(1), worker).await.unwrap().unwrap();
++    tokio::time::timeout(Duration::from_secs(1), worker)
++        .await
++        .unwrap()
++        .unwrap();
 +}
 +
 +#[test]
 +fn malformed_http_diagnostic_does_not_create_structured_code() {
 +    let err = map_api_error(ApiError::Transport(TransportError::Http {
-+        status: StatusCode::FORBIDDEN, url: None, headers: None, retry_after: None,
++        status: StatusCode::FORBIDDEN,
++        url: None,
++        headers: None,
++        retry_after: None,
 +        body: Some(r#"{"error":{"code":42,"message":"forbidden"}}"#.into()),
 +    }));
 +    assert_eq!(err.http_status_code_value(), Some(403));
@@ -404,8 +478,11 @@
 +            error_type: Some("server_error".into()),
 +            message: Some("metadata only".into()),
 +        };
-+        let error = error.with_response_error(fields.clone())
-+            .with_retry_after(codex_http_client::RetryAfter::from_delay(Duration::from_secs(3)).unwrap())
++        let error = error
++            .with_response_error(fields.clone())
++            .with_retry_after(
++                codex_http_client::RetryAfter::from_delay(Duration::from_secs(3)).unwrap(),
++            )
 +            .with_agent_context(AgentErrorContext::ChildStartup);
 +        assert_eq!(error.response_error(), Some(&fields));
 +        assert_eq!(error.to_codex_protocol_error(), kind);
@@ -416,6 +493,7 @@
 +        assert_eq!(error.response_error(), Some(&fields));
 +    }
 +}
+diff --git a/codex-rs/ext/guardian-v2/src/async_scorer/metrics.rs b/codex-rs/ext/guardian-v2/src/async_scorer/metrics.rs
 --- a/codex-rs/ext/guardian-v2/src/async_scorer/metrics.rs
 +++ b/codex-rs/ext/guardian-v2/src/async_scorer/metrics.rs
 @@ -29,7 +29,8 @@
@@ -428,6 +506,7 @@
              ApiError::Transport(TransportError::Http { status, .. })
              | ApiError::Api { status, .. } => match status.as_u16() {
                  401 => "http_401",
+diff --git a/codex-rs/ext/guardian-v2/src/async_scorer/sampler/execution.rs b/codex-rs/ext/guardian-v2/src/async_scorer/sampler/execution.rs
 --- a/codex-rs/ext/guardian-v2/src/async_scorer/sampler/execution.rs
 +++ b/codex-rs/ext/guardian-v2/src/async_scorer/sampler/execution.rs
 @@ -137,46 +137,38 @@
@@ -522,9 +601,10 @@
          };
          if retryable && *retries < MAX_SAMPLING_RETRIES {
              *retries += 1;
+diff --git a/codex-rs/protocol/src/error.rs b/codex-rs/protocol/src/error.rs
 --- a/codex-rs/protocol/src/error.rs
 +++ b/codex-rs/protocol/src/error.rs
-@@ -79,6 +79,27 @@
+@@ -79,6 +79,33 @@
      details: CodexErrorDetails,
      retry_after: Option<RetryAfter>,
      agent_context: Option<AgentErrorContext>,
@@ -545,14 +625,20 @@
 +    /// Decode typed fields without accepting numeric codes or coercing malformed values.
 +    pub fn from_value(value: &serde_json::Value) -> Option<Self> {
 +        let error: Self = serde_json::from_value(value.clone()).ok()?;
-+        (error.code.as_deref().is_some_and(|code| !code.trim().is_empty())
-+            || error.message.as_deref().is_some_and(|message| !message.trim().is_empty()))
++        (error
++            .code
++            .as_deref()
++            .is_some_and(|code| !code.trim().is_empty())
++            || error
++                .message
++                .as_deref()
++                .is_some_and(|message| !message.trim().is_empty()))
 +        .then_some(error)
 +    }
  }
  
  /// A terminal response that stopped before the model finished, with any reported usage.
-@@ -262,6 +283,7 @@
+@@ -262,6 +289,7 @@
              details,
              retry_after: None,
              agent_context: None,
@@ -560,7 +646,7 @@
          }
      }
  }
-@@ -327,6 +349,7 @@
+@@ -327,6 +355,7 @@
                  details: CodexErrorDetails::$variant,
                  retry_after: None,
                  agent_context: None,
@@ -568,7 +654,7 @@
              };
          )*
      };
-@@ -480,6 +503,15 @@
+@@ -480,6 +509,15 @@
          self
      }
  
@@ -584,6 +670,7 @@
      /// Minimal shim so that existing `e.downcast_ref::<CodexErr>()` checks continue to compile
      /// after replacing `anyhow::Error` in the return signature. This mirrors the behavior of
      /// `anyhow::Error::downcast_ref` but works directly on our concrete error type.
+diff --git a/codex-rs/response-debug-context/src/lib.rs b/codex-rs/response-debug-context/src/lib.rs
 --- a/codex-rs/response-debug-context/src/lib.rs
 +++ b/codex-rs/response-debug-context/src/lib.rs
 @@ -51,7 +51,7 @@
