@@ -7,6 +7,7 @@ on:
       - ci/magpie-passing-smoke-20261112
     paths:
       - 'validation/magpie-passing-smoke-r1/**'
+      - 'validation/magpie-web-entry-r1/**'
       - '.github/workflows/magpie-passing-smoke.yml'
 
 permissions:
@@ -23,7 +24,7 @@ jobs:
     timeout-minutes: 80
     env:
       PACKAGE_DIR: validation/magpie-passing-smoke-r1
-      PACKAGE_PIN: dda665921f737aa3c014d2f6e33ff8f9520d26af2ed2ecdb611565e7e1bcdc9a
+      PACKAGE_PIN: bec807556b16d369b7a83e062f93293eabe880bd65554068c80ae8bc788d937b
       GOTOOLCHAIN: local
       GOWORK: 'off'
       GOENV: 'off'
@@ -92,6 +93,23 @@ jobs:
       - name: Re-read exact logs and binary provenance
         if: ${{ !cancelled() }}
         run: python3 -B "$PACKAGE_DIR/audit.py" --candidate results/candidate --baseline results/baseline --client results/client --smoke results/smoke --package-pin "$PACKAGE_PIN"
+      - name: Verify web package before import
+        id: web_prepare
+        if: ${{ !cancelled() && steps.candidate.outcome == 'success' }}
+        run: |
+          python3 -B - <<'PYCODE'
+          import hashlib,json
+          from pathlib import Path
+          root=Path('validation/magpie-web-entry-r1')
+          assert hashlib.sha256((root/'PINNED-FILES.json').read_bytes()).hexdigest() == '6660fdc12a54273f1d5ceb8d9b434712d5d13da2f92f5dfd6fa4bc1c1d1551d6'
+          for name,sha in json.loads((root/'PINNED-FILES.json').read_text()).items():
+              assert Path(name).name == name
+              assert hashlib.sha256((root/name).read_bytes()).hexdigest() == sha,name
+          PYCODE
+          python3 -B -m unittest discover -s validation/magpie-web-entry-r1 -p test_web.py -v
+      - name: Real serve web entry with no model POST
+        if: ${{ !cancelled() && steps.candidate.outcome == 'success' && steps.web_prepare.outcome == 'success' }}
+        run: python3 -B validation/magpie-web-entry-r1/web_entry.py --build results/candidate/BUILD.json --output results/web-entry --package-pin 6660fdc12a54273f1d5ceb8d9b434712d5d13da2f92f5dfd6fa4bc1c1d1551d6
       - name: Preserve binaries and all original success or failure evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -103,6 +121,10 @@ jobs:
             results/**/*.log
             results/**/*.stdout
             results/**/*.stderr
+            results/web-entry/*.body
+            results/web-entry/*.sb
+            results/web-entry/*.yml
+            validation/magpie-web-entry-r1/**
             results/candidate/magpie-candidate
             results/baseline/magpie-baseline
             results/client/codex-aarch64-apple-darwin

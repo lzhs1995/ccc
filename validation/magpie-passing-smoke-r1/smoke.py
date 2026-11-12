@@ -207,6 +207,46 @@ def reserve():
     return sock
 
 
+TEXT_INPUTS = frozenset({
+    'config/magpie/settings.json', 'config/magpie/plugins.yml',
+    'config/magpie/providers.json', 'gateway.sb', 'codex.sb',
+    'gateway-probe.sb', 'codex-probe.sb',
+})
+
+
+def collect_inputs(private):
+    """Decode only known synthetic text; hash runtime-generated binary files."""
+    private = Path(private)
+    require(private.is_absolute() and not private.is_symlink() and private.is_dir(),
+            'evidence root must be an owned directory')
+    private = private.resolve(strict=True)
+    for directory in (private / 'config', private / 'config/magpie'):
+        require(not directory.is_symlink(), 'configuration ancestor became a symlink')
+        if directory.exists():
+            require(directory.is_dir(), 'configuration ancestor changed type')
+            require(directory.resolve(strict=True).is_relative_to(private),
+                    'configuration ancestor escaped evidence root')
+    inputs = {}
+    candidates = [private / name for name in sorted(TEXT_INPUTS)]
+    config = private / 'config/magpie'
+    if config.exists():
+        require(config.is_dir() and not config.is_symlink(), 'configuration directory changed type')
+        candidates.extend(sorted(config.iterdir()))
+    for path in sorted(set(candidates)):
+        require(not path.is_symlink(), 'evidence file became a symlink')
+        if not path.exists() or path.is_dir():
+            continue
+        require(stat.S_ISREG(path.lstat().st_mode), 'evidence file is not regular')
+        name = str(path.relative_to(private))
+        row = {'pin': pin(path)}
+        if name in TEXT_INPUTS:
+            row['text'] = path.read_text(encoding='utf-8', errors='strict')
+        else:
+            row['encoding'] = 'digest-only'
+        inputs[name] = row
+    return inputs
+
+
 def run_case(name, binary, binary_pin, codex, private_parent, output, installation, installation_before):
     output.mkdir(parents=True, exist_ok=False)
     success = name != 'baseline-comments'
@@ -303,9 +343,7 @@ def run_case(name, binary, binary_pin, codex, private_parent, output, installati
             require(result['artifact_unchanged'] and result['codex_unchanged'] and result['installation_unchanged'], 'identity changed during case')
             require(result['children_reaped'] and result['handlers_finished'], 'owned runtime did not fully stop')
             if private is not None:
-                inputs = {str(p.relative_to(private)): {'pin': pin(p), 'text':p.read_text()}
-                          for p in private.rglob('*') if p.is_file() and (p.suffix in ['.sb'] or p.parent == private/'config/magpie')}
-                save(output/'SYNTHETIC-INPUTS.json', inputs)
+                save(output/'SYNTHETIC-INPUTS.json', collect_inputs(private))
                 shutil.rmtree(private)
             result['private_removed'] = private is None or not private.exists()
         except Exception as error:result.update(status='FAIL', reconciliation_error=str(error))

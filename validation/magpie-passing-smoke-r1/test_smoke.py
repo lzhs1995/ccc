@@ -230,6 +230,67 @@ class CapacitySourceAndArchiveTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):extract(p,root/'binary',{'binary_name':'codex-test','binary_bytes':7,'binary_sha256':'0'*64})
 
 
+class EvidenceEncodingTests(unittest.TestCase):
+    def test_binary_generated_file_is_hashed_not_decoded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); config = root/'config/magpie'; config.mkdir(parents=True)
+            (config/'providers.json').write_text('{"providers": []}')
+            binary = config/'generated-cache'; binary.write_bytes(b'\xca\xfe\xba\xbe\x00')
+            result = smoke.collect_inputs(root)
+            self.assertEqual(result['config/magpie/generated-cache'],
+                             {'pin': pin(binary), 'encoding': 'digest-only'})
+            self.assertEqual(result['config/magpie/providers.json']['text'], '{"providers": []}')
+
+    def test_invalid_known_text_still_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); (root/'gateway.sb').write_bytes(b'\xca\xfe')
+            with self.assertRaises(UnicodeDecodeError): smoke.collect_inputs(root)
+
+    def test_symlink_is_rejected_without_following(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); config = root/'config/magpie'; config.mkdir(parents=True)
+            (config/'cache').symlink_to(root/'missing')
+            with self.assertRaises(RuntimeError): smoke.collect_inputs(root)
+
+    def test_only_fixed_policies_are_decoded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); (root/'gateway-probe.sb').write_text('(deny default)')
+            (root/'unknown.sb').write_bytes(b'\xca\xfe')
+            result = smoke.collect_inputs(root)
+            self.assertEqual(set(result), {'gateway-probe.sb'})
+            self.assertEqual(result['gateway-probe.sb']['text'], '(deny default)')
+
+
+    def test_config_parent_symlink_is_rejected_before_read(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory); root = base/'owned'; root.mkdir()
+            outside = base/'outside'; (outside/'magpie').mkdir(parents=True)
+            (outside/'magpie/providers.json').write_text('synthetic outside')
+            (root/'config').symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(RuntimeError, 'ancestor became a symlink'):
+                smoke.collect_inputs(root)
+
+    def test_config_parent_dangling_symlink_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); (root/'config').symlink_to(root/'missing')
+            with self.assertRaisesRegex(RuntimeError, 'ancestor became a symlink'):
+                smoke.collect_inputs(root)
+
+    def test_root_symlink_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory); root = base/'owned'; root.mkdir()
+            alias = base/'alias'; alias.symlink_to(root, target_is_directory=True)
+            with self.assertRaisesRegex(RuntimeError, 'owned directory'):
+                smoke.collect_inputs(alias)
+
+    def test_runtime_fifo_is_rejected_without_open(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); config = root/'config/magpie'; config.mkdir(parents=True)
+            os.mkfifo(config/'generated-cache')
+            with self.assertRaisesRegex(RuntimeError, 'not regular'):
+                smoke.collect_inputs(root)
+
+
 class AggregateTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
