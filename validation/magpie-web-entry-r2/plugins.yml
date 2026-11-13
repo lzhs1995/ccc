@@ -1,0 +1,31 @@
+preset: essentials
+settled: 1
+plugins:
+  - id: budget
+    enabled: false
+  - id: gateway
+    enabled: false
+  - id: groups
+    enabled: false
+  - id: library
+    enabled: false
+  - id: middleware
+    enabled: false
+  - id: otel
+    enabled: false
+  - id: redact
+    enabled: false
+  - id: rotation
+    enabled: false
+  - id: routing
+    enabled: false
+  - id: search
+    enabled: false
+  - id: sessions
+    enabled: false
+  - id: tools
+    enabled: false
+  - id: usage
+    enabled: false
+  - id: warmups
+    enabled: false

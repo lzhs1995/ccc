@@ -1,0 +1,11 @@
+{
+  "proxy": "direct",
+  "responseIdle": 60,
+  "responseTotal": 95,
+  "noAutoUpdate": true,
+  "gatewayConversations": false,
+  "redact": false,
+  "redactPersonal": false,
+  "redactWords": [],
+  "searcher": "off"
+}

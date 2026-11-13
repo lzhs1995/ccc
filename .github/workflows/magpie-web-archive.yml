@@ -1,0 +1,74 @@
+name: Magpie original artifact web entry
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - ci/magpie-passing-smoke-20261112
+    paths:
+      - 'validation/magpie-web-entry-r2/**'
+      - '.github/workflows/magpie-web-archive.yml'
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: magpie-original-artifact-web-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    if: github.ref == 'refs/heads/ci/magpie-passing-smoke-20261112'
+    runs-on: macos-15
+    timeout-minutes: 12
+    env:
+      PACKAGE_DIR: validation/magpie-web-entry-r2
+      PACKAGE_PIN: 937742066ae58ca96ab37e48de54a986aa7a8faf158240ab2d93604dba0aea82
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Checkout reviewed web-only harness
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Verify exact web-only package before import
+        run: |
+          python3 -B - <<'PYCODE'
+          import hashlib,json,os
+          from pathlib import Path
+          root=Path(os.environ['PACKAGE_DIR'])
+          pin=root/'PINNED-FILES.json'
+          assert hashlib.sha256(pin.read_bytes()).hexdigest()==os.environ['PACKAGE_PIN']
+          for name,expected in json.loads(pin.read_text()).items():
+              assert Path(name).name==name
+              assert hashlib.sha256((root/name).read_bytes()).hexdigest()==expected,name
+          PYCODE
+      - name: Cookie regression and web receipt controls
+        run: |
+          mkdir -p results
+          python3 -B -m unittest discover -s "$PACKAGE_DIR" -p test_web.py -v > results/web-tests.log 2>&1
+          cat results/web-tests.log
+      - name: Retrieve exact original four-case artifact
+        id: original
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -B "$PACKAGE_DIR/fetch_original.py" --output results/candidate --package-pin "$PACKAGE_PIN"
+      - name: Real original artifact serve web entry
+        if: ${{ !cancelled() && steps.original.outcome == 'success' }}
+        run: python3 -B "$PACKAGE_DIR/web_entry.py" --build results/candidate/BUILD.json --output results/web-entry --package-pin "$PACKAGE_PIN"
+      - name: Preserve original provenance and all web evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: magpie-original-artifact-web-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            results/**/*.json
+            results/**/*.log
+            results/**/*.stderr
+            results/**/*.stdout
+            results/web-entry/*.body
+            results/web-entry/*.yml
+            results/web-entry/*.sb
+            validation/magpie-web-entry-r2/**
+          if-no-files-found: error
+          retention-days: 14
