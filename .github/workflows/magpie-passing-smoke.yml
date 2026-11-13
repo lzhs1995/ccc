@@ -1,0 +1,139 @@
+name: Magpie passing native smoke
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - ci/magpie-passing-smoke-20261112
+    paths:
+      - 'validation/magpie-passing-smoke-r1/**'
+      - 'validation/magpie-web-entry-r1/**'
+      - '.github/workflows/magpie-passing-smoke.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: magpie-passing-smoke-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    if: github.ref == 'refs/heads/ci/magpie-passing-smoke-20261112'
+    runs-on: macos-15
+    timeout-minutes: 80
+    env:
+      PACKAGE_DIR: validation/magpie-passing-smoke-r1
+      PACKAGE_PIN: bec807556b16d369b7a83e062f93293eabe880bd65554068c80ae8bc788d937b
+      GOTOOLCHAIN: local
+      GOWORK: 'off'
+      GOENV: 'off'
+      GOMAXPROCS: '2'
+      GOOS: darwin
+      GOARCH: arm64
+      CGO_ENABLED: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Checkout frozen public harness
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Verify all package inputs before import
+        run: |
+          python3 -B - <<'PYCODE'
+          import hashlib,json,os
+          from pathlib import Path
+          root=Path(os.environ['PACKAGE_DIR'])
+          pin=root/'PINNED-FILES.json'
+          assert hashlib.sha256(pin.read_bytes()).hexdigest()==os.environ['PACKAGE_PIN']
+          for name,expected in json.loads(pin.read_text()).items():
+              rel=Path(name)
+              assert not rel.is_absolute() and '..' not in rel.parts
+              assert hashlib.sha256((root/rel).read_bytes()).hexdigest()==expected,name
+          PYCODE
+      - name: Run small fixture and receipt tests
+        run: |
+          mkdir -p results
+          python3 -B -m unittest discover -s "$PACKAGE_DIR" -p test_smoke.py -v > results/preparation-tests.log 2>&1
+          cat results/preparation-tests.log
+      - name: Checkout exact R5 base
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: yetone/magpie
+          ref: 86254d4049cb6be4a2ccdab02edf0bd59860c603
+          path: candidate-source
+          persist-credentials: false
+      - name: Checkout exact held baseline base
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: yetone/magpie
+          ref: 86254d4049cb6be4a2ccdab02edf0bd59860c603
+          path: baseline-source
+          persist-credentials: false
+      - name: Install pinned Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version: '1.26.8'
+          check-latest: false
+          cache: false
+      - name: Verify exact official Codex archive and binary
+        id: client
+        run: python3 -B "$PACKAGE_DIR/fetch_client.py" --output results/client --package-pin "$PACKAGE_PIN"
+      - name: Build new complete R5 candidate
+        id: candidate
+        if: ${{ !cancelled() && steps.client.outcome == 'success' }}
+        run: python3 -B "$PACKAGE_DIR/build.py" candidate --source candidate-source --output results/candidate --package-pin "$PACKAGE_PIN"
+      - name: Build new held source baseline
+        id: baseline
+        if: ${{ !cancelled() && steps.client.outcome == 'success' }}
+        run: python3 -B "$PACKAGE_DIR/build.py" baseline --source baseline-source --output results/baseline --package-pin "$PACKAGE_PIN"
+      - name: Native four-case smoke through real binaries
+        if: ${{ !cancelled() && steps.client.outcome == 'success' && steps.candidate.outcome == 'success' && steps.baseline.outcome == 'success' }}
+        run: python3 -B "$PACKAGE_DIR/smoke.py" --candidate results/candidate --baseline results/baseline --client results/client --output results/smoke --package-pin "$PACKAGE_PIN"
+      - name: Re-read exact logs and binary provenance
+        if: ${{ !cancelled() }}
+        run: python3 -B "$PACKAGE_DIR/audit.py" --candidate results/candidate --baseline results/baseline --client results/client --smoke results/smoke --package-pin "$PACKAGE_PIN"
+      - name: Verify web package before import
+        id: web_prepare
+        if: ${{ !cancelled() && steps.candidate.outcome == 'success' }}
+        run: |
+          python3 -B - <<'PYCODE'
+          import hashlib,json
+          from pathlib import Path
+          root=Path('validation/magpie-web-entry-r1')
+          assert hashlib.sha256((root/'PINNED-FILES.json').read_bytes()).hexdigest() == '6660fdc12a54273f1d5ceb8d9b434712d5d13da2f92f5dfd6fa4bc1c1d1551d6'
+          for name,sha in json.loads((root/'PINNED-FILES.json').read_text()).items():
+              assert Path(name).name == name
+              assert hashlib.sha256((root/name).read_bytes()).hexdigest() == sha,name
+          PYCODE
+          python3 -B -m unittest discover -s validation/magpie-web-entry-r1 -p test_web.py -v
+      - name: Real serve web entry with no model POST
+        if: ${{ !cancelled() && steps.candidate.outcome == 'success' && steps.web_prepare.outcome == 'success' }}
+        run: python3 -B validation/magpie-web-entry-r1/web_entry.py --build results/candidate/BUILD.json --output results/web-entry --package-pin 6660fdc12a54273f1d5ceb8d9b434712d5d13da2f92f5dfd6fa4bc1c1d1551d6
+      - name: Preserve binaries and all original success or failure evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: magpie-passing-native-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            results/**/*.json
+            results/**/*.jsonl
+            results/**/*.log
+            results/**/*.stdout
+            results/**/*.stderr
+            results/web-entry/*.body
+            results/web-entry/*.sb
+            results/web-entry/*.yml
+            validation/magpie-web-entry-r1/**
+            results/candidate/magpie-candidate
+            results/baseline/magpie-baseline
+            results/client/codex-aarch64-apple-darwin
+            validation/magpie-passing-smoke-r1/PINNED-FILES.json
+            validation/magpie-passing-smoke-r1/CLIENT-ASSET.json
+            validation/magpie-passing-smoke-r1/FIXTURE-ORIGIN.json
+            validation/magpie-passing-smoke-r1/candidate-source.json
+            validation/magpie-passing-smoke-r1/baseline-source.json
+            validation/magpie-passing-smoke-r1/candidate.patch
+            validation/magpie-passing-smoke-r1/baseline.patch
+          if-no-files-found: error
+          retention-days: 14

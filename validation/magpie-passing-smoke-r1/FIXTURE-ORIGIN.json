@@ -1,0 +1,53 @@
+{
+  "original_r8_sha256": "fce2531d2014e94872971db5b669a8d177ba8a9fdbeef484899c496110ad793f",
+  "original_prepared_sha256": "40d07effc7661099c23b384decde81bed673dc90af359c72a25e1cbfcc983e67",
+  "functions": {
+    "require": {
+      "sha256": "230921c826d24479c00b8472a8de280ca351219c4302c2fbfd916173eaebe14b",
+      "start_line": 231,
+      "end_line": 233
+    },
+    "frame": {
+      "sha256": "71d83f9e042861fef8c84d89f33b697ee19d948e6fa500dabb52943f51108b30",
+      "start_line": 281,
+      "end_line": 282
+    },
+    "prefix": {
+      "sha256": "f5a91e263634932ac4c5415d0c2077d3d2cb1054c0376736c0602942eb267014",
+      "start_line": 285,
+      "end_line": 294
+    },
+    "half_frame": {
+      "sha256": "19244a789a588ba3becfe4db9ed109893e5ffb374dcc4382e7cf2a545d2eb071",
+      "start_line": 297,
+      "end_line": 301
+    },
+    "finish": {
+      "sha256": "85411b99a9f2afb5640d6c587b6d840ee7b799ad0e4a65bf1999b127bbc68db8",
+      "start_line": 304,
+      "end_line": 315
+    },
+    "Fake": {
+      "sha256": "74799c77ec7a8577c707d967b57ce73f2e432f7861c95c11a7d2f3f552c509b4",
+      "start_line": 318,
+      "end_line": 336
+    },
+    "Handler": {
+      "sha256": "30fa88f95806848afdffc4352259d290f1425f7fa3718f86ec1f7acca36ae27c",
+      "start_line": 339,
+      "end_line": 389
+    },
+    "codex_command": {
+      "sha256": "c8312f0584f64cf2bd61f4f7c6f9c063b0bf68b39fe5f81520c48c1af3a35e64",
+      "start_line": 392,
+      "end_line": 411
+    },
+    "judge": {
+      "sha256": "145658d80cdceddcc07a5eede39e75ed4421f90c9d3ceebe89ca74d478ab9a41",
+      "start_line": 414,
+      "end_line": 433
+    }
+  },
+  "method": "exact source segments including unchanged function/class bodies; module globals supplied without original host paths",
+  "original_runs_reused": false
+}
