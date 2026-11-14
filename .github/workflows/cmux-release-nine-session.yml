@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - ccc/cmux-release-nine-session-20261112-r5
+      - ccc/cmux-release-nine-session-20261114-r7
 permissions:
   contents: read
   actions: read
@@ -16,7 +16,7 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 45
     env:
-      DEPLOYMENT_SHA256: 446c7426d02abcdd0305641e09a6cd6cd0f5b022b9c410e57a107496df92f9a1
+      DEPLOYMENT_SHA256: 8799d40382ae8156d22c06b74e66d5bc912a3722bfc2f85aac2e42fc41b1f078
     steps:
       - name: Verify actual GitHub hosted runner
         env:
@@ -84,7 +84,7 @@ jobs:
           python3 -BE "$RUNNER_TEMP/nine-supplemental/adapter/run_release_actions.py"
           --legacy "$CCC_PRIVATE_SOURCE"
           --package "$RUNNER_TEMP/nine-supplemental/natural/package"
-          --source-lock-sha256 76fcd85b8bc51f18eee43192e2e4a675e16a322ecd3669e3447ef21489775f2e
+          --source-lock-sha256 4168aaecb39a160ba254eb9248adeb3e7165e722e881a8cfa88a5ea731794f51
           --inputs "$RUNNER_TEMP/nine-original-inputs"
           --input-contract "$RUNNER_TEMP/nine-original-inputs/INPUT-CONTRACT.json"
           --input-contract-sha256 "$ORIGINAL_INPUT_PIN"

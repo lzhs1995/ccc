@@ -1,7 +1,7 @@
 {
-  "adapter_independent_review_sha256": "494ebaf583f776cb9070d2382983c699c3727232dd59bb7df1f548dd503db5e6",
+  "adapter_independent_review_sha256": "dfb14d0c147669d6d26459c79379ac75014ce92f243e17a8bc41b3f34bab435e",
   "input_contract_sha256": "987b2a3d8bc4bc2f26fae1787df19eb587cdf912243d35dedb314a93bb7392c5",
-  "original-inputs_transport_sha256": "e0912076faf06501381be67482370b1f57a8efc32e05b3dd4e974fb874d97f45",
+  "original-inputs_transport_sha256": "24b0dc9717092979e073d4dcc8cded7a51e8782c481ef4fdca73fe3c987c8f88",
   "producer": {
     "head_sha": "68c7e04ac9fa68d3ec8750bec4dc01d1b4f39ae7",
     "repository": "lzhs1995/ccc",
@@ -9,8 +9,8 @@
     "run_id": 43160452629
   },
   "schema": "ccc-nine-session-deployment-v1",
-  "source_lock_sha256": "76fcd85b8bc51f18eee43192e2e4a675e16a322ecd3669e3447ef21489775f2e",
-  "source_transport_sha256": "02570decd1cd2a0f657be842e5749ab211e16f0c3a650499c5310bcf55fa1d34",
+  "source_lock_sha256": "4168aaecb39a160ba254eb9248adeb3e7165e722e881a8cfa88a5ea731794f51",
+  "source_transport_sha256": "847df8a2396132cd6be07d41004cad56bc49b118052f9bee514806f86352a74d",
   "status": "PINNED_READY_FOR_ORIGINAL_CONTROLLER",
-  "workflow_independent_review_sha256": "c9d7a8ff6258db27e9d454239b63366f204f9234d2138a857c409b8a42310bba"
+  "workflow_independent_review_sha256": "11aa1bf5a3dc2402e74b72414007fb6d6ae0acb1a13b409ed1b8b64ce23bf313"
 }

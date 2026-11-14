@@ -1,8 +1,8 @@
 {
-  "archive_bytes": 325788,
-  "archive_sha256": "4c0b38e5eb76fabe9cd7b219d557e90e2b45efa6b87201c419cc61ee8ad90d77",
-  "ciphertext_bytes": 325816,
-  "ciphertext_sha256": "57d5a479116490109020ca4fe5a4aed9b059f3fe828036138376915ef576b3fd",
+  "archive_bytes": 326940,
+  "archive_sha256": "1ebb5d016c80f211934a70d8560c6157dad2c92e5240fca871add6c1730bacb6",
+  "ciphertext_bytes": 326968,
+  "ciphertext_sha256": "9802f9d86dc65d7b700473e623e6ee598560b31133ad17d34447e01108796686",
   "files": {
     "adapter/HERDR-PATH-SOURCE.json": {
       "bytes": 2895,
@@ -10,19 +10,19 @@
     },
     "adapter/SOURCE-LOCK.json": {
       "bytes": 147950,
-      "sha256": "76fcd85b8bc51f18eee43192e2e4a675e16a322ecd3669e3447ef21489775f2e"
+      "sha256": "4168aaecb39a160ba254eb9248adeb3e7165e722e881a8cfa88a5ea731794f51"
     },
     "adapter/release_gui.py": {
-      "bytes": 27921,
-      "sha256": "ac272e5429e0a11e2cd140e675a848c572041c10a23182ef3b6d8790bc5c17b3"
+      "bytes": 30960,
+      "sha256": "93cdda67eb811ee9ba0dc21a508606f33102239abfa2ef0c88b790c991a5c184"
     },
     "adapter/run_release_actions.py": {
       "bytes": 14814,
       "sha256": "1f663bb1da2871130195b3b0edc31b24b599b2c47e32985511c6d00b98d6c374"
     },
     "adapter/run_release_nested_restore.py": {
-      "bytes": 21981,
-      "sha256": "b9c88a7b94450b61aecd5dd8236f57c198a447fe08c2600cb2ad7f0f47ff17a6"
+      "bytes": 22978,
+      "sha256": "c830bed39963a88ef9b85213e6bb516f16481ddf9e655bc4ee45af87842cd1ac"
     },
     "adapter/seal_release_nested.py": {
       "bytes": 7047,
@@ -273,6 +273,6 @@
     "run_id": 43160452629
   },
   "schema": "ccc-nine-session-supplemental-transport-v1",
-  "source_lock_sha256": "76fcd85b8bc51f18eee43192e2e4a675e16a322ecd3669e3447ef21489775f2e",
+  "source_lock_sha256": "4168aaecb39a160ba254eb9248adeb3e7165e722e881a8cfa88a5ea731794f51",
   "status": "SEALED_ORIGINAL_PAYLOAD"
 }

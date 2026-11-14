@@ -17,7 +17,7 @@ import zipfile
 
 MAX_PAYLOAD = 32 * 1024**2
 MAX_NATIVE_EXPANDED = 128 * 1024**2
-SOURCE_LOCK = '76fcd85b8bc51f18eee43192e2e4a675e16a322ecd3669e3447ef21489775f2e'
+SOURCE_LOCK = '4168aaecb39a160ba254eb9248adeb3e7165e722e881a8cfa88a5ea731794f51'
 CRYPTO_SHA = '2a3c1485ed52bba1bff71fc3df1376383bf05fbe78aecbb7a90459dc78bd06d1'
 PRODUCER = {'repository': 'lzhs1995/ccc', 'run_id': 43160452629, 'run_attempt': 1,
             'head_sha': '68c7e04ac9fa68d3ec8750bec4dc01d1b4f39ae7'}

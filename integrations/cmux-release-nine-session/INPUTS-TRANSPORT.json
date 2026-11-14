@@ -2,7 +2,7 @@
   "archive_bytes": 5813548,
   "archive_sha256": "75b1ad38f53fa44e2d1a47b7da8e068aa8207af6fdd29ebc1145d5e87cf9a276",
   "ciphertext_bytes": 5813576,
-  "ciphertext_sha256": "621ecefb4328fd1e905414f227fc50ac4652809565ee100bc670ef019cf03332",
+  "ciphertext_sha256": "bb120f21da94ac7748d54bc90594727bb0837d06bf79cef50c9b371b2bfc9d2b",
   "files": {
     "APP-ARTIFACT.json": {
       "bytes": 798,
@@ -2634,6 +2634,6 @@
     "run_id": 43160452629
   },
   "schema": "ccc-nine-session-supplemental-transport-v1",
-  "source_lock_sha256": "76fcd85b8bc51f18eee43192e2e4a675e16a322ecd3669e3447ef21489775f2e",
+  "source_lock_sha256": "4168aaecb39a160ba254eb9248adeb3e7165e722e881a8cfa88a5ea731794f51",
   "status": "SEALED_ORIGINAL_PAYLOAD"
 }
