@@ -35,6 +35,13 @@ A sent command is not proof of receipt. Receipt is not proof of useful work.
 CCC preserves uncertain delivery instead of blindly replaying input. It cannot
 repair an exhausted provider balance or guarantee recovery from every upstream error.
 
+Codex transport detection also accepts the complete bare causes
+`Encrypted function output content could not be decrypted or decoded.` and
+`idle timeout waiting for SSE`, even without a `stream disconnected before completion`
+prefix. They use the existing `stream` recovery path and its delivery, draft,
+turn and Goal checks, including the existing legacy-client compatibility behavior.
+This does not add encrypted-input repair, change retry budgets or install Herdr support.
+
 ## Start by inspecting
 
 Requirements: macOS 13+, Python 3.10+, and [cmux](https://cmuxterm.app/).

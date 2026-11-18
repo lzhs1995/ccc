@@ -78,6 +78,13 @@ def task_snapshot(path, session_id):
 
 def _retryable_completed_message(message):
     normalized = " ".join(message.lower().split())
+    # Native task_complete may contain only the transport cause, without the
+    # usual stream-disconnected prefix. Match the complete cause, not prose.
+    if "".join(normalized.split()) in {
+        "encryptedfunctionoutputcontentcouldnotbedecryptedordecoded.",
+        "idletimeoutwaitingforsse",
+    }:
+        return True
     return (any(x in normalized for x in ("currently experiencing high demand", "rate limit exceeded",
                                           "temporarily unavailable", "stream disconnected before completion"))
             or normalized == "connection failed: error sending request")
