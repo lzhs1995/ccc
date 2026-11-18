@@ -33,6 +33,12 @@
 送出命令不代表對方收到，收到也不代表任務已有實際進展。CCC 遇到投遞結果不明時
 不盲目重送。它不能補足上游帳戶餘額，也無法保證修復所有上游錯誤。
 
+Codex 傳輸錯誤辨識也接受完整的裸原因
+`Encrypted function output content could not be decrypted or decoded.` 與
+`idle timeout waiting for SSE`，即使沒有 `stream disconnected before completion`
+前綴。兩者沿用既有 `stream` 恢復流程及投遞、草稿、turn、Goal 檢查，
+包括原有舊版客戶端相容行為；不新增加密輸入修復、不改重試預算，也不安裝 Herdr 支援。
+
 ## 先檢查，再操作
 
 需求：macOS 13 以上、Python 3.10 以上，以及 [cmux](https://cmuxterm.app/)。
