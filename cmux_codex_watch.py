@@ -136,7 +136,7 @@ RECONNECT_STATUS_SUFFIX_RE = (
     r"(?:\s*[.…]+)?)?"
 )
 RECONNECT_HEADER_RE = re.compile(
-    r"^•\s*Reconnecting(?:\.\.\.|…)(?:\s+\d+\s*/\s*\d+)?"
+    r"^•\s*Reconnecting(?:\.\.\.|…)(?:\s+\d+\s*/\s*\d+|\s+waiting\s+for\s+network)?"
     r"(?:\s+\((?:\d+[hms]\s*)+[•·]\s*esc\s+to\s+(?:interrupt|cancel)\))?"
     + RECONNECT_STATUS_SUFFIX_RE
     + r"$",
