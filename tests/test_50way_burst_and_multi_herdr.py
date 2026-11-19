@@ -19,7 +19,8 @@ from ccc_herdr_auto import (
     safe_regular_bytes,
 )
 from ccc_network_client import NetworkClient
-from ccc_provider_retry import ProviderRetryStore
+from ccc_provider_retry import ProviderRetryStore, structured_error_type
+import cmux_codex_watch as watch
 
 
 class BurstAndMultiHerdrTests(unittest.TestCase):
@@ -167,6 +168,35 @@ class BurstAndMultiHerdrTests(unittest.TestCase):
             with os.fdopen(fd, "wb") as f:
                 f.write(b"x" * (22 * 1024 * 1024))
             self.assertEqual(len(safe_regular_bytes(p)), 22 * 1024 * 1024)
+
+    def test_anyrouter_bad_response_400_invalid_encrypted_content_auto_continues(self) -> None:
+        wrapped_banner = (
+            '■ {"error":{"message":"bad response status code 400 (request id:\n'
+            '20261119194608146851059KqBH5yfb)","type":"invalid_request_error","para\n'
+            'm":"","code":"invalid_encrypted_content"}}'
+        )
+        self.assertEqual(structured_error_type(wrapped_banner), "encrypted_function_output")
+        self.assertEqual(watch._match_error_block(wrapped_banner), "encrypted_function_output")
+        with tempfile.TemporaryDirectory() as td:
+            store = ProviderRetryStore(Path(td) / "provider-retry.sqlite3")
+            ev = store.observe(
+                "01a1efb3-b29a-7fe2-8c97-383052d64f6f",
+                "custom",
+                "turn-anyrouter-iec",
+                "encrypted_function_output",
+                wrapped_banner,
+                1795092000.0,
+            )
+            self.assertIsNotNone(ev)
+            decision = store.evaluate(ev, "attempt-anyrouter-iec-1", reserve=True)
+            self.assertTrue(decision.allowed)
+
+        strict_iec = (
+            '■ unexpected status 400 Bad Request: {"error":{"message":"The encrypted content could not be verified.",'
+            '"type":"invalid_request_error","param":"input","code":"invalid_encrypted_content"}}'
+        )
+        self.assertEqual(structured_error_type(strict_iec), "invalid_encrypted_content")
+        self.assertEqual(watch._match_error_block(strict_iec), "invalid_encrypted_content")
 
 
 if __name__ == "__main__":

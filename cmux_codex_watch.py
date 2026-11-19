@@ -998,6 +998,8 @@ def _match_error_block(block_text: str) -> str | None:
     }:
         return "stream"
     if "400" in compact and '"code":"invalid_encrypted_content"' in compact:
+        if "badresponsestatuscode400" in compact:
+            return "encrypted_function_output"
         return "invalid_encrypted_content"
     if _provider_rate_limit_banner(compact):
         return "rate_limit"

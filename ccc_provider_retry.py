@@ -206,6 +206,8 @@ def structured_error_type(message):
     if 'insufficient_quota' in codes:
         return 'token_exhausted'
     if 'invalid_encrypted_content' in codes:
+        if 'badresponsestatuscode400' in detail:
+            return 'encrypted_function_output'
         return 'invalid_encrypted_content'
     # Whitespace has been removed to join native hard wraps, so a status
     # description immediately follows the last digit (429TooManyRequests).
