@@ -182,3 +182,52 @@ def rollover_ledger(path: Path, ledger: dict, final_phases: frozenset[str], *, k
         attempts.pop(k, None)
     atomic_write_json(Path(path), ledger)
     return len(archived)
+
+
+def normalize_herdr_pane_agent(pane: dict) -> dict:
+    """Backfill `pane['agent']` from `pane['agent_session']['agent']` when Herdr omits top-level `agent`."""
+    if isinstance(pane, dict) and pane.get("agent") is None and isinstance(pane.get("agent_session"), dict):
+        sess_agent = pane["agent_session"].get("agent")
+        if sess_agent in {"codex", "claude"}:
+            pane["agent"] = sess_agent
+    return pane
+
+
+def prune_orphaned_pre_io_intents(ledger: dict[str, dict], failed_turn_id: str, *, transcript_unchanged: bool) -> list[str]:
+    """Remove unsubmitted `phase == 'intent'` entries (`io_started_at` absent/0) left by pre-input persistence faults."""
+    if not transcript_unchanged:
+        return []
+    removed = [
+        aid for aid, rec in ledger.items()
+        if isinstance(rec, dict)
+        and rec.get("failed_turn_id") == failed_turn_id
+        and rec.get("phase") == "intent"
+        and not rec.get("io_started_at")
+    ]
+    for aid in removed:
+        del ledger[aid]
+    return removed
+
+
+def safe_regular_bytes(path: Path, *, limit: int = 128 * 1024 * 1024) -> bytes:
+    """Read an owner-controlled single-link production file up to 128 MiB so pre-rollover ledgers never crash startup."""
+    path = Path(path)
+    if not path.is_absolute() or path != path.resolve(strict=True):
+        raise ValueError("Noncanonical production file")
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        before = os.fstat(stream.fileno())
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or before.st_nlink != 1
+            or before.st_mode & 0o022
+            or before.st_size > limit
+        ):
+            raise ValueError("Unsafe or oversized production file")
+        raw = stream.read(limit + 1)
+        after = os.fstat(stream.fileno())
+    ident = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns, s.st_mode)
+    if ident(before) != ident(after) or ident(after) != ident(path.lstat()):
+        raise ValueError("Production file changed while reading")
+    return raw

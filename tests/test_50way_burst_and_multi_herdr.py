@@ -13,7 +13,10 @@ from ccc_herdr_auto import (
     discover_herdr_socket_candidates,
     extract_resume_uuid,
     herdr_placement_matches,
+    normalize_herdr_pane_agent,
+    prune_orphaned_pre_io_intents,
     rollover_ledger,
+    safe_regular_bytes,
 )
 from ccc_network_client import NetworkClient
 from ccc_provider_retry import ProviderRetryStore
@@ -142,6 +145,28 @@ class BurstAndMultiHerdrTests(unittest.TestCase):
             client = NetworkClient()
             snap = client.snapshot({"enabled": True, "config_path": str(cfg_path)}, now=now)
             self.assertEqual(snap["phase"], "healthy")
+
+    def test_orphaned_pre_io_intent_pruning_and_herdr_22mb_ledger_guard(self) -> None:
+        ledger = {
+            "acc-1": {"failed_turn_id": "turn-0", "phase": "accepted", "io_started_at": 100.0},
+            "orph-1": {"failed_turn_id": "turn-1", "phase": "intent"},
+            "sent-2": {"failed_turn_id": "turn-2", "phase": "intent", "io_started_at": 200.0},
+        }
+        removed = prune_orphaned_pre_io_intents(ledger, "turn-1", transcript_unchanged=True)
+        self.assertEqual(removed, ["orph-1"])
+        self.assertIn("acc-1", ledger)
+        self.assertIn("sent-2", ledger)
+        self.assertEqual(prune_orphaned_pre_io_intents(ledger, "turn-2", transcript_unchanged=True), [])
+
+        pane = {"pane_id": "w1:p3", "agent": None, "agent_session": {"agent": "codex", "value": "01a1d5c2-897c-7722-9b3f-79779237e19c"}}
+        self.assertEqual(normalize_herdr_pane_agent(pane)["agent"], "codex")
+
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td).resolve() / "ledger-22mb.json"
+            fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(b"x" * (22 * 1024 * 1024))
+            self.assertEqual(len(safe_regular_bytes(p)), 22 * 1024 * 1024)
 
 
 if __name__ == "__main__":
