@@ -2,7 +2,7 @@
 
 # CCC · 讓 agent 持續推進任務
 
-[English](README.md) · **繁體中文** · [Agent 操作指南](docs/agent-guide.md) · [Herdr 支援狀態](docs/herdr.md)
+[English](README.md) · [简体中文](README.zh-CN.md) · **繁體中文** · [Agent 操作指南](docs/agent-guide.md) · [Herdr 支援狀態](docs/herdr.md)
 
 <picture>
   <source srcset="assets/banner.svg" type="image/svg+xml">

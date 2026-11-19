@@ -1,0 +1,148 @@
+"""Unit tests for 50-way unthrottled AnyRouter burst retry and zero-config Multi-Herdr adaptation."""
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import tempfile
+import time
+import unittest
+
+from ccc_herdr_auto import (
+    codex_herdr_screen_admission,
+    discover_herdr_socket_candidates,
+    extract_resume_uuid,
+    herdr_placement_matches,
+    rollover_ledger,
+)
+from ccc_network_client import NetworkClient
+from ccc_provider_retry import ProviderRetryStore
+
+
+class BurstAndMultiHerdrTests(unittest.TestCase):
+    def test_50_way_concurrent_burst_retry_never_serializes_or_drops_slots(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = ProviderRetryStore(Path(td) / "provider-retry.sqlite3")
+            decisions_r1 = []
+            for idx in range(50):
+                ev = store.observe(
+                    f"01a1f100-0000-7000-8000-{idx:012d}",
+                    "anyrouter",
+                    f"turn-r1-{idx}",
+                    "high_demand",
+                    "We’re currently experiencing high demand, which may cause temporary errors.",
+                    1795050000.0 + idx * 0.001,
+                )
+                self.assertIsNotNone(ev)
+                d = store.evaluate(ev, f"attempt-r1-{idx}", reserve=True)
+                decisions_r1.append(d.allowed)
+                # Duplicate retry on the same failed turn must be blocked
+                dup = store.evaluate(ev, f"attempt-r1-dup-{idx}", reserve=True)
+                self.assertFalse(dup.allowed)
+            self.assertEqual(sum(decisions_r1), 50)
+
+            time.sleep(0.26)
+            decisions_r2 = []
+            for idx in range(50):
+                ev2 = store.observe(
+                    f"01a1f100-0000-7000-8000-{idx:012d}",
+                    "anyrouter",
+                    f"turn-r2-{idx}",
+                    "rate_limit",
+                    "429 rate limit exceeded",
+                    1795050005.0 + idx * 0.001,
+                )
+                d2 = store.evaluate(ev2, f"attempt-r2-{idx}", reserve=True)
+                decisions_r2.append(d2.allowed)
+            self.assertEqual(sum(decisions_r2), 50)
+
+    def test_codex_0170_footers_and_plan_mode_admission(self) -> None:
+        screen_fast = (
+            "› Reply only OK. Do not use tools. End the turn.\n\n"
+            "■ We’re currently experiencing high demand, which may cause temporary errors.\n\n"
+            "› Ask Codex to do anything\n\n"
+            "  GPT-6-Astra max fast · ~/work/15 · Context 0% used · Fast\n"
+            "  ← for agents · ? for shortcuts   ⚠ 2 warnings · f2 to view\n"
+        )
+        ok, reason = codex_herdr_screen_admission(screen_fast)
+        self.assertTrue(ok, reason)
+
+        screen_plan = (
+            "› Continue\n\n"
+            "■ We’re currently experiencing high demand, which may cause temporary errors.\n\n"
+            "› Ask Codex to do anything\n\n"
+            "  GPT-6-Astra medium fast · ~/Documents/project/…\n"
+            "  ← for agents  Plan mode (⇧tab to cycle) · ⚠ 5 warnings · f2 to view\n"
+        )
+        ok2, reason2 = codex_herdr_screen_admission(screen_plan)
+        self.assertTrue(ok2, reason2)
+
+    def test_multi_herdr_discovery_wrapper_env_and_ledger_rollover(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve() / "herdr"
+            (root / "sessions" / "stata").mkdir(parents=True, mode=0o700)
+            (root / "sessions" / "c3-llm-wiki").mkdir(parents=True, mode=0o700)
+            os.chmod(root, 0o700)
+            os.chmod(root / "sessions", 0o700)
+            cands, refs = discover_herdr_socket_candidates(root)
+            self.assertEqual([c[0] for c in cands], ["default", "c3-llm-wiki", "stata"])
+            self.assertEqual(refs, [])
+
+            ep = {
+                "session": "stata",
+                "socket": str(root / "sessions" / "stata" / "herdr.sock"),
+                "cmux_workspace_id": "EA1D69B4-2F78-4D24-B94D-5FC7C536C419",
+                "cmux_surface_id": "1A206BAF-1D2E-4107-992E-78FB15139AE0",
+            }
+            pane = {"pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1"}
+            env = {
+                "HERDR_ENV": "0",
+                "HERDR_SOCKET_PATH": ep["socket"],
+                "HERDR_PANE_ID": "w1:p1",
+                "HERDR_WORKSPACE_ID": "w1",
+                "HERDR_TAB_ID": "w1:t1",
+                "HERDR_SESSION": "stata",
+                "CMUX_WORKSPACE_ID": ep["cmux_workspace_id"],
+                "CMUX_SURFACE_ID": ep["cmux_surface_id"],
+            }
+            self.assertTrue(herdr_placement_matches(ep, pane, env))
+            sid = "01a1d58f-4afe-73c1-89d7-1001b9cb8e36"
+            argv = ["codex", "-c", 'model_providers.custom.base_url="http://127.0.0.1:3515/v1"', "resume", sid]
+            self.assertEqual(extract_resume_uuid(argv, "codex"), sid)
+
+            ledger_path = Path(td).resolve() / "herdr-input-ledger.json"
+            attempts = {
+                f"done-{i}": {"phase": "native_received", "attempted_at": float(i)}
+                for i in range(2500)
+            }
+            attempts["pending-1"] = {"phase": "submitted", "attempted_at": 9999.0}
+            ledger = {"schema": "herdr-input-ledger-v174", "attempts": attempts}
+            archived = rollover_ledger(ledger_path, ledger, frozenset({"native_received"}), keep=1000, trigger=2000)
+            self.assertEqual(archived, 1501)
+            self.assertEqual(len(ledger["attempts"]), 1000)
+            self.assertIn("pending-1", ledger["attempts"])
+
+    def test_network_client_tolerates_25s_probe_cycle(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            state_dir = Path(td)
+            cfg_path = state_dir / "network.json"
+            now = 1795050000.0
+            cfg_path.write_text(json.dumps({
+                "state_dir": str(state_dir),
+                "service_host": "anyrouter.example",
+                "probe": {"validation_mode": "reachability"},
+            }))
+            (state_dir / "status.json").write_text(json.dumps({
+                "version": 1,
+                "service_host": "anyrouter.example",
+                "validation_mode": "reachability",
+                "phase": "healthy",
+                "at": now - 22.0,
+            }))
+            client = NetworkClient()
+            snap = client.snapshot({"enabled": True, "config_path": str(cfg_path)}, now=now)
+            self.assertEqual(snap["phase"], "healthy")
+
+
+if __name__ == "__main__":
+    unittest.main()

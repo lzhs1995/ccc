@@ -1002,7 +1002,7 @@ class BatchWorker:
             if rule.get("batch_start_holds", {}).get(sid, {}).get("job_id") == self.job["id"]:
                 rule["batch_start_holds"].pop(sid)
         self.store.mutate(release)
-        slot["hold_released_at"] = self.clock()
+        slot.setdefault("hold_released_at", self.clock())
 
     def _protected(self, config, slot):
         rule = core.workspace_rule_by_id(config, self.job["workspace_id"])

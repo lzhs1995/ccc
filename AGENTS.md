@@ -1,6 +1,6 @@
 # Working with CCC
 
-Read [README.md](README.md) or [繁體中文介紹](README.zh-TW.md), then
+Read [README.md](README.md), [简体中文介绍](README.zh-CN.md) or [繁體中文介紹](README.zh-TW.md), then
 [the agent guide](docs/agent-guide.md). These instructions apply to coding agents
 editing this repository. Installing CCC does not enroll an agent or authorize input.
 `CLAUDE.md`, `GEMINI.md` and `llms.txt` link here; clients without automatic

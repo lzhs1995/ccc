@@ -921,7 +921,7 @@ class ManualFailover:
 
     def ready(self, monotonic):
         latest = self.latest
-        threshold = max(2, self.config.get("policy", {}).get("failures_before_isolation", 2))
+        threshold = max(1, self.config.get("policy", {}).get("failures_before_isolation", 1))
         return bool(self.binding and latest and self.failures >= threshold
                     and latest["manual"]["result"]["kind"] in LOCAL_FAILURES
                     and latest["candidate"] and latest["candidate"]["result"]["kind"] == "accessible"
@@ -931,7 +931,7 @@ class ManualFailover:
         latest = self.latest or {}
         return {"enabled": self.enabled, "state": self.state, "summary": self.detail,
                 "selection": (self.binding or {}).get("selection"), "consecutive_failures": self.failures,
-                "required_failures": max(2, self.config.get("policy", {}).get("failures_before_isolation", 2)),
+                "required_failures": max(1, self.config.get("policy", {}).get("failures_before_isolation", 1)),
                 "last_check": latest.get("manual"), "replacement_check": latest.get("candidate"),
                 "last_switch": self.last_switch, "model_requests": 0}
 

@@ -2,7 +2,7 @@
 
 # CCC · Keep your agents moving
 
-[English](README.md) · [繁體中文](README.zh-TW.md) · [Agent guide](docs/agent-guide.md) · [Support status](docs/herdr.md)
+[English](README.md) · [简体中文](README.zh-CN.md) · [繁體中文](README.zh-TW.md) · [Agent guide](docs/agent-guide.md) · [Support status](docs/herdr.md)
 
 <picture>
   <source srcset="assets/banner.svg" type="image/svg+xml">
