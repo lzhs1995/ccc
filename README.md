@@ -20,6 +20,19 @@ work while preserving the original session and the operator's input.
 not yet include the nested Herdr observer/guard.** Experimental builds and local
 validation are not a portable release. See [Herdr support and release gates](docs/herdr.md).
 
+## Demo
+
+- [Quick overview (34 seconds)](https://youtu.be/_T-k7GqMz0M)
+- [Walkthrough (3:20)](https://youtu.be/PD9xPhSQZvQ)
+
+Five offline tests of the actual watcher logic with synthetic terminal fixtures and injected conditions. The videos do not show live model recovery; Herdr support is in development in the pinned version.
+
+Silent, edited videos with burned-in Traditional Chinese and English captions.
+
+以合成終端夾具與注入條件，測試真實守護程式邏輯的五個案例；未拍攝真實模型故障後續跑，影片固定版本的 Herdr 支援仍在開發。
+
+無聲剪輯版，附繁中／英文燒錄字幕。
+
 ## What is available
 
 | Component | In this public branch |
