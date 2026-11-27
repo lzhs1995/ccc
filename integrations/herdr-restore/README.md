@@ -42,7 +42,7 @@ its account, provider configuration or environment differs from the default CLI.
 | Agent | Required on-disk evidence | Native invocation |
 | --- | --- | --- |
 | AGY | Saved source and UUID, same cascade ID in trajectory metadata, and at least one step | `agy --conversation ID` |
-| Grok | CWD-specific session directory, original ID and cwd in summary, and a readable chat record | `grok --resume ID` |
+| Grok | CWD-specific session directory (native `.cwd` marker for long paths), original ID and cwd in summary, and a matching conversation event in `updates.jsonl` | `grok --resume ID` |
 | Codex | Snapshot ID and exact fleet binding, SHA-256 history prefix and matching session metadata | `codex [saved provider option] resume ID` |
 | Claude | Snapshot ID and exact fleet binding, SHA-256 history prefix and matching session ID | `claude --resume ID` |
 
