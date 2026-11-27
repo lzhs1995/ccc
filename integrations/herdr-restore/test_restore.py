@@ -227,6 +227,95 @@ class RestoreTests(unittest.TestCase):
         with self.assertRaisesRegex(restore.Held, "ticket"):
             restore.enter(self.out / "plan.json", "0" * 32)
 
+    def witness(self, mutate=None, sid=None):
+        self.panes["3"].pop("agent_session", None)
+        sid = sid or self.agy
+        epoch = str(uuid4())
+        native = self.home / ("rollout-" + sid + ".jsonl")
+        raw = (json.dumps({"type": "session_meta", "payload": {"id": sid}}) + "\n").encode()
+        native.write_bytes(raw)
+        row = {"workspace": "wA", "tab": "wA:t4", "pane": "wA:p2", "terminal_id": "term_original",
+               "session": "demo", "agent": "codex", "sid": sid, "cwd": self.cwd, "identity_source": "native_current_turn",
+               "observed_process": {"pid": 114, "birth": [1600000000, 11]},
+               "history": {"path": str(native), "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}}
+        data = {"schema": "ccc-herdr-native-epoch-v1", "epoch": epoch, "session": "demo",
+                "snapshot_sha256": hashlib.sha256(json.dumps(self.snapshot).encode()).hexdigest(),
+                "observed_at_ns": 1700000000000000000, "panes": [row]}
+        if mutate:
+            mutate(data, row)
+        path = self.home / (epoch + ".json")
+        restore.private_json(path, data)
+        return {"witness": path, "witness_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+
+    def test_selected_epoch_restores_anonymous_seat(self):
+        first = self.witness(sid=self.grok)
+        second = self.witness()
+        plan = self.stage(auto=True, **first)
+        self.assertEqual(plan["witness_epoch"], first["witness"].stem)
+        self.assertEqual((plan["panes"][0]["sid"], plan["panes"][0]["status"]), (self.grok, "ready"))
+        self.assertEqual(plan["panes"][0]["witness_terminal_id"], "term_original")
+        self.out = self.home / "second-plan"
+        self.assertEqual(self.stage(**second)["panes"][0]["sid"], self.agy)
+
+    def test_legacy_fleet_cannot_bind_anonymous_seat(self):
+        w = self.witness()
+        row = restore.read_json(w["witness"])["panes"][0]
+        fleet = {"panes": {"demo#wA:p2": dict(row, pane_id=row["pane"])}}
+        self.assertEqual(self.stage(auto=True, fleet=fleet)["panes"][0]["status"], "held")
+
+    def test_identity_revalidated_from_history(self):
+        w = self.witness()
+        (self.home / ("rollout-" + self.agy + ".jsonl")).write_bytes(b"replaced\n")
+        row = self.stage(auto=True, **w)["panes"][0]
+        self.assertEqual(row["status"], "held")
+        self.assertNotIn("ticket", row)
+
+    def test_unpinned_replaced_or_wrong_permissions_rejected(self):
+        w = self.witness()
+        for args in [{"witness": w["witness"]}, {"witness_sha256": w["witness_sha256"]},
+                     dict(w, witness_sha256="0"*64)]:
+            with self.subTest(args=args), self.assertRaises(restore.Held):
+                self.stage(**args)
+        w["witness"].chmod(0o644)
+        with self.assertRaises(restore.Held):
+            self.stage(**w)
+        self.assertFalse(self.out.exists())
+
+    def test_witness_placement_source_and_epoch_mismatch(self):
+        changes = [(True,"session","other"), (True,"snapshot_sha256","0"*64), (True,"epoch",str(uuid4())),
+                   (False,"workspace","wB"), (False,"tab","wA:t6"), (False,"pane","wA:p3"), (False,"cwd","/"),
+                   (False,"identity_source","native_resume_argv"), (False,"terminal_id",""),
+                   (False,"observed_process",{"pid": 1, "birth": [0, 1]})]
+        for header,key,value in changes:
+            def change(data, row):
+                (data if header else row)[key] = value
+            with self.subTest(key=key), self.assertRaises(restore.Held):
+                self.stage(**self.witness(change))
+        self.assertFalse(self.out.exists())
+
+    def test_witness_rejects_terminal_pid_and_sid_collisions(self):
+        self.panes["8"].pop("agent_session")
+        for duplicate in ("terminal_id", "observed_process", "sid"):
+            def add(data, row):
+                other = dict(row, pane="wA:pN", terminal_id="term_other", sid=self.grok,
+                             observed_process={"pid": 225, "birth": [1600000030, 10]})
+                other[duplicate] = row[duplicate]
+                data["panes"].append(other)
+            with self.subTest(duplicate=duplicate), self.assertRaises(restore.Held):
+                self.stage(**self.witness(add))
+
+    def test_conflict_with_native_ref_is_rejected(self):
+        def change(data, row):
+            self.panes["3"]["agent_session"] = self.ref("claude", self.grok)
+            data["snapshot_sha256"] = hashlib.sha256(json.dumps(self.snapshot).encode()).hexdigest()
+        with self.assertRaisesRegex(restore.Held, "conflicts"):
+            self.stage(**self.witness(change))
+
+    def test_cross_source_duplicate_sid_holds_both(self):
+        self.panes["8"]["agent_session"] = self.ref("codex", self.agy)
+        plan = self.stage(auto=True, **self.witness())
+        self.assertEqual([r["status"] for r in plan["panes"]], ["held", "held"])
+
 
 if __name__ == "__main__":
     unittest.main()

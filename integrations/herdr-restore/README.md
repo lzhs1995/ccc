@@ -39,6 +39,24 @@ map from agent kind to an absolute executable, for example a profile-specific
 AGY wrapper. Reuse the original authenticated profile and executable when
 its account, provider configuration or environment differs from the default CLI.
 
+For a pane with a missing saved identity, select a private observation file from
+the backup taken while the original session was running. Set `EPOCH_FILE` to the
+chosen `<epoch-UUID>.json` and `EPOCH_SHA256` to the digest recorded at capture.
+Two captures with the same layout and snapshot digest may contain different
+conversations, so each requires its own explicit selection.
+
+```sh
+python3 -B restore.py stage --snapshot "$SNAPSHOT" --session "$SESSION" --out ./epoch-preview \
+  --witness "$EPOCH_FILE" --witness-sha256 "$EPOCH_SHA256"
+```
+
+The adapter checks the exact file digest, session and snapshot, every saved
+workspace/tab/pane/cwd, the original terminal and process generation, and
+unique native IDs across the selected session. It verifies the native
+history prefix at preparation and immediately before startup. A missing
+observation leaves the anonymous seat held. The plan records the selected
+epoch and digest; the current recovery terminal gets a fresh runtime identity.
+
 | Agent | Required on-disk evidence | Native invocation |
 | --- | --- | --- |
 | AGY | Saved source and UUID, same cascade ID in trajectory metadata, and at least one step | `agy --conversation ID` |
