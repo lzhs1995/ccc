@@ -29,6 +29,7 @@ BLOCKED_REASONS = {
     'http_413': 'provider rejected an oversized request (413); resolve payload or upstream size limit before retrying; session preserved',
     'deployment_not_found': 'provider has no deployment matching the requested model; restore the deployment; session and model preserved',
     'model_unavailable_for_group': 'provider group or gateway does not serve the selected model; check the original group/station and model',
+    'model_not_served': 'gateway does not serve the selected model; restore model access before retrying',
     'billing_exhausted': 'provider explicitly reported insufficient balance; top up the original account; session preserved',
     'invalid_request': 'provider rejected the request; inspect parameters/protocol; session preserved',
     'provider_error_unknown': 'unrecognized structured provider error; inspect original failure before retrying; session preserved',
@@ -92,22 +93,39 @@ def compaction_cooldown_seconds(message):
     return seconds if 0 < seconds <= 3600 else None
 
 
-MODEL_UNAVAILABLE_SENTENCE_RE = re.compile(
-    r'(?:streamdisconnectedbeforecompletion:'
-    r'|(?:unexpectedstatus(?:code)?|unknownstatuscode|http(?:/\d(?:\.\d)?)?|laststatus)'
-    r'[:=]?(?:403(?:forbidden)?|404(?:notfound)?):)?'
-    r'(?:[a-z0-9_\u4e00-\u9fff.-]{1,64}:)?'
-    r'(?:model"[a-z0-9._:\[\]/-]{1,200}"isnot(?:availablefor|supportedbyanyconfiguredaccountin)thisgroup'
-    r'|magpieknowsnomodel"[a-z0-9._:\[\]/-]{1,200}"'
-    r'|model"[a-z0-9._:\[\]/-]{1,200}"issetnottobeservedbyanyaccountorkey'
-    r'|modelnotallowedforthegatewaykey)\.?')
+_MODEL_NAME = r'"[a-z0-9._:\[\]/-]{1,200}"'
+_ROUTED_MODEL = r'[a-z0-9_-]{1,64}/[a-z0-9][a-z0-9._:/-]{0,198}(?<!\.)'
+_MODEL_LIST = rf'{_ROUTED_MODEL}(?:,{_ROUTED_MODEL}){{0,127}}'
+_ROUTING_HELP = re.escape(
+    "nameamodelasprovider/model(as/v1/modelslistsit),aroutinggroup'sidorname,"
+    "orabaremodelid(oneservedbyseveralprovidersgoestothegroupmagpiefoundforit,"
+    "elsetothefirstofthemintheprovidersorder);ithas")
+_SUGGESTIONS = rf'(?:;didyoumean{_MODEL_LIST}(?:\?(?:{_ROUTING_HELP}{_MODEL_LIST})?|\.\.\.))?'
+_RESPONSE_URL = r'(?:,url:https?://(?:[a-z0-9.-]+|\[[a-f0-9:]+\])(?::\d{1,5})?/(?:[a-z0-9._/-]*/)?v1/responses)?'
+_MODEL_SERVICE_BANNER = re.compile(
+    r'(?:(?:streamdisconnectedbeforecompletion:|'
+    r'(?:unexpectedstatus(?:code)?|unknownstatuscode|http(?:/\d(?:\.\d)?)?|laststatus)'
+    r'[:=]?(?:403(?:forbidden)?|404(?:notfound)?|502(?:badgateway)?):)){0,4}'
+    r'(?!(?:documentation|example|quoted|sample):)(?:[a-z0-9_\u4e00-\u9fff.-]{1,64}:)?'
+    r'(?:(?P<not_served>magpieknowsnomodel' + _MODEL_NAME + _SUGGESTIONS +
+    r'|model' + _MODEL_NAME + r'issetnottobeservedbyanyaccountorkey)'
+    r'|model' + _MODEL_NAME + r'isnot(?:availablefor|supportedbyanyconfiguredaccountin)thisgroup'
+    r'|modelnotallowedforthegatewaykey)\.?' + _RESPONSE_URL)
+
+
+def _model_service_error(detail):
+    match = _MODEL_SERVICE_BANNER.fullmatch(detail.lstrip('■⚠└'))
+    if match:
+        return 'model_not_served' if match['not_served'] else 'model_unavailable_for_group'
+    return None
 
 
 def _plain_native_error(compact):
     """Concrete terminal causes without JSON; callers supply native/UI proof."""
     prefix = compact.lstrip('■⚠└')
-    if MODEL_UNAVAILABLE_SENTENCE_RE.fullmatch(prefix):
-        return 'model_unavailable_for_group'
+    service_error = _model_service_error(prefix)
+    if service_error:
+        return service_error
     if re.search(r'(?:unexpectedstatus(?:code)?|unknownstatuscode|http)[:=]?(401|403)(?!\d)', prefix):
         return None  # Preserve existing authentication/quota classification.
     if any(token in compact for token in ('insufficient_quota', 'yourquotahasbeenexhausted',
@@ -207,12 +225,21 @@ def structured_error_type(message):
     except ValueError:
         return None
     error = payload.get('error') if isinstance(payload, dict) else None
+    # Responses SSE carries the provider failure in response.error. A model
+    # rejection inside this event outranks the outer transport status.
+    if isinstance(payload, dict) and payload.get('type') == 'response.failed':
+        response = payload.get('response')
+        if isinstance(response, dict) and isinstance(response.get('error'), dict):
+            nested = response['error'].get('message')
+            if isinstance(nested, str) and (service_error := _model_service_error(nested)):
+                return service_error
     if not isinstance(error, dict) or not error:
         return None
     codes = {error[key] for key in ('code', 'type') if isinstance(error.get(key), str)}
     detail = error.get('message') if isinstance(error.get('message'), str) else ''
-    if MODEL_UNAVAILABLE_SENTENCE_RE.fullmatch(detail.lstrip('■⚠└')):
-        return 'model_unavailable_for_group'
+    service_error = _model_service_error(detail)
+    if service_error:
+        return service_error
     if codes & {'deployment_not_found', 'deploymentnotfound', 'model_not_found'}:
         return 'deployment_not_found'
     if (codes & {'resource_mismatch', 'resource_mismatch_error'} or (

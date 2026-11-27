@@ -200,13 +200,9 @@ def _turns(data, session_id, message):
 
 
 def _completed_check(data, origin, message):
-    """Read actual OK completion of the original check, never an idle label.
-
-    All non-context user turns must still be this exact short check. An OK in
-    a tool output, reasoning, quoted user text or a different later task is not
-    a successful check. A new unfinished turn invalidates the displayed proof.
-    """
+    """Read an original check's native OK, including ordinary followups after failure."""
     from ccc_workspace_batch import _startup_context
+    from cmux_codex_watch import CONTINUE_ECHO_PHRASES
     if not data.endswith(b"\n"):
         return None
     lines = data.splitlines()
@@ -214,6 +210,22 @@ def _completed_check(data, origin, message):
     if meta.get("type") != "session_meta" or meta.get("payload", {}).get("id") != origin["session_id"]:
         return None
     current, pending, turns, seen = None, {}, [], set()
+
+    def record_input(text, channel, turn_id):
+        turn = current if current is not None else pending
+        if turn_id is not None:
+            if turn.get("turn_id", turn_id) != turn_id:
+                return False
+            turn["turn_id"] = turn_id
+        if text != message and (not turns or turns[-1]["ok"] or text not in CONTINUE_ECHO_PHRASES):
+            return False
+        # Multiple native representations must describe the same single input.
+        if channel in turn or turn.get("input", text) != text:
+            return False
+        turn[channel] = True
+        turn["input"] = text
+        return True
+
     for line in lines[1:]:
         event = json.loads(line)
         payload = event.get("payload")
@@ -221,6 +233,10 @@ def _completed_check(data, origin, message):
             return None
         kind = payload.get("type", "") if event.get("type") == "event_msg" else ""
         if event.get("type") == "session_meta" or kind in {"turn_aborted", "task_aborted"} or kind.startswith("goal_"):
+            return None
+        if any(key in payload and payload[key] != origin["session_id"] for key in ("thread_id", "session_id")):
+            return None
+        if current is not None and "turn_id" in payload and payload["turn_id"] != current["turn_id"]:
             return None
         if event.get("type") == "response_item":
             item_type, role = payload.get("type"), payload.get("role")
@@ -237,27 +253,23 @@ def _completed_check(data, origin, message):
                 if role == "user":
                     if _startup_context(text):
                         continue
-                    if text != message:
-                        return None
-                    destination = current if current is not None else pending
-                    destination["response_count"] = destination.get("response_count", 0) + 1
-                    if destination["response_count"] != 1:
+                    if not record_input(text, "response_input", payload.get("turn_id")):
                         return None
                 elif current is None or text.strip() != "OK" or payload.get("channel") not in (None, "final"):
                     return None
         if kind == "task_started":
             turn_id = payload.get("turn_id")
-            if current is not None or not turn_id or turn_id in seen or len(turns) >= 2048:
+            if (current is not None or not turn_id or turn_id in seen or len(turns) >= 2048
+                    or pending.get("turn_id", turn_id) != turn_id):
                 return None
             seen.add(turn_id)
             current = {**pending, "turn_id": turn_id, "started_at": epoch(event["timestamp"])}
+            if turns and (turns[-1]["ok"] or current["started_at"] < turns[-1]["at"]):
+                return None
             pending = {}
         elif kind == "user_message":
-            if payload.get("message") != message or any(payload.get(key) for key in ("images", "local_images", "text_elements")):
-                return None
-            destination = current if current is not None else pending
-            destination["user_count"] = destination.get("user_count", 0) + 1
-            if destination["user_count"] != 1:
+            if (any(payload.get(key) for key in ("images", "local_images", "text_elements"))
+                    or not record_input(payload.get("message"), "user_event", payload.get("turn_id"))):
                 return None
         elif kind == "item_completed":
             item = payload.get("item", {})
@@ -277,17 +289,14 @@ def _completed_check(data, origin, message):
                     or item.get("type") != "UserMessage" or not isinstance(content, list) or not content
                     or any(not isinstance(p, dict) or p.get("type") != "text"
                            or not isinstance(p.get("text"), str) or p.get("text_elements") for p in content)
-                    or "\n".join(p["text"] for p in content) != message):
-                return None
-            current["item_count"] = current.get("item_count", 0) + 1
-            if current["item_count"] != 1:
+                    or not record_input("\n".join(p["text"] for p in content), "item_input", payload["turn_id"])):
                 return None
         elif kind == "agent_message" and payload.get("message"):
             if current is None or str(payload["message"]).strip() != "OK":
                 return None
         elif kind == "task_complete":
             if (current is None or payload.get("turn_id") != current["turn_id"]
-                    or not any(current.get(key) == 1 for key in ("user_count", "response_count", "item_count"))):
+                    or "input" not in current):
                 return None
             at = epoch(event["timestamp"])
             if at < current["started_at"]:
@@ -302,7 +311,8 @@ def _completed_check(data, origin, message):
             or any(turn["ok"] for turn in turns[:-1])
             or (turns[0]["turn_id"], turns[0]["started_at"]) != (origin["first_turn_id"], origin["first_turn_at"])):
         return None
-    return {"turn_id": turns[-1]["turn_id"], "completed_at": turns[-1]["at"], "message": "OK"}
+    return {"turn_id": turns[-1]["turn_id"], "completed_at": turns[-1]["at"], "message": "OK",
+            "completion_kind": "ordinary_continue" if any(t["input"] != message for t in turns) else "short_check"}
 
 
 class PrivateChecks:

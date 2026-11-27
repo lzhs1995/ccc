@@ -7976,6 +7976,16 @@ class WatchDaemon:
             return None
         return classifier.resolve(None, gates, 'codex', model, message, provider=binding)
 
+    def _native_model_block(self, turn):
+        if self._codex_terminal_tail_proven(turn):
+            error = turn.get('error')
+            message = error.get('message') if isinstance(error, Mapping) else None
+            kind = structured_error_type(message) if isinstance(message, str) else None
+            if kind in {'model_not_served', 'model_unavailable_for_group'}:
+                return ScreenState('provider_blocked', message_kind='codex', error_type=kind,
+                                   reason=PROVIDER_BLOCKED_REASONS[kind])
+        return None
+
     def _native_goal_error_state(self, target, state, grid):
         """Resolve a superseded provider card only from an authenticated Goal EOF.
 
@@ -7984,8 +7994,13 @@ class WatchDaemon:
         compact, provider, placement and durable-attempt guards remain intact.
         """
         if (state.kind not in {'idle', 'unknown', 'error_superseded', 'recoverable_error'}
-                or (state.error_type is not None and state.error_type not in ORDINARY_CONTINUE_GOAL_ERRORS)
                 or _goal_boundary_signature(grid, draft=False) is None):
+            return state
+        turn = self.codex_queue_recovery.current_turn(target)
+        model_block = self._native_model_block(turn)
+        if model_block:
+            return dataclasses.replace(model_block, screen_signature=state.screen_signature)
+        if state.error_type is not None and state.error_type not in ORDINARY_CONTINUE_GOAL_ERRORS:
             return state
         stalled = any('Goal stalled (/goal resume)' in line
                       for line in grid.lines[grid.cursor.row + 1:grid.cursor.row + 4])
@@ -7994,7 +8009,6 @@ class WatchDaemon:
             # an active Goal. Its authenticated terminal EOF is still required.
             if state.error_type is not None:
                 return state
-            turn = self.codex_queue_recovery.current_turn(target)
             error_type = self._resolved_native_error(target, turn, enqueue=True, grid=grid)
             if not error_type or error_type in PROVIDER_BLOCKED:
                 return state
@@ -8697,6 +8711,12 @@ class WatchDaemon:
             )
             return self._native_goal_error_state(target, classify_grid(current_grid), current_grid)
 
+        def idle_codex(prefilter_state):
+            if (getattr(self, 'jev_classifier', None) is not None
+                    or self._native_model_block(self.codex_queue_recovery.current_turn(target))):
+                return replay_codex()
+            return prefilter_state
+
         if prefilter.kind in {"menu", "working"}:
             if claude_on:
                 label = self._candidate_process_label(target, client)
@@ -8708,9 +8728,7 @@ class WatchDaemon:
             if prefilter.kind == "idle":
                 if looks_like_claude:
                     return self._claude_observed_state("Claude UI")
-                if getattr(self, 'jev_classifier', None) is None:
-                    return prefilter
-                return replay_codex()
+                return idle_codex(prefilter)
             label = self._candidate_process_label(target, client)
             agent_kind = label.get("agent_kind")
             if agent_kind == "claude":
@@ -8729,9 +8747,7 @@ class WatchDaemon:
             if label.get("agent_kind") == "claude":
                 return replay_claude()
             if label.get("agent_kind") == "codex":
-                if getattr(self, 'jev_classifier', None) is not None:
-                    return replay_codex()
-                return dataclasses.replace(prefilter, message_kind="codex")
+                return idle_codex(dataclasses.replace(prefilter, message_kind="codex"))
             return prefilter
         label = self._candidate_process_label(target, client)
         agent_kind = label.get("agent_kind")
