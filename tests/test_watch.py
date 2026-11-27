@@ -1139,7 +1139,7 @@ class WatchTests(unittest.TestCase):
                 "■ " + error,
                 "",
                 "› ",
-                "gpt-5.6-sol xhigh · ~/Documents/cnm  100% context left",
+                "gpt-5.6-sol xhigh · ~/Documents/example  100% context left",
             ])
             client = FakeClient(grid_payload([], error=error), screen)
             daemon = self._one_second_daemon(directory, client)
@@ -1215,9 +1215,9 @@ class WatchTests(unittest.TestCase):
         self.assertFalse(_looks_like_claude_ui([
             "■ exceeded retry limit, last status: 429 Too Many Requests",
             "› Improve documentation in @filename",
-            "gpt-5.6-sol xhigh · ~/Documents/cnm  100% context left",
+            "gpt-5.6-sol xhigh · ~/Documents/example  100% context left",
         ]))
-        self.assertFalse(_looks_like_claude_ui(["❯ ", "lzhs@mac repo %"]))
+        self.assertFalse(_looks_like_claude_ui(["❯ ", "example@mac repo %"]))
         self.assertTrue(_looks_like_claude_ui([
             "❯ ",
             "  [Opus 5 (1M context)] │ ~/repo",

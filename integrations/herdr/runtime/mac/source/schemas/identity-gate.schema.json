@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Multi-agent identity gate",
+  "type": "object",
+  "required": [
+    "task_id",
+    "status",
+    "session",
+    "supervisor",
+    "supervisor_pane_id",
+    "identity_source",
+    "identity_status",
+    "executors",
+    "checks",
+    "blocking_reasons",
+    "pane_inventory",
+    "updated_at"
+  ],
+  "properties": {
+    "task_id": {"type": "string", "minLength": 1},
+    "status": {"type": "string", "enum": ["PASS", "FAIL"]},
+    "session": {"type": "string"},
+    "supervisor": {"type": "string"},
+    "supervisor_pane_id": {"type": "string"},
+    "identity_source": {"type": "string", "enum": ["env", "explicit", "fallback", "unknown"]},
+    "identity_status": {"type": "string"},
+    "identity_message": {"type": "string"},
+    "executors": {"type": "array"},
+    "checks": {"type": "object"},
+    "blocking_reasons": {"type": "array", "items": {"type": "string"}},
+    "pane_inventory": {"type": "string"},
+    "updated_at": {"type": "string", "minLength": 1}
+  }
+}

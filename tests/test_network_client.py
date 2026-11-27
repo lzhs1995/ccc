@@ -71,7 +71,7 @@ class NetworkClientTests(unittest.TestCase):
         self.assertFalse(verdict["blocked"])
 
     def test_missing_stale_future_or_observe_snapshot_does_not_claim_outage(self):
-        for stamp, mode in ((time.time() - 11, "manage"), (time.time() + 50, "manage"), (time.time(), "observe")):
+        for stamp, mode in ((time.time() - 31, "manage"), (time.time() + 50, "manage"), (time.time(), "observe")):
             self.status(at=stamp, mode=mode)
             self.assertFalse(self.client.verdict(self.options, self.target, self.turn)["blocked"])
         (self.root / "status.json").write_text("partial")

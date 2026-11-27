@@ -31,6 +31,8 @@ jobs:
         run: python -B -m unittest discover -s tests -p 'test_*.py'
       - name: Standalone stack contract tests
         run: python -B tests/test_cmux_stack.py
+      - name: Offline restore adapters
+        run: python -B -m unittest discover -s integrations/herdr-restore -p 'test_*.py' -v
       - name: Isolated profile editor PTY tests
         run: python -B tools/ccp_pty_stress.py --script ./ccp_new.py --rounds 3
       - name: Shell syntax

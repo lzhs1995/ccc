@@ -63,13 +63,20 @@ def self_test():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--self-test', action='store_true')
+    parser.add_argument('--export', action='store_true', help='scan every member of a source export')
     args = parser.parse_args()
     if args.self_test:
         self_test()
         return 0
     root = Path(__file__).resolve().parents[1]
-    names = subprocess.check_output(['git', '-C', str(root), 'ls-files', '-z',
-        '--cached', '--others', '--exclude-standard']).decode().split('\0')
+    if args.export:
+        names = [p.relative_to(root).as_posix() for p in root.rglob('*')
+                 if p.is_symlink() or not p.is_dir()]
+        scope = 'entire materialized source export'
+    else:
+        names = subprocess.check_output(['git', '-C', str(root), 'ls-files', '-z',
+            '--cached', '--others', '--exclude-standard']).decode().split('\0')
+        scope = 'current tracked and nonignored proposed files; no history scan'
     results, total = [], 0
     for name in sorted(set(filter(None, names))):
         path = root / name
@@ -80,7 +87,7 @@ def main():
             continue
         total += 1
         results.extend(findings(name, path.read_bytes()))
-    print(json.dumps({'scope': 'current tracked and nonignored proposed files; no history scan',
+    print(json.dumps({'scope': scope,
         'files_scanned': total, 'findings': results, 'passed': not results}, indent=2))
     return 1 if results else 0
 

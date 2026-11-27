@@ -10,10 +10,10 @@ venv/
 *credential*
 *.bak
 *.log
-runtime/
-state/
-profiles/
-handoff/
-observations/
-backups/
-dist/
+/runtime/
+/state/
+/profiles/
+/handoff/
+/observations/
+/backups/
+/dist/

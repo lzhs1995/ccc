@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "successor-rebind",
+  "oneOf": [{
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema", "binding_mode", "authorization_source", "writes_frozen",
+    "old_supervisor_uuid", "old_workspace_uuid", "successor_surface_uuid",
+    "successor_workspace_uuid", "successor_pane_uuid", "target_executor_uuid", "target_workspace_uuid", "target_pane_uuid",
+    "task_id", "episode_id", "old_task_pack_sha256", "old_attempt_sha256",
+    "successor_of_binding_sha256", "authorization_record_sha256",
+    "supervisor_failure_receipt", "freeze_evidence", "authorization_record",
+    "expires_at"
+  ],
+  "properties": {
+    "schema": {"const": "successor-rebind-v1"},
+    "binding_mode": {"const": "successor_cross_workspace_v1"},
+    "authorization_source": {"const": "user_message"},
+    "writes_frozen": {"const": true},
+    "consumed": {"type": "boolean"},
+    "expires_at": {"type": "number"}
+  }
+}, {
+  "type": "object",
+  "description": "Maintenance communication pins the exact user message and both endpoints; it grants no old task replay or shared writes.",
+  "required": ["schema", "binding_mode", "scope", "authorization_source", "communication_only", "allow_task_replay", "allow_shared_writes", "successor_surface_uuid", "successor_workspace_uuid", "successor_pane_uuid", "target_executor_uuid", "target_workspace_uuid", "target_pane_uuid", "authorization_record", "authorization_record_sha256"],
+  "properties": {
+    "schema": {"const": "successor-rebind-v2"},
+    "binding_mode": {"const": "user_authorized_maintenance_v2"},
+    "scope": {"const": "maintenance_handshake"},
+    "authorization_source": {"const": "user_message"},
+    "communication_only": {"const": true},
+    "allow_task_replay": {"const": false},
+    "allow_shared_writes": {"const": false},
+    "successor_surface_uuid": {"type": "string", "format": "uuid"},
+    "successor_workspace_uuid": {"type": "string", "format": "uuid"},
+    "successor_pane_uuid": {"type": "string", "format": "uuid"},
+    "target_executor_uuid": {"type": "string", "format": "uuid"},
+    "target_workspace_uuid": {"type": "string", "format": "uuid"},
+    "target_pane_uuid": {"type": "string", "format": "uuid"},
+    "authorization_record_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "authorization_record": {
+      "type": "object",
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {"type": "string", "pattern": "^/"},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "consumed": {"type": "boolean"},
+    "expires_at": {"type": "number"}
+  }
+}]
+}

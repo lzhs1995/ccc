@@ -136,7 +136,7 @@ RECONNECT_STATUS_SUFFIX_RE = (
     r"(?:\s*[.…]+)?)?"
 )
 RECONNECT_HEADER_RE = re.compile(
-    r"^•\s*Reconnecting(?:\.\.\.|…)(?:\s+\d+\s*/\s*\d+)?"
+    r"^•\s*Reconnecting(?:\.\.\.|…)(?:\s+\d+\s*/\s*\d+|\s+waiting\s+for\s+network)?"
     r"(?:\s+\((?:\d+[hms]\s*)+[•·]\s*esc\s+to\s+(?:interrupt|cancel)\))?"
     + RECONNECT_STATUS_SUFFIX_RE
     + r"$",
@@ -988,7 +988,18 @@ def _match_error_block(block_text: str) -> str | None:
     # prose mentioning rate limits. Geometry/adjacency is checked by the caller;
     # removing whitespace here also handles hard wraps inside words or models.
     compact = re.sub(r"\s+", "", lower)
+    # The native failure card can omit its stream-disconnected prefix. Keep
+    # these complete causes on the existing stream path (not encrypted-input
+    # repair); the caller still checks marker, adjacency and composer state.
+    bare = compact[1:] if compact[:1] in {"■", "⚠", "└"} else compact
+    if bare in {
+        "encryptedfunctionoutputcontentcouldnotbedecryptedordecoded.",
+        "idletimeoutwaitingforsse",
+    }:
+        return "stream"
     if "400" in compact and '"code":"invalid_encrypted_content"' in compact:
+        if "badresponsestatuscode400" in compact:
+            return "encrypted_function_output"
         return "invalid_encrypted_content"
     if _provider_rate_limit_banner(compact):
         return "rate_limit"

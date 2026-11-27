@@ -198,7 +198,7 @@ class NetworkClient:
                 self.cache = now, path, value
             value = dict(self.cache[2])
         at = value.get("at", 0)
-        if not isinstance(at, (int, float)) or not 0 <= now - at <= 10:
+        if not isinstance(at, (int, float)) or not 0 <= now - at <= 30:
             value["phase"] = "observer_stale"
         return value
 
@@ -209,7 +209,7 @@ class NetworkClient:
             return False
         key = (path, surface_id, route_id)
         with self.lock:
-            if 0 <= now - self.hinted_at.get(key, 0) < 2:
+            if 0 <= now - self.hinted_at.get(key, 0) < 0.5:
                 return False
             self.hinted_at[key] = now
             if len(self.hinted_at) > 1024:
