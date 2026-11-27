@@ -33,6 +33,9 @@ class RestoreTests(unittest.TestCase):
         self.summary = self.gdir / "summary.json"
         self.summary.write_text(json.dumps({"info": {"id": self.grok, "cwd": self.cwd}}))
         (self.gdir / "chat_history.jsonl").write_text('{"type":"user","content":"example"}\n')
+        self.updates = self.gdir / "updates.jsonl"
+        self.updates.write_text(json.dumps({"method": "session/update", "params": {"sessionId": self.grok, "update": {
+            "sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": "hello"}}}}) + "\n")
         self.panes = {
             "3": {"cwd": self.cwd, "label": "left", "agent_session": self.ref("agy", self.agy),
                   "launch_argv": ["obsolete-launcher"]},
@@ -82,6 +85,29 @@ class RestoreTests(unittest.TestCase):
     def test_duplicate_sid_held_in_both_seats(self):
         self.panes["8"]["agent_session"] = self.panes["3"]["agent_session"]
         self.assertTrue(all(r["status"] == "held" for r in self.stage(auto=True)["panes"]))
+
+    def test_grok_rejects_raw_chat_without_official_resume_log(self):
+        self.updates.unlink()
+        self.assertEqual(self.stage(auto=True)["panes"][1]["status"], "held")
+
+    def test_grok_rejects_foreign_update(self):
+        self.updates.write_text(self.updates.read_text().replace(self.grok, self.agy))
+        self.assertEqual(self.stage(auto=True)["panes"][1]["status"], "held")
+
+    def test_grok_long_cwd_group_from_marker(self):
+        import shutil
+        cwd = self.home / ("a" * 120) / ("b" * 120)
+        cwd.mkdir(parents=True)
+        group = self.gdir.parent.parent / "native-slug"
+        group.mkdir()
+        shutil.move(str(self.gdir), str(group / self.grok))
+        (group / ".cwd").write_text(str(cwd))
+        (group / self.grok / "summary.json").write_text(json.dumps({"info": {"id": self.grok, "cwd": str(cwd)}}))
+        row = {"agent": "grok", "sid": self.grok, "cwd": str(cwd)}
+        self.assertEqual(restore.verify_native(row, self.home), group / self.grok / "updates.jsonl")
+        shutil.copytree(group, group.with_name("second-group"))
+        with self.assertRaisesRegex(restore.Held, "ambiguous"):
+            restore.verify_native(row, self.home)
 
     def test_wrong_native_id_and_reused_grok_directory(self):
         with closing(sqlite3.connect(self.db)) as db, db:

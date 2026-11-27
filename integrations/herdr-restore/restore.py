@@ -116,15 +116,34 @@ def verify_native(row, home):
                     "AGY cascade ID or steps mismatch")
         return path
     if agent == "grok":
-        directory = home / ".grok/sessions" / quote(cwd, safe="") / sid
+        sessions = home / ".grok/sessions"
+        encoded = quote(cwd, safe="")
+        if len(encoded.encode()) <= 255:
+            directory = sessions / encoded / sid
+        else:
+            groups = [g for g in sessions.iterdir() if not g.is_symlink()
+                      and (g / ".cwd").is_file() and not (g / ".cwd").is_symlink()
+                      and (g / ".cwd").read_text().rstrip("\n") == cwd and (g / sid).is_dir()]
+            require(len(groups) == 1, "ambiguous or missing Grok long-cwd group")
+            directory = groups[0] / sid
+        require(not directory.is_symlink() and not directory.parent.is_symlink(), "unexpected session link")
         summary = read_json(directory / "summary.json")
         require(summary["info"].get("id") == sid and summary["info"].get("cwd") == cwd,
                 "Grok native ID or cwd mismatch")
-        path = directory / "chat_history.jsonl"
+        path = directory / "updates.jsonl"
         require(not path.is_symlink(), "unexpected history link")
         with path.open("rb") as stream:
-            first = json.loads(stream.readline())
-        require(isinstance(first.get("type"), str) and "content" in first, "Grok transcript missing")
+            for line in stream:
+                event = json.loads(line)
+                if event.get("method") != "session/update":
+                    continue
+                params = event["params"]
+                require(params.get("sessionId") == sid, "Grok update references a different SID")
+                update = params.get("update", {})
+                if update.get("sessionUpdate") in ("user_message_chunk", "agent_message_chunk") and update.get("content"):
+                    break
+            else:
+                raise Held("Grok resume log contains no conversation message")
         return path
     require(agent in ("codex", "claude"), "unsupported agent")
     proof = row["history"]
@@ -258,7 +277,7 @@ def check_holders(row, home, history):
     if row["agent"] == "agy":
         paths.append(home / ".gemini/antigravity-cli/presence" / (row["sid"] + ".lock"))
     if row["agent"] == "grok":
-        paths.append(history.with_name(history.name + ".lock"))
+        paths.extend(history.with_name(name) for name in ("updates.jsonl.lock", "chat_history.jsonl", "chat_history.jsonl.lock"))
     scan = subprocess.run(["lsof", "-nP", "-t", *[str(p) for p in paths if p.exists()]],
                           stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
     require(scan.returncode == 1 and not scan.stdout.strip() and not scan.stderr.strip(),
