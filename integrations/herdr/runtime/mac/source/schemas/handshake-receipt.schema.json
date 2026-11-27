@@ -1,0 +1,138 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Multi-agent handshake receipt",
+  "type": "object",
+  "required": [
+    "task_id",
+    "status",
+    "supervisor",
+    "executor",
+    "executor_ack",
+    "updated_at"
+  ],
+  "properties": {
+    "task_id": {"type": "string", "minLength": 1},
+    "status": {"type": "string", "enum": ["PASS", "HELLO_SENT", "AWAITING_EXECUTOR_ACK", "FAIL"]},
+    "supervisor": {"type": "string"},
+    "executor": {"type": "string"},
+    "executor_ack": {"type": "boolean"},
+    "ack_format": {"type": "string"},
+    "report_path": {"type": "string"},
+    "callback_line": {"type": "string"},
+    "hello_line": {"type": "string"},
+    "required_ack": {"type": "string"},
+    "delivery_method": {"type": "string"},
+    "artifact_root": {"type": "string"},
+    "updated_at": {"type": "string"},
+
+    "lifecycle": {
+      "type": "string",
+      "enum": ["PENDING", "ACKED", "EXPIRED", "REJECTED"],
+      "description": "Explicit phase. PENDING is not FAIL: a receipt awaiting an ACK inside its budget has not failed yet. EXPIRED means the budget elapsed with a legal budget; REJECTED means the ACK arrived but did not bind."
+    },
+
+    "submission_state": {
+      "type": ["string", "null"],
+      "description": "Original sender diagnostic, including native receipt or queue state; null before dispatch. Busy work does not prohibit communication. No diagnostic alone authorizes replay; reconcile the original attempt."
+    },
+
+    "detector_side": {
+      "type": ["string", "null"],
+      "enum": ["supervisor", "executor", "unknown", null],
+      "description": "Which side observed the condition. A supervisor-side abort must never be reported as executor silence."
+    },
+
+    "budget_source": {
+      "type": "string",
+      "enum": ["phase_handshake_default", "generic_timeout_override", "phase_default", "explicit_timeout_override", "explicit_phase_flag"],
+      "description": "Which budget governed the original poll. The first two values are emitted by the current harness; older values remain readable. A generic --timeout overrides the phase default."
+    },
+
+    "budget_seconds": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "The effective budget in seconds, as used, not as defaulted."
+    },
+
+    "phase_minimum_seconds": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "The phase floor (handshake 600, round 180). When budget_seconds is below this, a timeout must not be attributed to executor silence."
+    },
+
+    "budget_below_phase_minimum": {
+      "type": "boolean",
+      "description": "True when budget_seconds < phase_minimum_seconds. Requires reason SUPERVISOR_BUDGET_TOO_SHORT rather than HANDSHAKE_TIMEOUT."
+    },
+
+    "task_pack_sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$",
+      "description": "Binds the receipt to the exact pack content it was issued for, so a later pack edit cannot silently inherit an old ACK."
+    },
+
+    "source_revision": {
+      "type": "string",
+      "description": "Repository revision the executor was asked to work against."
+    },
+
+    "workspace_ref": {"type": ["string", "null"]},
+    "executor_surface_snapshot": {"type": "string"},
+
+    "clear_confirmed": {
+      "type": "boolean",
+      "description": "Legacy bridge diagnostic field; not proof that a fresh handshake ran a probe."
+    },
+    "bridge_probe_policy": {"const": "optional-probe-v1"},
+    "bridge_probe_status": {"enum": ["NOT_RUN", "CLEARED", "CLEAR_RECOVERED"]},
+    "bridge_clear_confirmed": {
+      "type": ["boolean", "null"],
+      "description": "Null when no optional probe ran. True only for a cleared original probe or its verified original recovery; never inferred from handshake success."
+    },
+    "bridge_clear_recovery": {"type": ["object", "null"]},
+    "executors": {"type": "array", "minItems": 1, "items": {"$ref": "#"}},
+
+    "dispatch_started_at": {"type": ["string", "null"]},
+    "dispatch_submitted_at": {
+      "type": ["string", "null"],
+      "description": "Null before dispatch or when the sender returned an error or uncertain result. It does not establish zero input; inspect the original journal and native evidence."
+    },
+    "ack_observed_at": {"type": ["string", "null"]},
+    "parser_confirmed_at": {"type": ["string", "null"]},
+    "terminal_error_at": {"type": ["string", "null"]},
+
+    "freshness": {
+      "type": "object",
+      "description": "Derived evidence must not predate its inputs. A validation summary older than the receipt it summarizes is not current evidence.",
+      "properties": {
+        "computed_at": {"type": "string"},
+        "inputs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["path", "mtime_epoch"],
+            "properties": {
+              "path": {"type": "string"},
+              "mtime_epoch": {"type": "number"},
+              "sha256": {"type": "string"}
+            }
+          }
+        },
+        "stale": {"type": "boolean"}
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {"required": ["bridge_probe_policy"]},
+      "then": {
+        "required": ["bridge_probe_status", "bridge_clear_confirmed", "bridge_clear_recovery"],
+        "oneOf": [
+          {"properties": {"bridge_probe_status": {"const": "NOT_RUN"}, "bridge_clear_confirmed": {"type": "null"}, "bridge_clear_recovery": {"type": "null"}}},
+          {"properties": {"bridge_probe_status": {"const": "CLEARED"}, "bridge_clear_confirmed": {"const": true}, "bridge_clear_recovery": {"type": "null"}}},
+          {"properties": {"bridge_probe_status": {"const": "CLEAR_RECOVERED"}, "bridge_clear_confirmed": {"const": true}, "bridge_clear_recovery": {"type": "object"}}}
+        ]
+      }
+    }
+  ]
+}

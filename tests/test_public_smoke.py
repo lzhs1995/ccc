@@ -33,8 +33,8 @@ class PublicSmokeTests(unittest.TestCase):
                 and path.suffix in {".py", ".sh", ".command", ".env", ".json", ".md", ".txt", ".template"}
             ):
                 raw = path.read_text(encoding="utf-8", errors="ignore")
-                self.assertNotIn("/Users/" + "lzhs", raw, str(path))
-                self.assertNotIn("com." + "lzhs", raw, str(path))
+                self.assertNotIn("/Users/" + "example", raw, str(path))
+                self.assertNotIn("com." + "example", raw, str(path))
 
 
 if __name__ == "__main__":

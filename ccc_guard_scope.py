@@ -11,19 +11,29 @@ import os
 from pathlib import Path
 import signal
 import sys
+import threading
 import uuid
 
 import ccc_codex_queue as native
 
+_PROCARGS_TLS = threading.local()
 
-def birth(pid, *, codex=False):
+
+def birth(pid, *, codex=False, observation=None):
     if native._proc_pidinfo is None or type(pid) is not int or not 1 < pid < 2**31:
+        if observation is not None:
+            observation.update(available=native._proc_pidinfo is not None, valid_pid=False)
         return None
     info = native._BsdInfo()
     size = ctypes.sizeof(info)
-    if (native._proc_pidinfo(pid, 3, 0, ctypes.byref(info), size) != size
+    result = native._proc_pidinfo(pid, 3, 0, ctypes.byref(info), size)
+    if observation is not None:
+        observation.update(returned_bytes=result, expected_bytes=size,
+            pid=info.pid, status=info.status, start_sec=info.start_sec,
+            start_usec=info.start_usec, name=(info.name or info.comm).decode('utf-8', 'replace'))
+    if (result != size
             or info.pid != pid or info.status == 5 or not info.start_sec
-            or (codex and (info.name or info.comm) != b"codex")):
+            or (codex and not native.codex_process_name(pid, info.name or info.comm))):
         return None
     return [info.start_sec, info.start_usec]
 
@@ -31,7 +41,9 @@ def birth(pid, *, codex=False):
 def arguments(pid):
     if native._procargs_sysctl is None or not 0 < native._procargs_bytes <= 2 * 1024 * 1024:
         raise RuntimeError("native process ownership inspection is unavailable")
-    buffer = ctypes.create_string_buffer(native._procargs_bytes)
+    buffer = getattr(_PROCARGS_TLS, "buffer", None)
+    if buffer is None or len(buffer) != native._procargs_bytes:
+        buffer = _PROCARGS_TLS.buffer = ctypes.create_string_buffer(native._procargs_bytes)
     length = ctypes.c_size_t(len(buffer))
     mib = (ctypes.c_int * 3)(1, 49, pid)
     if native._procargs_sysctl(mib, 3, buffer, ctypes.byref(length), None, 0) != 0:
@@ -83,7 +95,7 @@ def process(pid, *, launch=False):
         return None
     try:
         argv, env = arguments(pid)
-        if not argv or Path(argv[0]).name != "codex":
+        if not argv or Path(argv[0]).name not in native.CODEX_NATIVE_NAMES:
             return None
         sid = str(uuid.UUID(env.get("CMUX_SURFACE_ID", ""))).upper()
         wid = str(uuid.UUID(env.get("CMUX_WORKSPACE_ID", ""))).upper()
@@ -101,7 +113,7 @@ def process(pid, *, launch=False):
         return None
 
 
-def scan():
+def scan(*, reader=None):
     """One bounded local snapshot; never invoke slow ps/top on the stop path."""
     if native._proc_listpids is None or sys.platform != "darwin":
         raise RuntimeError("B realtime process coverage requires Darwin libproc")
@@ -115,7 +127,7 @@ def scan():
         raise RuntimeError("native process inventory incomplete")
     records = []
     for pid in values[:count // 4]:
-        row = process(pid)
+        row = (reader or process)(pid)
         if row:
             records.append(row)
     return records

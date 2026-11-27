@@ -223,7 +223,7 @@ class DeliveryTests(unittest.TestCase):
                 daemon._process_snapshots.close()
 
     def test_wrapped_encrypted_content_400_is_visible_and_never_retried(self):
-        frame = grid_payload(['■ {"error":{"message":"bad response status code 400",',
+        frame = grid_payload(['■ unexpected status 400 Bad Request: {"error":{"message":"The encrypted content",',
                               '"code":"invalid_encryp', 'ted_content"}}'])
         with tempfile.TemporaryDirectory() as directory:
             client = FakeClient(frame, "\n".join(visible_lines(frame)))
@@ -231,6 +231,16 @@ class DeliveryTests(unittest.TestCase):
             daemon.process_once(client)
             self.assertEqual(daemon.runtime["surface-uuid"].state, "provider_blocked")
             self.assertEqual(client.sent, [])
+
+    def test_wrapped_oneapi_bad_response_400_encrypted_content_auto_continues(self):
+        frame = grid_payload(['■ {"error":{"message":"bad response status code 400",',
+                              '"code":"invalid_encryp', 'ted_content"}}'])
+        with tempfile.TemporaryDirectory() as directory:
+            client = FakeClient(frame, "\n".join(visible_lines(frame)))
+            daemon = armed_daemon(directory, client)
+            daemon.process_once(client)
+            self.assertEqual(daemon.runtime["surface-uuid"].state, "awaiting_transition")
+            self.assertEqual(len(client.sent), 1)
 
 
 class ContinuationHealthTests(unittest.TestCase):

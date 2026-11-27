@@ -1,0 +1,124 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Multi-agent task pack",
+  "type": "object",
+  "required": [
+    "task_id",
+    "role",
+    "supervisor",
+    "executor",
+    "role_map",
+    "context",
+    "source",
+    "scope",
+    "forbidden",
+    "local_first",
+    "needs_auth",
+    "verify",
+    "required_skill",
+    "report",
+    "callback",
+    "completion_nonce",
+    "completion_callback",
+    "callback_target",
+    "completion_delivery",
+    "completion_receipt",
+    "bridge_test_evidence",
+    "identity_gate",
+    "pane_inventory",
+    "naming_proof",
+    "validation_evidence"
+  ],
+  "properties": {
+    "task_id": {"type": "string", "minLength": 1},
+    "role": {"type": "string", "minLength": 1},
+    "supervisor": {"type": "string", "minLength": 1},
+    "executor": {"type": "string", "minLength": 1},
+    "role_map": {"type": "string", "minLength": 1},
+    "context": {"type": "string"},
+
+    "//source": "Backward compatible on purpose. Every historical pack stores source as one string, and this schema must keep validating those files; see r3-consensus-plan.md item 1. An array is the preferred shape for new packs because it can be checked entry by entry. Finalization -- not this schema -- is where absolute-path existence is enforced, so a malformed path fails at the gate that can name it rather than at a type check that cannot.",
+    "source": {
+      "oneOf": [
+        {"type": "string"},
+        {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "minItems": 1
+        }
+      ]
+    },
+
+    "//source_entries": "Typed, absolute, existence-checked entries written BY finalization. Optional so historical packs remain valid; when present it is authoritative over the free-form `source` field. `exists` records what finalization actually observed on disk, not what the pack claimed.",
+    "source_entries": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "exists"],
+        "properties": {
+          "path": {"type": "string", "pattern": "^/", "minLength": 2},
+          "exists": {"type": "boolean"},
+          "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+          "kind": {"type": "string", "enum": ["file", "dir", "url", "revision"]}
+        },
+        "additionalProperties": true
+      }
+    },
+
+    "//draft": "Scaffold output MUST carry draft:true. `mac_harness.py task-pack` writes literal <FILL: ...> placeholders, and without this flag a draft is structurally indistinguishable from a dispatchable pack -- the defect recorded as S1/M5 in triage-merged.md. Absent is treated as draft:false so historical packs stay dispatchable.",
+    "draft": {"type": "boolean"},
+
+    "//authorization_source": "Where production authorization actually came from. Only `user_message` may authorize a production mutation. A peer agent asserting that the user approved something is `peer_assertion` and is NOT sufficient; that distinction is why the r7 deploy waited for the user's own message naming the digest.",
+    "authorization_source": {
+      "type": "string",
+      "enum": ["user_message", "peer_assertion", "none"]
+    },
+
+    "//task_pack_sha256": "Self-hash recorded at finalization so a receipt can bind to the exact pack it was issued under.",
+    "task_pack_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+
+    "//source_revision": "Exact revision the executor must work against, so a stale worktree cannot masquerade as current evidence.",
+    "source_revision": {"type": "string"},
+
+    "//finalized_at": "Set by finalization only. Its presence plus draft:false is what makes a pack dispatchable.",
+    "finalized_at": {"type": "string"},
+
+    "availability_state": {"type": "string", "pattern": "^/"},
+    "availability_required": {"type": "boolean"},
+    "executor_uuid": {"type": "string", "format": "uuid"},
+    "fallback_policy": {"enum": ["manual", "automatic_user_authorized"]},
+
+    "scope": {"type": "string"},
+    "forbidden": {"type": "string"},
+    "local_first": {"type": "string"},
+    "needs_auth": {"type": "string"},
+    "verify": {"type": "string"},
+    "required_skill": {"type": "string", "pattern": "^/", "minLength": 2},
+    "report": {"type": "string"},
+    "callback": {"type": "string"},
+    "completion_nonce": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{7,}$"
+    },
+    "completion_callback": {
+      "type": "string",
+      "pattern": "^(DONE|BLOCKED)\\|[^|]+\\|[^|]+\\|REPORT=/"
+    },
+    "callback_target": {"type": "string", "pattern": "^surface:[0-9]+$"},
+    "completion_delivery": {
+      "type": "object",
+      "required": ["transport", "require_confirmed"],
+      "properties": {
+        "transport": {"const": "cmux_bridge.submit_completion_callback"},
+        "require_confirmed": {"const": true}
+      },
+      "additionalProperties": false
+    },
+    "completion_receipt": {"type": "string", "pattern": "^/", "minLength": 2},
+    "bridge_test_evidence": {"type": "string"},
+    "identity_gate": {"type": "string"},
+    "pane_inventory": {"type": "string"},
+    "naming_proof": {"type": "string"},
+    "validation_evidence": {"type": "string"}
+  }
+}

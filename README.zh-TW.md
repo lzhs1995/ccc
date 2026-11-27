@@ -2,22 +2,19 @@
 
 # CCC · 讓 agent 持續推進任務
 
-[English](README.md) · **繁體中文** · [Agent 操作指南](docs/agent-guide.md) · [Herdr 支援狀態](docs/herdr.md)
+[English](README.md) · [简体中文](README.zh-CN.md) · **繁體中文** · [Agent 操作指南](docs/agent-guide.md) · [Herdr 支援狀態](docs/herdr.md)
 
 <picture>
   <source srcset="assets/banner.svg" type="image/svg+xml">
   <img src="assets/banner.png" width="1280" alt="CCC 架構：cmux 外層工作區與 Herdr 內部 agent 面板">
 </picture>
 
-此圖為架構示意；Herdr 整合仍在開發。
-
 **CCC 是 macOS 上的 cmux 續跑管理器，支援 Claude Code 與 Codex。**
 它觀察已授權的會話，在操作前核對原生證據，並以終端管理介面呈現續跑狀態。
 目標是在保留原會話及使用者輸入的前提下，讓中斷的工作繼續推進。
 
-**Herdr 整合仍在開發。目前 `main` 的預設安裝程式尚未包含 Herdr 內部面板的觀察器
-與守衛。** 實驗分支及本機驗證不等於可攜式正式發布。詳見
-[Herdr 支援範圍與發布條件](docs/herdr.md)。
+多實例 Herdr 安裝程式隨附守衛、配套的 CCC 執行環境和原生觀察器。先執行一次觀察，
+核對原會話與輸入授權。[安裝與回復](docs/herdr.md)。
 
 ## 目前提供什麼
 
@@ -27,11 +24,17 @@
 | 終端管理介面 | 工作區與 surface 清單、目前狀態、診斷及操作控制 |
 | 稽核 | 會話與 Hook 診斷、原始身分及投遞證據 |
 | 選用工具 | 設定檔編輯器、網路守衛、先隔離再清理的工具 |
-| Herdr 內部面板 | 開發中，尚未納入預設安裝程式 |
+| Herdr 內部面板 | 搜尋私有端點，依原生證據對 Codex 與 Claude 執行續跑 |
 | 其他 AI agent | 可以閱讀指南並操作 CLI；不宣稱可自動恢復它們自己的會話 |
 
 送出命令不代表對方收到，收到也不代表任務已有實際進展。CCC 遇到投遞結果不明時
 不盲目重送。它不能補足上游帳戶餘額，也無法保證修復所有上游錯誤。
+
+Codex 傳輸錯誤辨識也接受完整的裸原因
+`Encrypted function output content could not be decrypted or decoded.` 與
+`idle timeout waiting for SSE`，即使沒有 `stream disconnected before completion`
+前綴。兩者沿用既有 `stream` 恢復流程及投遞、草稿、turn、Goal 檢查，
+包括原有舊版客戶端相容行為；不新增加密輸入修復、不改重試預算，也不安裝 Herdr 支援。
 
 ## 先檢查，再操作
 
@@ -100,3 +103,5 @@ Claude 登記另需 `--allow-non-codex`、本機設定中的 `claude_enabled: tr
 
 [SVG／PNG Logo 與配圖](docs/branding.md)為本專案原創，適用倉庫的 [MIT 授權](LICENSE)。
 本專案獨立於 cmux、Herdr、OpenAI 與 Anthropic。
+
+可從 v3 快照重建原工作區、分頁與分割窗格，核對原生會話識別碼後在原窗格啟動。先預覽 `stage` 結果，再啟用 `--auto-enter`。[離線復原操作](integrations/herdr-restore/README.md)

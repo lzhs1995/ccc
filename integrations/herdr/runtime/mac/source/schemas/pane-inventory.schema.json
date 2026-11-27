@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Multi-agent pane inventory",
+  "type": "object",
+  "required": [
+    "task_id",
+    "current_session",
+    "current_pane_id",
+    "current_identity",
+    "identity_source",
+    "all_panes",
+    "same_session_panes",
+    "approved_panes",
+    "cross_session_panes_rejected",
+    "updated_at"
+  ],
+  "properties": {
+    "task_id": {"type": "string", "minLength": 1},
+    "current_session": {"type": "string"},
+    "current_pane_id": {"type": "string"},
+    "current_identity": {"type": "string"},
+    "identity_source": {"type": "string"},
+    "all_panes": {"type": "array", "items": {"$ref": "#/$defs/pane"}},
+    "same_session_panes": {"type": "array", "items": {"$ref": "#/$defs/pane"}},
+    "approved_panes": {"type": "array", "items": {"$ref": "#/$defs/pane"}},
+    "cross_session_panes_rejected": {"type": "array", "items": {"$ref": "#/$defs/pane"}},
+    "updated_at": {"type": "string", "minLength": 1}
+  },
+  "$defs": {
+    "pane": {
+      "type": "object",
+      "required": ["identity", "pane_id", "session", "role", "agent", "title", "visible_name", "path", "command"],
+      "properties": {
+        "identity": {"type": "string"},
+        "pane_id": {"type": "string"},
+        "session": {"type": "string"},
+        "role": {"type": "string"},
+        "agent": {"type": "string"},
+        "title": {"type": "string"},
+        "visible_name": {"type": "string"},
+        "path": {"type": "string"},
+        "command": {"type": "string"}
+      }
+    }
+  }
+}

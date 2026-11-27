@@ -3701,7 +3701,7 @@ class SessionFallbackTests(unittest.TestCase):
         stdout = "\n".join([
             "COMMAND   PID  USER   FD   TYPE DEVICE SIZE/OFF     NODE NAME",
             "codex    3636  tester  cwd    DIR   1,14      704 12063724 /Users/tester/secret-project",
-            "codex    3636  lzhs   12u   REG   1,14   1331483 12063724 "
+            "codex    3636  example   12u   REG   1,14   1331483 12063724 "
             f"/Users/tester/.codex/sessions/2026/07/05/rollout-2026-07-05T07-55-57-{SID_A}.jsonl",
         ])
         found, reason = tui.codex_session_from_lsof(3636, runner=_fake_run(stdout))
@@ -3720,8 +3720,8 @@ class SessionFallbackTests(unittest.TestCase):
         import cmux_supervisor_tui as tui
 
         stdout = "\n".join([
-            f"codex 1 lzhs 1u REG 1,14 1 1 /a/rollout-2026-07-05T07-55-57-{SID_A}.jsonl",
-            f"codex 1 lzhs 2u REG 1,14 1 2 /a/rollout-2026-07-06T07-55-57-{SID_B}.jsonl",
+            f"codex 1 example 1u REG 1,14 1 1 /a/rollout-2026-07-05T07-55-57-{SID_A}.jsonl",
+            f"codex 1 example 2u REG 1,14 1 2 /a/rollout-2026-07-06T07-55-57-{SID_B}.jsonl",
         ])
         found, reason = tui.codex_session_from_lsof(1, runner=_fake_run(stdout))
         self.assertIsNone(found)
@@ -3922,7 +3922,7 @@ class SessionFallbackConflictTests(unittest.TestCase):
             pid = argv[argv.index("-p") + 1]
             sid = by_pid[pid]
             return types.SimpleNamespace(
-                stdout=("codex 1 lzhs 1u REG 1,14 1 1 "
+                stdout=("codex 1 example 1u REG 1,14 1 1 "
                         f"/a/rollout-2026-07-05T07-55-57-{sid}.jsonl\n"),
                 returncode=0, stderr="")
         return runner
@@ -4122,7 +4122,7 @@ class SessionResolverTests(unittest.TestCase):
         import cmux_supervisor_tui as tui
 
         table = tui.parse_ps_table(_ps_line(300, f"codex --session-id {SID_A}"))
-        lsof = (f"codex 300 lzhs 1u REG 1,14 1 1 "
+        lsof = (f"codex 300 example 1u REG 1,14 1 1 "
                 f"/a/rollout-2026-07-05T07-55-57-{SID_B}.jsonl")
         result = tui.resolve_surface_session(
             "codex", [300], table, {}, now=time.time(),
@@ -4576,8 +4576,8 @@ class SessionNoRawRetentionTests(unittest.TestCase):
         text = (
             "COMMAND   PID  USER   FD   TYPE DEVICE  SIZE/OFF     NODE NAME\n"
             "codex   3636  tester  cwd    DIR   1,14       704 12063724 /Users/someone/secret-project\n"
-            "codex   3636  lzhs   12r   REG   1,14   1331483 12063724 " + self.ROLLOUT + "\n"
-            "codex   3636  lzhs   13u  IPv4 0x1234       0t0      TCP 10.0.0.2:52344->1.2.3.4:443\n"
+            "codex   3636  example   12r   REG   1,14   1331483 12063724 " + self.ROLLOUT + "\n"
+            "codex   3636  example   13u  IPv4 0x1234       0t0      TCP 10.0.0.2:52344->1.2.3.4:443\n"
             + extra
         )
         return lambda *a, **k: types.SimpleNamespace(stdout=text, returncode=0)
@@ -4616,7 +4616,7 @@ class SessionNoRawRetentionTests(unittest.TestCase):
     def test_two_rollouts_are_a_conflict_and_neither_path_is_kept(self):
         import cmux_supervisor_tui as tui
 
-        second = ("codex   3636  lzhs   14r   REG   1,14   999 999 "
+        second = ("codex   3636  example   14r   REG   1,14   999 999 "
                   "/Users/someone/.codex/sessions/2026/07/06/"
                   f"rollout-2026-07-06T01-02-03-{SID_C}.jsonl\n")
         found, why = tui.codex_session_from_lsof(3636, runner=self._lsof(second))

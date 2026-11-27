@@ -2,23 +2,21 @@
 
 # CCC · Keep your agents moving
 
-[English](README.md) · [繁體中文](README.zh-TW.md) · [Agent guide](docs/agent-guide.md) · [Support status](docs/herdr.md)
+[English](README.md) · [简体中文](README.zh-CN.md) · [繁體中文](README.zh-TW.md) · [Agent guide](docs/agent-guide.md) · [Support status](docs/herdr.md)
 
 <picture>
   <source srcset="assets/banner.svg" type="image/svg+xml">
   <img src="assets/banner.png" width="1280" alt="CCC architecture: cmux outer workspace and Herdr inner agent panels">
 </picture>
 
-Architecture illustration; Herdr integration is in development.
-
 **CCC manages guarded continuation for Claude Code and Codex in cmux on macOS.**
 It watches authorized sessions, checks native evidence before acting, and exposes
 continuation status in a terminal supervisor. The goal is to recover interrupted
 work while preserving the original session and the operator's input.
 
-**Herdr integration is in development. The default installation in `main` does
-not yet include the nested Herdr observer/guard.** Experimental builds and local
-validation are not a portable release. See [Herdr support and release gates](docs/herdr.md).
+The separate multi-Herdr installer bundles the guard, its paired CCC runtime
+and native observer. Start with a single observation cycle, then check the
+selected sessions and input policy. [Installation and rollback](docs/herdr.md).
 
 ## Demo
 
@@ -41,12 +39,19 @@ Silent, edited videos with burned-in Traditional Chinese and English captions.
 | Supervisor TUI | Workspace/surface inventory, current state, diagnostics and controls |
 | Auditing | Session and Hook diagnostics; original identities and delivery evidence |
 | Optional utilities | Profile editor, network guard and quarantine-based cleanup |
-| Herdr inner panels | Development work; not included in the default installer |
+| Herdr inner panels | Private endpoint discovery and guarded Codex/Claude continuation on macOS |
 | Other AI agents | Can use the documented CLI; automatic recovery of their own sessions is not claimed |
 
 A sent command is not proof of receipt. Receipt is not proof of useful work.
 CCC preserves uncertain delivery instead of blindly replaying input. It cannot
 repair an exhausted provider balance or guarantee recovery from every upstream error.
+
+Codex transport detection also accepts the complete bare causes
+`Encrypted function output content could not be decrypted or decoded.` and
+`idle timeout waiting for SSE`, even without a `stream disconnected before completion`
+prefix. They use the existing `stream` recovery path and its delivery, draft,
+turn and Goal checks, including the existing legacy-client compatibility behavior.
+This does not add encrypted-input repair, change retry budgets or install Herdr support.
 
 ## Start by inspecting
 
@@ -120,3 +125,5 @@ all Git history. Do not upload real sessions or credentials in bug reports.
 
 The [SVG/PNG logo and banner](docs/branding.md) are original project assets, included under the
 [MIT license](LICENSE). This project is independent of cmux, Herdr, OpenAI and Anthropic.
+
+Rebuild saved workspaces and panes from a v3 snapshot, then resume proven native session IDs. [Offline recovery](integrations/herdr-restore/README.md)

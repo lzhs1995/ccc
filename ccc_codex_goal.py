@@ -38,7 +38,7 @@ def blocked_goal(target, pid):
         paths = [locks[0], goals[0], logs[0]]
         if not all(linked(p, files[p]) for p in paths):
             return None
-        with closing(sqlite3.connect(goals[0].as_uri() + "?mode=ro", uri=True, timeout=.05)) as db:
+        with closing(sqlite3.connect(goals[0].as_uri() + "?mode=ro", uri=True, timeout=.5)) as db:
             goal = db.execute("SELECT goal_id,status,updated_at_ms FROM thread_goals WHERE thread_id=?", (sid,)).fetchone()
         if not goal or goal[1] != "blocked" or not 0 <= time.time() - goal[2] / 1000 < 86400:
             return None
@@ -60,7 +60,7 @@ def blocked_goal(target, pid):
             return None
         # Re-read after log lookup. A manual resume or replacement invalidates
         # this evidence before terminal input can be considered.
-        with closing(sqlite3.connect(goals[0].as_uri() + "?mode=ro", uri=True, timeout=.05)) as db:
+        with closing(sqlite3.connect(goals[0].as_uri() + "?mode=ro", uri=True, timeout=.5)) as db:
             if db.execute("SELECT goal_id,status,updated_at_ms FROM thread_goals WHERE thread_id=?", (sid,)).fetchone() != goal:
                 return None
         return {"kind": "goal_blocked", "session_id": sid, "turn_id": turn[1], "pid": pid,

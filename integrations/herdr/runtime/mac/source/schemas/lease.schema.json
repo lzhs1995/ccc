@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local/multi-agent-collaboration/lease.schema.json",
+  "title": "Task-scoped advisory file lease",
+  "description": "A lease declares intent to mutate specific absolute paths during one task. Scope is deliberately narrow: only paths the FINALIZED task pack enumerates, including the skill tree when the pack declares it a source. Not the home directory, not glob patterns, not git worktrees. An advisory record alone is a comment; the enforcement point is the hook layer, which is the only layer proven symmetric on both sides.",
+  "type": "object",
+  "required": [
+    "task_id",
+    "owner_role",
+    "owner_surface",
+    "paths",
+    "mode",
+    "created_at",
+    "expires_at",
+    "source_list_sha256"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "task_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Task this lease belongs to. A lease never outlives its task."
+    },
+    "owner_role": {
+      "type": "string",
+      "enum": ["supervisor", "executor", "executor2", "executor3"],
+      "description": "Machine role, matching role-map.json."
+    },
+    "owner_surface": {
+      "type": "string",
+      "pattern": "^surface:[0-9]+$",
+      "description": "Bound cmux surface of the owner, so a stale lease can be traced to a live pane."
+    },
+    "paths": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^/",
+        "description": "Absolute path. Relative paths resolve against whatever cwd happened to be active, which is exactly the defect that made the round guard's root resolution cwd-dependent."
+      },
+      "description": "Every path MUST appear in the finalized task pack's enumerated paths. A path outside that set is LEASE_SCOPE_VIOLATION."
+    },
+    "mode": {
+      "type": "string",
+      "enum": ["exclusive", "shared"],
+      "description": "exclusive: no other owner may hold any overlapping path. shared: concurrent readers permitted."
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "expires_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Bounded TTL. An expired lease reports LEASE_STALE and is never silently reclaimed: silent reclaim is how a lease becomes theatre."
+    },
+    "source_list_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "sha256 over the sorted newline-joined path list, so a lease cannot be widened after acquisition without changing its own identity."
+    },
+    "reason": {
+      "type": "string",
+      "description": "Optional human-readable purpose, e.g. an issue id."
+    },
+    "released_at": {
+      "type": ["string", "null"],
+      "format": "date-time",
+      "description": "Set on explicit release. A released lease no longer conflicts."
+    }
+  },
+  "$comment": "Conflict verdicts: LEASE_CONFLICT (overlapping exclusive path held by another live owner), LEASE_STALE (expired, requires explicit action, never auto-reclaimed), LEASE_SCOPE_VIOLATION (path not enumerated by the finalized pack). Motivating incident: mac_harness.py moved 834b6c73/L1931 -> 8201cd3d/L1944 during an active task while two agents independently recorded the same mutation from opposite sides, neither able to tell the other was mid-write."
+}
