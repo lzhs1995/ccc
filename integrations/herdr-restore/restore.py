@@ -12,6 +12,7 @@ import re
 import secrets
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
@@ -191,7 +192,54 @@ def private_json(path, value):
         os.fsync(writer.fileno())
 
 
-def stage(snapshot, session, out, home, auto=False, fleet=None, launchers=None):
+def witness_rows(path, pin, digest, session, topology_rows):
+    require(path is not None and isinstance(pin, str) and re.fullmatch("[0-9a-f]{64}", pin),
+            "explicit witness file and SHA-256 required together")
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as stream:
+        st = os.fstat(stream.fileno())
+        require(stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and st.st_uid == os.getuid()
+                and stat.S_IMODE(st.st_mode) in (0o400, 0o600), "witness must be a private regular file")
+        raw = stream.read(8388609)
+    require(len(raw) <= 8388608 and hashlib.sha256(raw).hexdigest() == pin, "witness digest mismatch")
+    data = json.loads(raw, object_pairs_hook=unique_keys)
+    epoch = data["epoch"]
+    require(data["schema"] == "ccc-herdr-native-epoch-v1" and str(uuid.UUID(epoch)) == epoch
+            and path.name == epoch + ".json" and data["snapshot_sha256"] == digest and data["session"] == session
+            and type(data["observed_at_ns"]) is int and data["observed_at_ns"] > 0
+            and isinstance(data["panes"], list), "wrong witness epoch, file, session or snapshot")
+    seats = {pane: (wid, tid, p) for wid, tid, pane, p in topology_rows}
+    by_pane = {}
+    terminals, processes, identities = set(), set(), set()
+    for item in data["panes"]:
+        pane, agent, sid = item["pane"], item["agent"], item["sid"]
+        require(pane in seats and pane not in by_pane, "unknown or duplicate witness pane")
+        wid, tid, p = seats[pane]
+        require((session, wid, tid, p["cwd"]) == (item["session"], item["workspace"], item["tab"], item["cwd"]),
+                "witness placement differs from snapshot")
+        allowed_sources = {"codex": ("native_current_turn",),
+                           "claude": ("native_resume_argv", "native_herdr_session_reference")}
+        require(agent in allowed_sources and item["identity_source"] in allowed_sources[agent]
+                and str(uuid.UUID(sid)) == sid, "unsupported native witness")
+        ref = p.get("agent_session")
+        require(ref is None or (ref.get("kind"), ref.get("agent"), ref.get("value"), ref.get("source")) ==
+                ("id", agent, sid, "herdr:" + agent), "witness conflicts with saved native identity")
+        terminal = item["terminal_id"]
+        proc = item["observed_process"]
+        birth = proc["birth"]
+        require(isinstance(terminal, str) and re.fullmatch(r"term_[A-Za-z0-9_-]+", terminal)
+                and type(proc["pid"]) is int and proc["pid"] > 0 and isinstance(birth, list) and len(birth) == 2
+                and all(type(v) is int for v in birth) and birth[0] > 0 and 0 <= birth[1] < 1000000,
+                "missing witness terminal or process generation")
+        require(terminal not in terminals and proc["pid"] not in processes and (agent, sid) not in identities,
+                "duplicate terminal, process or SID in witness")
+        terminals.add(terminal)
+        processes.add(proc["pid"])
+        identities.add((agent, sid))
+        by_pane[pane] = item
+    return epoch, by_pane
+
+
+def stage(snapshot, session, out, home, auto=False, fleet=None, launchers=None, witness=None, witness_sha256=None):
     require(re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*", session), "invalid session name")
     raw = snapshot.read_bytes()
     digest = hashlib.sha256(raw).hexdigest()
@@ -199,11 +247,21 @@ def stage(snapshot, session, out, home, auto=False, fleet=None, launchers=None):
         require(snapshot.stem == digest and snapshot.parent.name == session, "archive digest or session mismatch")
     saved = json.loads(raw, object_pairs_hook=unique_keys)
     rows = topology(saved)
-    identities = Counter((r.get("agent"), r.get("value")) for *_, p in rows
-                         if (r := p.get("agent_session")) and r.get("kind") == "id")
     plan = {"version": 1, "session": session, "snapshot_sha256": digest, "home": str(home), "panes": []}
-    for wid, tid, pane, p in rows:
+    observed = {}
+    if witness is not None or witness_sha256 is not None:
+        epoch, observed = witness_rows(witness, witness_sha256, digest, session, rows)
+        plan.update(witness_epoch=epoch, witness_sha256=witness_sha256)
+    refs = {}
+    for _, _, pane, p in rows:
         ref = p.get("agent_session") or {}
+        if not ref and pane in observed:
+            item = observed[pane]
+            ref = {"source": "herdr:" + item["agent"], "kind": "id", "agent": item["agent"], "value": item["sid"]}
+        refs[pane] = ref
+    identities = Counter((r.get("agent"), r.get("value")) for r in refs.values() if r.get("kind") == "id")
+    for wid, tid, pane, p in rows:
+        ref = refs[pane]
         row = {"workspace": wid, "tab": tid, "pane": pane, "cwd": p.get("cwd"),
                "agent": ref.get("agent"), "sid": ref.get("value")}
         # Never carry arbitrary saved shell commands or agent launch hooks into a new server.
@@ -216,9 +274,13 @@ def stage(snapshot, session, out, home, auto=False, fleet=None, launchers=None):
                     "no supported original binding")
             require(identities[(agent, sid)] == 1, "same native SID bound to multiple panes")
             if agent in ("codex", "claude"):
-                entry = (fleet or {}).get("panes", {}).get(session + "#" + pane, {})
-                require((entry.get("session"), entry.get("pane_id"), entry.get("cwd"), entry.get("agent"), entry.get("sid"))
-                        == (session, pane, row["cwd"], agent, sid), "matching fleet record required")
+                if pane in observed:
+                    entry = observed[pane]
+                    row.update(witness_terminal_id=entry["terminal_id"], observed_process=entry["observed_process"])
+                else:
+                    entry = (fleet or {}).get("panes", {}).get(session + "#" + pane, {})
+                    require((entry.get("session"), entry.get("pane_id"), entry.get("cwd"), entry.get("agent"), entry.get("sid"))
+                            == (session, pane, row["cwd"], agent, sid), "matching fleet record required")
                 row.update(history=entry["history"], base_url_override=entry.get("base_url_override"))
             verify_native(row, home)
             native_args(row)
@@ -331,6 +393,8 @@ def main():
     build.add_argument("--home", type=Path, default=Path.home())
     build.add_argument("--auto-enter", action="store_true")
     build.add_argument("--fleet-manifest", type=Path)
+    build.add_argument("--witness", type=Path, help="one explicitly selected private epoch JSON file")
+    build.add_argument("--witness-sha256", help="independently recorded digest of the selected epoch")
     build.add_argument("--launchers", type=Path, help="private agent to absolute executable JSON map")
     run = sub.add_parser("enter")
     run.add_argument("--plan", type=Path, required=True)
@@ -339,7 +403,7 @@ def main():
     if args.cmd == "stage":
         plan = stage(args.snapshot, args.session, args.out.resolve(), args.home.resolve(), args.auto_enter,
                      read_json(args.fleet_manifest) if args.fleet_manifest else None,
-                     read_json(args.launchers) if args.launchers else None)
+                     read_json(args.launchers) if args.launchers else None, args.witness, args.witness_sha256)
         print(json.dumps(dict(Counter(r["status"] for r in plan["panes"]))))
     else:
         enter(args.plan, args.ticket)
