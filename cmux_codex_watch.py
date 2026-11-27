@@ -508,6 +508,7 @@ class ScreenState:
     # Reconnect stalls have a 60-second repeat floor even as their timers change.
     allow_repeat: bool = True
     native_goal_stalled: bool = False
+    encrypted_request_id: str = ""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2277,6 +2278,8 @@ def classify_grid(grid: Grid) -> ScreenState:
     evidence_error = RECONNECT_COMPACT_PREFIX_RE.sub(
         "", re.sub(r"\s+", "", error.block.lower()), count=1,
     )
+    encrypted_request = (re.search(r"\(requestid:([a-z0-9_-]{1,160})\)", evidence_error)
+                         if error.error_type == "encrypted_function_output" else None)
     return ScreenState(
         "recoverable_error",
         error_type=error.error_type,
@@ -2285,6 +2288,7 @@ def classify_grid(grid: Grid) -> ScreenState:
         reason=f"current {error.error_type} error block",
         message_kind="codex",
         content_fingerprint=_short_hash(evidence_prefix + "\0" + evidence_error),
+        encrypted_request_id=encrypted_request.group(1) if encrypted_request else "",
         ignored_chrome_rows=tuple(sorted(chrome_rows)),
         allow_repeat=(
             error.error_type in PROVIDER_REPEAT_ERROR_TYPES
@@ -9552,6 +9556,22 @@ class WatchDaemon:
         if turn is None and state.native_goal_stalled:
             turn = {"kind": "unknown"}
         if turn is None:
+            if state.error_type == "encrypted_function_output":
+                # Older clients expose no native turn. Only a distinct provider
+                # request ID can distinguish a second such card after delivery.
+                prefix = "encrypted-viewport:"
+                key = prefix + state.encrypted_request_id
+                previous = runtime.codex_sent_turn_key
+                if reserved:
+                    return runtime.codex_observed_turn_key == key
+                if runtime.send_attempt_id and runtime.delivery_status not in {"failed", "cancelled"}:
+                    if previous.startswith(prefix):
+                        if (not state.encrypted_request_id or previous == prefix or previous == key):
+                            return False
+                    elif previous or runtime.send_attempt_evidence == state.content_fingerprint:
+                        return False
+                runtime.codex_observed_turn_key = key
+                return True
             if not (reserved and runtime.codex_observed_turn_key):
                 runtime.codex_observed_turn_key = ""
                 return True
@@ -9569,6 +9589,11 @@ class WatchDaemon:
                 and _match_error_block("■ " + str(error.get("message") or "")) == state.error_type):
             key = f"{turn.get('session_id')}:{turn.get('turn_id')}:{turn.get('at')}"
             already_sent = key == runtime.codex_sent_turn_key
+            if (state.error_type == "encrypted_function_output" and not reserved
+                    and runtime.codex_sent_turn_key.startswith("encrypted-viewport:")
+                    and runtime.delivery_status not in {"failed", "cancelled"}
+                    and float(turn.get("at") or 0) <= runtime.send_started_at):
+                return False
             # The renderer can retain an old error after accepting input.
             # Only a new failed turn or independently proved non-delivery may
             # authorize another prompt; accepted/unknown are not retry proofs.

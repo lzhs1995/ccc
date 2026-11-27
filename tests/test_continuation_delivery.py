@@ -222,7 +222,7 @@ class DeliveryTests(unittest.TestCase):
                 scheduler.close()
                 daemon._process_snapshots.close()
 
-    def test_wrapped_encrypted_content_400_is_visible_and_never_retried(self):
+    def test_strict_encrypted_content_400_stays_blocked(self):
         frame = grid_payload(['■ unexpected status 400 Bad Request: {"error":{"message":"The encrypted content",',
                               '"code":"invalid_encryp', 'ted_content"}}'])
         with tempfile.TemporaryDirectory() as directory:
@@ -231,6 +231,47 @@ class DeliveryTests(unittest.TestCase):
             daemon.process_once(client)
             self.assertEqual(daemon.runtime["surface-uuid"].state, "provider_blocked")
             self.assertEqual(client.sent, [])
+
+    def test_wrapped_encrypted_content_400_continues_once_across_restart(self):
+        frame = grid_payload(['■ {"error":{"message":"bad response status code 400",',
+                              '"code":"invalid_encryp', 'ted_content"}}'])
+        with tempfile.TemporaryDirectory() as directory:
+            client = FakeClient(frame, "\n".join(visible_lines(frame)))
+            daemon = armed_daemon(directory, client)
+            with mock.patch.object(core.time, "time", return_value=1000):
+                daemon.process_once(client)
+            self.assertEqual(client.sent, [("workspace-uuid", "surface-uuid", "任务请继续")])
+            restarted = core.WatchDaemon(daemon.config_path, daemon.state_path, client=client)
+            reframed = grid_payload(['■ {"error":{"message":"bad response status code 400",',
+                                     '"code":"invalid_encrypted_content"}}'])
+            client.payload, client.text = reframed, "\n".join(visible_lines(reframed))
+            with mock.patch.object(core.time, "time", return_value=1016):
+                restarted.process_once(client)
+            self.assertEqual(len(client.sent), 1)
+            later = {"kind": "task_complete", "session_id": "session", "turn_id": "second",
+                     "at": 1018, "error": {"message": '{"message":"bad response status code 400",'
+                                                      '"code":"invalid_encrypted_content"}'}}
+            with mock.patch.object(restarted.codex_queue_recovery, "current_turn", return_value=later):
+                for now in (1020, 1030):
+                    with mock.patch.object(core.time, "time", return_value=now):
+                        restarted.process_once(client)
+            self.assertEqual(len(client.sent), 2)
+
+    def test_encrypted_content_distinct_request_and_unrelated_400(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = FakeClient(error_frame())
+            daemon = armed_daemon(directory, client)
+            for index, (request, code, count) in enumerate((
+                    ("example-a", "invalid_model", 0),
+                    ("example-a", "invalid_encrypted_content", 1),
+                    ("example-a", "invalid_encrypted_content", 1),
+                    ("example-b", "invalid_encrypted_content", 2))):
+                frame = grid_payload([f'■ {{"error":{{"message":"bad response status code 400 (request id: {request})",',
+                                      f'"code":"{code}"}}}}'])
+                client.payload, client.text = frame, "\n".join(visible_lines(frame))
+                with mock.patch.object(core.time, "time", return_value=1000 + 10 * index):
+                    daemon.process_once(client)
+                self.assertEqual(len(client.sent), count)
 
     def test_wrapped_oneapi_bad_response_400_encrypted_content_auto_continues(self):
         frame = grid_payload(['■ {"error":{"message":"bad response status code 400",',

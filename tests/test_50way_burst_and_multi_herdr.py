@@ -86,17 +86,17 @@ class BurstAndMultiHerdrTests(unittest.TestCase):
     def test_multi_herdr_discovery_wrapper_env_and_ledger_rollover(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td).resolve() / "herdr"
-            (root / "sessions" / "stata").mkdir(parents=True, mode=0o700)
-            (root / "sessions" / "c3-llm-wiki").mkdir(parents=True, mode=0o700)
+            (root / "sessions" / "example-beta").mkdir(parents=True, mode=0o700)
+            (root / "sessions" / "example-alpha").mkdir(parents=True, mode=0o700)
             os.chmod(root, 0o700)
             os.chmod(root / "sessions", 0o700)
             cands, refs = discover_herdr_socket_candidates(root)
-            self.assertEqual([c[0] for c in cands], ["default", "c3-llm-wiki", "stata"])
+            self.assertEqual([c[0] for c in cands], ["default", "example-alpha", "example-beta"])
             self.assertEqual(refs, [])
 
             ep = {
-                "session": "stata",
-                "socket": str(root / "sessions" / "stata" / "herdr.sock"),
+                "session": "example-beta",
+                "socket": str(root / "sessions" / "example-beta" / "herdr.sock"),
                 "cmux_workspace_id": "00000000-0000-4000-8000-000000000005",
                 "cmux_surface_id": "00000000-0000-4000-8000-000000000004",
             }
@@ -107,7 +107,7 @@ class BurstAndMultiHerdrTests(unittest.TestCase):
                 "HERDR_PANE_ID": "w1:p1",
                 "HERDR_WORKSPACE_ID": "w1",
                 "HERDR_TAB_ID": "w1:t1",
-                "HERDR_SESSION": "stata",
+                "HERDR_SESSION": "example-beta",
                 "CMUX_WORKSPACE_ID": ep["cmux_workspace_id"],
                 "CMUX_SURFACE_ID": ep["cmux_surface_id"],
             }
@@ -174,7 +174,7 @@ class BurstAndMultiHerdrTests(unittest.TestCase):
     def test_anyrouter_bad_response_400_invalid_encrypted_content_auto_continues(self) -> None:
         wrapped_banner = (
             '■ {"error":{"message":"bad response status code 400 (request id:\n'
-            '20261119194608146851059KqBH5yfb)","type":"invalid_request_error","para\n'
+            'example-request-1)","type":"invalid_request_error","para\n'
             'm":"","code":"invalid_encrypted_content"}}'
         )
         self.assertEqual(structured_error_type(wrapped_banner), "encrypted_function_output")
@@ -204,7 +204,7 @@ class BurstAndMultiHerdrTests(unittest.TestCase):
         narrow_spatial = (
             "■ stream disconnected before completion: cooldown probe incomplete (504: you can retry your request)\n"
             "» Ask Codex to do anything\n"
-            "  GPT-6.2-Astra ultra fast · ~/Documents/example/tasks/01_R_analysis ·\n"
+            "  GPT-6.2-Astra ultra fast · ~/Documents/example/tasks/sample-project ·\n"
             "  Context 65% used · 258K window · Fast · Main [default]\n"
             "  ← for agents                Goal stalled (/goal resume) · ⚠ 4 · f2\n"
         )
@@ -214,7 +214,7 @@ class BurstAndMultiHerdrTests(unittest.TestCase):
         wrapped_window = (
             "■ stream disconnected before completion (504: you can retry your request)\n"
             "» Ask Codex to do anything\n"
-            "  GPT-6.2-Astra ultra fast · ~/Documents/example/tasks/01_R_analysis · Fast · Context 35% used · 258K\n"
+            "  GPT-6.2-Astra ultra fast · ~/Documents/example/tasks/sample-project · Fast · Context 35% used · 258K\n"
             "  window · Main [default]\n"
             "  ← for agents · ? for shortcuts                 Goal stalled (/goal resume) · ⚠ 8 warnings · f2 to view\n"
         )
@@ -233,7 +233,8 @@ class BurstAndMultiHerdrTests(unittest.TestCase):
             '■ unexpected status 403 Forbidden: model not allowed for the gateway key',
         ]
         for msg in samples:
-            self.assertEqual(structured_error_type(msg), "model_unavailable_for_group", msg)
+            expected = "model_not_served" if ("magpie knows no model" in msg or "set not to be served" in msg) else "model_unavailable_for_group"
+            self.assertEqual(structured_error_type(msg), expected, msg)
 
 
 if __name__ == "__main__":
